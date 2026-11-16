@@ -244,6 +244,8 @@ class ReservedNamespaceRoutesTest {
                 .toSortedSet()
         assertThat(filesMatching("""(\.|::)createNamespace\b""")).containsExactly(
             "com/posthog/hoglake/api/Routes.kt",
+            // A request's view of a store: it passes the route's call on to the store it wraps.
+            "com/posthog/hoglake/store/BoundCatalogStore.kt",
             "com/posthog/hoglake/store/PostgresCatalogStore.kt",
         )
         // The row writers: PostgreSQL's from CatalogService.createNamespace only, hoglite's in its store only.

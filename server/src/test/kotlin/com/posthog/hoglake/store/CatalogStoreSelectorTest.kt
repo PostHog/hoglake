@@ -2,6 +2,7 @@ package com.posthog.hoglake.store
 
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.installErrorMapping
+import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthService
@@ -13,6 +14,8 @@ import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
+import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
+import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -57,6 +60,15 @@ class CatalogStoreSelectorTest {
         client: HogliteClient,
         field: String,
     ): Any? = HogliteClient::class.java.getDeclaredField(field).apply { isAccessible = true }.get(client)
+
+    /** [handed] is the caller's view of [behind]: not the object itself, and it wraps it. */
+    private fun assertView(
+        handed: Any,
+        behind: Any,
+    ) {
+        assertThat(handed).isNotSameAs(behind)
+        assertThat(handed.plain()).isSameAs(behind)
+    }
 
     private val postgres =
         Proxy.newProxyInstance(
@@ -149,45 +161,52 @@ class CatalogStoreSelectorTest {
                 routing {
                     get("/v1/catalogs") {
                         val listing = selector.forListing(call)
-                        assertThat(listing.store).isInstanceOf(HogliteCatalogStore::class.java)
-                        assertThat(selector.forCatalog(call, "lake")).isSameAs(listing.store)
-                        val hoglite = listing.store as HogliteCatalogStore
+                        // Under auth a handler gets the caller's view of the store and of each backend.
+                        // MUTATION: hand out a hoglite store or backend itself and its line fails.
+                        val listed = listing.store!!.plain()
+                        assertThat(listing.store).isNotSameAs(listed)
+                        assertThat(listed).isInstanceOf(HogliteCatalogStore::class.java)
+                        assertView(selector.forCatalog(call, "lake"), listed)
+                        val hoglite = listed as HogliteCatalogStore
                         assertThat(hoglite.ledgerRetentionSeconds).isEqualTo(cfg.removalLedgerRetentionSeconds)
                         assertThat(hoglite.smallFileThresholdBytes).isEqualTo(cfg.compactionTargetBytes)
                         assertThat(hoglite.minInputFiles).isEqualTo(cfg.compactionMinInputFiles)
                         assertThat(hoglite.maxInputFiles).isEqualTo(cfg.compactionMaxInputFiles)
-                        assertThat(selector.uploads(call, "lake", hoglite.uploads)).isSameAs(hoglite.uploads)
-                        assertThat(selector.tableCreations(call, "lake", hoglite.tableCreations))
-                            .isSameAs(hoglite.tableCreations)
-                        assertThat(selector.alters(call, "lake", hoglite.alters)).isSameAs(hoglite.alters)
-                        assertThat(selector.views(call, "lake", hoglite.views)).isSameAs(hoglite.views)
-                        assertThat(
-                            selector.partitionStats(call, "lake", hoglite.partitions),
-                        ).isSameAs(hoglite.partitions)
-                        assertThat(
-                            selector.partitionListing(call, "lake", hoglite.partitions),
-                        ).isSameAs(hoglite.partitions)
-                        assertThat(selector.partitionLookup(call, "lake", hoglite.partitionLookup))
-                            .isSameAs(hoglite.partitionLookup)
-                        assertThat(selector.options(call, "lake") { error("must not construct PostgreSQL options") })
-                            .isSameAs(hoglite.options)
-                        assertThat(
+                        assertView(selector.uploads(call, "lake", hoglite.uploads), hoglite.uploads)
+                        assertView(
+                            selector.tableCreations(call, "lake", hoglite.tableCreations),
+                            hoglite.tableCreations,
+                        )
+                        assertView(selector.alters(call, "lake", hoglite.alters), hoglite.alters)
+                        assertView(selector.views(call, "lake", hoglite.views), hoglite.views)
+                        assertView(selector.partitionStats(call, "lake", hoglite.partitions), hoglite.partitions)
+                        assertView(selector.partitionListing(call, "lake", hoglite.partitions), hoglite.partitions)
+                        assertView(
+                            selector.partitionLookup(call, "lake", hoglite.partitionLookup),
+                            hoglite.partitionLookup,
+                        )
+                        assertView(
+                            selector.options(call, "lake") { error("must not construct PostgreSQL options") },
+                            hoglite.options,
+                        )
+                        assertView(
                             selector.retirement(call, "lake") { error("must not construct PostgreSQL retirement") },
+                            hoglite.retirement,
                         )
-                            .isSameAs(hoglite.retirement)
-                        assertThat(
-                            selector.hydratorMaintenance(
-                                call,
-                                "lake",
-                            ) { error("must not construct PostgreSQL hydrator") },
+                        assertView(
+                            selector.hydratorMaintenance(call, "lake") { error("must not build PostgreSQL hydrator") },
+                            hoglite.hydratorMaintenance,
                         )
-                            .isSameAs(hoglite.hydratorMaintenance)
-                        stores.add(listing.store)
+                        val status =
+                            selector.maintenanceStatus(call, "lake") { error("must not build PostgreSQL status") }
+                        assertThat(status).isNotSameAs(status.plain())
+                        assertThat(status.plain()).isInstanceOf(HogliteMaintenanceStatus::class.java)
+                        stores.add(listed)
                         call.respondText(listing.catalogs!!.single())
                     }
                     get("/v1/catalogs/{catalog}") {
                         val selected = selector.forCatalog(call, call.parameters["catalog"]!!)
-                        call.respondText(if (selected === postgres) "postgres" else "hoglite")
+                        call.respondText(if (selected.plain() === postgres) "postgres" else "hoglite")
                     }
                 }
             }
@@ -250,6 +269,103 @@ class CatalogStoreSelectorTest {
             )
                 .isEqualTo(HttpStatusCode.Unauthorized)
         }
+
+    @Test
+    fun `a hoglite catalog's maintenance status is read from hoglite for every caller its token allows`() {
+        val engine = CopyOnWriteArrayList<String>()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        backend = server
+        server.createContext("/") { exchange ->
+            exchange.requestBody.readBytes()
+            engine.add(exchange.requestURI.path)
+            val body = """{"code":"refused","error":"engine-status-probe"}""".toByteArray()
+            exchange.sendResponseHeaders(422, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        server.start()
+        val cfg = config("postgres", backendUrl = "http://127.0.0.1:${server.address.port}")
+        val placed = """"rtg":{"b":"hoglite","be":"$id","t":"opaque_1"}"""
+
+        fun tenant(catalog: String) =
+            TestTokens.mint(
+                pair,
+                TestTokens.tenantClaims(catalogs = mapOf(catalog to listOf("read"))).dropLast(1) + ",$placed}",
+            )
+        val scoped =
+            TestTokens.mint(
+                pair,
+                TestTokens.scopedClaims(catalogs = """{"lake":["read"]}""", extra = ",$placed"),
+            )
+        val notUnderTest: () -> Nothing = { error("not under test") }
+        for (mode in listOf(AuthMode.ENFORCE, AuthMode.WARN, AuthMode.OFF)) {
+            testApplication {
+                application {
+                    val verifier =
+                        JwtVerifier(
+                            TestTokens.ISSUER,
+                            TestTokens.AUDIENCE,
+                            StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
+                            backends = cfg.backendKinds,
+                            predicateFields = setOf("team_id"),
+                            clock = { 1_700_000_001 },
+                        )
+                    installAuth(AuthService(mode, verifier.takeIf { mode != AuthMode.OFF }))
+                    install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                    install(StatusPages) { installErrorMapping() }
+                    installMaintenanceRoutes(
+                        notUnderTest,
+                        notUnderTest,
+                        notUnderTest,
+                        notUnderTest,
+                        notUnderTest,
+                        // The PostgreSQL status: what a catalog that is not the token's hoglite placement reads.
+                        { throw HoglakeException.NotFound("postgres-status-probe") },
+                        notUnderTest,
+                        CatalogStoreSelector(postgres, cfg),
+                    )
+                }
+                for (read in listOf("status", "runs")) {
+                    suspend fun ask(
+                        catalog: String,
+                        token: String,
+                    ): String {
+                        engine.clear()
+                        val response =
+                            client.get("/v1/catalogs/$catalog/maintenance/$read") {
+                                header(HttpHeaders.Authorization, "Bearer $token")
+                            }
+                        val from = if (engine.isEmpty()) "" else " from the engine"
+                        return "${response.status.value} ${response.bodyAsText()}$from"
+                    }
+                    val what = "$mode $read"
+                    if (mode == AuthMode.OFF) {
+                        // No caller, so no placement: the PostgreSQL default, as before.
+                        assertThat(ask("lake", tenant("lake"))).describedAs(what).contains("postgres-status-probe")
+                        assertThat(engine).isEmpty()
+                        continue
+                    }
+                    // MUTATION: choose by casting forCatalog's answer to HogliteCatalogStore, which is
+                    // a view under auth, and these read PostgreSQL's status.
+                    for (caller in listOf(tenant("lake"), token())) {
+                        assertThat(ask("lake", caller)).describedAs(what)
+                            .startsWith("422 ").contains("engine-status-probe").endsWith(" from the engine")
+                    }
+                    // A token for another catalog: refused under enforce, let through to the default
+                    // backend under warn, as before. The placement is not the request's.
+                    val other = ask("lake", tenant("other"))
+                    if (mode == AuthMode.ENFORCE) {
+                        assertThat(other).describedAs(what).startsWith("404 ").doesNotContain("postgres-status-probe")
+                    } else {
+                        assertThat(other).describedAs(what).startsWith("404 ").contains("postgres-status-probe")
+                    }
+                    assertThat(engine).describedAs(what).isEmpty()
+                    // A scoped caller: the route is not one of its routes.
+                    assertThat(ask("lake", scoped)).describedAs(what).startsWith("403 ")
+                    assertThat(engine).describedAs(what).isEmpty()
+                }
+            }
+        }
+    }
 
     @Test
     fun `unrouted and anonymous requests keep the configured PostgreSQL default`() =
