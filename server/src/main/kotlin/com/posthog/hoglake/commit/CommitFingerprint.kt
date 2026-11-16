@@ -18,7 +18,7 @@ internal fun commitFingerprint(request: CommitRequest): String {
                     }.sortedBy { it.first }.map { it.second },
             ).let { mapper.writeValueAsString(it) to it }
         }.sortedBy { it.first }.map { it.second }
-    return mapper.writeValueAsString(request.copy(appends = appends))
+    return mapper.writeValueAsString(FileEnds.canonical(request.copy(appends = appends)))
 }
 
 /**

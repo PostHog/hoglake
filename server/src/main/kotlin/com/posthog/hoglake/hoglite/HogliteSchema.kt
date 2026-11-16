@@ -48,6 +48,18 @@ internal object HogliteSchema {
     /** Numeric storage-execution time, using SQLite's timestamp parser. */
     const val CREATION_NOW_SQL = "julianday('now')"
 
+    /**
+     * The data files a replacement ended, by its idempotency key: what a replay and
+     * GET /commit/receipts answer with. A table of its own because tenants have no
+     * migrations, so the column Postgres added to its receipts is not available;
+     * every replacement creates it if missing, and a reader checks it exists.
+     */
+    const val RECEIPT_ENDED_DDL =
+        """CREATE TABLE IF NOT EXISTS receipt_ended(
+                idempotency_key TEXT PRIMARY KEY,
+                ended_files INTEGER NOT NULL
+            )"""
+
     /*
      * The object-prefix layout (`set_object_prefix_field`), Postgres V29's
      * hog_table_layout: versioned like the spec rows, at most one live row
@@ -78,6 +90,11 @@ internal object HogliteSchema {
             "CREATE INDEX IF NOT EXISTS files_compaction_bucket ON files(" +
                 "table_id, COALESCE(spec_id, -1), COALESCE(partition_values_json, ''), file_size_bytes, id) " +
                 "WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_live_stats ON files(stats_state) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_live_size ON files(file_size_bytes) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS removals_queued_at ON removals(queued_at) WHERE drained_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_loop ON maintenance_runs(task, id, started_at) " +
+                "WHERE run_trigger = 'loop'",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_status ON maintenance_runs(task, status, id)",
             "CREATE INDEX IF NOT EXISTS dvs_path ON dvs(path)",
             "CREATE INDEX IF NOT EXISTS removals_undrained_path ON removals(path) WHERE drained_at IS NULL",
@@ -314,6 +331,7 @@ internal object HogliteSchema {
                 schema_version INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             )""",
+            RECEIPT_ENDED_DDL,
             // First-release DDL. Drop and recreate development tenants instead of adding migration code.
             "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
             """CREATE TABLE IF NOT EXISTS offsets(
