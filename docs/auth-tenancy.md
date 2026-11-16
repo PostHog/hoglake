@@ -855,7 +855,66 @@ binding, a mount or a store (`auth/StoreEntitlement.kt`):
 
 This covers catalogs only. A scoped caller's namespaces are the gate's and the
 handlers'. The PostgreSQL store that is handed out takes a catalog name again on
-each call and is not bound to the name that was checked.
+each call. The view a handler gets of the store (below) checks both again, behind
+them: the catalog of every call, and a scoped caller's namespaces.
+
+**What a handler gets is a view of the store** (built). Under every mode that
+resolves a caller, the selector hands a handler a view of the store and of each
+sub-backend (uploads, table creations, alters, views, partitions, maintenance) in
+place of the object itself (`store/BoundCatalogStore.kt`, `store/BoundBackends.kt`).
+Each operation first asks the request's rule (`auth/StoreGrant.kt`) with the
+catalog and the namespace the handler passed:
+
+- Every caller kind: the view answers only for the catalog it was handed out
+  for. Another name gets the plugin's 404 for a catalog the token does not name.
+  The catalog listing's store lists only names the token names.
+- A scoped caller: a namespace must be live, contained, and contained for a value
+  the token holds for the operation: read or write, the lower of `prd` and `cat`.
+  The route table is not asked. Any other namespace gets the gate's 404 for a
+  missing namespace. This covers a namespace in the path, in a body (a commit, a
+  table creation, the prefix of an upload claim) and behind an id (a table
+  creation's operation).
+- A table creation in a namespace the caller may not use answers the 404 of a
+  creation that does not exist, here and in the route's own check, so neither its
+  existence nor its namespace shows. The audit names the namespace.
+- A scoped caller gets 403 for every operation that names no namespace, such as
+  storage usage, snapshots, receipts, consumer offsets and maintenance. Reading
+  the catalog stays open, and so do renewing and abandoning upload claims: they
+  name a claim owner and no namespace, and the view holds them to the catalog
+  only, not to whose claims they are.
+- This is a second layer. The namespace gate and the handlers' own checks
+  (`requireScopedNamespaces`, `requireScopedUploadPrefix` and the table-creation
+  routes' `requireScopedCreation`) still decide first. They read through the view,
+  or for a table creation through the selector, and what they read is kept for the
+  request: a request whose handler passes its own route's values reads nothing more
+  than before and is never refused at the store. A refusal audited `at=store` is
+  one the first layer did not make.
+- The modes, the counting and the audit are those of the catalog check above
+  (`at=store`, at most one refusal for a request). Under `off` the selector hands
+  out the store itself.
+- The views are written out method by method, with no delegation by default. A
+  method added to `CatalogStore` or to a sub-backend without a body does not
+  compile until its view is written. One added with a default body compiles, and
+  `BoundStoreTest` fails until its rule is listed there.
+  `ScopedRouteHandlersIntegrationTest` sends a scoped caller's request on every
+  route open to it through the real handlers, and fails on any refusal at the
+  store.
+
+Not covered:
+
+- The publication routes and the maintenance export answer 501 and call no
+  service. `requirePostgres` checks their catalog's placement and returns nothing
+  to wrap. An implementation must hand its handler a view, as the sub-backend
+  accessors do.
+- The instance-wide routes read PostgreSQL with no view: `GET
+  /v1/maintenance/status`, `GET /v1/maintenance/runs`, `GET /v1/database/health`,
+  `GET /v1/mounts` and `GET /v1/mounts/{mount}`. They are operator routes, and the
+  plugin refuses a scoped caller on each of them.
+- A mount's reads (§6.5a: its catalog row, and the export's scan) read
+  PostgreSQL with no view. They serve a scoped reader of the mount by design: the
+  row is the source catalog's under the mount's name, and ReadScope bounds the
+  scan in SQL.
+- The `remote_schemas` claim is not read here.
 
 ### 6.5a Mount dispatch
 

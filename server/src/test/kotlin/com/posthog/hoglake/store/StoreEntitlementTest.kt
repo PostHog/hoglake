@@ -92,7 +92,14 @@ class StoreEntitlementTest {
                 suspend fun RoutingContext.hand() {
                     val header = call.request.headers["X-Handler-Catalog"]
                     for (name in header?.split(',') ?: listOf(call.parameters["catalog"]!!)) {
-                        assertThat(stores.forCatalog(call, name)).isSameAs(store)
+                        // The store itself with auth off; under auth, the caller's view of it.
+                        val handedOut = stores.forCatalog(call, name)
+                        if (mode == null || mode == AuthMode.OFF) {
+                            assertThat(handedOut).isSameAs(store)
+                        } else {
+                            assertThat(handedOut).isNotSameAs(store)
+                            assertThat(handedOut.plain()).isSameAs(store)
+                        }
                         handed += name
                     }
                     call.respondText("store")

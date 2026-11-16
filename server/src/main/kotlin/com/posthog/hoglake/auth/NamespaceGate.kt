@@ -115,7 +115,10 @@ private fun Application.installCallNamespaceGate(
             } catch (failure: HoglakeException) {
                 // The lookup answered the request itself; the error mapping
                 // sends the answer, and this counts the request's one auth
-                // outcome. An outage is not an auth outcome.
+                // outcome. An outage is not an auth outcome. A refusal the
+                // lookup counted itself (the store's, StoreGrant.kt) is not
+                // counted again.
+                if (call.attributes.contains(RefusalCountedKey)) throw failure
                 when (failure) {
                     // A mount reader on a route the mount does not serve
                     // (store/Mounts.kt): authorized, as the plugin counts it

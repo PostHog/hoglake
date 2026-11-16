@@ -3,6 +3,7 @@ package com.posthog.hoglake.store
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.Routing
+import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.verifiedBackendToken
@@ -66,11 +67,18 @@ class CatalogStoreSelector(
      * The binding resolved for this request's `{catalog}`, cached so the
      * namespace gate and the handler resolve a mount once (plan row 1.3h:
      * "cache the binding per request"). A request names one catalog, so a
-     * single entry suffices; only a successful resolution is cached.
+     * single entry suffices; only a successful resolution is cached. It
+     * holds what was handed out and, for a local store, the store behind
+     * the view ([Handed]).
      */
-    private val boundCatalog = AttributeKey<Pair<String, CatalogBinding>>("HoglakeCatalogBinding")
+    private val boundCatalog = AttributeKey<Pair<String, Handed>>("HoglakeCatalogBinding")
 
     /**
+     * Under auth this hands out the caller's view of the store ([asView]),
+     * never a [HogliteCatalogStore] itself: `forCatalog(...) as?
+     * HogliteCatalogStore` is null there and quietly takes the PostgreSQL
+     * path. Choose a backend from the store itself, as [handOut] does.
+     *
      * Return one request-scoped hoglite store, or the process's PostgreSQL
      * singleton. Every catalog route calls this before any service or body
      * work, so a mount is refused here on every route it has no reader for.
@@ -95,7 +103,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding {
-        call.attributes.getOrNull(boundCatalog)?.let { (name, binding) -> if (name == catalog) return binding }
+        call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
         // Before any binding: a name resolves only when the caller's token allows it.
         call.requireCatalogEntitlement(catalog)
         val binding =
@@ -105,8 +113,9 @@ class CatalogStoreSelector(
                     if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
                 )
             }
-        call.attributes.put(boundCatalog, catalog to binding)
-        return binding
+        val handed = asView(call, catalog, binding)
+        call.attributes.put(boundCatalog, catalog to handed)
+        return handed.binding
     }
 
     /**
@@ -162,7 +171,7 @@ class CatalogStoreSelector(
         val mounts = mountVisibility(caller)
         return if (routing != null) {
             Listing(
-                routed(call, routing),
+                listed(call, routed(call, routing)),
                 setOf(routing.catalog),
                 usePostgresTotals = routing.backend == BackendKind.POSTGRES,
                 mounts = mounts,
@@ -171,7 +180,7 @@ class CatalogStoreSelector(
             // A mount reader on a Client with no default backend has no local
             // catalogs to list, only the Host's mounts.
             val store = if (mounts.any { mountHosts.resolve(caller, it) != null }) defaultPostgres() else fallback("")
-            Listing(store, caller?.visibleCatalogs(), usePostgresTotals = true, mounts = mounts)
+            Listing(listed(call, store), caller?.visibleCatalogs(), usePostgresTotals = true, mounts = mounts)
         }
     }
 
@@ -237,7 +246,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> UploadBackend,
-    ): UploadBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.uploads ?: postgres()
+    ): UploadBackend = handOut(call, catalog, postgres, ::BoundUploads) { it.uploads }
 
     fun tableCreations(
         call: ApplicationCall,
@@ -249,7 +258,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> TableCreationBackend,
-    ): TableCreationBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.tableCreations ?: postgres()
+    ): TableCreationBackend = handOut(call, catalog, postgres, ::BoundTableCreations) { it.tableCreations }
 
     fun alters(
         call: ApplicationCall,
@@ -261,7 +270,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> AlterBackend,
-    ): AlterBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.alters ?: postgres()
+    ): AlterBackend = handOut(call, catalog, postgres, ::BoundAlters) { it.alters }
 
     fun views(
         call: ApplicationCall,
@@ -273,7 +282,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> ViewBackend,
-    ): ViewBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.views ?: postgres()
+    ): ViewBackend = handOut(call, catalog, postgres, ::BoundViews) { it.views }
 
     fun partitionStats(
         call: ApplicationCall,
@@ -285,7 +294,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> PartitionStatsBackend,
-    ): PartitionStatsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres()
+    ): PartitionStatsBackend = handOut(call, catalog, postgres, ::BoundPartitionStats) { it.partitions }
 
     fun partitionListing(
         call: ApplicationCall,
@@ -297,7 +306,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> PartitionListingBackend,
-    ): PartitionListingBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres()
+    ): PartitionListingBackend = handOut(call, catalog, postgres, ::BoundPartitionListing) { it.partitions }
 
     fun partitionLookup(
         call: ApplicationCall,
@@ -309,7 +318,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> PartitionLookupBackend,
-    ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres()
+    ): PartitionLookupBackend = handOut(call, catalog, postgres, ::BoundPartitionLookup) { it.partitionLookup }
 
     /** Resolve options through the same request-scoped store as catalog operations. */
     fun options(
@@ -322,7 +331,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> OptionsBackend,
-    ): OptionsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.options ?: postgres()
+    ): OptionsBackend = handOut(call, catalog, postgres, ::BoundOptions) { it.options }
 
     fun expiry(
         call: ApplicationCall,
@@ -334,7 +343,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> ExpiryBackend,
-    ): ExpiryBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.expiry ?: postgres()
+    ): ExpiryBackend = handOut(call, catalog, postgres, ::BoundExpiry) { it.expiry }
 
     fun cleanup(
         call: ApplicationCall,
@@ -347,9 +356,9 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> CleanupBackend,
     ): CleanupBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+        handOut(call, catalog, postgres, ::BoundCleanup) {
             HogliteCleanup(checkNotNull(cfg), it, removalStore())
-        } ?: postgres()
+        }
 
     fun compaction(
         call: ApplicationCall,
@@ -362,15 +371,17 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> CompactionBackend,
     ): CompactionBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+        handOut(call, catalog, postgres, ::BoundCompaction) {
             HogliteCompaction(
-                it, objectStore(), hogliteCompactionConfig(),
+                it,
+                objectStore(),
+                hogliteCompactionConfig(),
                 cursors =
                     compactionCursors.computeIfAbsent(checkNotNull(call.hoglakeAuth.callerOrNull?.routing).backendId) {
                         HogliteCompactionCursors()
                     },
             )
-        } ?: postgres()
+        }
 
     fun retirement(
         call: ApplicationCall,
@@ -382,7 +393,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> RetirementBackend,
-    ): RetirementBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.retirement ?: postgres()
+    ): RetirementBackend = handOut(call, catalog, postgres, ::BoundRetirement) { it.retirement }
 
     fun hydratorMaintenance(
         call: ApplicationCall,
@@ -395,7 +406,7 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
     ): HydratorMaintenanceBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.hydratorMaintenance ?: postgres()
+        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) { it.hydratorMaintenance }
 
     fun maintenanceStatus(
         call: ApplicationCall,
@@ -407,26 +418,94 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> MaintenanceStatusBackend,
-    ): MaintenanceStatusBackend = postgresMaintenance(call, catalog, postgres)
-
-    private fun <T> postgresMaintenance(
-        call: ApplicationCall,
-        catalog: String,
-        postgres: () -> T,
-    ): T {
-        requirePostgres(call, catalog)
-        return postgres()
-    }
+    ): MaintenanceStatusBackend = handOut(call, catalog, postgres, ::BoundMaintenanceStatus) { throw notOnHoglite() }
 
     /** Maintenance is PostgreSQL-only. Resolve placement before any service or body work. */
     fun requirePostgres(
         call: ApplicationCall,
         catalog: String,
     ) {
-        if (forCatalog(call, catalog) is HogliteCatalogStore) {
-            throw HoglakeException.NotSupported("this operation is not supported on a hoglite backend")
-        }
+        if (local(call, catalog).store is HogliteCatalogStore) throw notOnHoglite()
     }
+
+    private fun notOnHoglite() = HoglakeException.NotSupported("this operation is not supported on a hoglite backend")
+
+    /**
+     * The namespace table creation [operationId] of [catalog] was prepared
+     * for, read from the backend itself: the input of the handler's own check
+     * (api/TableCreationRoutes.kt), which decides before the handler asks the
+     * caller's view. The view then finds it kept for the request.
+     */
+    fun creationNamespace(
+        call: ApplicationCall,
+        catalog: String,
+        operationId: UUID,
+        postgres: () -> TableCreationBackend,
+    ): String {
+        val local = local(call, catalog)
+        val backend = (local.store as? HogliteCatalogStore)?.tableCreations ?: postgres()
+        return backend.status(catalog, operationId).definition.namespace.also { local.grant?.found(operationId, it) }
+    }
+
+    /**
+     * What [resolve] handed out for a catalog on this request ([binding]),
+     * and for a local store the store itself and the grant its views ask
+     * (auth/StoreGrant.kt).
+     */
+    private class Handed(
+        val binding: CatalogBinding,
+        val store: CatalogStore? = null,
+        val grant: StoreGrant? = null,
+    )
+
+    /**
+     * A local store leaves this class only as the caller's view of it
+     * (BoundCatalogStore.kt), which holds every operation to this catalog
+     * and to what the caller's token allows in it. With no caller resolved
+     * (auth `off`) there is no grant, and the store itself is handed out.
+     */
+    private fun asView(
+        call: ApplicationCall,
+        catalog: String,
+        binding: CatalogBinding,
+    ): Handed {
+        if (binding !is CatalogBinding.Local) return Handed(binding)
+        val grant = StoreGrant.of(call, catalog, binding.store) ?: return Handed(binding, binding.store)
+        return Handed(CatalogBinding.Local(BoundCatalogStore(grant, binding.store)), binding.store, grant)
+    }
+
+    /** What [forCatalog] handed out, after every refusal it makes: for this class's backend choice. */
+    private fun local(
+        call: ApplicationCall,
+        catalog: String,
+    ): Handed {
+        forCatalog(call, catalog)
+        // forCatalog resolved [catalog] last, so the request's one entry is its.
+        return call.attributes[boundCatalog].second
+    }
+
+    /**
+     * The sub-backend of [catalog] for this request: the hoglite store's
+     * own ([hoglite]) or the PostgreSQL service, chosen from the store
+     * itself and handed out as the caller's view of it ([view]).
+     */
+    private fun <T : Any> handOut(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> T,
+        view: (StoreGrant, T) -> T,
+        hoglite: (HogliteCatalogStore) -> T,
+    ): T {
+        val local = local(call, catalog)
+        val backend = (local.store as? HogliteCatalogStore)?.let(hoglite) ?: postgres()
+        return local.grant?.let { view(it, backend) } ?: backend
+    }
+
+    /** The catalog listing's store, as a view bound to no catalog: it lists the token's catalogs and nothing else. */
+    private fun listed(
+        call: ApplicationCall,
+        store: CatalogStore?,
+    ): CatalogStore? = store?.let { StoreGrant.of(call, null, it)?.let { grant -> BoundCatalogStore(grant, it) } ?: it }
 
     /** Readiness also checks every configured hoglite backend, including clients not yet used by a request. */
     fun reachable(): Boolean = cfg?.hogliteBackends?.keys?.all { client(it).reachable() } ?: true

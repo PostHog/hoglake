@@ -58,6 +58,15 @@ class CatalogStoreSelectorTest {
         field: String,
     ): Any? = HogliteClient::class.java.getDeclaredField(field).apply { isAccessible = true }.get(client)
 
+    /** [handed] is the caller's view of [behind]: not the object itself, and it wraps it. */
+    private fun assertView(
+        handed: Any,
+        behind: Any,
+    ) {
+        assertThat(handed).isNotSameAs(behind)
+        assertThat(handed.plain()).isSameAs(behind)
+    }
+
     private val postgres =
         Proxy.newProxyInstance(
             CatalogStore::class.java.classLoader,
@@ -149,45 +158,48 @@ class CatalogStoreSelectorTest {
                 routing {
                     get("/v1/catalogs") {
                         val listing = selector.forListing(call)
-                        assertThat(listing.store).isInstanceOf(HogliteCatalogStore::class.java)
-                        assertThat(selector.forCatalog(call, "lake")).isSameAs(listing.store)
-                        val hoglite = listing.store as HogliteCatalogStore
+                        // Under auth a handler gets the caller's view of the store and of each backend.
+                        // MUTATION: hand out a hoglite store or backend itself and its line fails.
+                        val listed = listing.store!!.plain()
+                        assertThat(listing.store).isNotSameAs(listed)
+                        assertThat(listed).isInstanceOf(HogliteCatalogStore::class.java)
+                        assertView(selector.forCatalog(call, "lake"), listed)
+                        val hoglite = listed as HogliteCatalogStore
                         assertThat(hoglite.ledgerRetentionSeconds).isEqualTo(cfg.removalLedgerRetentionSeconds)
                         assertThat(hoglite.smallFileThresholdBytes).isEqualTo(cfg.compactionTargetBytes)
                         assertThat(hoglite.minInputFiles).isEqualTo(cfg.compactionMinInputFiles)
                         assertThat(hoglite.maxInputFiles).isEqualTo(cfg.compactionMaxInputFiles)
-                        assertThat(selector.uploads(call, "lake", hoglite.uploads)).isSameAs(hoglite.uploads)
-                        assertThat(selector.tableCreations(call, "lake", hoglite.tableCreations))
-                            .isSameAs(hoglite.tableCreations)
-                        assertThat(selector.alters(call, "lake", hoglite.alters)).isSameAs(hoglite.alters)
-                        assertThat(selector.views(call, "lake", hoglite.views)).isSameAs(hoglite.views)
-                        assertThat(
-                            selector.partitionStats(call, "lake", hoglite.partitions),
-                        ).isSameAs(hoglite.partitions)
-                        assertThat(
-                            selector.partitionListing(call, "lake", hoglite.partitions),
-                        ).isSameAs(hoglite.partitions)
-                        assertThat(selector.partitionLookup(call, "lake", hoglite.partitionLookup))
-                            .isSameAs(hoglite.partitionLookup)
-                        assertThat(selector.options(call, "lake") { error("must not construct PostgreSQL options") })
-                            .isSameAs(hoglite.options)
-                        assertThat(
+                        assertView(selector.uploads(call, "lake", hoglite.uploads), hoglite.uploads)
+                        assertView(
+                            selector.tableCreations(call, "lake", hoglite.tableCreations),
+                            hoglite.tableCreations,
+                        )
+                        assertView(selector.alters(call, "lake", hoglite.alters), hoglite.alters)
+                        assertView(selector.views(call, "lake", hoglite.views), hoglite.views)
+                        assertView(selector.partitionStats(call, "lake", hoglite.partitions), hoglite.partitions)
+                        assertView(selector.partitionListing(call, "lake", hoglite.partitions), hoglite.partitions)
+                        assertView(
+                            selector.partitionLookup(call, "lake", hoglite.partitionLookup),
+                            hoglite.partitionLookup,
+                        )
+                        assertView(
+                            selector.options(call, "lake") { error("must not construct PostgreSQL options") },
+                            hoglite.options,
+                        )
+                        assertView(
                             selector.retirement(call, "lake") { error("must not construct PostgreSQL retirement") },
+                            hoglite.retirement,
                         )
-                            .isSameAs(hoglite.retirement)
-                        assertThat(
-                            selector.hydratorMaintenance(
-                                call,
-                                "lake",
-                            ) { error("must not construct PostgreSQL hydrator") },
+                        assertView(
+                            selector.hydratorMaintenance(call, "lake") { error("must not build PostgreSQL hydrator") },
+                            hoglite.hydratorMaintenance,
                         )
-                            .isSameAs(hoglite.hydratorMaintenance)
-                        stores.add(listing.store)
+                        stores.add(listed)
                         call.respondText(listing.catalogs!!.single())
                     }
                     get("/v1/catalogs/{catalog}") {
                         val selected = selector.forCatalog(call, call.parameters["catalog"]!!)
-                        call.respondText(if (selected === postgres) "postgres" else "hoglite")
+                        call.respondText(if (selected.plain() === postgres) "postgres" else "hoglite")
                     }
                 }
             }
