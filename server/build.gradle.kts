@@ -303,6 +303,7 @@ val fuzzSoakTargets =
         "CommitReceiptFuzzTest",
         "VariantShreddingFuzzTest",
         "JwtAudienceFuzzTest",
+        "NamespaceFieldRewriteFuzzTest",
     )
 
 val fuzzSweepTargets =

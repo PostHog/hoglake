@@ -61,8 +61,9 @@ import kotlin.coroutines.resumeWithException
  *   namespace and table names that pass the identifier grammar, each
  *   percent-encoded as one segment; a name outside the grammar is the 404 a
  *   missing one gets, with nothing sent. For a remote schema the path is
- *   the caller's own: its catalog, the schema's configured name and the
- *   table, by the same rules. Query parameters are re-encoded one
+ *   the caller's own: its catalog, the schema's name on the host
+ *   ([MountHost.remoteName], by default its local name) and the table, by
+ *   the same rules. Query parameters are re-encoded one
  *   by one; one named `catalog`, `namespace` or `table` (in any letter case)
  *   is not sent, because those are route values and come from the path only.
  *   Redirects are not followed and no proxy is used.
@@ -71,9 +72,11 @@ import kotlin.coroutines.resumeWithException
  *   covering the wait for the Host and its whole body, and a byte cap on a
  *   body (the host's `max_concurrent`, `timeout_ms`, `max_response_bytes`). The
  *   handler suspends while the Host works, so no request-dispatcher thread
- *   is held; a body is streamed, never held whole.
- * - **What comes back.** A 200 JSON body, byte for byte. A typed refusal
- *   (an allowed status and an `ApiError` body) as the Host's status, code
+ *   is held; a body is streamed, never held whole, and so is one rewritten.
+ * - **What comes back.** A 200 JSON body, byte for byte, except one
+ *   field of a remote schema's namespace and table answers when the schema
+ *   has another name on the host, rewritten as it streams ([relaySchema]).
+ *   A typed refusal (an allowed status and an `ApiError` body) as the Host's status, code
  *   and detail. Unreachable or late: 503 `mount_host_unavailable`. Anything
  *   else: 502 `mount_host_invalid_response`. No message built here carries
  *   the Host's address or bytes the Host sent.
@@ -162,31 +165,33 @@ class MountHostClient(
     /**
      * The four routes of a remote schema ([CatalogBinding.RemoteSchema]):
      * the caller's request for the namespace `schema.schema` of its own
-     * catalog, sent to this host with the same path and query. The Host
-     * derives what to serve from the catalog, the schema and the token;
-     * the Client holds no Host-side name and no table list.
+     * catalog, sent to this host with the same path and query, the
+     * namespace under its name on the host. The Host derives what to serve
+     * from the catalog, the schema and the token; the Client holds no table
+     * list. Each names the field of its answer that carries the namespace
+     * name, if one does: the namespace's `name`, the table's `namespace`.
      */
     suspend fun schemaNamespace(
         call: ApplicationCall,
         schema: CatalogBinding.RemoteSchema,
-    ) = relaySchema(call, schema)
+    ) = relaySchema(call, schema, "name")
 
     suspend fun schemaTables(
         call: ApplicationCall,
         schema: CatalogBinding.RemoteSchema,
-    ) = relaySchema(call, schema, "tables")
+    ) = relaySchema(call, schema, null, "tables")
 
     suspend fun schemaTable(
         call: ApplicationCall,
         schema: CatalogBinding.RemoteSchema,
         table: String,
-    ) = relaySchema(call, schema, "tables", tableName(schema.schema, table))
+    ) = relaySchema(call, schema, "namespace", "tables", tableName(schema.schema, table))
 
     suspend fun schemaScan(
         call: ApplicationCall,
         schema: CatalogBinding.RemoteSchema,
         table: String,
-    ) = relaySchema(call, schema, "tables", tableName(schema.schema, table), "scan")
+    ) = relaySchema(call, schema, null, "tables", tableName(schema.schema, table), "scan")
 
     /**
      * The Host's catalog entries for [mounts], as the Host sent them: one
@@ -216,19 +221,30 @@ class MountHostClient(
         vararg tail: String,
     ) = relay(call, mountSubject(setOf(mount)), path(mount, tail.asList()))
 
-    /** Forward the caller's GET for `/v1/catalogs/{catalog}/namespaces/{schema}[/tail...]`, as [relay] does. */
+    /**
+     * Forward the caller's GET for `/v1/catalogs/{catalog}/namespaces/{schema}[/tail...]`,
+     * the schema under its name on the host, and relay the answer as
+     * [relay] does. When that name is not the local one and the answer
+     * carries the namespace name in [field], the answer is rewritten as it
+     * streams ([NamespaceFieldRewrite]): [field] must hold the host's name,
+     * and becomes the local one; nothing else changes. An answer the
+     * rewrite refuses is an invalid one, refused as [relay] refuses a body
+     * over the size cap.
+     */
     private suspend fun relaySchema(
         call: ApplicationCall,
         schema: CatalogBinding.RemoteSchema,
+        field: String?,
         vararg tail: String,
     ) {
         check((host.match as? MountMatch.Namespace)?.name == schema.schema) { "not this host's remote schema" }
         if (!CATALOG.matches(schema.catalog)) throw HoglakeException.NotFound("catalog '${schema.catalog}'")
-        relay(
-            call,
-            Subject(setOf(schema.schema), "namespace '${schema.schema}' in catalog '${schema.catalog}'"),
-            path(schema.catalog, listOf("namespaces", schema.schema) + tail),
-        )
+        val remote = host.remoteName ?: schema.schema
+        val subject = Subject(setOf(schema.schema), "namespace '${schema.schema}' in catalog '${schema.catalog}'")
+        val path = path(schema.catalog, listOf("namespaces", remote) + tail)
+        if (field == null || remote == schema.schema) return relay(call, subject, path)
+        NamespaceFieldRewrite(field, remote, schema.schema) { invalid(subject.labels, it) }
+            .use { relay(call, subject, path, it) }
     }
 
     /**
@@ -253,6 +269,8 @@ class MountHostClient(
         call: ApplicationCall,
         subject: Subject,
         path: String,
+        /** Rewrites the body as it streams ([relaySchema]); null sends it byte for byte. */
+        rewrite: NamespaceFieldRewrite? = null,
     ) {
         val mounts = subject.labels
         exchange(call, subject, URI.create(base + path + query(call))) { body, deadline ->
@@ -260,8 +278,11 @@ class MountHostClient(
             if (head.size > maxResponseBytes) throw tooLarge(mounts)
             if (head.size <= prebufferBytes) {
                 // The whole body is in hand: answered complete, or not at all.
-                call.respondBytes(head, ContentType.Application.Json, HttpStatusCode.OK)
+                val whole = if (rewrite == null) head else withContext(io) { rewrite.feed(head) + rewrite.end() }
+                call.respondBytes(whole, ContentType.Application.Json, HttpStatusCode.OK)
             } else {
+                // Refused in the head, a rewrite still gets its status.
+                val first = if (rewrite == null) head else withContext(io) { rewrite.feed(head) }
                 call.respondBytesWriter(ContentType.Application.Json, HttpStatusCode.OK) {
                     val out = this
                     try {
@@ -269,7 +290,7 @@ class MountHostClient(
                             // Flushed as it goes, so the caller gets each
                             // piece when the host sends it and the caller's
                             // pace is this loop's pace.
-                            out.writeFully(head)
+                            out.writeFully(first)
                             out.flush()
                             var total = head.size.toLong()
                             val buffer = ByteArray(COPY_BUFFER_BYTES)
@@ -283,9 +304,11 @@ class MountHostClient(
                                 if (n < 0) break
                                 total += n
                                 if (total > maxResponseBytes) throw tooLarge(mounts)
-                                out.writeFully(buffer, 0, n)
+                                val chunk = rewrite?.feed(buffer, 0, n)
+                                if (chunk == null) out.writeFully(buffer, 0, n) else out.writeFully(chunk)
                                 out.flush()
                             }
+                            rewrite?.let { out.writeFully(it.end()) }
                         }
                     } catch (cause: Throwable) {
                         // The response is already under way, so no status
@@ -307,7 +330,7 @@ class MountHostClient(
      * the body of a 200 JSON answer; every other answer is thrown as the
      * typed error the caller is given. Counted and timed against the
      * [subject]'s labels: mount names the caller's verified `cat` holds, or
-     * a remote schema's configured name.
+     * a remote schema's local name.
      */
     private suspend fun <T> exchange(
         call: ApplicationCall,
