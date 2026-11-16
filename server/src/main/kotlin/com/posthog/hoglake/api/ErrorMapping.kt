@@ -4,11 +4,13 @@ import com.posthog.hoglake.auth.bearerChallenge
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionLookupInvalidRequest
 import com.posthog.hoglake.model.PartitionLookupUnavailable
+import com.posthog.hoglake.persistence.partialHoglakeCause
 import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.JsonConvertException
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.ContentTransformationException
 import io.ktor.server.plugins.statuspages.StatusPagesConfig
@@ -205,43 +207,7 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
 
 /** Installs [errorBody] plus the malformed-input and catch-all handlers. */
 fun StatusPagesConfig.installErrorMapping() {
-    exception<HoglakeException> { call, cause ->
-        // A mount Client's relayed body can fail after its 200 is on the
-        // wire. The proxy has already cut the connection and logged it;
-        // there is no response left to write (store/MountHostClient.kt).
-        // Anything else that fails after it answered is still worth a line.
-        if (call.response.isCommitted) {
-            val relayed =
-                cause is HoglakeException.MountHostUnavailable || cause is HoglakeException.MountHostInvalidResponse
-            if (!relayed) {
-                log.warn(cause) { "exception after the response was sent for ${call.request.httpMethod.value}" }
-            }
-            return@exception
-        }
-        val (status, body) = errorBody(cause)
-        if (cause is HoglakeException.CommitQueueTimeout ||
-            cause is HoglakeException.BackendUnavailable ||
-            cause is HoglakeException.MountScanTimeout ||
-            cause is HoglakeException.MountScanBusy ||
-            cause is HoglakeException.MountHostUnavailable ||
-            cause is HoglakeException.MountProxyBusy ||
-            cause is PartitionLookupUnavailable
-        ) {
-            call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
-        }
-        if (cause is HoglakeException.Unauthenticated) {
-            call.response.headers.append(HttpHeaders.WWWAuthenticate, bearerChallenge(cause))
-        }
-        // A mount Client relays the Host's refusal with the headers a
-        // caller acts on: when to retry, and (401) the bearer challenge.
-        if (cause is HoglakeException.MountHostRefused) {
-            cause.retryAfterSeconds?.let { call.response.headers.append(HttpHeaders.RetryAfter, it.toString()) }
-            if (cause.status == HttpStatusCode.Unauthorized.value) {
-                call.response.headers.append(HttpHeaders.WWWAuthenticate, "Bearer error=\"${cause.code}\"")
-            }
-        }
-        call.respond(status, body)
-    }
+    exception<HoglakeException> { call, cause -> call.respondHoglakeFailure(cause) }
     // A receipt this server WROTE and cannot read back. Still a 500 —
     // the caller did nothing wrong and can do nothing about it — but a
     // named one carrying which receipt, because the catch-all's generic
@@ -282,6 +248,10 @@ fun StatusPagesConfig.installErrorMapping() {
         call.respond(HttpStatusCode.BadRequest, ApiErrorDto("bad_request", rootMessage(cause)))
     }
     exception<Throwable> { call, cause ->
+        cause.partialHoglakeCause()?.let {
+            call.respondHoglakeFailure(it)
+            return@exception
+        }
         log.error(cause) {
             "unhandled exception for ${call.request.httpMethod.value} ${call.request.uri}"
         }
@@ -312,3 +282,41 @@ private fun apiError(
 
 private fun rootMessage(t: Throwable): String =
     generateSequence(t) { it.cause }.mapNotNull { it.message }.lastOrNull() ?: "malformed request"
+
+private suspend fun ApplicationCall.respondHoglakeFailure(cause: HoglakeException) {
+    // A mount Client's relayed body can fail after its 200 is on the
+    // wire. The proxy has already cut the connection and logged it;
+    // there is no response left to write (store/MountHostClient.kt).
+    // Anything else that fails after it answered is still worth a line.
+    if (response.isCommitted) {
+        val relayed =
+            cause is HoglakeException.MountHostUnavailable || cause is HoglakeException.MountHostInvalidResponse
+        if (!relayed) {
+            log.warn(cause) { "exception after the response was sent for ${request.httpMethod.value}" }
+        }
+        return
+    }
+    val (status, body) = errorBody(cause)
+    if (cause is HoglakeException.CommitQueueTimeout ||
+        cause is HoglakeException.BackendUnavailable ||
+        cause is HoglakeException.MountScanTimeout ||
+        cause is HoglakeException.MountScanBusy ||
+        cause is HoglakeException.MountHostUnavailable ||
+        cause is HoglakeException.MountProxyBusy ||
+        cause is PartitionLookupUnavailable
+    ) {
+        response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
+    }
+    if (cause is HoglakeException.Unauthenticated) {
+        response.headers.append(HttpHeaders.WWWAuthenticate, bearerChallenge(cause))
+    }
+    // A mount Client relays the Host's refusal with the headers a
+    // caller acts on: when to retry, and (401) the bearer challenge.
+    if (cause is HoglakeException.MountHostRefused) {
+        cause.retryAfterSeconds?.let { response.headers.append(HttpHeaders.RetryAfter, it.toString()) }
+        if (cause.status == HttpStatusCode.Unauthorized.value) {
+            response.headers.append(HttpHeaders.WWWAuthenticate, "Bearer error=\"${cause.code}\"")
+        }
+    }
+    respond(status, body)
+}
