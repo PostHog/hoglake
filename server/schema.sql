@@ -72,7 +72,7 @@ CREATE TABLE hog_snapshot_change (
                     'namespace_created', 'namespace_dropped',
                     'table_created', 'table_dropped', 'table_altered',
                     'table_inserted_into', 'table_deleted_from',
-                    'table_compacted',
+                    'table_compacted', 'table_replaced',
                     'view_created', 'view_dropped')),
     -- table_id, namespace_id, or view_id. Every kind in the vocabulary
     -- names an object; a NULL here would be a conflict row the conflict
@@ -845,6 +845,9 @@ CREATE TABLE hog_commit_receipt (
     -- V24: the retention key. Fast default, so every pre-V24 row carries
     -- the migration's timestamp rather than its own (unknowable) age.
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- V36: the data files a replacement ended; NULL = not a replacement, or a
+    -- receipt written before V36.
+    ended_files BIGINT,
     PRIMARY KEY (catalog_id, idempotency_key)
 );
 -- The purge's ordered walk (V24). The primary key leads on a random UUID
