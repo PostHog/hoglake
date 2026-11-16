@@ -146,11 +146,22 @@ object StorageCredentialProviders {
             Config.StorageProviderKind.STATIC -> StaticProvider(cfg.s3AccessKey, cfg.s3SecretKey)
             Config.StorageProviderKind.BROKER ->
                 BrokerProvider(
-                    brokerUrl = BrokerUrls.require("HOGLAKE_STORAGE_BROKER_URL", cfg.storageBrokerUrl),
-                    tokenUrl = BrokerUrls.require("HOGLAKE_STORAGE_BROKER_TOKEN_URL", cfg.storageBrokerTokenUrl),
+                    brokerUrl =
+                        BrokerUrls.require(
+                            "HOGLAKE_STORAGE_BROKER_URL",
+                            cfg.storageBrokerUrl,
+                            cfg.storageBrokerAllowHttp,
+                        ),
+                    tokenUrl =
+                        BrokerUrls.require(
+                            "HOGLAKE_STORAGE_BROKER_TOKEN_URL",
+                            cfg.storageBrokerTokenUrl,
+                            cfg.storageBrokerAllowHttp,
+                        ),
                     clientId = cfg.storageBrokerClientId,
                     clientSecret = cfg.storageBrokerClientSecret,
                     audience = cfg.storageBrokerAudience,
+                    allowHttp = cfg.storageBrokerAllowHttp,
                     refreshMargin = Duration.ofSeconds(cfg.storageBrokerRefreshMarginSeconds),
                 )
         }
@@ -170,8 +181,13 @@ object StorageCredentialProviders {
  * The one rule for the broker's two URLs, applied at boot (`Config`) and
  * again where the provider is built: `https`, because the client secret
  * and every vended key cross this hop; `http` only to the loopback host
- * a dev stack or an in-test server listens on. Surrounding whitespace is
- * trimmed, so a value that passed the boot check builds too.
+ * a dev stack or an in-test server listens on — or to any host when the
+ * operator has stated, with `HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true`,
+ * that this hop runs inside a network they already trust (a broker's
+ * in-cluster listener, reached by its Service name). That is an explicit
+ * knob rather than a hostname heuristic: what counts as a trusted network
+ * belongs in the values file, not in a pattern here. Surrounding
+ * whitespace is trimmed, so a value that passed the boot check builds too.
  */
 object BrokerUrls {
     private val loopback = setOf("localhost", "127.0.0.1", "[::1]", "::1")
@@ -179,6 +195,7 @@ object BrokerUrls {
     fun require(
         name: String,
         raw: String,
+        allowHttp: Boolean = false,
     ): URI {
         val trimmed = raw.trim()
         val uri =
@@ -189,10 +206,13 @@ object BrokerUrls {
         val ok =
             when (uri.scheme) {
                 "https" -> host != null
-                "http" -> host != null && host in loopback
+                "http" -> host != null && (allowHttp || host in loopback)
                 else -> false
             }
-        require(ok) { "$name must be an https URL (http only for localhost), got '$raw'" }
+        require(ok) {
+            "$name must be an https URL (http only for localhost, or for any host with " +
+                "HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true), got '$raw'"
+        }
         return uri
     }
 }

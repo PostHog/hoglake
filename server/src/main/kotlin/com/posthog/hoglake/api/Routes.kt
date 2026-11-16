@@ -24,12 +24,15 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.MountReadService
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.Parameters
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.receive
 import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
+import io.ktor.server.routing.RoutingCall
+import io.ktor.server.routing.RoutingPipelineCall
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -705,7 +708,7 @@ fun Application.installApiRoutes(
                     val commits = selector.forCatalog(call, call.catalog())
                     val operation =
                         try {
-                            UUID.fromString(call.parameters["operation"])
+                            UUID.fromString(call.pathParam("operation"))
                         } catch (_: IllegalArgumentException) {
                             throw BadRequestException("invalid operation UUID")
                         }
@@ -1011,8 +1014,24 @@ internal fun parseStatsFields(raw: String): Set<Long> {
 // ---- parameter helpers ---------------------------------------------------
 // internal (not private): ViewRoutes.kt shares them.
 
+/**
+ * A route value: the `{name}` segment of the path this call matched. Route
+ * values come from the path only, the same path the route table reads
+ * (auth/AuthPolicy.kt). The call's merged parameters also hold the query
+ * string's, so no handler reads a route value from them; a query value is
+ * read from `request.queryParameters`. RoutePathValuesTest holds every file
+ * under `api/` to this.
+ */
 internal fun ApplicationCall.pathParam(name: String): String =
-    parameters[name] ?: throw BadRequestException("missing path parameter '$name'")
+    pathValues()[name] ?: throw BadRequestException("missing path parameter '$name'")
+
+/** The matched route's path parameters; only a call inside a route handler has them. */
+private fun ApplicationCall.pathValues(): Parameters =
+    when (this) {
+        is RoutingCall -> pathParameters
+        is RoutingPipelineCall -> pathParameters
+        else -> error("a route value was read outside a route handler")
+    }
 
 internal fun ApplicationCall.catalog() = pathParam("catalog")
 

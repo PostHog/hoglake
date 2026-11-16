@@ -80,8 +80,8 @@ fun Application.installMaintenanceRoutes(
                     call.respond(backend.get(call.maintenanceCatalog()).toDto())
                 }
                 patch {
-                    // Refuse unsupported placement before parsing. Build PostgreSQL options only after a valid body.
-                    selector?.requirePostgres(call, call.maintenanceCatalog())
+                    // Resolve placement before parsing. Build PostgreSQL options only after a valid body.
+                    selector?.forCatalog(call, call.maintenanceCatalog())
                     val req = OptionsPatchRequest.from(call.receive<JsonNode>())
                     val backend = selector?.options(call, call.maintenanceCatalog()) { options } ?: options
                     call.respond(
@@ -175,15 +175,18 @@ fun Application.installMaintenanceRoutes(
         // ledger feed. Same query-parameter conventions as the
         // per-catalog routes.
         get("/v1/maintenance/status") {
+            selector?.requirePostgresInstance()
             call.respond(status.instanceStatus(call.request.queryParameters["after"], call.limitQuery()).toDto())
         }
         // The backing store's own health. Instance-level, not per
         // catalog: the manifest tables, the vacuum horizon and the
         // connection budget are shared by every catalog in the database.
         get("/v1/database/health") {
+            selector?.requirePostgresInstance()
             call.respond(databaseHealth.report().toDto())
         }
         get("/v1/maintenance/runs") {
+            selector?.requirePostgresInstance()
             call.respond(
                 status.instanceRuns(
                     call.taskQuery(),
@@ -201,8 +204,7 @@ private const val DEFAULT_EXPIRE_BATCH = 10_000
 /** Default `?batch` for POST /maintenance/cleanup (Config's cleanupBatchSize default). */
 private const val DEFAULT_CLEANUP_BATCH = 2_000
 
-private fun ApplicationCall.maintenanceCatalog(): String =
-    parameters["catalog"] ?: throw BadRequestException("missing path parameter 'catalog'")
+private fun ApplicationCall.maintenanceCatalog(): String = pathParam("catalog")
 
 private fun ApplicationCall.batchQuery(): Int? =
     request.queryParameters["batch"]?.let {

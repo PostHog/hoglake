@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchMetricsText } from "../api/client";
+import { OperatorTokenNotice, isOperatorRefusal } from "../components/Auth";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock } from "../components/Skeleton";
 import { TimeSeriesChart } from "../components/TimeSeriesChart";
@@ -497,9 +498,14 @@ export function MetricsPage() {
     queryFn: fetchMetricsText,
     refetchOnWindowFocus: false,
     // The poll. Background tabs stop polling (the default), so history
-    // has gaps where the tab was hidden rather than a stale wall.
-    refetchInterval: Number(pollSeconds) * 1000,
+    // has gaps where the tab was hidden rather than a stale wall. A
+    // refused caller (/metrics is OPERATOR) stops polling: every tick
+    // would be one more counted auth failure for nothing. Signing in
+    // resets the query, which starts it again.
+    refetchInterval: (query) =>
+      isOperatorRefusal(query.state.error) ? false : Number(pollSeconds) * 1000,
   });
+  const operatorOnly = query.isError && isOperatorRefusal(query.error);
 
   const families = useMemo(
     () => (query.data === undefined ? [] : parsePrometheusText(query.data)),
@@ -646,7 +652,8 @@ export function MetricsPage() {
           </span>
         )}
       </div>
-      {query.isError && <ErrorBox error={query.error} />}
+      {operatorOnly && <OperatorTokenNotice routes="/metrics" />}
+      {query.isError && !operatorOnly && <ErrorBox error={query.error} />}
       {query.isPending && <SkeletonBlock />}
       {query.data !== undefined && (
         <>

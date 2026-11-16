@@ -94,7 +94,8 @@ class StorageProviderConfigTest {
     fun `broker urls are https, or http to the loopback host, and are trimmed`() {
         assertThatThrownBy { broker(storageBrokerUrl = "http://broker.example/storage")() }
             .isInstanceOf(IllegalArgumentException::class.java)
-            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL must be an https URL (http only for localhost)")
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL must be an https URL (http only for localhost")
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true")
         assertThatThrownBy { broker(storageBrokerTokenUrl = "http://10.0.0.5/oauth/token")() }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_STORAGE_BROKER_TOKEN_URL")
@@ -119,6 +120,32 @@ class StorageProviderConfigTest {
     }
 
     @Test
+    fun `HOGLAKE_STORAGE_BROKER_ALLOW_HTTP accepts http to any host`() {
+        val inCluster = "http://hogtower.hogtower.svc.cluster.local:8080"
+        // Off (the default): refused, as above.
+        assertThatThrownBy { broker(storageBrokerUrl = "$inCluster/oauth/credentials")() }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_ALLOW_HTTP")
+        // On: both URLs may be http to any host, and https is still fine.
+        val cfg =
+            broker(
+                storageBrokerUrl = "$inCluster/oauth/credentials",
+                storageBrokerTokenUrl = "$inCluster/oauth/token",
+                storageBrokerAllowHttp = true,
+            )()
+        assertThat(cfg.effectiveStorageProvider).isEqualTo(Config.StorageProviderKind.BROKER)
+        StorageCredentialProviders.fromConfig(cfg).use { provider ->
+            assertThat(provider.toString()).isEqualTo("broker($inCluster/oauth/credentials)")
+        }
+        assertThat(broker(storageBrokerAllowHttp = true)().effectiveStorageProvider)
+            .isEqualTo(Config.StorageProviderKind.BROKER)
+        // The knob is about the scheme, nothing else: ftp stays refused.
+        assertThatThrownBy { broker(storageBrokerUrl = "ftp://broker/vend", storageBrokerAllowHttp = true)() }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL")
+    }
+
+    @Test
     fun `a complete broker configuration builds the broker provider`() {
         val cfg = broker()()
         assertThat(cfg.effectiveStorageProvider).isEqualTo(Config.StorageProviderKind.BROKER)
@@ -140,6 +167,7 @@ class StorageProviderConfigTest {
         storageBrokerClientSecret: String = "hunter2",
         storageBrokerAudience: String = "hoglake",
         storageBrokerRefreshMarginSeconds: Long = 300,
+        storageBrokerAllowHttp: Boolean = false,
         s3AccessKey: String = "",
         s3SecretKey: String = "",
     ): () -> Config =
@@ -152,6 +180,7 @@ class StorageProviderConfigTest {
                 storageBrokerClientSecret = storageBrokerClientSecret,
                 storageBrokerAudience = storageBrokerAudience,
                 storageBrokerRefreshMarginSeconds = storageBrokerRefreshMarginSeconds,
+                storageBrokerAllowHttp = storageBrokerAllowHttp,
                 s3AccessKey = s3AccessKey,
                 s3SecretKey = s3SecretKey,
             )

@@ -10,8 +10,10 @@ ages live in memory only. ``/readyz`` answers 503 for the whole drain;
 the deployment's startup probe must allow for it (README).
 
 Besides the ``MILLRACE_*`` knobs (config.py) the process reads
-``HOGLAKE_URL`` (required), ``HOGLAKE_S3_*`` for the parquet writes, and
-the standard ``AWS_*`` environment SlateDB's ``s3://`` store resolves.
+``HOGLAKE_URL`` (required), ``HOGLAKE_AUTH_*`` for the credential it
+presents to hoglake (:func:`hoglake_auth`), ``HOGLAKE_S3_*`` for the
+parquet writes, and the standard ``AWS_*`` environment SlateDB's ``s3://``
+store resolves.
 
 Exit codes: 0 clean stop; 1 any other failure; 2 invalid configuration
 or an assignment refusal; 3 halted (the destination table was recreated,
@@ -33,6 +35,7 @@ from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any
 
+import httpx
 from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFamily
 from pyhoglake import _variant_backend
 
@@ -451,12 +454,103 @@ class _PipelineCollector:
             )
 
 
-async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> int:
+def hoglake_auth(env: Mapping[str, str]) -> httpx.Auth | None:
+    """The credential millrace presents to hoglake, from ``HOGLAKE_AUTH_*``
+    (hoglake's docs/auth.md, "Clients"): OAuth client credentials against
+    the token endpoint that issues hoglake tokens, minted and refreshed by
+    pyhoglake (``HOGLAKE_AUTH_TOKEN_URL``, ``HOGLAKE_AUTH_CLIENT_ID``,
+    ``HOGLAKE_AUTH_CLIENT_SECRET``, and ``HOGLAKE_AUTH_AUDIENCE``, default
+    ``hoglake``); or a fixed token (``HOGLAKE_AUTH_TOKEN``, or the contents
+    of ``HOGLAKE_AUTH_TOKEN_FILE``, read once at startup) for a standalone
+    server whose operator minted one with ``hoglake-server token mint``.
+
+    Exactly one source, or none: none sends no ``Authorization`` header,
+    which is what an ``HOGLAKE_AUTH_MODE=off`` server expects and what
+    millrace always did. Two sources is a configuration error rather than
+    a precedence rule, so a leftover variable can never silently pick the
+    credential.
+    """
+    from pyhoglake.auth import BearerToken, ClientCredentials
+
+    def read(name: str) -> str:
+        return env.get(name, "").strip()
+
+    token_url, client_id, client_secret = (
+        read("HOGLAKE_AUTH_TOKEN_URL"),
+        read("HOGLAKE_AUTH_CLIENT_ID"),
+        read("HOGLAKE_AUTH_CLIENT_SECRET"),
+    )
+    token, token_file = read("HOGLAKE_AUTH_TOKEN"), read("HOGLAKE_AUTH_TOKEN_FILE")
+    sources = [
+        name
+        for name, present in (
+            (
+                "HOGLAKE_AUTH_TOKEN_URL/CLIENT_ID/CLIENT_SECRET",
+                bool(token_url or client_id or client_secret),
+            ),
+            ("HOGLAKE_AUTH_TOKEN", bool(token)),
+            ("HOGLAKE_AUTH_TOKEN_FILE", bool(token_file)),
+        )
+        if present
+    ]
+    if len(sources) > 1:
+        raise ConfigError(
+            [
+                (
+                    "hoglake credential: set exactly one of client credentials "
+                    "(HOGLAKE_AUTH_TOKEN_URL + HOGLAKE_AUTH_CLIENT_ID + "
+                    "HOGLAKE_AUTH_CLIENT_SECRET), HOGLAKE_AUTH_TOKEN or "
+                    f"HOGLAKE_AUTH_TOKEN_FILE; got {' and '.join(sources)}"
+                )
+            ]
+        )
+    if not sources:
+        return None
+    if token:
+        return BearerToken(token)
+    if token_file:
+        try:
+            with open(token_file, encoding="utf-8") as f:
+                contents = f.read().strip()
+        except OSError as e:
+            raise ConfigError([f"HOGLAKE_AUTH_TOKEN_FILE {token_file!r}: {e}"]) from e
+        if not contents:
+            raise ConfigError([f"HOGLAKE_AUTH_TOKEN_FILE {token_file!r} is empty"])
+        return BearerToken(contents)
+    missing = [
+        name
+        for name, value in (
+            ("HOGLAKE_AUTH_TOKEN_URL", token_url),
+            ("HOGLAKE_AUTH_CLIENT_ID", client_id),
+            ("HOGLAKE_AUTH_CLIENT_SECRET", client_secret),
+        )
+        if not value
+    ]
+    if missing:
+        raise ConfigError(
+            [
+                (
+                    "hoglake client credentials need HOGLAKE_AUTH_TOKEN_URL, "
+                    "HOGLAKE_AUTH_CLIENT_ID and HOGLAKE_AUTH_CLIENT_SECRET together; "
+                    f"missing {', '.join(missing)}"
+                )
+            ]
+        )
+    audience = read("HOGLAKE_AUTH_AUDIENCE") or "hoglake"
+    return ClientCredentials(token_url, client_id, client_secret, audience=audience)
+
+
+async def _run(
+    cfg: Config,
+    hoglake_url: str,
+    s3_kwargs: Mapping[str, Any],
+    auth: httpx.Auth | None = None,
+) -> int:
     """Assemble the pipeline and run it until a signal or a terminal
     condition."""
     from pyhoglake import HoglakeClient, S3Config
 
-    client = HoglakeClient(hoglake_url, s3=S3Config(**s3_kwargs))
+    client = HoglakeClient(hoglake_url, s3=S3Config(**s3_kwargs), auth=auth)
     stages = StageManager(
         cfg.stage_store_url,
         cfg.stage_base_path,
@@ -603,7 +697,12 @@ def _main(env: Mapping[str, str]) -> int:
         print("HOGLAKE_URL is required and is not set", file=sys.stderr)
         return EXIT_CONFIG
     try:
-        return asyncio.run(_run(cfg, hoglake_url, _s3_kwargs(env)))
+        auth = hoglake_auth(env)
+    except ConfigError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        return asyncio.run(_run(cfg, hoglake_url, _s3_kwargs(env), auth))
     except KeyboardInterrupt:  # pragma: no cover - signal handlers own the stop
         return 0
     except ConfigError as e:

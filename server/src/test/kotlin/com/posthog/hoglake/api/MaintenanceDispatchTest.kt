@@ -7,6 +7,7 @@ import com.posthog.hoglake.auth.AuthService
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
+import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
@@ -30,7 +31,65 @@ class MaintenanceDispatchTest {
     lateinit var dir: Path
 
     @Test
-    fun `all catalog maintenance routes refuse hoglite before PostgreSQL or malformed input`() {
+    fun `retirement trigger remains absent without auth or PostgreSQL`() {
+        App.build(
+            Config(defaultBackend = "none", authMode = "off", jdbcUrl = "jdbc:no-such-driver:must-not-open"),
+        ).use {
+                app ->
+            testApplication {
+                application { app.module(this) }
+                val response = client.request("/v1/catalogs/lake/maintenance/retire") { method = HttpMethod.Post }
+                assertThat(response.status).isEqualTo(HttpStatusCode.NotFound)
+            }
+        }
+    }
+
+    @Test
+    fun `fleet routes reject a deployment without PostgreSQL before initialization or query parsing`() {
+        App.build(
+            Config(defaultBackend = "none", authMode = "off", jdbcUrl = "jdbc:no-such-driver:must-not-open"),
+        ).use { app ->
+            testApplication {
+                application { app.module(this) }
+                for (path in listOf(
+                    "/v1/maintenance/status?limit=bad",
+                    "/v1/maintenance/runs?task=bad",
+                    "/v1/database/health",
+                )) {
+                    val response = client.get(path)
+                    assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotImplemented)
+                    assertThat(response.bodyAsText()).contains("not_supported_on_backend")
+                    assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `fleet routes retain unavailable errors for configured PostgreSQL`() {
+        App.build(
+            Config(
+                defaultBackend = "none",
+                authMode = "off",
+                postgresBackendId = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+                jdbcUrl = "jdbc:no-such-driver:configured",
+                dbUser = "test",
+                dbPassword = "test",
+            ),
+        ).use { app ->
+            testApplication {
+                application { app.module(this) }
+                for (path in listOf("/v1/maintenance/status", "/v1/maintenance/runs", "/v1/database/health")) {
+                    val response = client.get(path)
+                    assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                    assertThat(response.bodyAsText()).contains("backend_unavailable")
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `maintenance routes resolve placement before malformed input or PostgreSQL`() {
         val id = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
         val backends = dir.resolve("backends.json")
         Files.writeString(backends, """{"backends":[{"id":"$id","kind":"hoglite","url":"http://localhost:1"}]}""")
@@ -62,20 +121,13 @@ class MaintenanceDispatchTest {
             )
         val probes =
             listOf(
-                HttpMethod.Get to "/options",
-                HttpMethod.Patch to "/options",
-                HttpMethod.Post to "/maintenance/expire?batch=bad",
-                HttpMethod.Post to "/maintenance/cleanup?batch=bad",
-                HttpMethod.Post to "/maintenance/compact?batch=bad",
-                HttpMethod.Post to "/maintenance/rehydrate?namespace=ns",
-                HttpMethod.Get to "/maintenance/status",
-                HttpMethod.Get to "/maintenance/runs?before=bad&task=bad&limit=bad",
+                HttpMethod.Get to "/maintenance/runs?before=bad",
             )
         App.build(cfg).use { app ->
             testApplication {
                 application { app.module(this, auth) }
                 for ((catalog, status, code) in listOf(
-                    Triple("lake", HttpStatusCode.NotImplemented, "not_supported_on_backend"),
+                    Triple("lake", HttpStatusCode.BadRequest, "bad_request"),
                     Triple("other", HttpStatusCode.NotFound, "not_found"),
                 )) {
                     for ((method, suffix) in probes) {
@@ -93,6 +145,47 @@ class MaintenanceDispatchTest {
                         assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
                     }
                 }
+                val otherStatus =
+                    client.request("/v1/catalogs/other/maintenance/status") {
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                    }
+                assertThat(otherStatus.status).isEqualTo(HttpStatusCode.NotFound)
+                val export =
+                    client.request("/v1/catalogs/lake/export") {
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                    }
+                assertThat(export.status).isEqualTo(HttpStatusCode.NotImplemented)
+                assertThat(export.bodyAsText()).contains("not_supported_on_backend")
+                for (operation in listOf("compact", "expire", "cleanup")) {
+                    for ((catalog, status) in listOf(
+                        "lake" to HttpStatusCode.BadRequest,
+                        "other" to HttpStatusCode.NotFound,
+                    )) {
+                        val response =
+                            client.request("/v1/catalogs/$catalog/maintenance/$operation?batch=bad") {
+                                method = HttpMethod.Post
+                                header(HttpHeaders.Authorization, "Bearer $token")
+                            }
+                        assertThat(response.status).describedAs("$catalog $operation").isEqualTo(status)
+                        assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
+                    }
+                }
+                val malformedOptions =
+                    client.request("/v1/catalogs/lake/options") {
+                        method = HttpMethod.Patch
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                        contentType(ContentType.Application.Json)
+                        setBody("{")
+                    }
+                assertThat(malformedOptions.status).isEqualTo(HttpStatusCode.BadRequest)
+                val otherOptions =
+                    client.request("/v1/catalogs/other/options") {
+                        method = HttpMethod.Patch
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                        contentType(ContentType.Application.Json)
+                        setBody("{")
+                    }
+                assertThat(otherOptions.status).isEqualTo(HttpStatusCode.NotFound)
             }
         }
     }

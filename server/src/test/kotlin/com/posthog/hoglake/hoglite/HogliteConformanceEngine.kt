@@ -122,6 +122,16 @@ internal class HogliteConformanceEngine(private val authArgs: List<String> = emp
 
     private fun s3Endpoint(): String = "http://127.0.0.1:${minio.firstMappedPort}"
 
+    /** The server-side S3 configuration for tests that drain real objects. */
+    fun config(): com.posthog.hoglake.Config =
+        com.posthog.hoglake.Config(
+            s3Endpoint = s3Endpoint(),
+            s3Region = "us-east-1",
+            s3AccessKey = minio.userName,
+            s3SecretKey = minio.password,
+            s3PathStyle = true,
+        )
+
     fun s3Client(): S3Client =
         S3Client.builder()
             .endpointOverride(URI.create(s3Endpoint()))

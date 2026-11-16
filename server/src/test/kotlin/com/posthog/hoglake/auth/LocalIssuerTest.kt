@@ -223,6 +223,8 @@ class LocalIssuerTest {
             "scoped_without_ten",
             "operator_without_ten",
             "scoped_over_lifetime_cap",
+            // The session profile (docs/auth.md) is minted by no issuer yet, this one included.
+            "tenant_session_profile_disabled",
         )
     }
 }

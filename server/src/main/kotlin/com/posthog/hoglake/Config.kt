@@ -293,6 +293,16 @@ data class Config(
      */
     val storageBrokerRefreshMarginSeconds: Long = env("HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS", "300").toLong(),
     /**
+     * `broker` only: accept `http` broker and token URLs to ANY host, not
+     * just the loopback one. Off by default; an operator turns it on to
+     * say the hop to the broker runs inside a network they already trust
+     * — a broker's in-cluster listener reached by its Service name, the
+     * same convention that broker uses for its own token URL. Explicit
+     * rather than a hostname pattern, because "trusted network" is a
+     * statement for the values file to make.
+     */
+    val storageBrokerAllowHttp: Boolean = boolEnv("HOGLAKE_STORAGE_BROKER_ALLOW_HTTP", false),
+    /**
      * Authentication at the HTTP boundary (docs/auth-tenancy.md):
      * `off` | `warn` | `enforce` (§11).
      *
@@ -369,6 +379,14 @@ data class Config(
      * `other`. Empty (the default): only the built-in generic classes.
      */
     val authClientClasses: Set<String> = nameList(env("HOGLAKE_AUTH_CLIENT_CLASSES", "")),
+    /**
+     * Whether the verifier accepts tokens carrying the session profile
+     * (docs/auth.md, "Session profile with embedded storage credentials"):
+     * `off` (the default) refuses them with `profile_not_enabled`; `on`
+     * validates the profile and records its read-only remote schemas. hoglake
+     * never uses the credentials such a token carries.
+     */
+    val authSessionProfile: String = env("HOGLAKE_AUTH_SESSION_PROFILE", "off"),
     /**
      * The server's own ES256 signing key, for `HOGLAKE_AUTH_MODE=local` only
      * (docs/auth.md, "Local issuer"): a private P-256 JWK, base64url, as
@@ -1444,6 +1462,9 @@ data class Config(
 ) {
     val hogliteBackends: Map<UUID, HogliteBackend> = readBackends(backendsFile)
 
+    /** [authSessionProfile] resolved: true for `on`. */
+    val authSessionProfileEnabled: Boolean = authSessionProfile.trim().lowercase() == "on"
+
     val backendKinds: Map<UUID, BackendKind> =
         hogliteBackends.keys.associateWith { BackendKind.HOGLITE } +
             if (postgresBackendId.isEmpty()) {
@@ -1527,8 +1548,8 @@ data class Config(
                     "HOGLAKE_STORAGE_PROVIDER=broker vends every session; unset " +
                         "HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY"
                 }
-                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_URL", storageBrokerUrl)
-                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_TOKEN_URL", storageBrokerTokenUrl)
+                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_URL", storageBrokerUrl, storageBrokerAllowHttp)
+                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_TOKEN_URL", storageBrokerTokenUrl, storageBrokerAllowHttp)
                 require(storageBrokerAudience.isNotBlank()) { "HOGLAKE_STORAGE_BROKER_AUDIENCE must not be blank" }
                 require(storageBrokerRefreshMarginSeconds >= 0) {
                     "HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS must not be negative, " +
@@ -1542,6 +1563,9 @@ data class Config(
         ) {
             "HOGLAKE_AUTH_CLIENT_CLASSES takes at most $MAX_AUTH_CLIENT_CLASSES lowercase User-Agent product " +
                 "tokens ([a-z][a-z0-9._-]{0,31}, not 'none' or 'other'), got $authClientClasses"
+        }
+        require(authSessionProfile.trim().lowercase() in setOf("off", "on")) {
+            "HOGLAKE_AUTH_SESSION_PROFILE must be off or on, got '$authSessionProfile'"
         }
         require(authScopedMaxLifetimeSeconds > 0) {
             "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be positive, got $authScopedMaxLifetimeSeconds"

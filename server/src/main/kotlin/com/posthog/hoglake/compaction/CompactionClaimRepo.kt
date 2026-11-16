@@ -1,7 +1,7 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import org.jdbi.v3.core.Handle
-import java.security.MessageDigest
 import java.util.UUID
 
 /**
@@ -103,65 +103,18 @@ import java.util.UUID
  * `claimed_elsewhere`, which is the pre-marker behaviour.
  */
 internal object CompactionClaimRepo {
-    /**
-     * The group's identity: spec id, partition values and sorted input
-     * file ids, hashed.
-     *
-     * SORTED file ids, because the two replicas' planners may emit a
-     * group's files in different orders if the candidate query's tie
-     * break ever moves; the SET is the identity. Partition values are
-     * length-prefixed rather than joined with a separator so a value
-     * containing the separator cannot collide with two values that do
-     * not, and a null value is distinguishable from an empty one.
-     */
-    fun groupKey(group: CompactionGroup): String =
-        tupleDigest(group.specId, group.partitionValues) { feed ->
-            group.files.map { it.dataFileId }.sorted().forEach { feed("f$it") }
-        }
+    fun groupKey(group: CompactionGroup): String = CompactionClaimKey.groupKey(group)
 
-    /** The prefix that marks a bucket claim; see the class KDoc. */
-    const val BUCKET_KEY_PREFIX: String = "bucket:"
+    const val BUCKET_KEY_PREFIX: String = CompactionClaimKey.BUCKET_KEY_PREFIX
 
-    /**
-     * A bucket claim's key: [BUCKET_KEY_PREFIX] and a hex SHA-256 over
-     * the bucket's spec id and partition values, fed exactly as
-     * [groupKey] feeds them (length-prefixed, null distinct from empty)
-     * and with no file ids. The prefix is what keeps the two key spaces
-     * disjoint — a group key is 64 hex characters and nothing else.
-     */
     fun bucketKey(
         specId: Long?,
         partitionValues: List<String?>?,
-    ): String {
-        // The prefix IS the type tag that keeps the two kinds of row apart
-        // (the overlap read, the pre-probe read, anything that counts
-        // groups); an empty one would make every bucket claim look like a
-        // group claim to a reader that filters on it.
-        require(BUCKET_KEY_PREFIX.isNotEmpty()) { "BUCKET_KEY_PREFIX must be non-empty" }
-        val key = BUCKET_KEY_PREFIX + tupleDigest(specId, partitionValues) { }
-        check(key.startsWith(BUCKET_KEY_PREFIX) && key.length == BUCKET_KEY_PREFIX.length + 64)
-        return key
-    }
-
-    private fun tupleDigest(
-        specId: Long?,
-        partitionValues: List<String?>?,
-        rest: ((String) -> Unit) -> Unit,
-    ): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-
-        fun feed(s: String) {
-            val bytes = s.toByteArray(Charsets.UTF_8)
-            digest.update(bytes.size.toString().toByteArray(Charsets.UTF_8))
-            digest.update(':'.code.toByte())
-            digest.update(bytes)
-        }
-        feed("spec=${specId ?: "none"}")
-        feed("values=${partitionValues?.size ?: -1}")
-        partitionValues?.forEach { feed(if (it == null) "null:" else "v:$it") }
-        rest(::feed)
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
+    ): String =
+        CompactionClaimKey.bucketKey(
+            specId,
+            partitionValues,
+        )
 
     /**
      * The pre-probe read: every LIVE bucket claim's key for one table.
@@ -422,6 +375,12 @@ internal object CompactionClaimRepo {
      * it: after our own lease expired, another maintainer may hold this
      * key, and shortening ITS lease would be the one thing a release
      * must never do.
+     *
+     * [inputFileIds] narrows the row to the inputs that actually DIED:
+     * a group of a VARIANT table is rewritten per layout
+     * (`VariantLayoutGroups`), and the files its probe left behind are
+     * still live candidates whose next plan must not read them as held
+     * for the committed lease. Null keeps the row's ids as claimed.
      */
     fun shortenToCommitted(
         h: Handle,
@@ -430,11 +389,13 @@ internal object CompactionClaimRepo {
         groupKey: String,
         claimant: UUID,
         ttlSeconds: Long,
+        inputFileIds: List<Long>? = null,
     ): Int =
         h.createUpdate(
             """
             UPDATE hog_compaction_claim
-               SET expires_at = now() + make_interval(secs => :ttlSeconds)
+               SET expires_at = now() + make_interval(secs => :ttlSeconds),
+                   input_file_ids = COALESCE(:inputFileIds, input_file_ids)
              WHERE catalog_id = :catalogId AND table_id = :tableId
                AND group_key = :groupKey AND claimant = :claimant
             """,
@@ -444,6 +405,7 @@ internal object CompactionClaimRepo {
             .bind("groupKey", groupKey)
             .bind("claimant", claimant)
             .bind("ttlSeconds", ttlSeconds.toDouble())
+            .bindBigintArrayOrNull("inputFileIds", inputFileIds)
             .execute()
 
     /**

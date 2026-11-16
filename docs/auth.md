@@ -72,6 +72,7 @@ under `local` and 404s otherwise.
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
 | `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
+| `HOGLAKE_AUTH_SESSION_PROFILE` | `off` (default) or `on`: whether tokens carrying the [session profile](#session-profile-with-embedded-storage-credentials) are accepted. Off, such a token is refused as `profile_not_enabled`, never read as a plain metadata token |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
 
 One issuer and one key set per server, by decision: every token's `iss` must
@@ -170,6 +171,55 @@ issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
 
+### Session profile with embedded storage credentials
+
+**Status: PROPOSED, experimental, off by default.** A query engine that runs
+one user's work across many processes (a coordinator, its workers, hoglake, a
+backend that verifies the token itself) wants ONE token to carry both the
+metadata grants and the storage credentials the user's work needs, so that
+every process verifies the same bytes offline and none of them holds a
+standing cloud identity. This profile is how such a token is spelled; hoglake
+owns it the way it owns the rest of the contract, so an issuer that mints it
+conforms to this section and to `server/src/test/resources/oauth/session-profile-vectors.json`
+(generated here, like the contract vectors; verified with the profile on).
+The verifier's half is built; routing requests to remote schemas is not.
+
+What the server does with such a token is deliberately small. It verifies the
+profile's shape, records the read-only remote schemas the token authorizes,
+and forwards the exact bytes to any backend that verifies the token itself
+(above). **It never uses the embedded credentials**: it does not read them
+into the caller, log them, or echo them in a refusal — every refusal names a
+claim, never a value. The server's own jobs keep getting storage through the
+[storage credential provider](#storage-credentials).
+
+A token carries the profile when it carries any of `profile`, `aws`,
+`primary_catalog` or `remote_schemas`. Then, with `HOGLAKE_AUTH_SESSION_PROFILE=on`,
+it must carry all of the following, or it is refused (`invalid_token`):
+
+| claim | meaning |
+| --- | --- |
+| `profile` | the marker that selects this parser: exactly `storage-session`. A credential object without it is a token nobody declared the meaning of |
+| `version` | exactly `1`; an unknown version is refused, never parsed as the one the server knows |
+| `purpose` | exactly `user-session`; this profile is for a caller's own work, so an `operator` token may not carry it |
+| `primary_catalog` | the one catalog the session is about; it must be the single key of the `cat` object as written — a second `cat` entry refuses the token even when a plain tenant token would have dropped its unknown scope words, and the `scope` spelling alone does not carry the profile. A routed token (`rtg`) routes only this catalog |
+| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction and parsed strictly: any other word, a non-string entry, a non-array value or an empty list refuses the token; nothing is dropped |
+| `aws` | the credential bundle: non-empty strings `access_key_id`, `secret_access_key`, `session_token`, `region`, and integer `expires_at`. The token may not outlive its credentials: `exp ≤ aws.expires_at` |
+| `sid`, `generation`, `session_deadline`, `grants` | optional, for the engine that refreshes the session: a non-empty string, a positive integer, integer seconds with `aws.expires_at ≤ session_deadline`, and an array. The server checks their types and the ordering, nothing more |
+
+Everything else about the token is the ordinary contract: `ten`, `org`,
+`cat`/`scope`, `prd` (with its lifetime cap), `rtg` and the audiences all
+apply unchanged, and the profile is checked after them. A deployment that
+wants a distinct audience for session tokens sets `HOGLAKE_AUTH_AUDIENCE`
+accordingly; the verifier does not special-case one.
+
+With the profile `off`, a token carrying any of its claims is refused as
+`profile_not_enabled`, and that check runs before every other claim rule so
+the reason is never shadowed — never accepted as a plain metadata token, because an
+older or unconfigured hoglake granting on a token whose other half it does
+not understand is the same widening the strict `prd` rule exists to prevent.
+`hoglake_auth_session_profile_total{outcome}` counts `accepted`,
+`refused_disabled` and `refused_invalid`.
+
 ### Scoped tokens, exactly
 
 A `scoped` token is a tenant token narrowed to some values of a field, and the
@@ -198,7 +248,8 @@ is an operator.
 ### Errors
 
 - `401` with `WWW-Authenticate: Bearer error=<reason>` for a missing, malformed,
-  expired, mis-issued or mis-signed token. The reason strings are part of the
+  expired, mis-issued or mis-signed token, or one carrying the session profile
+  where it is off (`profile_not_enabled`). The reason strings are part of the
   contract; clients branch on them.
 - `403` for a scope shortfall on a catalog the token can see.
 - `404` for a catalog the token cannot see.
@@ -229,7 +280,7 @@ chosen per deployment:
 | --- | --- |
 | `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
 | `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
-| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write" \| "delete"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store |
+| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write" \| "delete"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store. `HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true` accepts `http` URLs to any host |
 
 `HOGLAKE_STORAGE_PROVIDER` selects one. Unset, it is `static` when both keys
 are set and `ambient` otherwise — what hoglake did before the knob existed, so
@@ -248,7 +299,12 @@ clients' client-credentials form, `grant_type=client_credentials` with
 URLs must be `https` — the client secret and every vended key cross that
 hop — with `http` accepted only for `localhost`, `127.0.0.1` or `[::1]`,
 the dev stack's and the test suite's in-process brokers; anything else
-refuses to start. The refresh lead is the margin or half the credential's
+refuses to start, naming the one way around it:
+`HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true`, which accepts `http` to any host
+and is the operator's statement that the hop to the broker runs inside a
+network they already trust — a broker's in-cluster listener reached by its
+Service name, for instance. It is a knob, not a hostname pattern, so that
+statement lives in the values file. The refresh lead is the margin or half the credential's
 lifetime, whichever is shorter, for the session and for the bearer token
 alike, so a 300-second session is still cached for 150 seconds rather than
 re-vended on every request. A refresh that fails is not retried by the
@@ -304,7 +360,7 @@ Every hoglake client supports the same two shapes:
 | DuckDB extension | `ATTACH … (TOKEN_URL, CLIENT_ID, CLIENT_SECRET)` | `ATTACH … (TOKEN '…')` |
 | hedgerow | `auth: {token_url, client_id, client_secret}` per side | through pyhoglake |
 | Trino connector (PostHog/trino) | `hoglake.auth.token-uri`, `hoglake.auth.client-id`, `hoglake.auth.client-secret` | planned (tracked) |
-| millrace | planned ([#574](https://github.com/PostHog/hoglake/issues/574)) | planned ([#574](https://github.com/PostHog/hoglake/issues/574)) |
+| millrace | `HOGLAKE_AUTH_TOKEN_URL`, `HOGLAKE_AUTH_CLIENT_ID`, `HOGLAKE_AUTH_CLIENT_SECRET` (+ `HOGLAKE_AUTH_AUDIENCE`), through pyhoglake | `HOGLAKE_AUTH_TOKEN` or `HOGLAKE_AUTH_TOKEN_FILE` |
 | webui | — | sign in with a pasted token (in review) |
 
 pyhoglake accepts any `httpx.Auth`, and the Trino connector's token source is an
@@ -377,11 +433,13 @@ tokens with `prd` and a configurable lifetime cap; `ten` defaulting to
 here; the `ambient`, `static` and `broker` storage providers behind the
 server's own jobs; the local issuer (`local`, `hoglake token keygen` and
 `mint`); client credentials and fixed tokens in pyhoglake, the DuckDB
-extension, hedgerow and the Trino connector.
+extension, hedgerow, the Trino connector and millrace; the session profile's
+verifier gate and vectors (`HOGLAKE_AUTH_SESSION_PROFILE`, proposed, off by
+default).
 
 Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): a fixed-token
-option in the Trino connector; client credentials in millrace; a token for the
-web UI.
+option in the Trino connector; a token for the web UI
+([#560](https://github.com/PostHog/hoglake/pull/560)).
 
 Decided, not tracked: `jti` stays required, and the server verifies one issuer
 (both above).

@@ -14,7 +14,7 @@ it, any JWKS issuer, or auth off, with `ambient` or `static` storage.
 
 Each item is tagged with its repository: **hoglake**, **hogtower** (PostHog's
 issuer), **trino** (the hoglake connector in PostHog/trino), **millpond**,
-**charts** (PostHog's deployment). Status is as of 2026-11-11; "approved"
+**charts** (PostHog's deployment). Status is as of 2026-11-15; "approved"
 means the PR has review approval and is waiting on CI or a merge.
 
 ## Phase 0 — write the design down
@@ -96,14 +96,16 @@ means the PR has review approval and is waiting on CI or a merge.
 
 ## Phase 2 — every client authenticates
 
-- [ ] **trino** A fixed-token option (`hoglake.auth.token` / `token-file`)
-      beside client credentials
-- [ ] **millpond** `HOGLAKE_AUTH_*` settings for client credentials or a fixed
-      token, and the auth path in the startup probe —
-      [PostHog/millpond#165](https://github.com/PostHog/millpond/issues/165)
-- [ ] **hoglake** millrace: client credentials or a fixed token through
-      pyhoglake
-- [ ] **hoglake** webui: a way to present a token —
+- [x] **trino** A fixed-token option (`hoglake.auth.token` / `token-file`)
+      beside client credentials; exactly one auth source per catalog —
+      [PostHog/trino#198](https://github.com/PostHog/trino/pull/198)
+- [x] **millpond** `HOGLAKE_AUTH_*` settings for client credentials or a fixed
+      token (through pyhoglake, plus a re-reading token file) —
+      [PostHog/millpond#168](https://github.com/PostHog/millpond/pull/168)
+- [x] **hoglake** millrace: client credentials or a fixed token through
+      pyhoglake (`HOGLAKE_AUTH_*`)
+- [x] **hoglake** webui: a pasted token, held in sessionStorage and sent as a
+      bearer on every call; SSO/redirect sign-in is a later item —
       [#560](https://github.com/PostHog/hoglake/pull/560)
 - [x] **hoglake** pyhoglake, the DuckDB extension and hedgerow: issuer-neutral
       docs and the extension point described —
@@ -111,19 +113,35 @@ means the PR has review approval and is waiting on CI or a merge.
 
 ## Phase 3 — Trino users, and PostHog's rollout
 
-- [ ] **hogtower** Trino per-login tokens on the hogtower side: PostHog-user
-      logins, with a membership version in the cache key
-- [ ] **trino** Per-session tokens: exchange the catalog credential plus the
-      session user at the token URI (RFC 8693), cached per user
-- [ ] **trino** Per-session storage: hand the session's vended credentials to
-      workers as extra credentials instead of the catalog's static filesystem
-      credentials
-- [ ] **hogtower** Mounts: the reader presents a token scoped to the mount;
-      the host forwards it (what replaces #181)
+Reconciled 2026-11-15 with PostHog's architecture specs
+(PostHog/hogtower `docs/remote_schema.md`,
+`docs/truffle-hoglake-catalog-routing.md`,
+`docs/jwt-aws-session-design.md`; indexed in that repo's `AGENTS.md`). Those
+specs carry the burndown for the PostHog-specific pieces — a single stateless
+`hoglake` catalog per Trino pool resolved from the session's token, a session
+token that carries the caller's storage session, and Remote Schemas replacing
+mounts — so this list keeps only what hoglake owns and what has no other home.
+
+- [x] **hoglake** Session profile with embedded storage credentials: the
+      contract section, the verifier gate (`off` refuses any token carrying a
+      storage session) and the vectors, so an issuer that mints such tokens
+      conforms to hoglake's contract rather than defining it — the design is
+      PostHog/hogtower `docs/jwt-aws-session-design.md` — [#622](https://github.com/PostHog/hoglake/pull/622)
+- [ ] **hoglake** Remote Schemas: a read-only namespace in one catalog served
+      by forwarding the caller's verified token to another hoglake deployment
+      (`docs/remote_schema.md` D3/D4; this is what the mount feature becomes)
 - [ ] **hogtower** Signing-key rotation (`rotate-key`)
 - [ ] **charts** `HOGLAKE_STORAGE_PROVIDER=broker` and its settings on
-      PostHog's hoglake deployments, once the provider and the vend exist
+      PostHog's hoglake deployments — hogtower side live in dev
+      ([PostHog/hogtower#201](https://github.com/PostHog/hogtower/pull/201),
+      [PostHog/hogtower#202](https://github.com/PostHog/hogtower/pull/202)); the hoglake values
+      and the backend credential remain
 - [ ] **charts**, **hogtower** Rollout: the shared hoglake from `warn` to
       `enforce` in dev; the Trino token URL everywhere; the customer hoglake
-      service in prod; prod from `off` to `warn` to `enforce` once millpond,
-      millrace and the webui authenticate
+      service in prod; prod from `off` to `warn` to `enforce` now that
+      millpond, millrace and the webui authenticate (Phase 2)
+
+Superseded here, tracked in PostHog/hogtower's specs instead: per-login tokens
+for the org catalog and per-session storage in the Trino connector (the
+`posthog`-schema exchange and `<org>-events` mount tokens are a deprecated
+pattern there); mount tokens on the hogtower side (replaced by Remote Schemas).

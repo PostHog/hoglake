@@ -196,6 +196,10 @@ internal class ByteCountingInputFile(private val delegate: InputFile) : InputFil
 
     override fun newStream(): SeekableInputStream = Counted(delegate.newStream())
 
+    /** `S3InputFile.newDataStream` when the delegate is one (a reader that already holds the footer), else [newStream]. */
+    fun newDataStream(): SeekableInputStream =
+        Counted((delegate as? S3InputFile)?.newDataStream() ?: delegate.newStream())
+
     override fun toString(): String = delegate.toString()
 
     private inner class Counted(private val d: SeekableInputStream) : SeekableInputStream() {

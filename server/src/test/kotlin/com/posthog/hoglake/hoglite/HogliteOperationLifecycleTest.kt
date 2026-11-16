@@ -64,6 +64,58 @@ class HogliteOperationLifecycleTest {
         }
 
     @Test
+    fun `a worker reuses the captured incarnation and clears its thread binding`() =
+        fixture { store, calls ->
+            val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+            try {
+                store.catalogOperation("cat") {
+                    val operation = store.captureCatalogOperation("cat")
+                    worker.submit {
+                        store.withCatalogOperation("cat", operation) {
+                            assertThat(store.boundTenant("cat")).isEqualTo("t-cat")
+                            store.queryCatalog("cat", "SELECT 1")
+                        }
+                        assertThat(catchThrowable { store.queryCatalog("cat", "SELECT 1") })
+                            .isInstanceOf(IllegalStateException::class.java)
+                    }.get()
+                    assertThat(store.boundTenant("cat")).isEqualTo("t-cat")
+                    assertThat(calls.get()).isEqualTo(1)
+                }
+            } finally {
+                worker.shutdownNow()
+            }
+        }
+
+    @Test
+    fun `a worker bound absence also prevents the parent operation from continuing`() =
+        fixture { store, calls ->
+            val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+            try {
+                var poison: Throwable? = null
+                val failure =
+                    catchThrowable {
+                        store.catalogOperation("cat") {
+                            val operation = store.captureCatalogOperation("cat")
+                            worker.submit {
+                                poison =
+                                    catchThrowable {
+                                        store.withCatalogOperation("cat", operation) {
+                                            store.queryCatalog("cat", "SELECT bound_absence")
+                                        }
+                                    }
+                            }.get()
+                            assertThat(catchThrowable { store.queryCatalog("cat", "SELECT 1") }).isSameAs(poison)
+                            assertThat(calls.get()).isEqualTo(1)
+                        }
+                    }
+                assertThat(failure).isSameAs(poison).isInstanceOf(HoglakeException.NotFound::class.java)
+                assertUnboundAndFresh(store)
+            } finally {
+                worker.shutdownNow()
+            }
+        }
+
+    @Test
     fun `unknown outcome retains original txid when finalizer has binding poison`() =
         fixture { store, _ ->
             val original = HoglakeException.CommitOutcomeUnknown("original-txid", "ambiguous write")

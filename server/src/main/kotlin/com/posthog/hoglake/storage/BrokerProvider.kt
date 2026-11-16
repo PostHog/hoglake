@@ -53,13 +53,15 @@ class BrokerProvider(
     private val clientSecret: String,
     private val audience: String,
     private val refreshMargin: Duration,
+    /** Accept `http` to any host: the operator has stated this hop is inside a trusted network. */
+    private val allowHttp: Boolean = false,
     private val http: HttpClient = defaultHttpClient(),
     private val clock: Clock = Clock.systemUTC(),
     private val requestTimeout: Duration = DEFAULT_REQUEST_TIMEOUT,
 ) : StorageCredentialProvider {
     init {
-        BrokerUrls.require("broker url", brokerUrl.toString())
-        BrokerUrls.require("token url", tokenUrl.toString())
+        BrokerUrls.require("broker url", brokerUrl.toString(), allowHttp)
+        BrokerUrls.require("token url", tokenUrl.toString(), allowHttp)
         require(clientId.isNotBlank()) { "broker client id must not be blank" }
         require(clientSecret.isNotBlank()) { "broker client secret must not be blank" }
         require(audience.isNotBlank()) { "broker audience must not be blank" }

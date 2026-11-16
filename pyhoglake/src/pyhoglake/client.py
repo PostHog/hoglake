@@ -1779,6 +1779,15 @@ class Table:
     ) -> TableInfo:
         """Apply ``ops`` as one DDL commit and return the new shape.
 
+        One exception commits nothing: a request made only of
+        :func:`pyhoglake.ops.set_variant_shredding` ops that re-declare
+        what their columns already declare is a no-op on the server — no
+        snapshot, no column row — and the shape it returns is the table at
+        the unmoved head (``snapshot_id`` = ``read_snapshot_id`` = head),
+        with a head GET's sampled totals (or none) rather than an alter
+        receipt's exact ones. The cache and the DDL pin are re-seeded at
+        that head, so nothing prepared before is invalidated.
+
         A 409 from concurrent DDL is :class:`CommitConflictError`. An
         ``add_column`` or ``rename_column`` refused because the table has
         a live file the server has proven id-less (``missing_field_ids``)

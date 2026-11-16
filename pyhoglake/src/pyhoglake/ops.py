@@ -122,8 +122,8 @@ def add_column(
     (``type_="variant"``, in any case; see :mod:`pyhoglake.variant`). It
     is validated here, refused on any other type the server knows, and
     copied into the op, so changing the caller's dict afterwards changes
-    nothing. A declaration is fixed once the column exists: no alter op
-    changes it.
+    nothing. :func:`set_variant_shredding` replaces or clears it once
+    the column exists.
     """
     column = _column_def(name, type_, nullable, shredding)
     if not nullable:
@@ -137,6 +137,57 @@ def add_column(
             status_code=None,
         )
     return AlterOp("add_column", {"column": column})
+
+
+def set_variant_shredding(name: str, shredding: Shredding | None) -> AlterOp:
+    """Replace the shredded layout the top-level ``variant`` column
+    ``name`` declares in ``type_params.shredding``; ``None`` clears it,
+    and the column then has no ``type_params`` (see
+    :mod:`pyhoglake.variant`).
+
+    The declaration is checked here as :func:`add_column` checks one,
+    against the server's grammar and limits, so one the server would
+    refuse raises :class:`ValidationError` before the request, in the
+    server's words; and copied into the op, so changing the caller's
+    dict afterwards changes nothing. Whether ``name`` is a top-level
+    variant is the server's to decide, with the column in hand: a column
+    of another type or a variant nested in a struct, list or map is its
+    422, worded as at ``create_table``.
+
+    The declaration is a target for the writers that honour one
+    (pyhoglake's own write paths, the Trino connector, millrace) and for
+    compaction, not a rule the catalog holds files to: files written
+    under the old declaration keep the layout their footers record, and
+    this client's writers lay out the files they write after the alter
+    in the new one. Reading those older files back:
+    :func:`pyhoglake.variant.to_python` and
+    :func:`pyhoglake.variant.verify` given a ``column`` check the storage
+    against the LIVE declaration and refuse another layout
+    (``invalid_shredding``), so pass ``shredding=`` the declaration the
+    file was written under, or neither, which reads any layout from the
+    storage's own types.
+
+    A changed declaration is a DDL snapshot: a request prepared before it
+    is refused at commit with :class:`~pyhoglake.DdlSinceReadSnapshotError`
+    and must be prepared again. Re-declaring what the column already has
+    is a no-op on the server: nothing is written, no snapshot is minted,
+    and requests prepared before it stay committable, so a setup or
+    reconcile script may apply declarations on every run. "Already has"
+    is decided on JSON values, not spelling: key order and number
+    spelling do not matter, and a column whose stored ``type_params`` is
+    absent, ``{}`` or ``{"shredding": null}`` already has no declaration,
+    so ``shredding=None`` on it is a no-op. The ARGUMENT has one spelling
+    for "none", ``None``: ``{}`` and ``{"shredding": None}`` are
+    declarations, and invalid ones (``$ has no type``). A server without
+    ``mutable-variant-shredding-v1`` in ``catalog.info.capabilities``
+    answers 400 ``unknown alter op``.
+    """
+    if shredding is not None:
+        validate_shredding(shredding, column=name)
+    return AlterOp(
+        "set_variant_shredding",
+        {"name": name, "shredding": None if shredding is None else _plain(shredding)},
+    )
 
 
 def drop_column(name: str) -> AlterOp:

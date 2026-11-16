@@ -46,6 +46,12 @@ data class Caller(
     val user: String? = null,
     /** Verified placement for one catalog. Endpoints come only from server configuration. */
     val routing: Routing? = null,
+    /**
+     * `remote_schemas`, on a token carrying the session profile: the read-only
+     * remote schemas of the primary catalog this caller may use. Empty on every
+     * other token. The profile's credentials are never carried here.
+     */
+    val remoteSchemas: Set<String> = emptySet(),
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */

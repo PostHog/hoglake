@@ -108,6 +108,7 @@ data class CatalogDto(
             "claimed-uploads-v1",
             "atomic-dml-transactions-v1",
             "object-prefix-layout-v1",
+            "mutable-variant-shredding-v1",
             "atomic-partition-replacement-v1",
         ),
     /**

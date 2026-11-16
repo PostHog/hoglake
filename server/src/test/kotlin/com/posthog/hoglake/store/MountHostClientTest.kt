@@ -323,6 +323,22 @@ class MountHostClientTest {
     }
 
     @Test
+    fun `a query parameter named like a route value is not forwarded`() {
+        StubHost().use { host ->
+            client(host) {
+                // Route values come from the path only; every other parameter still goes.
+                // Parameter names are matched without regard to case, so each spelling is left out.
+                val query = "Catalog=other&snapshot=5&NAMESPACE=elsewhere&table=other_table&include=column_stats"
+                assertThat(get("$scan?$query", scoped()).status).isEqualTo(HttpStatusCode.OK)
+                assertThat(get("/v1/catalogs/$mount/namespaces?catalog=other", scoped()).status)
+                    .isEqualTo(HttpStatusCode.OK)
+                assertThat(host.seen.map { it.rawPath }).containsExactly(scan, "/v1/catalogs/$mount/namespaces")
+                assertThat(host.seen.map { it.rawQuery }).containsExactly("snapshot=5&include=column_stats", null)
+            }
+        }
+    }
+
+    @Test
     fun `a path segment is one segment whatever it holds`() {
         assertThat(MountHostClient.pathSegment("events_v2")).isEqualTo("events_v2")
         assertThat(MountHostClient.pathSegment("a/b")).isEqualTo("a%2Fb")

@@ -608,11 +608,53 @@ server back below this version once a table has the option.
 `rename_table`, `set_partition_spec`, `set_sort_order`, the V11
 metadata ops `add_column_with_metadata`, `set_table_comment`,
 `set_column_comment`, `set_properties` (`versioned-table-metadata-v1`),
-and `set_object_prefix_field` (see Partitioning) — applied **in
+`set_object_prefix_field` (see Partitioning) and `set_variant_shredding`
+(`mutable-variant-shredding-v1`, below) — applied **in
 order, atomically, as one DDL commit** (one snapshot, one
 `table_altered` change row, one schema-version bump). Renames keep the
 `field_id` (end the old row, begin a new one with the same id), so
-files written before a rename still bind correctly. Type promotion is
+files written before a rename still bind correctly.
+
+`set_variant_shredding` (`name`, `shredding`) replaces the layout a
+top-level `variant` column declares in `type_params.shredding`, or
+clears it (`shredding: null`; the column then has no `type_params`).
+The declaration is held to the rules of `service/VariantShredding.kt`
+exactly as at `create_table` and `add_column` (grammar, at most 1000
+fields and arrays, 1024 bytes of names on a path, 16 levels), and a
+column of another type or a nested variant is refused with the same
+messages. It is a **writer's and compaction's target, not a rule on
+files**: the catalog checks no file against it and rewrites none for
+it; each file's footer carries its own layout and readers use that, so
+files written under the old declaration stay as they are and keep
+reading. Writers that honour a declaration (pyhoglake, the Trino
+connector, millrace through pyhoglake) read it from the live column and
+lay out the files they write after re-reading in the new one — the
+alter's DDL snapshot refuses a commit whose `read_snapshot` predates it
+(`ddl_since_read_snapshot`), which is what makes them re-read — and
+compaction copies each file's variant leaves in that file's own layout,
+grouping its inputs by layout (the declared one preferred), so files in
+an older layout compact among themselves (see Compaction). Re-declaring
+what the column already declares is a **no-op**: it writes no row and
+mints no snapshot, so writers holding an older read are not refused and
+a reconcile script may apply declarations on every deploy. "Already
+declares" compares JSON values, not spellings — key order and number
+spelling do not matter, and a STORED `type_params` that is absent, `{}`
+or `{"shredding": null}` declares nothing, so `shredding: null` on such
+a column is a no-op; the op's own `shredding` has one spelling for
+"none", `null`/absent — `{}` and `{"shredding": null}` as the argument
+are declarations, and invalid ones (`$ has no type`). A request of only
+such ops answers 200 with the table at the unmoved head and, like a head
+GET, the sampler's totals with their freshness fields (or none while the
+sampler has none) — never the exact aggregate under the commit lock that
+a changing alter's receipt pays for; in a request with other ops those
+commit while the equal declaration writes nothing. (This departs from
+`set_column_comment` / `set_object_prefix_field`, which commit a
+snapshot for a no-change request.) Both catalog backends
+(`service/AlterService.kt`, `hoglite/HogliteAlters.kt`) implement it
+identically: the column keeps its `field_id`, the live row ends and a
+replacement begins at the alter's snapshot, carrying a full copy of the
+declaration in its `type_params` — one row per change, at operator
+frequency, so the copies are not a storage concern. Type promotion is
 a strict widening lattice (`int8→int16→int→long` and `uint8→uint16→uint32`, any rung to any
 higher one, plus `float→double`) chosen so
 existing files remain readable under the new schema — and a promote
@@ -707,13 +749,17 @@ the newest and both ancestors must go. Same-consumer is load-bearing:
 another consumer that has not reconciled keeps its position and keeps
 pinning.
 
-Two scope notes. The sweep's release is **not** gated on
-`consumer_floor` — the rows are dead either way, and `GET /consumers`
-should not show them — but it *is* gated on
-`snapshot_retention_seconds` being set, because it runs inside the
-sweep; a catalog with retention disabled releases only through
-`commitOffset`. And a released row **disappears from `GET /consumers`**,
-which is a visible contract change from "offsets outlive drops".
+The sweep releases superseded offsets even when retention or consumer
+protection is disabled. A released row disappears from `GET /consumers`.
+An unreconciled consumer keeps its position.
+
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/expire` through
+the token's placement. Each call runs one bounded sweep for that catalog.
+The operation advances the retention floor, purges expired metadata,
+and queues ended files in the removal ledger. It does not delete objects.
+`HOGLAKE_EXPIRY_PURGE_PAGE` and `HOGLAKE_EXPIRY_PURGE_BUDGET_MS` bound the
+purge. PostgreSQL keeps its background sweeps. Hoglite has no background
+sweep, catalog registry, or loop lease.
 
 The lineage is **recorded, not derived**: V14 adds
 `hog_table.replaced_table_id`, written by `CatalogService.createTable`
@@ -965,6 +1011,32 @@ hours, and API p99 of 20–60 s across routes because parked commits held
 the API pods' pool connections — with RDS idle at 8% CPU the whole time.
 Shortening the sweep interval to 15 s shortens each hold and leaves the
 duty cycle where it was.
+
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/cleanup` for the
+catalog in the token's placement. Each call drains bounded bulk and staging
+queues, then purges old run records, receipts, and drained removals.
+The drain checks live and historical file references and active uploads.
+It uses the server's object-store configuration, as PostgreSQL cleanup does.
+Per-call AWS identity remains separate work. Hoglite has no cleanup loop,
+catalog registry, or loop lease.
+
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/compact` for the
+catalog in the token's placement. Its `CompactionStorage` adapter uses the same
+`CompactionExecutor` as PostgreSQL. The executor owns packing, VARIANT layout
+probing, budget admission, Parquet rewriting, and result aggregation.
+The adapter reserves individual inputs and publishes with transaction-local guards.
+Each table plan reads at most `CompactionConfig.candidateBudget` candidates,
+in bucket, size, and file-ID order. The next window overlaps the trailing bucket
+by at most `minInputFiles - 1` files. This overlap prevents interleaved partitions
+from permanently stranding a static backlog.
+A bounded process-local cache retains fetch cursors and shared VARIANT layout observations across manual calls.
+A process restart can repeat work. Correct claims and publication do not depend on this cache.
+New tenant schemas include the live bucket-order index.
+Without that index, each plan uses one capped read instead of repeated sorted pages.
+Run manual cleanup to drain old staged-output tickets.
+The server owns the shared object store and its configured credential provider.
+Per-call AWS identity remains separate work. Hoglite has no compaction loop,
+catalog registry, fleet sweep, or loop lease.
 
 Physical deletion is decoupled and paranoid
 (`service/CleanupService.kt`): the queue is a *suggestion*. At drain
@@ -1976,28 +2048,236 @@ variant's storage leaf by leaf as plain Parquet groups, never through
 parquet-java's Variant reader (hoglake#70), into the layout the column's
 `type_params.shredding` declares (`compaction/VariantLayout.kt`, pinned
 to pyhoglake's by `pyhoglake/tests/vectors/variant_layout_vectors.json`).
-The copy is positional, so a group holding a file in any other layout,
-or one DuckDB wrote (Trino reads its top-level Variant nulls as SQL NULL
-by `created_by`), is refused as `unconvertible_schema` and also counted
-in `hoglake_compaction_variant_layout_mismatch_total{catalog,
-reason="layout"|"duckdb"}`. Such a group is refused again every sweep
-until its files change, and each refusal spends one of the sweep's
-`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` slots after rewriting every input
-ahead of the refused one (an input is checked when the rewrite reaches
-it, and the partial output is discarded); tables plan in name order, so
-refused groups can starve the catalog's other tables. Enable the flag
-only for catalogs whose variant tables pyhoglake or the Trino connector
-write (the allowlist), not one holding DuckDB-written variant files
-(hedgerow). A group refused at a variant column of a DuckDB-written
-input counts as `duckdb`, whatever that column's layout. The warning
-logged with each refusal names the table, column and input file: a
-`layout` refusal of a
-file that pyhoglake's `Table.append` or `prepare_append_tables` or the
-connector wrote means the layout port has drifted, and the flag should
-go off; one of a file registered from another writer
-(`prepare_append_files`) is just another layout. A variant's chunk in
-the sorted rewrite is sized by its layout's Parquet nodes, not as one
-catalog node.
+The copy is positional, so every input of one rewrite must hold the
+layout its output is written in. A group whose inputs hold MORE THAN ONE
+layout — the files a partition holds after `set_variant_shredding`
+changed a declaration, or files a writer laid out itself
+(`prepare_append_files`) — is rewritten PER LAYOUT rather than refused
+(`compaction/VariantLayoutGroups.kt`): before the rewrite, the service
+reads every input's footer (the tail read the rewrite's open would make;
+the footer is handed on so it is read once, up to 16 MiB of registered
+`footer_size` per group) and partitions the inputs by the layout of
+every variant column. Each partition that still meets the group-size
+rule (`minInputFiles`, scaled as `CompactionGrouping` scales it) is
+rewritten on its own, its output in ITS layout — the declared layout's
+partition first; a partition in a layout the declaration no longer names
+still compacts, into that layout, with no decoding and no re-shredding.
+Compaction CONSOLIDATES WITHIN each layout and never converts rows from
+one to another: an output is a new live file in its inputs' layout, and
+expiry removes only ended files, so an old layout's rows stay in it
+until they are deleted or rewritten by a writer. A
+partition too small is left alone, uncompacted and unrefused, and a file
+DuckDB wrote (Trino reads its top-level Variant nulls as SQL NULL by
+`created_by`, which an output does not keep) is excluded on its own and
+never blocks the rest. Only a variant field that is no VARIANT group at
+all (a leaf, a REPEATED group, no annotation, no REQUIRED BINARY
+`metadata`), or one holding a REPEATED node outside a LIST or MAP layer,
+still refuses its group as `unconvertible_schema`. `metadata` is found
+by name, so it may come before or after `value`; the layout keeps the
+file's field order, so a `value`-first file (Spark's) never matches the
+declared layout, which lays out `metadata` first, and compacts only with
+files of its own order.
+
+Not starving the sweep: a mixed group whose every partition is too small
+would spend one of the sweep's `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`
+slots and compact nothing, every sweep, because the planner packs in
+metadata and cannot see a layout. So the service REMEMBERS, in its own
+heap, every file it has probed: how its layouts DEVIATE from the
+declaration (the variant columns whose subtree is not the declared one),
+as a fingerprint, together with a fingerprint of the declaration it was
+judged against. The planner then packs files it knows to deviate only
+with files deviating the same way, drops files it knows DuckDB wrote,
+and packs the rest — the declared layout's, the never-probed, and any
+entry judged against an older declaration — together as before. A
+remembered remainder forms no group until enough files of its layout are
+known, except by a LOAN. A never-probed file is IDLE when it is in no
+group of the rest (declared and never-probed) that the planner would
+run: a main group the declared estimate's budget admission (the
+`spill_budget` / `merge_budget` check below) refuses is no work, this
+sweep or any other, so its never-probed files are as idle as those in
+no group, while a group it admits keeps every file it holds. Remembered
+populations are tried largest first, and the first is lent the shortest
+prefix of the idle files in candidate order, at most
+`minInputFiles − 1`, such that the planner's packing of population + loan
+forms a group that holds every lent file and a population file the
+population's own packing left out, and that passes the sorted-budget
+shape admission (below). So a population at or past the minimum can borrow to complete
+one of its size bands, and one whose layout the budgets refuse is passed
+over (a loan merely considered is not counted as a refusal). Only
+prefixes are tried, which keeps the search bounded and the same every
+sweep, so a completer queued behind a file that doesn't complete is
+skipped until the candidate order changes. The probe sorts the lent
+files out; at most one loan per bucket per sweep, and a lent file is
+probed and remembered, so never lent again. A loan is made only if the
+planner's packing of the rest WITHOUT it still holds every admitted main
+group with the same files: a file lent from a refused band of files no
+larger than an admitted band's would otherwise shift the smallest-first
+packing, close the refused remainder with the admitted band's first file
+and strand its other four until something arrived. And the search is
+bounded per bucket whatever the backlog: only the first fan-in
+(`effectiveMaxInputFiles`) of idle files in candidate order is offered,
+and only the eight largest remembered populations WITH a stranded file
+are tried (`VariantLayoutGroups.LOAN_POPULATIONS_TRIED`; one whose files
+all pack has nothing to complete and takes no slot), so a bucket of
+thousands of refused unknowns beside dozens of layouts costs one packing
+of its main population, one of each remembered population's own files,
+a bounded tail per population tried, and one more packing of main per
+loan found and checked against the admitted groups (at most eight) —
+not a packing of the backlog per layout every sweep. A loan that proves to be
+another layout leaves every file of its group where it was, the lent
+file now remembered where it belongs, and is charged as one
+`layout_probe_only` attempt (below): the one speculation a bucket makes
+a sweep, paid once per arrival, never twice for the same file. Deviations
+rather than whole layouts, so a file written before a
+variant column was added (which the rewrite null-fills) packs with later
+files of its layout; the declaration's fingerprint, so DDL
+(`set_variant_shredding`, a variant column added, dropped or renamed)
+makes every entry of the table unknown again and each file is probed
+once more rather than stranded — a DuckDB entry included, since whether
+a DuckDB file holds live variant data depends on the live columns, so a
+DuckDB file that no longer does compacts, null-filled, after that one
+re-probe. A compaction output is entered as it is
+registered — its layout is what was just written — so it is not probed
+on the next sweep to learn it. The memory is per process (empty after a
+restart, so each file is probed once per restart), bounded at 250k
+entries, and cleared of a file when it is compacted away; it is correct
+without it — the probe splits any group — and only the repeat depends on
+it. Not a column on `hog_data_file`: the hydrator never sees a file
+registered with inline stats (pyhoglake's), so the planner would need
+this fallback anyway.
+
+Beside each deviating layout's fingerprint the probe also remembers its
+SHAPE (`VariantLayoutMemory.Shape`: node count, nestedness, output
+leaves). The planner admits a sorted group of a remembered deviating
+layout against the sorted budgets with THAT shape alone, in metadata,
+where every other group is admitted against the declared one; the
+declared estimate is not applied to it as well. So a narrower layout
+left by a since-widened declaration still compacts, and a known layout
+wider than the declaration is refused on its real leaf count without a
+re-probe. A layout the
+budgets refuse is probed and charged once (`layout_probe_only`, below),
+and on every later sweep refused by the planner without reading a
+footer: counted like the planner's other budget refusals — in the ledger
+as `spill_budget_exceeded` / `merge_budget_exceeded`, in Prometheus as
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}` (the metric's labels drop the `_exceeded`; the
+budget section above maps the two) — and not charged to
+`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`. Admission is recomputed every
+plan from the current inputs and budgets, so raising
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`
+admits the group on the next plan without a re-probe; a declaration
+change makes the files' entries stale, so they are probed once more.
+Shapes are kept one per distinct deviating layout, not per file, at most
+4096 (`SHAPE_CAPACITY`), least recently used evicted first (the
+planner's lookup counts as a use, so a shape still planned every sweep
+stays); a group of an evicted layout is probed once more.
+
+What a probe costs. For a variant table the probe's footer read replaces
+the one the rewrite's open would make: the footer is handed on
+(`ParquetRewriter.Input.footer`) while the serialized footer bytes kept
+so far — measured off each footer, not the registered `footer_size`
+hint — stay under 16 MiB per group, and released as each part's rewrite
+ends; beyond that the rewrite re-reads the tail as it always did. A
+parsed footer is several times its serialized length, so this is up to
+a few hundred MB of heap at worst, beside (not inside)
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES`, which bounds the sorted
+rewrite's chunk and merge; size the pod with that headroom. A probe that
+finds nothing worth a rewrite (one file per layout; only DuckDB files),
+or whose every part is refused on re-admission (below), still read every
+footer, so it is charged as one attempt against
+`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`, counted in the ledger as
+`layout_probe_only` and in
+`hoglake_compaction_skipped_total{reason="layout_probe_only"}`. A
+budget-refused layout is charged this way only at its first probe; after
+that it recurs as a planner refusal — ledger `spill_budget_exceeded` /
+`merge_budget_exceeded`, Prometheus
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}` (above) — whose levers are
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`.
+A recurring `layout_probe_only` rate has one ORDINARY cause: a loan that
+did not pay off. A remembered remainder borrows an arrival (above), the
+probe finds it in another layout, nothing runs, and the attempt is
+charged — once per such arrival, since the arrival is then remembered
+and never lent again, so the rate is bounded by the arrival rate into
+buckets that hold a short remainder, and the remainder's own files are
+not counted again in `files_left` (below). Read a rate past what
+arrivals explain as the memory being lost (restarts, its 250k-entry
+capacity, or shape eviction).
+A group split into N parts spends N attempts, so a sweep can
+run past `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` by at most
+(layouts − 1) × `HOGLAKE_COMPACTION_PARALLEL_GROUPS` in its last wave;
+the first part of a group never yields (an in-flight group completes),
+though it can still be refused on re-admission; later parts yield to a
+sibling's heap exhaustion or a cancellation.
+After a split group commits, its claim is narrowed to the inputs that
+died, so the files left behind are free to be planned again at once.
+
+Counted in `hoglake_compaction_variant_layout_mismatch_total{catalog,
+reason}`: `split`, one per group the probe found in more than one layout;
+`duckdb`, one per DuckDB-written file excluded (a DuckDB file holding no
+live variant column — scalars written before the column was added —
+is not excluded: it compacts, null-filled); `layout`, one per group
+refused because a variant field is no VARIANT group, or one whose
+subtree the copy could not carry whole (a REPEATED node outside a LIST or
+MAP layer). Rewrite activity per layout is
+`hoglake_compaction_variant_layout_outputs_total{catalog,
+layout="declared"|"other"}` — outputs per layout. It measures rewrites
+only: a falling `other` rate means less rewriting in old layouts, not
+that an old layout is gone — and
+`hoglake_compaction_variant_layout_files_left_total{catalog}`, files set
+aside for want of company in their layout: each once per time the memory
+LEARNS it is set aside (the entry records it), since the memory keeps it
+out of the next plan. A remembered file probed again — a remainder as
+the company of a loan that proves to be another layout, a declared file
+beside arrivals that prove so — and left exactly as it was is not
+counted again; the lent file, or the arrivals, are, once, as they are
+learned. Accumulated observations, not distinct live files: a file
+probed again after a restart or an eviction of its entry is learned anew
+and counted anew, so the counter's rate is "files newly set aside", and
+the files still waiting are the maintenance summary's debt.
+
+**A `split` after `set_variant_shredding` is EXPECTED**, for as long as
+files written under the previous declaration remain in a partition beside
+files written under the new one: that is the case this mechanism exists
+for, and each layout keeps compacting among its own files without any
+operator action. Do not turn
+`HOGLAKE_COMPACTION_VARIANT` off on seeing it — that stops the very
+compaction that consolidates the old layout's files and lets small files
+pile up. Before reading a `split` as drift, check the table's declaration
+history. A change row holds only `kind` and `object_id`, and every alter
+records the same `table_altered`, so the change log narrows the
+candidates and the table's own reads decide: page
+`GET /catalogs/{catalog}/snapshots` for `table_altered` changes whose
+`object_id` is the table's `hog_table.table_id`, and for each such
+snapshot S compare the variant column's `type_params.shredding` in
+`GET .../tables/{table}?snapshot=S` and `?snapshot=S-1`. A snapshot
+below the catalog's retained floor answers 410, so a change since
+expired cannot be found and the cause stays unknown. A `split` with NO
+declaration change behind it, on a table only pyhoglake's `Table.append`
+or `prepare_append_tables` or the connector write, and likewise a
+`layout` refusal of such a file, means the layout port has drifted from
+theirs (`pyhoglake/tests/vectors/variant_layout_vectors.json` pins the
+two) — then the flag should go off until the port is fixed.
+
+A variant's chunk in the sorted rewrite is sized by its layout's Parquet
+nodes, not as one catalog node, and a part in another layout is sized by
+THAT layout's nodes (`CompactionConfig.spillChunkRows` with the part's
+layouts), not the declaration's: a declaration since cleared or narrowed
+leaves files far wider than the catalog says, and a chunk sized for the
+narrow rows would hold too many wide ones for the heap. A layout holding
+a LIST or MAP layer counts as nested, so its chunk is divided by
+`HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` like a nested column's. Each part is
+re-admitted against its own bounds before its rewrite; a part the wider
+rows push over a budget the declared estimate fit is refused, counted
+with the planner's budget refusals (ledger `spill_budget_exceeded` /
+`merge_budget_exceeded`, Prometheus
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}`).
+The refusal is uncharged when another part of the group ran; when no
+part ran, the probe is charged as one `layout_probe_only` attempt
+(above). A part whose output leaf count cannot be computed skips the
+check and goes to the rewrite, which refuses it as
+`unconvertible_schema`.
 
 Each table's candidate list is fixed before rewriting starts, so an
 output cannot feed another group in the **same run**. Input bytes only
@@ -2157,6 +2437,14 @@ The catalog reports on itself instead of waiting for ops SQL:
 - **`POST /maintenance/rehydrate`** — the operator requeue for the
   hydrator's structural failures (above): flips `failed` → `pending`,
   catalog-wide or scoped to one namespace+table.
+  Hoglite uses the token's placement and excludes ended files and dropped tables.
+  The manual action changes metadata only; it does not start a hydration sweep.
+  One transaction updates all matching files, subject to the engine's write limits.
+  Full hydration still needs the existing server-side `ObjectStore` path and per-run AWS identity.
+  Hoglite retirement is available through the backend seam for trusted placement.
+  It has no HTTP trigger or background driver.
+  Each retirement batch queues current vector and data paths before it deletes their rows.
+  Candidate and victim reads use bounded keyset pages.
 - **`GET /stats/partitions`** (`service/PartitionStatsService.kt`) —
   leaf partitions ranked by compaction debt: `debt_score` is the
   small-file count under exactly the threshold the compactor plans
@@ -2635,9 +2923,10 @@ requires.) Both keys set selects the `static` storage provider; see
 `http://host.docker.internal:9000` — or `http://minio:9000` with the
 container attached to the compose network — as the endpoint.
 
-pyhoglake's `test_compaction_copies_a_declared_variant_table` needs
-`HOGLAKE_COMPACTION_VARIANT=true` on the server it runs against; it
-fails, not skips, without it. `ci/live-python.sh` sets it; a dev server
+pyhoglake's `test_compaction_copies_a_declared_variant_table` and
+`test_compaction_after_set_variant_shredding_compacts_each_layout_apart`
+need `HOGLAKE_COMPACTION_VARIANT=true` on the server they run against;
+they fail, not skip, without it. `ci/live-python.sh` sets it; a dev server
 must set it by hand.
 
 

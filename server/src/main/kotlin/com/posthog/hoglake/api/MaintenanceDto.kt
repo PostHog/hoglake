@@ -247,6 +247,11 @@ data class CompactionResultDto(
      * See CompactionResult.objectPrefixUnresolvable.
      */
     val objectPrefixUnresolvable: Long,
+    /**
+     * Variant-table groups whose layout probe found nothing to rewrite.
+     * See CompactionResult.layoutProbeOnly.
+     */
+    val layoutProbeOnly: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -284,6 +289,7 @@ fun CompactionResult.toDto() =
         filesUnranged = filesUnranged,
         bucketsSkippedClaimed = bucketsSkippedClaimed,
         objectPrefixUnresolvable = objectPrefixUnresolvable,
+        layoutProbeOnly = layoutProbeOnly,
     )
 
 data class RehydrateResultDto(
@@ -405,6 +411,7 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "files_unranged",
         "buckets_skipped_claimed",
         "object_prefix_unresolvable",
+        "layout_probe_only",
     )
 
 /**

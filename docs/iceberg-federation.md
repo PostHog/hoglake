@@ -546,7 +546,8 @@ and its metadata/value storage shape; an ordinary struct is not equivalent.
 Shredded child statistics are not whole-column statistics and are omitted.
 Compaction planning skips tables with live VARIANT columns, and the rewriter
 rejects them explicitly, unless `HOGLAKE_COMPACTION_VARIANT` is on; then each
-VARIANT is copied in its declared layout (server/README.md). A top-level variant
+VARIANT is copied as it is, a group's files rewritten per layout
+(server/README.md). A top-level variant
 may declare the shredded layout writers give it (`type_params.shredding`); it is
 catalog metadata for writers, has no Iceberg counterpart, and no read depends on
 it. Reader support must be verified per engine; this does not enable an Iceberg

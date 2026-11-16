@@ -996,7 +996,9 @@ requests go through the Client.
   routes, with the caller's `Authorization` header and `X-Request-Id`, to a
   path built from the mount name and identifier-grammar namespace and table
   names (anything else is a local 404), with the query parameters
-  re-encoded. Redirects are not followed and no proxy is used. A 200 comes
+  re-encoded. A query parameter named `catalog`, `namespace` or `table` (in
+  any letter case) is not forwarded: those are route values and come from
+  the path only. Redirects are not followed and no proxy is used. A 200 comes
   back byte for byte (one with no length and no chunking, or with a content
   encoding, is refused); `GET /v1/catalogs` asks each host once and keeps
   the entries it returns for the names in the caller's `cat`.
@@ -1246,6 +1248,18 @@ honest options:
   should not ride along with this one.
 
 Recommend **(i)** in this plan, **(ii)** as a separate decision.
+
+**What the webui does today.** It accepts a pasted access token: a JWT the user
+gets from hogtower's `/oauth/token` with a hoglake credential created in PostHog.
+The token is kept in `sessionStorage` for the tab, sent as `Authorization: Bearer`
+on every `/v1` call and on `/metrics`, and dropped on a 401 or once its `exp`
+passes. The header shows its subject and expiry, decoded in the browser for
+display only. `/v1/info` does not report the auth mode, so the console never
+prompts up front: the sign-in panel opens on the first 401, and a "sign in"
+control is always in the header. Under `off` nothing else changes. Page
+JavaScript can read a token held in `sessionStorage`, which is acceptable for a
+token that lives 15 minutes. Option (ii), an SSO/redirect login with a server-side
+session that keeps the token out of JS, is still a separate decision.
 
 ---
 
