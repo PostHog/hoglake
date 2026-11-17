@@ -60,7 +60,9 @@ import kotlin.coroutines.resumeWithException
  *   literals, the mount name (which must have the reserved shape) and
  *   namespace and table names that pass the identifier grammar, each
  *   percent-encoded as one segment; a name outside the grammar is the 404 a
- *   missing one gets, with nothing sent. Query parameters are re-encoded one
+ *   missing one gets, with nothing sent. For a remote schema the path is
+ *   the caller's own: its catalog, the schema's configured name and the
+ *   table, by the same rules. Query parameters are re-encoded one
  *   by one; one named `catalog`, `namespace` or `table` (in any letter case)
  *   is not sent, because those are route values and come from the path only.
  *   Redirects are not followed and no proxy is used.
@@ -158,6 +160,35 @@ class MountHostClient(
     ) = relay(call, mount, "namespaces", namespaceName(namespace), "tables", tableName(namespace, table), "scan")
 
     /**
+     * The four routes of a remote schema ([CatalogBinding.RemoteSchema]):
+     * the caller's request for the namespace `schema.schema` of its own
+     * catalog, sent to this host with the same path and query. The Host
+     * derives what to serve from the catalog, the schema and the token;
+     * the Client holds no Host-side name and no table list.
+     */
+    suspend fun schemaNamespace(
+        call: ApplicationCall,
+        schema: CatalogBinding.RemoteSchema,
+    ) = relaySchema(call, schema)
+
+    suspend fun schemaTables(
+        call: ApplicationCall,
+        schema: CatalogBinding.RemoteSchema,
+    ) = relaySchema(call, schema, "tables")
+
+    suspend fun schemaTable(
+        call: ApplicationCall,
+        schema: CatalogBinding.RemoteSchema,
+        table: String,
+    ) = relaySchema(call, schema, "tables", tableName(schema.schema, table))
+
+    suspend fun schemaScan(
+        call: ApplicationCall,
+        schema: CatalogBinding.RemoteSchema,
+        table: String,
+    ) = relaySchema(call, schema, "tables", tableName(schema.schema, table), "scan")
+
+    /**
      * The Host's catalog entries for [mounts], as the Host sent them: one
      * upstream listing whatever [mounts] holds, and only entries it names
      * are kept. The Host decides which of them serve; one it leaves out is
@@ -168,7 +199,7 @@ class MountHostClient(
         mounts: Set<String>,
     ): List<JsonNode> {
         if (mounts.isEmpty()) return emptyList()
-        return exchange(call, mounts, URI.create("$base/v1/catalogs")) { body, deadline ->
+        return exchange(call, mountSubject(mounts), URI.create("$base/v1/catalogs")) { body, deadline ->
             val bytes = read(body, LISTING_BYTES, mounts, deadline)
             if (bytes.size > LISTING_BYTES) throw tooLarge(mounts)
             val root = runCatching { json.readTree(bytes) }.getOrNull()
@@ -183,9 +214,48 @@ class MountHostClient(
         call: ApplicationCall,
         mount: String,
         vararg tail: String,
+    ) = relay(call, mountSubject(setOf(mount)), path(mount, tail.asList()))
+
+    /** Forward the caller's GET for `/v1/catalogs/{catalog}/namespaces/{schema}[/tail...]`, as [relay] does. */
+    private suspend fun relaySchema(
+        call: ApplicationCall,
+        schema: CatalogBinding.RemoteSchema,
+        vararg tail: String,
     ) {
-        val mounts = setOf(mount)
-        exchange(call, mounts, URI.create(base + path(mount, tail.asList()) + query(call))) { body, deadline ->
+        check((host.match as? MountMatch.Namespace)?.name == schema.schema) { "not this host's remote schema" }
+        if (!CATALOG.matches(schema.catalog)) throw HoglakeException.NotFound("catalog '${schema.catalog}'")
+        relay(
+            call,
+            Subject(setOf(schema.schema), "namespace '${schema.schema}' in catalog '${schema.catalog}'"),
+            path(schema.catalog, listOf("namespaces", schema.schema) + tail),
+        )
+    }
+
+    /**
+     * What one exchange is for: the names it is counted against in metrics
+     * ([labels]) and the wording of the 404 a request with no credential
+     * gets ([missing]). Built only by [mountSubject] and [relaySchema], which
+     * check the names first, so no label is raw request input.
+     */
+    private class Subject(
+        val labels: Set<String>,
+        val missing: String,
+    )
+
+    /** The subject for mount [names]: each must have the reserved shape, and this host must serve mounts. */
+    private fun mountSubject(names: Set<String>): Subject {
+        check(names.isNotEmpty() && names.all(MountNames::isReserved)) { "not a mount name" }
+        check(host.match !is MountMatch.Namespace) { "a remote schema's host serves no mount" }
+        return Subject(names, "catalog '${names.first()}'")
+    }
+
+    private suspend fun relay(
+        call: ApplicationCall,
+        subject: Subject,
+        path: String,
+    ) {
+        val mounts = subject.labels
+        exchange(call, subject, URI.create(base + path + query(call))) { body, deadline ->
             val head = read(body, prebufferBytes, mounts, deadline)
             if (head.size > maxResponseBytes) throw tooLarge(mounts)
             if (head.size <= prebufferBytes) {
@@ -235,16 +305,17 @@ class MountHostClient(
     /**
      * One request to the Host under the cap and the deadline. [onOk] gets
      * the body of a 200 JSON answer; every other answer is thrown as the
-     * typed error the caller is given. Counted and timed against [mounts],
-     * which the caller's verified `cat` names.
+     * typed error the caller is given. Counted and timed against the
+     * [subject]'s labels: mount names the caller's verified `cat` holds, or
+     * a remote schema's configured name.
      */
     private suspend fun <T> exchange(
         call: ApplicationCall,
-        mounts: Set<String>,
+        subject: Subject,
         uri: URI,
         onOk: suspend (body: InputStream, deadline: Deadline) -> T,
     ): T {
-        check(mounts.isNotEmpty() && mounts.all(MountNames::isReserved)) { "not a mount name" }
+        val mounts = subject.labels
         val authorization =
             when (host.auth) {
                 // The caller's own credential, exactly as it arrived and as
@@ -252,7 +323,7 @@ class MountHostClient(
                 // verifies the same issuer's tokens (MountHost.Auth.FORWARD).
                 MountHost.Auth.FORWARD ->
                     call.request.headers[HttpHeaders.Authorization]
-                        ?: throw HoglakeException.NotFound("catalog '${mounts.first()}'")
+                        ?: throw HoglakeException.NotFound(subject.missing)
             }
         if (!permits.tryAcquire()) {
             mounts.forEach { Metrics.mountRefused(it, "mount_proxy_busy") }
@@ -499,6 +570,7 @@ class MountHostClient(
         val RELAYED_STATUSES = setOf(400, 401, 403, 404, 409, 410, 422, 429, 500, 501, 503)
         private val ERROR_CODE = Regex("^[a-z][a-z0-9_]{0,63}$")
         private val IDENTIFIER = Regex(Identifiers.PATTERN)
+        private val CATALOG = Regex(Identifiers.CATALOG_NAME_PATTERN)
 
         /** [namespace] as a path segment, or the 404 a missing namespace gets when no catalog could hold it. */
         fun namespaceName(namespace: String): String {

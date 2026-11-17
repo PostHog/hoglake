@@ -182,7 +182,9 @@ standing cloud identity. This profile is how such a token is spelled; hoglake
 owns it the way it owns the rest of the contract, so an issuer that mints it
 conforms to this section and to `server/src/test/resources/oauth/session-profile-vectors.json`
 (generated here, like the contract vectors; verified with the profile on).
-The verifier's half is built; routing requests to remote schemas is not.
+The verifier's half is built, and so is the Client side of remote schemas
+([auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client)),
+which serves a schema the token names only to a `scoped` token.
 
 What the server does with such a token is deliberately small. It verifies the
 profile's shape, records the read-only remote schemas the token authorizes,

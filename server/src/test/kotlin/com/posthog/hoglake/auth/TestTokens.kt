@@ -133,6 +133,23 @@ object TestTokens {
             """"iat":$iat,"exp":$exp,"cat":$catalogs$prdClaim$extra}"""
     }
 
+    /**
+     * The session profile's claims (docs/auth.md), each with a leading comma:
+     * for [scopedClaims]' `extra`, or spliced in before a tenant claim set's
+     * closing brace. [primaryCatalog] must be the one catalog the token's
+     * `cat` names. [remoteSchemas] is spliced in verbatim (null leaves the
+     * claim out). The credential bundle is fictional and outlives any token.
+     */
+    fun sessionProfile(
+        primaryCatalog: String,
+        remoteSchemas: String?,
+    ): String =
+        ""","profile":"storage-session","version":1,"purpose":"user-session",""" +
+            """"primary_catalog":"$primaryCatalog","aws":{"access_key_id":"FICTIONAL_KEY",""" +
+            """"secret_access_key":"FICTIONAL_SECRET","session_token":"FICTIONAL_TOKEN",""" +
+            """"region":"us-east-1","expires_at":4000000000}""" +
+            (remoteSchemas?.let { ""","remote_schemas":$it""" } ?: "")
+
     fun operatorClaims(
         exp: Long = 4_000_000_000L,
         sub: String = "sa:bulk-loader",
