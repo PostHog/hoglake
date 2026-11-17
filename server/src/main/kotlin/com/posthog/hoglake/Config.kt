@@ -108,7 +108,12 @@ data class Config(
      * namespace entry's URL must be https unless that key is true: the token
      * relayed for a remote schema can carry storage credentials, and http
      * sends it without transport encryption. The key is refused on the
-     * other match types, whose URLs may be http as before. Entries contain
+     * other match types, whose URLs may be http as before. A namespace
+     * entry may also set remote_name, the schema's name on the host (default
+     * NAME): NAME is what this server shows and reserves, while the relayed
+     * path and the token's `remote_schemas` use remote_name. Refused on the other
+     * match types; no two namespace entries, on any hosts, may have one
+     * name on their hosts. Entries contain
      * endpoints, never credentials; each id must be unique and canonical,
      * each URL a bare http(s) origin, and no name may match two entries.
      *
@@ -2244,7 +2249,7 @@ private fun readMountHosts(file: String): List<MountHost> {
         require(entry.isObject) { "mount host entry must be an object" }
         val keys =
             setOf("id", "match", "kind", "url", "auth", "timeout_ms", "max_response_bytes", "max_concurrent") +
-                "allow_insecure_http"
+                setOf("allow_insecure_http", "remote_name")
         require(entry.properties().all { it.key in keys }) { "mount host entry has unknown fields" }
         val insecure = entry.get("allow_insecure_http")
         require(insecure == null || insecure.isBoolean) { "mount host allow_insecure_http must be true or false" }
@@ -2337,6 +2342,8 @@ private fun readMountHosts(file: String): List<MountHost> {
                 maxResponseBytes = positive("max_response_bytes", MountHost.DEFAULT_MAX_RESPONSE_BYTES),
                 maxConcurrent = concurrent.toInt(),
                 allowInsecureHttp = insecure?.asBoolean() == true,
+                // Grammar and match type are checked by MountHost itself.
+                remoteName = if (entry.has("remote_name")) text(entry, "remote_name") else null,
             )
     }
     MountHost.requireDisjoint(hosts)

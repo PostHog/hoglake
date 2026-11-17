@@ -96,7 +96,7 @@ class RemoteSchemaRuleTest {
                     // the auth plugin decided on `lake` only.
                     get("/v1/catalogs/{catalog}/namespaces") {
                         val asked = call.request.headers["X-Handler-Catalog"]!!
-                        call.requireRemoteSchemaEntitlement(asked, "posthog", "posthog")
+                        call.requireRemoteSchemaEntitlement(asked, "posthog", "posthog", "posthog")
                         call.respondText("entitled")
                     }
                 }
@@ -124,7 +124,7 @@ class RemoteSchemaRuleTest {
 
     @Test
     fun `a listing shows a caller exactly the schemas the rule would let it read`() {
-        val configured = listOf("posthog", "imports")
+        val configured = mapOf("posthog" to "posthog", "imports" to "imports")
         val both = setOf("posthog", "imports", "other")
         assertThat(caller(schemas = both).remoteSchemasAmong("lake", configured)).containsExactly("imports", "posthog")
         assertThat(caller().remoteSchemasAmong("lake", configured)).containsExactly("posthog")
@@ -134,6 +134,17 @@ class RemoteSchemaRuleTest {
         assertThat(caller(kind = Caller.Kind.OPERATOR).remoteSchemasAmong("lake", configured)).isEmpty()
         val none: Caller? = null
         assertThat(none.remoteSchemasAmong("lake", configured)).isEmpty()
-        assertThat(caller().remoteSchemasAmong("lake", emptyList())).isEmpty()
+        assertThat(caller().remoteSchemasAmong("lake", emptyMap())).isEmpty()
+    }
+
+    @Test
+    fun `an alias is checked by the host's name and listed by the local one`() {
+        // Local `analytics` is the host's `shared`; local `posthog` is the host's `analytics`.
+        val configured = mapOf("analytics" to "shared", "posthog" to "analytics")
+        assertThat(caller(schemas = setOf("shared")).remoteSchemasAmong("lake", configured))
+            .containsExactly("analytics")
+        assertThat(caller(schemas = setOf("analytics")).remoteSchemasAmong("lake", configured))
+            .containsExactly("posthog")
+        assertThat(caller(schemas = setOf("posthog")).remoteSchemasAmong("lake", configured)).isEmpty()
     }
 }

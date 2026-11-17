@@ -210,7 +210,7 @@ class CatalogStoreSelector(
         store: CatalogStore,
     ): CatalogBinding.RemoteSchema? {
         val (schema, namespace) = namedSchema(call, catalog) ?: return null
-        call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace)
+        call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace, schema.remoteName)
         store.getCatalog(catalog)
         return CatalogBinding.RemoteSchema(catalog, schema.name, schema.host)
     }
@@ -227,7 +227,8 @@ class CatalogStoreSelector(
         catalog: String,
     ): List<String> {
         call.requireCatalogEntitlement(catalog)
-        return call.hoglakeAuth.callerOrNull.remoteSchemasAmong(catalog, mountHosts.remoteSchemas().map { it.name })
+        val schemas = mountHosts.remoteSchemas().associate { it.name to it.remoteName }
+        return call.hoglakeAuth.callerOrNull.remoteSchemasAmong(catalog, schemas)
     }
 
     /**
@@ -249,7 +250,7 @@ class CatalogStoreSelector(
         for (namespace in namespaces) {
             val schema = schemas.firstOrNull { it.match.covers(namespace) } ?: continue
             if (resolve(call, catalog) !is CatalogBinding.Local) return
-            call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace)
+            call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace, schema.remoteName)
             throw remoteSchemaRefusal(call, schema.name)
         }
     }

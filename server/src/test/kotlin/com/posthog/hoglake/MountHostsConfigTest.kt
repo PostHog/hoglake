@@ -399,4 +399,92 @@ class MountHostsConfigTest {
             assertThat(schemaConfig(old).mountHosts).isNotEmpty()
         }
     }
+
+    // ---- an alias: "remote_name" on a namespace entry -------------------------
+
+    @Test
+    fun `a namespace entry may name the schema on its host, and only the local name is reserved`() {
+        val cfg = schemaConfig("""{"hosts":[${schema("analytics", extra = ""","remote_name":"shared"""")}]}""")
+        val host = cfg.mountHosts.single()
+        assertThat(host.match).isEqualTo(MountMatch.Namespace("analytics"))
+        assertThat(host.remoteName).isEqualTo("shared")
+        StaticMountHosts(cfg.mountHosts).use { hosts ->
+            val schema = hosts.remoteSchemas().single()
+            assertThat(schema.name to schema.remoteName).isEqualTo("analytics" to "shared")
+        }
+        // Only the local name is reserved; the host's name is no local business.
+        assertThat(cfg.reservedNamespaces.names).containsExactly("analytics")
+        assertThat(cfg.reservedNamespaces.isReserved("shared")).isFalse()
+        // Without the key, or with the local name itself, the two names are one.
+        for (extra in listOf("", ""","remote_name":"analytics"""")) {
+            val plain = schemaConfig("""{"hosts":[${schema("analytics", extra = extra)}]}""").mountHosts
+            StaticMountHosts(plain).use { assertThat(it.remoteSchemas().single().remoteName).isEqualTo("analytics") }
+        }
+    }
+
+    @Test
+    fun `remote_name is refused on a mount entry, outside the grammar, and for a name on the hosts taken twice`() {
+        fun refusedSchema(
+            hosts: String,
+            message: String,
+        ) = assertThatThrownBy { schemaConfig(hosts) }
+            .describedAs(hosts)
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining(message)
+        val alias = ""","remote_name":"shared""""
+        for (name in listOf("", "sha/red", "9lives", "sha red", "a".repeat(129), "é")) {
+            refusedSchema(
+                """{"hosts":[${schema("analytics", extra = ""","remote_name":"$name"""")}]}""",
+                "remote_name must be a namespace name",
+            )
+        }
+        for (value in listOf("7", "null", "true", """["shared"]""")) {
+            refusedSchema(
+                """{"hosts":[${schema("analytics", extra = ""","remote_name":$value""")}]}""",
+                "requires a string remote_name",
+            )
+        }
+        // Not a mount entry's key, whatever the value.
+        for (match in listOf("""{"type":"events"}""", """{"type":"catalog","name":"$mount"}""")) {
+            refused("""{"hosts":[${entry(match = match, extra = alias)}]}""", "remote_name is only for")
+        }
+        assertThatThrownBy {
+            MountHost(
+                UUID.randomUUID(),
+                MountMatch.Events,
+                MountHost.Kind.HOGLAKE,
+                URI("https://h"),
+                MountHost.Auth.FORWARD,
+                remoteName = "shared",
+            )
+        }.hasMessageContaining("remote_name is only for")
+        // One entry per name on a host, whatever the hosts, since a claim names a schema by that name alone:
+        // an alias of another entry's local name and two aliases of one name, on one host or on two.
+        val aliased = schema("analytics", extra = alias)
+        val elsewhere = "https://other-hoglake.example"
+        val toAnalytics = ""","remote_name":"analytics""""
+        for (second in listOf(
+            schema("events_v2", otherId, extra = toAnalytics),
+            schema("events_v2", otherId, url = elsewhere, extra = toAnalytics),
+        )) {
+            refusedSchema("""{"hosts":[${schema("analytics")},$second]}""", "relay to the same schema name 'analytics'")
+        }
+        for (second in listOf(
+            schema("events_v2", otherId, extra = alias),
+            schema("events_v2", otherId, url = elsewhere, extra = alias),
+            schema("shared", otherId),
+            schema("shared", otherId, url = elsewhere),
+        )) {
+            refusedSchema("""{"hosts":[$aliased,$second]}""", "relay to the same schema name 'shared'")
+        }
+        // Another name on the host is another schema, names compare exactly (as the claim does), and a
+        // local name may be another entry's host name (the claim names a host's schema, the reservation a local one).
+        for (second in listOf(
+            schema("events_v2", otherId, extra = ""","remote_name":"published""""),
+            schema("events_v2", otherId, url = elsewhere, extra = ""","remote_name":"Shared""""),
+            schema("shared", otherId, extra = ""","remote_name":"published""""),
+        )) {
+            assertThat(schemaConfig("""{"hosts":[$aliased,$second]}""").mountHosts).hasSize(2)
+        }
+    }
 }
