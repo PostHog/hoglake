@@ -410,7 +410,9 @@ class MountReadService(
     /**
      * Column statistics for the SCOPED files only: the cap counts the
      * scoped provided-file count (plan row 1.3h, "stats cap applied to the
-     * scoped plan"), and only files in [files] are given rows.
+     * scoped plan"), and only the statistics rows of files in [files] are
+     * read. The statement is keyed on those files' ids, so its cost is the
+     * caller's plan and never the table's, which holds every org's files.
      */
     private fun withScopedColumnStats(
         h: Handle,
@@ -427,10 +429,9 @@ class MountReadService(
             leafFieldIds,
             request,
         )
-        val scopedIds = files.map { it.dataFile.dataFileId }.toSet()
+        val provided = files.filter { it.dataFile.statsState == StatsState.PROVIDED }.map { it.dataFile.dataFileId }
         val rowsByFile =
-            FileRepo.providedColumnStatsAt(h, pinned.catalogId, pinned.tableId, at, request.fieldIds)
-                .filterKeys { it in scopedIds }
+            FileRepo.providedColumnStatsOf(h, pinned.catalogId, pinned.tableId, provided, request.fieldIds)
         return files.map { file ->
             if (file.dataFile.statsState != StatsState.PROVIDED) return@map file
             val rows = rowsByFile[file.dataFile.dataFileId].orEmpty()
