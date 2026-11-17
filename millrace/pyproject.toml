@@ -23,7 +23,7 @@ dependencies = [
     # safety, "compactor disabled stalls L0 at l0_max_ssts",
     # submit_compaction's enqueue-only shape, the emitted metric names.
     # A minor bump is a deliberate re-verification, not a refresh.
-    "slatedb==0.17.*",
+    "slatedb==0.18.*",
     "confluent-kafka>=2.16.0",
     "prometheus-client>=0.20",
     "httpx>=0.27",
