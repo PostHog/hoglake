@@ -68,8 +68,10 @@ class SessionProfileVectorsTest {
                     "accept" -> {
                         val caller = verifier(true).verify(token)
                         assertThat(caller.kind.name.lowercase()).isEqualTo(expect["kind"].asText())
-                        assertThat(caller.remoteSchemas)
-                            .isEqualTo(vector["claims"]["remote_schemas"].fieldNames().asSequence().toSet())
+                        val named = vector["claims"]["remote_schemas"].fieldNames().asSequence().toSet()
+                        // The key `team` is the family entry, never a schema of that name.
+                        assertThat(caller.remoteSchemas).isEqualTo(named - "team")
+                        assertThat(caller.remoteSchemaFamilies).isEqualTo(named intersect setOf("team"))
                     }
                     "refuse" ->
                         assertThatThrownBy { verifier(true).verify(token) }

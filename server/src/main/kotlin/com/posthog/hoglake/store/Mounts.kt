@@ -106,6 +106,23 @@ sealed interface CatalogBinding {
         val catalog: String,
         val schema: String,
         val host: MountHostClient,
+        /** What this schema's traffic is counted against: its configured name, or its family's label. */
+        val label: String = schema,
+    ) : CatalogBinding
+
+    /**
+     * A namespace this server serves to relayed readers (docs/auth-tenancy.md
+     * §6.5d): the request's path names [namespace], and [catalog] is the
+     * caller's own, not one this server holds. [reader] reads the source
+     * catalog's namespace of that name. Built only once the caller's token
+     * and the namespace's org mark are known to allow it.
+     */
+    data class Served(
+        val catalog: String,
+        val namespace: String,
+        val reader: ServedNamespaceReader,
+        /** What a refusal is counted against: the served family's label, never a team id. */
+        val label: String,
     ) : CatalogBinding
 }
 
@@ -223,6 +240,26 @@ internal fun remoteSchemaRefusal(
         )
     } else {
         refused(schema, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a remote schema is read-only"))
+    }
+
+/**
+ * The refusal for a request that names a served namespace on a route that is
+ * not relayed, with [remoteSchemaRefusal]'s codes, counted against the
+ * served family's [label]. Only for a caller the entitlement check has
+ * passed (auth/StoreEntitlement.kt); build it only to throw it.
+ */
+internal fun servedNamespaceRefusal(
+    call: ApplicationCall,
+    label: String,
+): HoglakeException =
+    if (AuthPolicy.match(call.request.httpMethod, call.request.path())?.requirement == Requirement.READ) {
+        refused(
+            label,
+            "mount_operation_unavailable",
+            HoglakeException.MountOperationUnavailable("this operation is not available on a served namespace"),
+        )
+    } else {
+        refused(label, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a served namespace is read-only"))
     }
 
 /**

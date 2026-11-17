@@ -140,7 +140,7 @@ class MountHostsConfigTest {
         }
         refused(
             """{"hosts":[${entry(match = """{"type":"prefix","name":"x"}""")}]}""",
-            "match type must be events, catalog or namespace",
+            "match type must be events, catalog, namespace or namespace_family",
         )
         refused("""{"hosts":[${entry(match = """{"type":"events","name":"$mount"}""")}]}""", "takes no other field")
         refused("""{"hosts":[${entry(match = """{"type":"catalog"}""")}]}""", "takes exactly a name")
@@ -221,6 +221,13 @@ class MountHostsConfigTest {
         url: String = "https://host-hoglake.example",
         extra: String = "",
     ) = entry(id = id, match = """{"type":"namespace","name":"$name"}""", url = url, extra = extra)
+
+    private fun family(
+        id: String = this.id,
+        family: String = "team",
+        url: String = "https://host-hoglake.example",
+        extra: String = "",
+    ) = entry(id = id, match = """{"type":"namespace_family","family":"$family"}""", url = url, extra = extra)
 
     /** The warnings logged when [cfg]'s hosts are taken up, as the server does once at boot. */
     private fun bootWarnings(cfg: Config): List<String> {
@@ -410,7 +417,7 @@ class MountHostsConfigTest {
         assertThat(host.remoteName).isEqualTo("shared")
         StaticMountHosts(cfg.mountHosts).use { hosts ->
             val schema = hosts.remoteSchemas().single()
-            assertThat(schema.name to schema.remoteName).isEqualTo("analytics" to "shared")
+            assertThat(schema.name to schema.remoteNameFor(schema.name)).isEqualTo("analytics" to "shared")
         }
         // Only the local name is reserved; the host's name is no local business.
         assertThat(cfg.reservedNamespaces.names).containsExactly("analytics")
@@ -418,7 +425,14 @@ class MountHostsConfigTest {
         // Without the key, or with the local name itself, the two names are one.
         for (extra in listOf("", ""","remote_name":"analytics"""")) {
             val plain = schemaConfig("""{"hosts":[${schema("analytics", extra = extra)}]}""").mountHosts
-            StaticMountHosts(plain).use { assertThat(it.remoteSchemas().single().remoteName).isEqualTo("analytics") }
+            StaticMountHosts(plain).use {
+                assertThat(
+                    it.remoteSchemas().single().let {
+                            s ->
+                        s.remoteNameFor(s.name)
+                    },
+                ).isEqualTo("analytics")
+            }
         }
     }
 
@@ -486,5 +500,161 @@ class MountHostsConfigTest {
         )) {
             assertThat(schemaConfig("""{"hosts":[$aliased,$second]}""").mountHosts).hasSize(2)
         }
+    }
+
+    @Test
+    fun `a namespace_family entry matches no catalog and reserves every team_digits name`() {
+        val cfg = schemaConfig("""{"hosts":[${family()}]}""")
+        val match = cfg.mountHosts.single().match
+        assertThat(match).isEqualTo(MountMatch.NamespaceFamily("team"))
+        for (catalog in listOf("team_5", "lake", mount)) assertThat(match.matches(catalog)).isFalse()
+        match as MountMatch.NamespaceFamily
+        // Every spelling of the shape is kept off the local catalogs; only the canonical one is relayed.
+        for (name in listOf("team_5", "TEAM_5", "Team_5", "team_007", "team_0", "team_99999999999999999999")) {
+            assertThat(match.covers(name)).describedAs(name).isTrue()
+            assertThat(cfg.reservedNamespaces.isReserved(name)).describedAs(name).isTrue()
+        }
+        for (name in listOf("team_x", "teams", "team_", "team5", "xteam_5", "team_5x", "team-5", "posthog")) {
+            assertThat(match.covers(name)).describedAs(name).isFalse()
+            assertThat(cfg.reservedNamespaces.isReserved(name)).describedAs(name).isFalse()
+        }
+        assertThat(match.relays("team_5")).isTrue()
+        for (name in listOf("TEAM_5", "team_007", "team_99999999999999999999", "team_x")) {
+            assertThat(match.relays(name)).describedAs(name).isFalse()
+        }
+        assertThat(cfg.reservedNamespaces.names).isEmpty()
+        // The reservation refuses a create the way a reserved name does.
+        assertThatThrownBy { cfg.reservedNamespaces.refuse("team_5") }.hasMessageContaining("is reserved")
+        cfg.reservedNamespaces.refuse("team_x")
+        // Beside the names a deployment reserves, and with no family entry nothing of the shape is reserved.
+        assertThat(config("""{"hosts":[${entry()}]}""").reservedNamespaces.isReserved("team_5")).isFalse()
+        assertThat(Config().reservedNamespaces.isReserved("team_5")).isFalse()
+    }
+
+    @Test
+    fun `a namespace_family entry is a remote schema host and is held to the same boot checks`() {
+        val http = "http://host-hoglake.example:8080"
+        val opted = ""","allow_insecure_http":true"""
+        assertThatThrownBy { schemaConfig("""{"hosts":[${family(url = http)}]}""") }
+            .hasMessageContaining("must be an https origin")
+        assertThat(
+            schemaConfig("""{"hosts":[${family(url = http, extra = opted)}]}""").mountHosts.single().allowInsecureHttp,
+        )
+            .isTrue()
+        assertThatThrownBy {
+            config(
+                """{"hosts":[${family()}]}""",
+            )
+        }.hasMessageContaining("HOGLAKE_AUTH_SESSION_PROFILE=on")
+        assertThatThrownBy { config("""{"hosts":[${family()}]}""", authMode = "off", sessionProfile = "on") }
+            .hasMessageContaining("HOGLAKE_AUTH_MODE")
+        assertThatThrownBy { config("""{"hosts":[${family()}]}""", predicateFields = "", sessionProfile = "on") }
+            .hasMessageContaining("HOGLAKE_AUTH_PREDICATE_FIELDS")
+        assertThatThrownBy { config("""{"hosts":[${family()}]}""", allowlist = setOf("*"), sessionProfile = "on") }
+            .hasMessageContaining("HOGLAKE_MOUNT_ALLOWLIST")
+    }
+
+    @Test
+    fun `only the team family exists, and the entry takes exactly a family`() {
+        for (name in listOf("org", "Team", "teams", "")) {
+            refused("""{"hosts":[${family(family = name)}]}""", "the only namespace family is 'team'")
+        }
+        refused("""{"hosts":[${entry(match = """{"type":"namespace_family"}""")}]}""", "takes exactly a family")
+        refused(
+            """{"hosts":[${entry(match = """{"type":"namespace_family","family":"team","name":"x"}""")}]}""",
+            "takes exactly a family",
+        )
+        refused(
+            """{"hosts":[${entry(match = """{"type":"namespace_family","family":7}""")}]}""",
+            "requires a string family",
+        )
+    }
+
+    @Test
+    fun `a namespace_family entry has no alias, so remote_name is refused on it`() {
+        refused(
+            """{"hosts":[${family(extra = ""","remote_name":"shared"""")}]}""",
+            "remote_name is only for a mount host that matches a namespace",
+        )
+    }
+
+    @Test
+    fun `a family entry and a namespace entry of a team name are an overlap, in either order`() {
+        for (name in listOf("team_5", "TEAM_5", "team_007", "Team_0")) {
+            val named = schema(name, otherId)
+            for (hosts in listOf(listOf(family(), named), listOf(named, family()))) {
+                refused("""{"hosts":[${hosts.joinToString(",")}]}""", "two mount hosts match the same namespace name")
+            }
+        }
+        // A name the family does not cover is not an overlap.
+        val cfg =
+            schemaConfig(
+                """{"hosts":[${family()},${schema(
+                    "team_x",
+                    otherId,
+                )},${schema("teams", "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")}]}""",
+            )
+        assertThat(cfg.mountHosts).hasSize(3)
+        // The family is one entry: a second is the same names matched twice.
+        refused(
+            """{"hosts":[${family()},${family(otherId)}]}""",
+            "two mount hosts match the same namespace name",
+        )
+        // Beside mount entries, each is found its own way.
+        val beside = schemaConfig("""{"hosts":[${entry()},${family(otherId)}]}""").mountHosts
+        assertThat(beside.map { it.match }).containsExactly(MountMatch.Events, MountMatch.NamespaceFamily("team"))
+    }
+
+    @Test
+    fun `an alias into a team name is refused beside a family entry`() {
+        val alias =
+            entry(
+                id = otherId,
+                match = """{"type":"namespace","name":"legacy"}""",
+                url = "https://other-hoglake.example",
+                extra = ""","remote_name":"team_7"""",
+            )
+        refused("""{"hosts":[${family()},$alias]}""", "has the team_<digits> shape")
+        refused("""{"hosts":[$alias,${family()}]}""", "has the team_<digits> shape")
+        // Without a family entry it is an ordinary alias, and a non-team alias is fine beside one.
+        assertThat(schemaConfig("""{"hosts":[$alias]}""").mountHosts).hasSize(1)
+        val plain = alias.replace("team_7", "legacy_remote")
+        assertThat(schemaConfig("""{"hosts":[${family()},$plain]}""").mountHosts).hasSize(2)
+    }
+
+    @Test
+    fun `a namespace_family entry needs team_id among the auth predicate fields`() {
+        assertThatThrownBy { config("""{"hosts":[${family()}]}""", predicateFields = "org_id", sessionProfile = "on") }
+            .hasMessageContaining("'team_id' in HOGLAKE_AUTH_PREDICATE_FIELDS")
+        assertThat(
+            config(
+                """{"hosts":[${family()}]}""",
+                predicateFields = "org_id, team_id",
+                sessionProfile = "on",
+            ).mountHosts,
+        ).hasSize(1)
+        // A namespace entry asks nothing of the field.
+        assertThat(
+            config(
+                """{"hosts":[${schema("posthog")}]}""",
+                predicateFields = "org_id",
+                sessionProfile = "on",
+            ).mountHosts,
+        )
+            .hasSize(1)
+    }
+
+    @Test
+    fun `a namespace entry named team, by name or remote_name, is refused`() {
+        refused("""{"hosts":[${schema("team")}]}""", "may not be named 'team'")
+        val aliased =
+            entry(
+                match = """{"type":"namespace","name":"legacy"}""",
+                url = "https://h.example",
+                extra = ""","remote_name":"team"""",
+            )
+        refused("""{"hosts":[$aliased]}""", "may not be named 'team'")
+        // Only the exact key is the family entry.
+        assertThat(schemaConfig("""{"hosts":[${schema("teams")}]}""").mountHosts).hasSize(1)
     }
 }

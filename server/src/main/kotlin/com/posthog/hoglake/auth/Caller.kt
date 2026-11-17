@@ -47,11 +47,24 @@ data class Caller(
     /** Verified placement for one catalog. Endpoints come only from server configuration. */
     val routing: Routing? = null,
     /**
+     * The token carried an `rtg` this instance does not know and ignored it
+     * (a Host serving namespaces, [Routing]). Such a caller may read a
+     * served namespace and nothing else: it has no placement, so it must
+     * never fall through to this instance's default backend.
+     */
+    val routingIgnored: Boolean = false,
+    /**
      * `remote_schemas`, on a token carrying the session profile: the read-only
      * remote schemas of the primary catalog this caller may use. Empty on every
      * other token. The profile's credentials are never carried here.
      */
     val remoteSchemas: Set<String> = emptySet(),
+    /**
+     * The `remote_schemas` family entries of the same token (only `team`
+     * exists): each stands for every schema of that family the caller's
+     * `prd` holds, with `read`. Empty on every other token.
+     */
+    val remoteSchemaFamilies: Set<String> = emptySet(),
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */
@@ -124,6 +137,26 @@ data class Caller(
         if (org != null && org != orgId) return false
         val held = catalogScopes[catalog] ?: return false
         if (held.none { it.satisfies(scope) }) return false
+        val perm =
+            when (val grant = predicates[field] ?: return false) {
+                is PredicateGrant.All -> grant.scope
+                is PredicateGrant.Values -> grant.values[value] ?: return false
+            }
+        return perm.satisfies(scope)
+    }
+
+    /**
+     * Does this caller's `prd` give it [scope] on `field = value`? The
+     * predicate alone: no catalog is named, so `cat` is not consulted. Only a
+     * caller whose reach has been bound to the object by some other check may
+     * rely on it, because `*` ([PredicateGrant.All]) holds for every value.
+     */
+    internal fun holdsPredicate(
+        field: String,
+        value: Long,
+        scope: Scope,
+    ): Boolean {
+        if (kind != Kind.SCOPED) return false
         val perm =
             when (val grant = predicates[field] ?: return false) {
                 is PredicateGrant.All -> grant.scope

@@ -97,13 +97,19 @@ class RemoteSchemaClientIntegrationTest {
         Files.deleteIfExists(keyFile)
     }
 
-    private fun hostsFile(hostPort: Int): String =
+    private val posthogMatch = """{"type":"namespace","name":"posthog"}"""
+    private val teamFamily = """{"type":"namespace_family","family":"team"}"""
+
+    private fun hostsFile(
+        hostPort: Int,
+        match: String,
+    ): String =
         Files.createTempFile("hoglake-remote-schema-hosts-", ".json").also {
             it.toFile().deleteOnExit()
             Files.writeString(
                 it,
-                """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":{"type":"namespace",""" +
-                    """"name":"posthog"},"kind":"hoglake","url":"http://127.0.0.1:$hostPort","auth":"forward",""" +
+                """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":$match,""" +
+                    """"kind":"hoglake","url":"http://127.0.0.1:$hostPort","auth":"forward",""" +
                     // The stub Host speaks http, which a remote schema's entry must opt in to.
                     """"allow_insecure_http":true}]}""",
             )
@@ -112,6 +118,7 @@ class RemoteSchemaClientIntegrationTest {
     /** The Client with the Host at [hostPort]; null is the same server with no hosts file. */
     private fun <T> withClient(
         hostPort: Int?,
+        match: String = posthogMatch,
         block: (port: Int) -> T,
     ): T {
         val cfg =
@@ -121,7 +128,7 @@ class RemoteSchemaClientIntegrationTest {
                 authJwksFile = keyFile.toString(),
                 authPredicateFields = "team_id",
                 authSessionProfile = "on",
-                mountHostsFile = hostPort?.let(::hostsFile) ?: "",
+                mountHostsFile = hostPort?.let { hostsFile(it, match) } ?: "",
             )
         val app = App.build(cfg, db.jdbi)
         val server = embeddedServer(Netty, configure = { configureApiListener(cfg) }) { app.module(this) }
@@ -133,6 +140,9 @@ class RemoteSchemaClientIntegrationTest {
             app.close()
         }
     }
+
+    private val team7 = "/v1/catalogs/$cat/namespaces/team_7"
+    private val team7Routes = listOf(team7, "$team7/tables", "$team7/tables/t", "$team7/tables/t/scan")
 
     /**
      * A scoped token for teams 7 and 8 with `write` on the catalog. [schemas] is its `remote_schemas`
@@ -615,6 +625,100 @@ class RemoteSchemaClientIntegrationTest {
             val body = """{"owner":"${UUID.randomUUID()}","prefix":"$dataPath/data/posthog","file_kind":"data"}"""
             val claimed = send(port, "PUT", "/v1/catalogs/$cat/uploads/${UUID.randomUUID()}", tenant(), body)
             assertThat(claimed.statusCode()).describedAs(claimed.body()).isEqualTo(200)
+        }
+    }
+
+    @Test
+    fun `the team family relays a held team's schema and hides every local namespace of that shape`() {
+        StubHost().use { host ->
+            val before = head()
+            withClient(host.port, teamFamily) { port ->
+                val holder = scoped("""{"team":["read"]}""")
+                for (path in team7Routes) {
+                    val response = send(port, "GET", path, holder)
+                    assertThat(response.statusCode()).describedAs(path).isEqualTo(200)
+                    assertThat(response.body()).describedAs(path).isEqualTo(hostAnswer)
+                }
+                assertThat(host.seen).isEqualTo(team7Routes)
+                host.seen.clear()
+                // A team the prd does not hold, and every caller without the family entry or a schema.
+                for (path in team7Routes) {
+                    assertMissing(send(port, "GET", path.replace("team_7", "team_9"), holder), "unheld team: $path")
+                    for (token in listOf(
+                        tenant(),
+                        operator(),
+                        scoped(schemas = null),
+                        scoped("""{"posthog":["read"]}"""),
+                    )) {
+                        assertMissing(send(port, "GET", path, token), path)
+                    }
+                    for (variant in listOf("TEAM_7", "team_007", "Team_7")) {
+                        assertMissing(send(port, "GET", path.replace("team_7", variant), holder), "$variant: $path")
+                    }
+                }
+                assertThat(host.seen).isEmpty()
+                // The other namespaces of the catalog are served as before, `posthog` among them.
+                assertThat(send(port, "GET", "$schema/tables", scoped()).statusCode()).isEqualTo(200)
+                assertThat(send(port, "GET", "/v1/catalogs/$cat/storage-usage", tenant()).statusCode()).isEqualTo(200)
+            }
+            assertThat(head()).isEqualTo(before)
+        }
+    }
+
+    @Test
+    fun `the team family lists a holder's explicit teams, and reserves every team name for creation`() {
+        StubHost().use { host ->
+            val before = head()
+            withClient(host.port, teamFamily) { port ->
+                val listing = "/v1/catalogs/$cat/namespaces"
+                val holder = mapper.readTree(send(port, "GET", listing, scoped("""{"team":["read"]}""")).body())
+                assertThat(holder.map { it["name"].asText() }).containsExactly("posthog", "team_7", "team_8")
+                assertThat(mapper.writeValueAsString(holder[2])).isEqualTo("""{"name":"team_8","remote":true}""")
+                assertThat(names(send(port, "GET", listing, scoped(schemas = null)))).containsExactly("posthog")
+                for (token in listOf(tenant(), operator())) {
+                    assertThat(names(send(port, "GET", listing, token))).containsExactlyInAnyOrder("posthog", "PostHog")
+                    for (name in listOf("team_5", "TEAM_5", "team_007", "team_7")) {
+                        val refused = send(port, "POST", listing, token, """{"name":"$name"}""")
+                        assertThat(refused.statusCode()).describedAs(name).isEqualTo(422)
+                        assertThat(refused.body()).contains("is reserved on this server")
+                    }
+                }
+                // A name that is not team_<digits> is created as any other.
+                for (name in listOf("team_x", "teams")) {
+                    val created = send(port, "POST", listing, operator(), """{"name":"$name"}""")
+                    assertThat(created.statusCode()).describedAs("%s: %s", name, created.body()).isEqualTo(201)
+                    catalogs.dropNamespace(cat, name, author = "test", message = "test")
+                }
+            }
+            assertThat(host.seen).isEmpty()
+            assertThat(head()).isGreaterThan(before)
+        }
+    }
+
+    @Test
+    fun `an upload claim under a team directory is refused for every caller, and another directory is not`() {
+        StubHost().use { host ->
+            withClient(host.port, teamFamily) { port ->
+                fun claim(
+                    token: String,
+                    prefix: String,
+                ) = send(
+                    port,
+                    "PUT",
+                    "/v1/catalogs/$cat/uploads/${UUID.randomUUID()}",
+                    token,
+                    """{"owner":"${UUID.randomUUID()}","prefix":"$prefix","file_kind":"data"}""",
+                )
+                val spellings = listOf("data/team_7", "data/team_7/t", "data/TEAM_7", "data/team_007", "data/team_%37")
+                for (token in listOf(tenant(), operator())) {
+                    for (spelling in spellings) assertMissing(claim(token, "$dataPath/$spelling"), spelling)
+                    for (other in listOf("data/team_x/t", "data/teams", "data/posthog")) {
+                        val claimed = claim(token, "$dataPath/$other")
+                        assertThat(claimed.statusCode()).describedAs("%s: %s", other, claimed.body()).isEqualTo(200)
+                    }
+                }
+            }
+            assertThat(host.seen).isEmpty()
         }
     }
 }
