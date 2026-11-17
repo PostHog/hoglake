@@ -157,6 +157,7 @@ class App private constructor(
             mountHosts.value ?: MountHostResolver.NONE,
             objectStore = { objectStore },
             removalStore = { removalStore },
+            servedFamilies = cfg.servedFamilies,
         )
     }
 
