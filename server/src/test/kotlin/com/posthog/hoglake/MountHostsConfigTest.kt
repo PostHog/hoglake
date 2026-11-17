@@ -1,11 +1,17 @@
 package com.posthog.hoglake
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
+import com.posthog.hoglake.store.StaticMountHosts
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.slf4j.LoggerFactory
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -34,6 +40,8 @@ class MountHostsConfigTest {
         authMode: String = "enforce",
         predicateFields: String = "team_id",
         allowlist: Set<String> = emptySet(),
+        /** `HOGLAKE_AUTH_SESSION_PROFILE`; the server's default is off. */
+        sessionProfile: String = "off",
     ): Config {
         val file = Files.writeString(dir.resolve("hosts-${UUID.randomUUID()}.json"), hosts)
         return Config(
@@ -41,8 +49,12 @@ class MountHostsConfigTest {
             authMode = authMode,
             authPredicateFields = predicateFields,
             mountAllowlist = allowlist,
+            authSessionProfile = sessionProfile,
         )
     }
+
+    /** A Client with remote schemas: the session profile is on, as a namespace entry requires. */
+    private fun schemaConfig(hosts: String) = config(hosts, sessionProfile = "on")
 
     private fun refused(
         hosts: String,
@@ -128,7 +140,7 @@ class MountHostsConfigTest {
         }
         refused(
             """{"hosts":[${entry(match = """{"type":"prefix","name":"x"}""")}]}""",
-            "match type must be events or catalog",
+            "match type must be events, catalog or namespace",
         )
         refused("""{"hosts":[${entry(match = """{"type":"events","name":"$mount"}""")}]}""", "takes no other field")
         refused("""{"hosts":[${entry(match = """{"type":"catalog"}""")}]}""", "takes exactly a name")
@@ -199,5 +211,192 @@ class MountHostsConfigTest {
                 .hasMessageContaining("HOGLAKE_AUTH_PREDICATE_FIELDS")
         }
         assertThat(config(hosts, authMode = "warn").mountHosts).hasSize(1)
+    }
+
+    // ---- remote schemas: {"type":"namespace","name":...} ---------------------
+
+    private fun schema(
+        name: String,
+        id: String = this.id,
+        url: String = "https://host-hoglake.example",
+        extra: String = "",
+    ) = entry(id = id, match = """{"type":"namespace","name":"$name"}""", url = url, extra = extra)
+
+    /** The warnings logged when [cfg]'s hosts are taken up, as the server does once at boot. */
+    private fun bootWarnings(cfg: Config): List<String> {
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val logger = LoggerFactory.getLogger(StaticMountHosts::class.java) as Logger
+        logger.addAppender(capture)
+        try {
+            StaticMountHosts(cfg.mountHosts).close()
+        } finally {
+            logger.detachAppender(capture)
+        }
+        return capture.list.filter { it.level == Level.WARN }.map { it.formattedMessage }
+    }
+
+    @Test
+    fun `a namespace entry over http is refused unless the entry opts in, and then says so once`() {
+        val http = "http://host-hoglake.example:8080"
+        val opted = ""","allow_insecure_http":true"""
+        // Refused, with the reason and the way out.
+        for (extra in listOf("", ""","allow_insecure_http":false""")) {
+            assertThatThrownBy { schemaConfig("""{"hosts":[${schema("posthog", url = http, extra = extra)}]}""") }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("must be an https origin")
+                .hasMessageContaining("storage credentials")
+                .hasMessageContaining("allow_insecure_http")
+        }
+        // Opted in: it boots, and one warning names the host by its id, never by its URL.
+        val cfg = schemaConfig("""{"hosts":[${entry()},${schema("posthog", otherId, http, opted)}]}""")
+        assertThat(cfg.mountHosts.map { it.allowInsecureHttp }).containsExactly(false, true)
+        assertThat(bootWarnings(cfg)).singleElement().asString()
+            .contains(otherId, "http", "without transport encryption")
+            .doesNotContain("host-hoglake.example")
+        // https is as it was, with the key or without it, and warns of nothing.
+        for (extra in listOf("", opted)) {
+            val secure = schemaConfig("""{"hosts":[${schema("posthog", extra = extra)}]}""")
+            assertThat(secure.mountHosts.single().origin.scheme).isEqualTo("https")
+            assertThat(bootWarnings(secure)).isEmpty()
+        }
+        refused(
+            """{"hosts":[${schema("posthog", url = http, extra = ""","allow_insecure_http":"yes"""")}]}""",
+            "must be true or false",
+        )
+    }
+
+    @Test
+    fun `the http opt-in is a namespace entry's alone, and the mount entries keep http as before`() {
+        val catalog = """{"type":"catalog","name":"$mount"}"""
+        for (match in listOf("""{"type":"events"}""", catalog)) {
+            // The key is refused on these entries whatever its value: it is not a general switch.
+            for (value in listOf("true", "false")) {
+                refused(
+                    """{"hosts":[${entry(match = match, extra = ""","allow_insecure_http":$value""")}]}""",
+                    "allow_insecure_http is only for a mount host that matches a namespace",
+                )
+            }
+            // http and https both boot, as before, and nothing is warned about.
+            for (url in listOf("http://gigahog-server.gigahog:8080", "https://gigahog-server.gigahog")) {
+                val cfg = config("""{"hosts":[${entry(match = match, url = url)}]}""")
+                assertThat(cfg.mountHosts.single().allowInsecureHttp).isFalse()
+                assertThat(bootWarnings(cfg)).isEmpty()
+            }
+        }
+        // Built directly, the rule is the same.
+        assertThatThrownBy {
+            MountHost(
+                UUID.randomUUID(),
+                MountMatch.Events,
+                MountHost.Kind.HOGLAKE,
+                URI("http://h:1"),
+                MountHost.Auth.FORWARD,
+                allowInsecureHttp = true,
+            )
+        }.hasMessageContaining("only for a mount host that matches a namespace")
+    }
+
+    @Test
+    fun `a namespace entry is a remote schema that matches no catalog name and reserves its own`() {
+        val cfg = schemaConfig("""{"hosts":[${schema("posthog")}]}""")
+        val host = cfg.mountHosts.single()
+        assertThat(host.match).isEqualTo(MountMatch.Namespace("posthog"))
+        // Found by namespace name only: no catalog is this host's, whatever it is called.
+        for (catalog in listOf("posthog", "lake", mount)) assertThat(host.match.matches(catalog)).isFalse()
+        val match = host.match as MountMatch.Namespace
+        assertThat(match.covers("posthog")).isTrue()
+        assertThat(match.covers("PostHog")).isTrue()
+        assertThat(match.covers("posthog_raw")).isFalse()
+        assertThat(match.covers("postho")).isFalse()
+        // The name is reserved without being listed, compared as a reserved name is.
+        assertThat(cfg.reservedNamespaces.names).containsExactly("posthog")
+        assertThat(cfg.reservedNamespaces.isReserved("POSTHOG")).isTrue()
+        assertThat(cfg.reservedNamespaces.isReserved("imports")).isFalse()
+    }
+
+    @Test
+    fun `remote schema names join the configured reserved names, and old entries reserve nothing`() {
+        val file =
+            Files.writeString(
+                dir.resolve("hosts-reserved.json"),
+                """{"hosts":[${schema("posthog")},${schema("Imports", otherId)}]}""",
+            )
+        val cfg =
+            Config(
+                mountHostsFile = file.toString(),
+                authMode = "enforce",
+                authPredicateFields = "team_id",
+                authSessionProfile = "on",
+                reservedNamespaceNames = setOf("billing", "posthog"),
+            )
+        assertThat(cfg.reservedNamespaces.names).containsExactly("billing", "imports", "posthog")
+        assertThat(config("""{"hosts":[${entry()}]}""").reservedNamespaces.names).isEmpty()
+        assertThat(
+            Config(reservedNamespaceNames = setOf("posthog")).reservedNamespaces.names,
+        ).containsExactly("posthog")
+    }
+
+    @Test
+    fun `a namespace entry lives beside the mount entries, each found its own way`() {
+        val hosts =
+            schemaConfig("""{"hosts":[${entry()},${schema("posthog", otherId)}]}""").mountHosts
+        assertThat(hosts.map { it.match }).containsExactly(MountMatch.Events, MountMatch.Namespace("posthog"))
+        assertThat(hosts.filter { it.match.matches(mount) }.map { it.id.toString() }).containsExactly(id)
+    }
+
+    @Test
+    fun `a namespace entry with a bad name, a duplicate name or another field is refused`() {
+        for (name in listOf("", "post/hog", "9lives", "post hog", "a".repeat(129), "é")) {
+            refused("""{"hosts":[${schema(name)}]}""", "matches a namespace by a namespace name")
+        }
+        // Two entries for one name, and for two spellings the reserved-name fold makes one.
+        for (second in listOf("posthog", "PostHog")) {
+            refused(
+                """{"hosts":[${schema("posthog")},${schema(second, otherId)}]}""",
+                "match the same namespace name",
+            )
+        }
+        refused(
+            """{"hosts":[${entry(match = """{"type":"namespace"}""")}]}""",
+            "a namespace match takes exactly a name",
+        )
+        refused(
+            """{"hosts":[${entry(match = """{"type":"namespace","name":"posthog","host_name":"ingest"}""")}]}""",
+            "a namespace match takes exactly a name",
+        )
+        refused("""{"hosts":[${entry(match = """{"type":"namespace","name":7}""")}]}""", "requires a string name")
+    }
+
+    @Test
+    fun `a namespace entry is held to the mount client's boot checks`() {
+        val hosts = """{"hosts":[${schema("posthog")}]}"""
+        val on = "on"
+        assertThatThrownBy { config(hosts, allowlist = setOf("*"), sessionProfile = on) }
+            .hasMessageContaining("HOGLAKE_MOUNT_ALLOWLIST")
+        assertThatThrownBy { config(hosts, authMode = "off", sessionProfile = on) }
+            .hasMessageContaining("HOGLAKE_AUTH_MODE")
+        assertThatThrownBy { config(hosts, predicateFields = "", sessionProfile = on) }
+            .hasMessageContaining("HOGLAKE_AUTH_PREDICATE_FIELDS")
+    }
+
+    @Test
+    fun `a namespace entry refuses to boot while the session profile is off`() {
+        // Off, no token can carry `remote_schemas`: the name would be reserved and hidden, and never readable.
+        for (hosts in listOf(
+            """{"hosts":[${schema("posthog")}]}""",
+            """{"hosts":[${entry()},${schema("posthog", otherId)}]}""",
+        )) {
+            assertThatThrownBy { config(hosts) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_AUTH_SESSION_PROFILE=on")
+            assertThat(schemaConfig(hosts).mountHosts.map { it.match }).contains(MountMatch.Namespace("posthog"))
+        }
+        // The mount entries ask nothing of the profile: they boot with it off, as before, and with it on.
+        val catalog = entry(id = otherId, match = """{"type":"catalog","name":"$other"}""")
+        val mounts = """{"hosts":[${entry(match = """{"type":"catalog","name":"$mount"}""")},$catalog]}"""
+        for (old in listOf("""{"hosts":[${entry()}]}""", mounts)) {
+            assertThat(config(old).mountHosts).isNotEmpty()
+            assertThat(schemaConfig(old).mountHosts).isNotEmpty()
+        }
     }
 }
