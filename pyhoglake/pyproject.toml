@@ -29,7 +29,7 @@ dependencies = [
     # pyarrow matrix runs the variant suites on this one. (Below that, 21
     # is the floor of the parquet UUID annotation hoglake's uuid wire form
     # requires: 18-20 write a bare FIXED_LEN_BYTE_ARRAY(16).)
-    "pyarrow>=26.0.0",
+    "pyarrow>=26.0.1",
     "thrift>=0.22.0,<1",
 ]
 
