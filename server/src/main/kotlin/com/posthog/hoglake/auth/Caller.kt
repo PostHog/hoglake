@@ -107,16 +107,21 @@ data class Caller(
      * May this SCOPED caller use, with [scope], a namespace in [catalog]
      * contained for `field = value`? Its permission on the value is the lower
      * of the predicate's and the catalog's (`cat`), so both must satisfy
-     * [scope]. False for every other kind: a tenant's authority is [holds],
+     * [scope]. A namespace whose mark names an [org] is usable only by a
+     * token carrying that same org. False for every other kind: a tenant's authority is [holds],
      * and nothing here may widen it.
      */
     fun mayUseContained(
         catalog: String,
         field: String,
         value: Long,
+        org: String?,
         scope: Scope,
     ): Boolean {
         if (kind != Kind.SCOPED) return false
+        // A team belongs to one org: a mark naming another org than the
+        // token's is a namespace this caller does not have.
+        if (org != null && org != orgId) return false
         val held = catalogScopes[catalog] ?: return false
         if (held.none { it.satisfies(scope) }) return false
         val perm =

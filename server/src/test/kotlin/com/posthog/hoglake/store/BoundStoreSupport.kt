@@ -115,6 +115,9 @@ internal enum class Rule {
  * fails there until it has a rule here (and a view that compiles).
  */
 internal object BoundStoreCalls {
+    /** The org mark of the `orged` namespace (team 9400). */
+    const val MARK_ORG = "01a1e5de-1ac5-0000-e53e-d2f9a77deae4"
+
     const val DATA_PATH = "s3://bucket/alpha"
 
     val rules: Map<KClass<*>, Map<String, Rule>> =
@@ -132,6 +135,7 @@ internal object BoundStoreCalls {
                     "dropNamespace" to Rule.CLOSED,
                     "setNamespaceContainment" to Rule.CLOSED,
                     "liveContainment" to Rule.LOOKUP,
+                    "liveContainedFor" to Rule.LOOKUP,
                     "createTable" to Rule.WRITE,
                     "getTable" to Rule.READ,
                     "listTables" to Rule.READ,
@@ -237,7 +241,8 @@ internal object BoundStoreCalls {
             p.name == "catalog" -> catalog
             p.name == "name" && op.fn.name in setOf("createCatalog", "getCatalog") -> catalog
             p.name == "namespace" -> namespace
-            p.name == "prefix" -> "$DATA_PATH/data/$namespace"
+            p.name == "prefix" ->
+                if (namespace == "orged") "$DATA_PATH/org_id=$MARK_ORG/team_id=9400" else "$DATA_PATH/data/$namespace"
             type == CommitRequest::class -> CommitRequest(appends = listOf(TableAppend(namespace, "t", emptyList())))
             type == TableCreationDefinition::class -> TableCreationDefinition(namespace, "t", emptyList())
             type == UUID::class ->
@@ -357,6 +362,9 @@ internal class RecordingStores(
             calls += Call("${type.simpleName}.${method.name}", given)
             when {
                 method.name == "liveContainment" -> contained[given[1]]
+                method.name == "liveContainedFor" ->
+                    contained.entries.firstOrNull { it.value.field == given[1] && it.value.value == given[2] }
+                        ?.let { it.key to it.value }
                 method.name == "getCatalog" -> CatalogInfo(1, given[0] as String, BoundStoreCalls.DATA_PATH, 0, 0)
                 method.name == "listNamespaces" ->
                     namespaces.mapIndexed { i, name -> NamespaceInfo(i.toLong(), name, contained[name]) }

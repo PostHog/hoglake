@@ -16,6 +16,7 @@ import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.store.CatalogBinding
@@ -76,6 +77,8 @@ fun Application.installApiRoutes(
     mountRead: () -> MountReadService? = { null },
     /** Names `POST .../namespaces` refuses for every caller (HOGLAKE_RESERVED_NAMESPACES). */
     reservedNamespaces: ReservedNamespaces = ReservedNamespaces.NONE,
+    /** Names only an operator creates in the listed catalogs (HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS). */
+    operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces.NONE,
 ) {
     // The handlers keep the receiver names `catalogs.` and `commits.`.
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
@@ -249,7 +252,13 @@ fun Application.installApiRoutes(
                                             (
                                                 scoped == null ||
                                                     ns.containment?.let {
-                                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
+                                                        scoped.mayUseContained(
+                                                            catalog,
+                                                            it.field,
+                                                            it.value,
+                                                            it.org,
+                                                            Scope.READ,
+                                                        )
                                                     } == true
                                             )
                                     }.map { it.toDto() } +
@@ -265,6 +274,16 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         // Before the store: the only path that creates a namespace, on every backend.
                         reservedNamespaces.refuse(req.name)
+                        // Auth off has no callers to tell apart: it is the operator, as for a drop.
+                        val operator = call.hoglakeAuth.callerOrNull?.kind?.isOperator() ?: true
+                        operatorTeamNamespaces.refuse(call.catalog(), req.name, operator)
+                        // The mark is the operator's alone (PUT .../containment is OPERATOR in AuthPolicy), and
+                        // this route is WRITE, so the body decides.
+                        if (req.containment != null && !operator) {
+                            throw com.posthog.hoglake.model.HoglakeException.Forbidden(
+                                "only an operator may create a namespace with a containment mark",
+                            )
+                        }
                         call.respond(
                             HttpStatusCode.Created,
                             catalogs.createNamespace(
@@ -272,6 +291,7 @@ fun Application.installApiRoutes(
                                 req.name,
                                 call.actorOrRefuse(req.author),
                                 req.message,
+                                req.containment?.let { NamespaceContainment(it.field, it.value, it.org) },
                             ).toDto(),
                         )
                     }
@@ -314,7 +334,7 @@ fun Application.installApiRoutes(
                             catalogs.setNamespaceContainment(
                                 call.catalog(),
                                 call.namespace(),
-                                NamespaceContainment(req.field, req.value),
+                                NamespaceContainment(req.field, req.value, req.org),
                                 call.actorOrRefuse(null),
                             ).toDto(),
                         )

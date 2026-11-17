@@ -126,10 +126,11 @@ object TestTokens {
         iat: Long = 1_700_000_000L,
         exp: Long = iat + 900,
         extra: String = "",
+        org: String = "11111111-1111-1111-1111-111111111111",
     ): String {
         val prdClaim = prd?.let { ""","prd":$it""" } ?: ""
         return """{"iss":"$ISSUER","aud":"$AUDIENCE","sub":"hlc_team","jti":"jti-s","ten":"scoped",""" +
-            """"org":"11111111-1111-1111-1111-111111111111","cli":"laptop","usr":"user-1",""" +
+            """"org":"$org","cli":"laptop","usr":"user-1",""" +
             """"iat":$iat,"exp":$exp,"cat":$catalogs$prdClaim$extra}"""
     }
 

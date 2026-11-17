@@ -411,12 +411,29 @@ paths:
                 name:
                   type: string
                   pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+                containment:
+                  description: >
+                    Operator only. Creates the namespace already marked, as
+                    `PUT .../containment` marks one, in one transaction with
+                    the same checks: it is never visible unmarked, and a
+                    refused mark creates nothing. Another caller gets 403.
+                    Postgres catalogs only (422 elsewhere).
+                  allOf:
+                    - { $ref: "#/components/schemas/NamespaceContainment" }
       responses:
         "201":
-          description: Created
+          description: Created, with its `containment` when one was given.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
+        "403":
+          description: >-
+            A non-operator creating a `containment` mark, or a namespace named
+            `team_<digits>` (any case, any leading zeros) in a catalog listed in
+            `HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS`. Error `forbidden`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: >-
@@ -426,7 +443,9 @@ paths:
             and every backend, before any write (a mount catalog answers its
             own 403 `read_only_catalog` first); a namespace created before
             its name was reserved keeps working but cannot be created again
-            once dropped.
+            once dropped. A `containment` with an invalid field, value or org is
+            `validation` too, and creates nothing; one whose prefix already
+            holds another table's files is a 409.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -491,6 +510,20 @@ paths:
         spelling that decodes to it (409 otherwise). At most one live namespace per (field, value) (409).
         Marking the same containment again is a no-op; to change it, clear
         it first. A contained namespace can be dropped only by an operator.
+
+        An optional `org` is the org mark (capability
+        `org-marked-containment-v1`, Postgres catalogs only; 422 elsewhere).
+        It moves the namespace's prefix to
+        `<data_path>/org_id=<org>/<field>=<value>/`, the prefix a table
+        creation's `write_path`, a scoped upload claim and a compaction
+        output are held to, and no other table registers files under it,
+        compared raw and percent-decoded per segment. Marking scans for
+        foreign files under that prefix. The org must be a canonical lowercase
+        UUID. An org-marked namespace can be re-marked or cleared only while
+        it has never held a table or view (at any snapshot) and no file is
+        registered under its prefix; otherwise 409. A scoped token may use an
+        org-marked namespace only when its `org` claim equals the mark; any
+        other org gets the answer a missing namespace gets.
         The prefix check reads the catalog's file rows under a time bound;
         503 `containment_unverified` when it cannot finish, and the
         namespace is left unmarked.
@@ -519,7 +552,11 @@ paths:
     delete:
       operationId: clearNamespaceContainment
       summary: Clear a namespace's containment (operator only)
-      description: Requires the namespace to hold no live table or view (409 otherwise). Clearing an uncontained namespace is a no-op.
+      description: >
+        Requires the namespace to hold no live table or view (409 otherwise).
+        Clearing an uncontained namespace is a no-op. A namespace with an org
+        mark is cleared only while it has never held a table or view (409
+        otherwise).
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -4034,7 +4071,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 and mutable-variant-shredding-v1 and atomic-partition-replacement-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 and mutable-variant-shredding-v1 and atomic-partition-replacement-v1 and org-marked-containment-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
         read_only:
           type: boolean
           description: >
@@ -4138,6 +4175,15 @@ components:
       properties:
         field: { type: string, pattern: "^[a-z][a-z0-9_]{0,62}$", description: "The predicate field, e.g. team_id." }
         value: { type: integer, format: int64, minimum: 1, description: The value this namespace holds. }
+        org:
+          type: string
+          pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          description: >
+            The org mark, omitted when the namespace has none. Set, it makes the
+            namespace's prefix `<data_path>/org_id=<org>/<field>=<value>/`
+            and may be replaced or cleared only while the namespace has never held a
+            table or view. A canonical lowercase UUID. Capability
+            `org-marked-containment-v1`.
 
     TableCreation:
       type: object

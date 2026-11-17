@@ -130,6 +130,7 @@ class V23PartitionValueLookupMigrationIntegrationTest {
         // The namespace reads need V33's containment columns, so its file is
         // applied out of order (idempotent; the migrate below re-applies it).
         PgTestSupport.applyMigrationFile(db, "V33__namespace_containment.sql")
+        PgTestSupport.applyMigrationFile(db, "V37__namespace_containment_org.sql")
         catalogId = createCatalog("v23")
         neighbourId = createCatalog("v23-neighbour")
         seedManifest()

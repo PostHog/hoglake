@@ -116,11 +116,19 @@ CREATE TABLE hog_namespace (
     -- table registers files there. Both or neither; operator-only.
     contained_field text,
     contained_value bigint,
+    -- V37: the org mark. Moves the prefix to
+    -- `<data_path>/org_id=<org>/<field>=<value>/`; replaceable only while the
+    -- namespace has never held a table.
+    contained_org text,
     PRIMARY KEY (catalog_id, namespace_id),
     CONSTRAINT hog_namespace_containment_shape CHECK (
         (contained_field IS NULL AND contained_value IS NULL)
         OR (contained_field IS NOT NULL AND contained_value IS NOT NULL
             AND contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
+    ),
+    CONSTRAINT hog_namespace_containment_org_shape CHECK (
+        contained_org IS NULL
+        OR (contained_field IS NOT NULL AND contained_org ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
     )
 );
 CREATE UNIQUE INDEX hog_namespace_live_name

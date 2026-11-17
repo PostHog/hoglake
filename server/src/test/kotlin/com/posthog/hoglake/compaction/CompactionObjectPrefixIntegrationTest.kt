@@ -12,6 +12,7 @@ import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
@@ -154,8 +155,9 @@ class CompactionObjectPrefixIntegrationTest {
         team: Long,
         rows: List<Long> = List(5) { team },
         deferred: Boolean = false,
+        under: String = prefix(cat, team),
     ): Long {
-        val path = prefix(cat, team) + "${UUID.randomUUID()}.parquet"
+        val path = under + "${UUID.randomUUID()}.parquet"
         val bytes = parquet(rows)
         store.put(path, bytes)
         val stats = listOf(ColumnStats(1, rows.size.toLong(), 0, null, null, le8(team), le8(team)))
@@ -278,6 +280,20 @@ class CompactionObjectPrefixIntegrationTest {
         assertThat(liveFiles(off).single().path)
             .describedAs("today's shape: a bare uuid at the table root, whatever the inputs' directories")
             .matches(Regex.escape("s3://$BUCKET/$off/data/ns/t/") + UUID_PARQUET)
+    }
+
+    @Test
+    fun `a table in an org-marked namespace compacts into its org prefix, not data under the namespace`() {
+        val cat = "prefix-compact-${counter.incrementAndGet()}"
+        val org = "01a1e5de-1ac5-0000-e53e-d2f9a77deae4"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat/imports")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.setNamespaceContainment(cat, "ns", NamespaceContainment("team_id", 4, org))
+        createTable(cat, option = false)
+        val root = "s3://$BUCKET/$cat/imports/org_id=$org/team_id=4/t/"
+        repeat(3) { register(cat, 4, under = root) }
+        assertThat(svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP).groupsCompacted).isEqualTo(1)
+        assertThat(liveFiles(cat).single().path).matches(Regex.escape(root) + UUID_PARQUET)
     }
 
     @Test

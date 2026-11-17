@@ -2330,7 +2330,14 @@ internal class CompactionExecutor(
         // which is what the commit's recheck and every later DV on the
         // output are held to; without it, exactly the old path.
         val outputPath =
-            ObjectPrefix.dataFilePath(ctx.dataPath, ctx.namespace, ctx.table, ctx.objectPrefix, prefixValue)
+            ObjectPrefix.dataFilePath(
+                ctx.dataPath,
+                ctx.namespace,
+                ctx.table,
+                ctx.objectPrefix,
+                prefixValue,
+                containment = ctx.containment,
+            )
 
         // Claim ticket BEFORE the rewrite (its own committed
         // transaction): if this group never commits — skip, crash,

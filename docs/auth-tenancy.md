@@ -708,8 +708,42 @@ is any lowercase identifier, the value a positive id, and the convention that
 - **Operators only.** Marking and clearing are operator routes; a tenant
   token cannot drop a contained namespace (403). Clearing requires the
   namespace to be empty.
+- **Org mark.** The body may also carry `"org": "<org>"` (a canonical lowercase UUID, `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`;
+  capability `org-marked-containment-v1`, Postgres catalogs only, 422 on
+  hoglite). It moves the namespace's prefix to
+  `<data_path>/org_id=<org>/<field>=<value>/`: its tables register files only
+  there (literally spelled), table creation's `write_path` is
+  `<prefix><uuid>/`, a scoped upload claim must spell the prefix, and a
+  compacted output lands in `<prefix><table>/`. `data/<n>/` is then no
+  prefix of its own. No other table registers a path whose first two
+  segments are `org_id=<org>` and `<field>=<value>`, compared raw and
+  percent-decoded per segment; the commit finds the owner by
+  `(field, value)` and compares its org, so the same value under another org
+  is not foreign. Marking scans for foreign files under the hive prefix as
+  it does under `data/<n>/`. A scoped caller uses an org-marked
+  namespace only when its token's `org` claim equals the mark (a team belongs
+  to one org); on any other org every route answers as for a missing
+  namespace (404), and the namespace is absent from its listings. Tenant and
+  operator callers are unaffected. The mark can be replaced or cleared only
+  while the namespace has never held a table or view (at any snapshot, dropped
+  ones included) and no file is registered under its prefix; after that
+  re-marking with anything but the identical containment, and clearing, are
+  `commit_conflict`. A name whose earlier, dropped namespaces never held a
+  table or view can be marked again. A table with the object-prefix layout in
+  an org-marked namespace is unsupported (compaction keeps its path, the
+  commit refuses it).
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
+- **One call.** `POST /v1/catalogs/{c}/namespaces` takes an optional
+  `"containment": {"field": "team_id", "value": 7, "org": "<org>"}`, the body
+  of the containment `PUT`. It is operator-only (403 `forbidden` otherwise,
+  decided in the handler because the route is `write`): the namespace is
+  created already marked, in one transaction under the commit lock, with
+  the checks the mark makes (field, value and org validation, the prefix
+  scan, the reused-name rule and one live namespace per value). A refused
+  mark (422 `validation`, 409 `commit_conflict` or `already_exists`) creates
+  nothing: no snapshot and no namespace row, and the namespace is never visible
+  unmarked. Postgres catalogs only: hoglite answers 422.
 
 ### 6.2c Reserved namespace names
 
@@ -755,6 +789,34 @@ hoglake reserves no name itself.
 - **Reserve only names nobody provisions.** The provisioner's `team_<id>`
   namespaces (§6.2b) are created by an operator token, which the guard does not
   exempt.
+
+### 6.2d Operator-only team namespaces
+
+`HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS` (comma-separated catalog names)
+lists the catalogs where only an operator creates a namespace named
+`team_<digits>`. Empty, the default, lists none. A per-team scoped writer
+(§6.2a) reaches `team_<id>` through an operator's org mark (§6.2b), so a
+tenant that created the name first would hold the namespace the mark is meant
+to claim.
+
+- **One path.** The check is in `POST /v1/catalogs/{c}/namespaces`, the only
+  way a namespace is created (§6.2c: no rename, no implicit creation), so it
+  holds for every backend. It runs after the reserved-name check and before the
+  store is called, so a refusal writes nothing.
+- **Matching.** `team_` followed by one or more ASCII digits and nothing else,
+  ASCII-case-insensitively: `team_5`, `TEAM_5`, `Team_05` and `team_007` all
+  match; `team_`, `team_5a` and `myteam_5` do not. Catalog names are compared
+  exactly.
+- **Callers.** A non-operator gets 403 `forbidden`: a tenant, and a scoped
+  token, which cannot create namespaces at all. Operators are unaffected, and
+  so is auth `off`, which has no callers to tell apart.
+- **Auth modes.** Under `warn`, a request with no valid token is treated as
+  the operator, as everywhere else, so this rule is enforced only in `enforce`
+  mode or on the public listener.
+- **Boot.** Each entry must match the catalog-name pattern, else the server
+  does not start.
+- **Existing namespaces are left alone.** One created before its catalog was
+  listed stays readable, writable and droppable.
 
 ### 6.3 Scope vocabulary
 
