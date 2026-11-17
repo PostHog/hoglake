@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
@@ -552,6 +553,74 @@ class ReplacementCommitParityIntegrationTest {
             "appended path s3://hoglake-it/$cat/d1 is already recorded as a data file of this catalog, " +
                 "live or ended; write the replacement to a new path",
         )
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `a path under another contained namespace is refused by containment whether or not it is recorded`(
+        backend: Backend,
+    ) {
+        select(backend)
+        val cat = fixture()
+        val columns = listOf(ColumnDef("day", ColType.LONG), ColumnDef("v", ColType.LONG))
+        for ((ns, team) in listOf("mine" to 7L, "theirs" to 9L)) {
+            store.createNamespace(cat, ns)
+            store.setNamespaceContainment(cat, ns, NamespaceContainment("team_id", team))
+            store.createTable(cat, ns, "ev", columns)
+            alters.alterTable(cat, ns, "ev", listOf(AlterOp.SetPartitionSpec(listOf(identityDay))))
+        }
+
+        fun under(
+            ns: String,
+            name: String,
+        ) = FileRegistration("s3://hoglake-it/$cat/data/$ns/ev/$name", 10, 100, 50, partitionValues = listOf("20401"))
+        for (ns in listOf("mine", "theirs")) {
+            store.commit(
+                cat,
+                CommitRequest(
+                    readSnapshot = head(cat),
+                    idempotencyKey = UUID.randomUUID(),
+                    appends = listOf(TableAppend(ns, "ev", listOf(under(ns, "seed")))),
+                ),
+            )
+        }
+        val written = state(cat)
+
+        fun replaceMineWith(file: FileRegistration) =
+            catchThrowable {
+                store.commit(
+                    cat,
+                    CommitRequest(
+                        readSnapshot = head(cat),
+                        idempotencyKey = UUID.randomUUID(),
+                        author = "tester",
+                        message = "replace",
+                        appends = listOf(TableAppend("mine", "ev", listOf(file))),
+                        fileEnds =
+                            listOf(
+                                TableFileEnds(
+                                    "mine",
+                                    "ev",
+                                    store.getTable(cat, "mine", "ev").tableUuid,
+                                    partitions = listOf(listOf("20401")),
+                                ),
+                            ),
+                    ),
+                )
+            }
+        // The same answer for a path the other namespace has recorded and one it has not:
+        // the refusal says nothing about what is recorded outside the caller's namespace.
+        val recorded = replaceMineWith(under("theirs", "seed"))
+        val unrecorded = replaceMineWith(under("theirs", "guess"))
+        assertThat(recorded).isExactlyInstanceOf(HoglakeException.ContainmentViolation::class.java)
+        assertThat(unrecorded).isExactlyInstanceOf(HoglakeException.ContainmentViolation::class.java)
+        assertThat(recorded.message!!.replace("/seed", "/<path>"))
+            .isEqualTo(unrecorded.message!!.replace("/guess", "/<path>"))
+        assertThat(state(cat)).isEqualTo(written)
+        // Inside the caller's own namespace the recorded path is still refused as recorded.
+        assertThat(replaceMineWith(under("mine", "seed")))
+            .isExactlyInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("$cat/data/mine/ev/seed is already recorded")
     }
 
     @ParameterizedTest(name = "{0}")
