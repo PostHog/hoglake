@@ -1,5 +1,6 @@
 package com.posthog.hoglake.store
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.TestTokens
@@ -7,6 +8,7 @@ import com.posthog.hoglake.configureApiListener
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.wireObjectMapper
@@ -15,6 +17,8 @@ import io.ktor.server.netty.Netty
 import kotlinx.coroutines.runBlocking
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.jdbi.v3.core.statement.SqlLogger
+import org.jdbi.v3.core.statement.StatementContext
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -24,6 +28,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * The mount (export) read surface end to end (plan row 1.3h): the five
@@ -46,6 +51,15 @@ class MountReadIntegrationTest {
 
     private val sourceTableUuid: java.util.UUID
     private val teamFieldId: Long
+    private val sourceCatalogId: Long
+    private val eventsTableId: Long
+    private val otherTableId: Long
+
+    @Volatile
+    private var capturing = false
+
+    /** Every statement's text sent on the test database while [capturing] is on. */
+    private val sqls = CopyOnWriteArrayList<String>()
 
     /** The mount's values: teams the export admits (49, outside the token, is never served). */
     private val registry =
@@ -60,14 +74,19 @@ class MountReadIntegrationTest {
         catalogs.createNamespace(source, "other")
         val events = catalogs.createTable(source, "ingest", "events_v2", listOf(ColumnDef("team_id", ColType.LONG)))
         sourceTableUuid = events.tableUuid
+        eventsTableId = events.tableId
         teamFieldId = events.columns.single { it.def.name == "team_id" }.fieldId
         // A sibling table in the source catalog the mount must NOT expose: a
         // mount reader naming it gets a 404, never its schema or files.
-        catalogs.createTable(source, "ingest", "other_events", listOf(ColumnDef("secret", ColType.LONG)))
-        db.jdbi.useHandle<Exception> { h ->
-            val catId =
+        otherTableId =
+            catalogs.createTable(source, "ingest", "other_events", listOf(ColumnDef("secret", ColType.LONG))).tableId
+        sourceCatalogId =
+            db.jdbi.withHandle<Long, Exception> { h ->
                 h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :n").bind("n", source)
                     .mapTo(Long::class.java).one()
+            }
+        db.jdbi.useHandle<Exception> { h ->
+            val catId = sourceCatalogId
             h.execute(
                 "INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id) " +
                     "VALUES (?, ?, 1, ?)",
@@ -132,9 +151,39 @@ class MountReadIntegrationTest {
                 events.tableId,
                 "s3://bucket/millrace/$source/data/ingest/events_v2/team_id=42/dv1.puffin",
             )
+            // Column statistics for the scoped files 1-3 AND for file 4, which is team 99's, in the same table.
+            for (id in listOf(1L, 2L, 3L, 4L)) {
+                h.execute(
+                    "INSERT INTO hog_file_column_stats (catalog_id, data_file_id, field_id, value_count, " +
+                        "null_count, lower_bound, upper_bound) VALUES (?, ?, ?, 10, 0, " +
+                        "'\\x0000000000000001'::bytea, '\\x0000000000000002'::bytea)",
+                    catId,
+                    id,
+                    teamFieldId,
+                )
+            }
             // The instance kill switch is migrated off; the export serves only while it is on.
             h.execute("UPDATE hog_mount_switch SET enabled = true")
         }
+        db.jdbi.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (capturing) sqls += context.rawSql
+                }
+            },
+        )
+    }
+
+    /** The statements [requests] sent, in [sqls]. */
+    private fun captured(requests: () -> Unit): List<String> {
+        sqls.clear()
+        capturing = true
+        try {
+            requests()
+        } finally {
+            capturing = false
+        }
+        return sqls.toList()
     }
 
     @AfterAll
@@ -357,6 +406,42 @@ class MountReadIntegrationTest {
             // The tables listing shows only the pinned table.
             val tables = mapper.readTree(get(port, "/v1/catalogs/$mount/namespaces/ingest/tables", reader()).body())
             assertThat(tables.map { it["name"].asText() }).containsExactly("events_v2")
+        }
+    }
+
+    @Test
+    fun `column statistics are read for the scoped files only`() {
+        val scanPath = "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2/scan"
+        withServer { port, _ ->
+            lateinit var scan: JsonNode
+            val sent = captured { scan = mapper.readTree(get(port, "$scanPath?include=column_stats", reader()).body()) }
+            assertThat(scan.map { it["data_file"]["data_file_id"].asLong() }).containsExactlyInAnyOrder(1L, 2L, 3L)
+            scan.forEach { assertThat(it["data_file"]["column_stats"]).describedAs(it.toString()).hasSize(1) }
+            // One statement, entered from the plan's own file ids: never the whole table's statement.
+            val stats = sent.filter { "hog_file_column_stats" in it }
+            assertThat(stats).hasSize(1)
+            assertThat(stats.single()).contains("s.data_file_id = ANY(:fileIds)")
+            assertThat(stats.single().trim()).isEqualTo(FileRepo.scopedColumnStatsSql(filtered = false).trim())
+            // Narrowed by field, and without the option: no statistics statement at all.
+            val narrowed =
+                captured { get(port, "$scanPath?include=column_stats&stats_fields=$teamFieldId", reader()) }
+            assertThat(narrowed.filter { "hog_file_column_stats" in it }.map { it.trim() })
+                .containsExactly(FileRepo.scopedColumnStatsSql(filtered = true).trim())
+            assertThat(captured { get(port, scanPath, reader()) }).noneMatch { "hog_file_column_stats" in it }
+        }
+        // The statement returns the rows of the files it is given and no others. File 4 is team 99's, in the
+        // same table, with statistics of its own, and the whole-table statement returns it.
+        db.jdbi.useHandle<Exception> { h ->
+            val head =
+                h.createQuery("SELECT last_snapshot_id FROM hog_catalog WHERE catalog_id = :c")
+                    .bind("c", sourceCatalogId).mapTo(Long::class.java).one()
+            assertThat(FileRepo.providedColumnStatsAt(h, sourceCatalogId, eventsTableId, head, null).keys)
+                .containsExactlyInAnyOrder(1L, 2L, 3L, 4L)
+            assertThat(FileRepo.providedColumnStatsOf(h, sourceCatalogId, eventsTableId, listOf(1L, 3L), null).keys)
+                .containsExactlyInAnyOrder(1L, 3L)
+            // A file of another table is not returned, even when it is named.
+            assertThat(FileRepo.providedColumnStatsOf(h, sourceCatalogId, otherTableId, listOf(1L), null)).isEmpty()
+            assertThat(FileRepo.providedColumnStatsOf(h, sourceCatalogId, eventsTableId, emptyList(), null)).isEmpty()
         }
     }
 

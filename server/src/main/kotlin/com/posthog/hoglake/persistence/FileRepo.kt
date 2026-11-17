@@ -370,6 +370,57 @@ object FileRepo {
     }
 
     /**
+     * [providedColumnStatsSql] for a plan that is a SUBSET of the table's
+     * files: a mount's scoped scan (store/MountReadService.kt). The
+     * statistics table is entered on its primary key from the plan's own
+     * file ids, so the work is the plan's rows and never the table's,
+     * which holds every org's files. One array parameter holds the ids,
+     * however many; the scan's file budget bounds how many there can be.
+     * `stats_state = 'provided'` stays in the statement, for the reason
+     * [providedColumnStatsAt] gives.
+     */
+    internal fun scopedColumnStatsSql(filtered: Boolean): String =
+        """
+        SELECT s.data_file_id, s.field_id, s.value_count, s.null_count, s.nan_count,
+               s.lower_bound, s.upper_bound
+          FROM hog_file_column_stats s
+          JOIN hog_data_file df
+            ON df.catalog_id = s.catalog_id
+           AND df.data_file_id = s.data_file_id
+         WHERE s.catalog_id = :catalogId AND s.data_file_id = ANY(:fileIds)
+           AND df.table_id = :tableId
+           AND df.stats_state = 'provided'
+           ${if (filtered) "AND s.field_id = ANY(:fieldIds)" else ""}
+         ORDER BY s.data_file_id, s.field_id
+        """
+
+    /**
+     * The stats rows of the files [dataFileIds] of [tableId], grouped by
+     * data file id as [providedColumnStatsAt] groups them. Only those
+     * files' rows are read ([scopedColumnStatsSql]). The caller has
+     * already decided the files are visible at its snapshot.
+     */
+    fun providedColumnStatsOf(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        dataFileIds: Collection<Long>,
+        fieldIds: Set<Long>?,
+    ): Map<Long, List<ColumnStats>> {
+        if (dataFileIds.isEmpty()) return emptyMap()
+        val query =
+            handle.createQuery(scopedColumnStatsSql(filtered = fieldIds != null))
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bindArray("fileIds", Long::class.javaObjectType, dataFileIds.toList())
+        if (fieldIds != null) query.bindArray("fieldIds", Long::class.javaObjectType, fieldIds.toList())
+        return query
+            .map { rs, ctx -> rs.getLong("data_file_id") to scanColumnStatsMapper.map(rs, ctx) }
+            .list()
+            .groupBy({ it.first }, { it.second })
+    }
+
+    /**
      * The versioned-row visibility predicate (invariant 6) for [alias] at
      * `:snapshot`, as SQL text. The scan plan builds its file and
      * deletion-vector joins from it and [providedColumnStatsAt] its stats
