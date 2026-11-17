@@ -344,8 +344,18 @@ class JwtVerifier(
      * signature, then claims. Claims are never trusted before the signature
      * verifies, so a `cat` claim cannot be read out of an unsigned token — which
      * is the whole class of bug this ordering prevents.
+     *
+     * [ignoreRouting] is for a request on a remote schema this server serves
+     * as its Host (docs/auth-tenancy.md §6.5d): the token's `rtg` places the
+     * caller's own catalog on a backend of the Client, which this server
+     * need not know. The claim's shape is still checked, the backend is not
+     * looked up, and the caller carries no routing, so nothing can route
+     * with it.
      */
-    fun verify(token: String): Caller {
+    fun verify(
+        token: String,
+        ignoreRouting: Boolean = false,
+    ): Caller {
         val jws = Jwt.parse(token)
 
         // No `kid` at all can never resolve, whatever the key set contains, so it
@@ -377,7 +387,7 @@ class JwtVerifier(
         validateTimes(claims, now)
         validateIssuerAndAudience(claims)
 
-        return toCaller(claims)
+        return toCaller(claims, ignoreRouting)
     }
 
     private fun validateTimes(
@@ -431,7 +441,10 @@ class JwtVerifier(
         }
     }
 
-    private fun toCaller(claims: JsonNode): Caller {
+    private fun toCaller(
+        claims: JsonNode,
+        ignoreRouting: Boolean,
+    ): Caller {
         // The session profile's gate runs before any other claim rule, so a
         // token carrying the profile where it is off is refused for THAT
         // reason, never for whatever the ordinary contract notices first.
@@ -443,7 +456,7 @@ class JwtVerifier(
         // string is still refused, and a scoped or operator token must say so.
         val kindText = if (claims.has("ten")) Jwt.text(claims, "ten") else null
         val clientName = Jwt.textOrNull(claims, "cli")
-        val routing = routing(claims)
+        val routing = routing(claims, ignoreRouting)
 
         // The profile is checked for EVERY kind, operator included, so an
         // operator token carrying credentials is refused rather than ignored.
@@ -626,7 +639,10 @@ class JwtVerifier(
     }
 
     /** A present placement must be understood in full before it can route a request. */
-    private fun routing(claims: JsonNode): Routing? {
+    private fun routing(
+        claims: JsonNode,
+        ignored: Boolean,
+    ): Routing? {
         val rtg = claims.get("rtg") ?: return null
 
         fun malformed(detail: String): Nothing = throw JwtViolation(JwtViolation.MALFORMED, detail)
@@ -657,6 +673,8 @@ class JwtVerifier(
             } else {
                 null
             }
+        // Understood in full, and then not used: see [verify].
+        if (ignored) return null
         if (backends[id] != backend) throw JwtViolation(JwtViolation.UNKNOWN_BACKEND, "rtg backend is not configured")
         return Routing(catalog, backend, id, tenant)
     }

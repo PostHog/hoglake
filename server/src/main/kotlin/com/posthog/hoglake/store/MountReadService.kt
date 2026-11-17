@@ -12,6 +12,8 @@ import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.FileRepo
+import com.posthog.hoglake.persistence.LayoutRepo
+import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
 import com.posthog.hoglake.persistence.getBigintListOrNull
@@ -19,6 +21,7 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.columnsByFieldId
 import com.posthog.hoglake.service.enforceScanColumnStatsEntryCap
 import com.posthog.hoglake.service.resolveColumnStats
+import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -50,6 +53,13 @@ import java.util.concurrent.Semaphore
  *    and a statement deadline (503 `mount_scan_timeout`), both counted on
  *    `hoglake_mount_refusals_total`; and
  *  - records per-mount served/latency/in-flight metrics.
+ *
+ * A REMOTE SCHEMA THIS SERVER SERVES (docs/auth-tenancy.md §6.5d) is read
+ * here too, by the `served*` methods: the same scoped statements, cap,
+ * budget and deadline, over every table of one configured namespace instead
+ * of one pinned table. The table is found by its name in that namespace of
+ * the schema's source catalog and nowhere else, so no other namespace of the
+ * source is reachable. Its series are labelled by the schema's name.
  */
 class MountReadService(
     private val jdbi: Jdbi,
@@ -70,10 +80,13 @@ class MountReadService(
      */
     internal val scanCap: Semaphore? = maxConcurrentScans.takeIf { it > 0 }?.let { Semaphore(it) }
 
+    private val log = KotlinLogging.logger {}
+
     /** The pinned source table, resolved by uuid at a read snapshot. */
     private data class Pinned(
         val catalogId: Long,
         val tableId: Long,
+        val tableUuid: UUID,
         val namespaceId: Long,
         val namespace: String,
         val table: String,
@@ -129,7 +142,7 @@ class MountReadService(
             listOf(
                 TableSummaryInfo(
                     tableId = pinned.tableId,
-                    tableUuid = sourceTableUuid!!,
+                    tableUuid = pinned.tableUuid,
                     name = pinned.table,
                     comment = pinned.comment,
                     recordCount = totals.records,
@@ -179,45 +192,288 @@ class MountReadService(
         atTimestamp: Instant?,
         columnStats: ScanService.ColumnStatsRequest?,
         splitOffsets: Boolean,
-    ): List<ScanFile> {
+    ): List<ScanFile> =
+        underCap(record.name) {
+            inScanTransaction(record.name) { h ->
+                val (at, pinned) = resolve(h, snapshot, atTimestamp)
+                if (namespace != pinned.namespace || table != pinned.table) notFoundTable(namespace, table)
+                val scope = loadScope(h, caller, record, pinned, at)
+                scopedScan(h, record.name, pinned, scope, at, columnStats, splitOffsets)
+            }
+        }
+
+    /** One scan under the shared cap, counted and timed against [label]: a mount's name or a served schema's. */
+    private fun underCap(
+        label: String,
+        plan: () -> List<ScanFile>,
+    ): List<ScanFile> =
+        withPermit(label) {
+            val inFlight = Metrics.mountScanInFlight(label)?.also { it.incrementAndGet() }
+            val started = System.nanoTime()
+            try {
+                plan().also { Metrics.mountScanServed(label, System.nanoTime() - started) }
+            } finally {
+                inFlight?.decrementAndGet()
+            }
+        }
+
+    /** [work] holding one permit of the shared cap, or 503 `mount_scan_busy`, counted against [label], when it is full. */
+    private fun <R> withPermit(
+        label: String,
+        work: () -> R,
+    ): R {
         val cap = scanCap
         if (cap != null && !cap.tryAcquire()) {
-            Metrics.mountRefused(record.name, "mount_scan_busy")
+            Metrics.mountRefused(label, "mount_scan_busy")
             throw HoglakeException.MountScanBusy("too many export scans in flight; retry shortly")
         }
         // The permit is released on EVERY exit: nothing between the acquire
         // and this try can leak it.
         try {
-            val inFlight = Metrics.mountScanInFlight(record.name)?.also { it.incrementAndGet() }
-            val started = System.nanoTime()
-            try {
-                val files =
-                    inScanTransaction(record) { h ->
-                        val (at, pinned) = resolve(h, snapshot, atTimestamp)
-                        if (namespace != pinned.namespace || table != pinned.table) notFoundTable(namespace, table)
-                        val scope = loadScope(h, caller, record, pinned, at)
-                        scopedScan(h, record, pinned, scope, at, columnStats, splitOffsets)
-                    }
-                Metrics.mountScanServed(record.name, System.nanoTime() - started)
-                return files
-            } finally {
-                inFlight?.decrementAndGet()
-            }
+            return work()
         } finally {
             cap?.release()
         }
     }
 
-    // ---- internals -------------------------------------------------------
+    // ---- a served schema (docs/auth-tenancy.md §6.5d) --------------------
 
-    private fun resolve(
-        h: Handle,
+    /** The served namespace in its source catalog at a read snapshot. */
+    private data class ServedAt(
+        val catalogId: Long,
+        val at: Long,
+        val namespaceId: Long,
+    )
+
+    /** The served namespace, under its real name (containment stripped: a reader has none). */
+    fun servedNamespace(
+        served: CatalogBinding.Served,
         snapshot: Long?,
         atTimestamp: Instant?,
-    ): Pair<Long, Pinned> {
+    ): NamespaceInfo =
+        jdbi.withHandleUnchecked { h ->
+            NamespaceInfo(
+                namespaceId = servedAt(h, served, snapshot, atTimestamp).namespaceId,
+                name = served.schema.name,
+            )
+        }
+
+    /**
+     * Every table of the served namespace that has the schema's team field,
+     * each with SCOPED totals, as [tables] gives the pinned one. A table
+     * without the field cannot be scoped, so it is not served and not listed.
+     * A handful of indexed reads per table, under the scan deadline and
+     * the shared scan cap (503 `mount_scan_busy` when it is full): a
+     * listing is as many scoped statements as the namespace has tables.
+     *
+     * A table whose layout and specs disagree ([MountIntegrityError]) is
+     * left out as well, and counted: the fault is one table's, and it
+     * must not fail the listing for every org. Its scan still refuses.
+     */
+    fun servedTables(
+        caller: Caller?,
+        served: CatalogBinding.Served,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): List<TableSummaryInfo> =
+        withPermit(served.schema.name) {
+            servedTablesUnderCap(caller, served, snapshot, atTimestamp)
+        }
+
+    private fun servedTablesUnderCap(
+        caller: Caller?,
+        served: CatalogBinding.Served,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): List<TableSummaryInfo> =
+        inScanTransaction(served.schema.name) { h ->
+            val at = servedAt(h, served, snapshot, atTimestamp)
+            servedTablesAt(h, served, at, null).mapNotNull { table ->
+                val fieldId = teamFieldId(h, served.schema, table, at.at) ?: return@mapNotNull null
+                val scope =
+                    try {
+                        servedScope(h, caller, served, table, fieldId, at.at)
+                    } catch (e: MountIntegrityError) {
+                        // The table's id, never its name's worth of request input, and no org.
+                        log.warn { "served schema '${served.schema.name}': a table is left out: ${e.message}" }
+                        Metrics.servedTableUnscopable(served.schema.name)
+                        return@mapNotNull null
+                    }
+                val totals = scopedTotals(h, scope, at.at)
+                TableSummaryInfo(
+                    tableId = table.tableId,
+                    tableUuid = table.tableUuid,
+                    name = table.table,
+                    comment = table.comment,
+                    recordCount = totals.records,
+                    fileCount = totals.files,
+                    fileSizeBytes = totals.bytes,
+                    snapshotCount = 0,
+                    earliestSnapshotId = null,
+                )
+            }
+        }
+
+    /** The definition of [table] of the served namespace, WITHOUT totals, as [table] gives the pinned one. */
+    fun servedTable(
+        served: CatalogBinding.Served,
+        table: String,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): TableInfo {
+        jdbi.withHandleUnchecked { h -> requireServedTable(h, served, table, snapshot, atTimestamp) }
+        return try {
+            source().getTable(served.schema.catalog, served.schema.name, table, snapshot, atTimestamp, totals = false)
+        } catch (_: HoglakeException.NotFound) {
+            // Dropped since the check above. The store's words would name the source catalog.
+            notFoundTable(served.schema.name, table)
+        }
+    }
+
+    /** The scoped scan of [table] of the served namespace, as [scan] plans the pinned one. */
+    fun servedScan(
+        caller: Caller?,
+        served: CatalogBinding.Served,
+        table: String,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+        columnStats: ScanService.ColumnStatsRequest?,
+        splitOffsets: Boolean,
+    ): List<ScanFile> =
+        underCap(served.schema.name) {
+            inScanTransaction(served.schema.name) { h ->
+                val (at, pinned, fieldId) = requireServedTable(h, served, table, snapshot, atTimestamp)
+                val scope = servedScope(h, caller, served, pinned, fieldId, at.at)
+                scopedScan(h, served.schema.name, pinned, scope, at.at, columnStats, splitOffsets)
+            }
+        }
+
+    /**
+     * The served namespace at the read snapshot, or the 404 of a missing
+     * namespace in the words a refused caller gets (auth/StoreEntitlement.kt),
+     * which name the path's catalog and never the source.
+     */
+    private fun servedAt(
+        h: Handle,
+        served: CatalogBinding.Served,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): ServedAt {
+        val (catalogId, at) = readSnapshot(h, served.schema.catalog, snapshot, atTimestamp)
+        val namespace =
+            NamespaceRepo.findAt(h, catalogId, served.schema.name, at)
+                ?: throw HoglakeException.NotFound("namespace '${served.schema.name}' in catalog '${served.catalog}'")
+        return ServedAt(catalogId, at, namespace.namespaceId)
+    }
+
+    /**
+     * The tables of the served namespace visible at the read snapshot, by
+     * name; only [name] when it is given. The namespace id is the only way
+     * in, so a table of any other namespace cannot be returned.
+     */
+    private fun servedTablesAt(
+        h: Handle,
+        served: CatalogBinding.Served,
+        at: ServedAt,
+        name: String?,
+    ): List<Pinned> =
+        h.createQuery(
+            """
+            SELECT t.table_id, t.table_uuid, tv.name AS table_name, tv.comment AS table_comment
+              FROM hog_table_version tv
+              JOIN hog_table t ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
+             WHERE tv.catalog_id = :catalogId AND tv.namespace_id = :namespaceId
+               ${if (name == null) "" else "AND tv.name = :name"}
+               AND tv.begin_snapshot <= :at AND (tv.end_snapshot IS NULL OR :at < tv.end_snapshot)
+               AND (t.dropped_snapshot IS NULL OR :at < t.dropped_snapshot)
+             ORDER BY tv.name
+            """,
+        )
+            .bind("catalogId", at.catalogId)
+            .bind("namespaceId", at.namespaceId)
+            .bind("at", at.at)
+            .also { if (name != null) it.bind("name", name) }
+            .map { rs, _ ->
+                Pinned(
+                    catalogId = at.catalogId,
+                    tableId = rs.getLong("table_id"),
+                    tableUuid = rs.getObject("table_uuid", UUID::class.java),
+                    namespaceId = at.namespaceId,
+                    namespace = served.schema.name,
+                    table = rs.getString("table_name"),
+                    comment = rs.getString("table_comment"),
+                )
+            }
+            .list()
+
+    /** [table] of the served namespace with its team field, or the 404 of a missing table. */
+    private fun requireServedTable(
+        h: Handle,
+        served: CatalogBinding.Served,
+        table: String,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): Triple<ServedAt, Pinned, Long> {
+        val at = servedAt(h, served, snapshot, atTimestamp)
+        val pinned = servedTablesAt(h, served, at, table).singleOrNull() ?: notFoundTable(served.schema.name, table)
+        val fieldId = teamFieldId(h, served.schema, pinned, at.at) ?: notFoundTable(served.schema.name, table)
+        return Triple(at, pinned, fieldId)
+    }
+
+    /**
+     * The field a served table is scoped on: its object-prefix field at the
+     * read snapshot, when that is the top-level column the schema names as
+     * its team field. Null otherwise, and the table is then not served: with
+     * no prefix field nothing proves which team a file belongs to, and a
+     * prefix on another column is not what the org's team ids describe.
+     */
+    private fun teamFieldId(
+        h: Handle,
+        schema: ServedSchema,
+        table: Pinned,
+        at: Long,
+    ): Long? {
+        val fieldId = LayoutRepo.layoutAt(h, table.catalogId, table.tableId, at) ?: return null
+        val path = columnsByFieldId(TableRepo.columnsAt(h, table.catalogId, table.tableId, at))[fieldId]?.first
+        return fieldId.takeIf { path == schema.teamField }
+    }
+
+    /**
+     * The caller's `ReadScope` on a served table: its `prd` grant on the
+     * team field, intersected with the org's team ids ([CatalogBinding.Served.teams]).
+     * `*` means those ids, an explicit grant is limited to them, and with
+     * none no file is read.
+     */
+    private fun servedScope(
+        h: Handle,
+        caller: Caller?,
+        served: CatalogBinding.Served,
+        table: Pinned,
+        fieldId: Long,
+        at: Long,
+    ): ReadScope =
+        ReadScope.load(
+            h,
+            table.catalogId,
+            table.tableId,
+            at,
+            fieldId,
+            served.teams,
+            caller?.predicates?.get(served.schema.teamField),
+        )
+
+    // ---- internals -------------------------------------------------------
+
+    /** The id of the source catalog [catalog] and the snapshot a read of it is served at. */
+    private fun readSnapshot(
+        h: Handle,
+        catalog: String,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): Pair<Long, Long> {
         val cat =
-            CatalogRepo.findByName(h, sourceCatalog)
-                ?: error("a mount resolved, but HOGLAKE_MOUNT_SOURCE_CATALOG names no catalog")
+            CatalogRepo.findByName(h, catalog)
+                ?: error("the source catalog of a mount or a served schema does not exist")
         if (snapshot != null && atTimestamp != null) {
             throw HoglakeException.Validation("snapshot and at_timestamp are mutually exclusive; supply at most one")
         }
@@ -251,6 +507,15 @@ class MountReadService(
                 }
             }
         }
+        return cat.catalogId to at
+    }
+
+    private fun resolve(
+        h: Handle,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): Pair<Long, Pinned> {
+        val (catalogId, at) = readSnapshot(h, sourceCatalog, snapshot, atTimestamp)
         val uuid = sourceTableUuid ?: error("a mount resolved, but HOGLAKE_MOUNT_SOURCE_TABLE_UUID is not set")
         val pinned =
             h.createQuery(
@@ -265,13 +530,14 @@ class MountReadService(
                    AND (t.dropped_snapshot IS NULL OR :at < t.dropped_snapshot)
                 """,
             )
-                .bind("catalogId", cat.catalogId)
+                .bind("catalogId", catalogId)
                 .bind("uuid", uuid)
                 .bind("at", at)
                 .map { rs, _ ->
                     Pinned(
-                        catalogId = cat.catalogId,
+                        catalogId = catalogId,
                         tableId = rs.getLong("table_id"),
+                        tableUuid = uuid,
                         namespaceId = rs.getLong("namespace_id"),
                         namespace = rs.getString("namespace_name"),
                         table = rs.getString("table_name"),
@@ -348,7 +614,7 @@ class MountReadService(
 
     private fun scopedScan(
         h: Handle,
-        record: MountRecord,
+        label: String,
         pinned: Pinned,
         scope: ReadScope,
         at: Long,
@@ -398,7 +664,7 @@ class MountReadService(
                 .map { rs, _ -> scanRow(rs, keyBySpec) }
                 .list()
         if (files.size > fileBudget) {
-            Metrics.mountRefused(record.name, "mount_scan_too_many_files")
+            Metrics.mountRefused(label, "mount_scan_too_many_files")
             throw HoglakeException.MountScanTooManyFiles(
                 "the scoped scan returns more than the file budget of $fileBudget files; the scope is fixed by the " +
                     "token, so this table is too large to plan through the export and must be read another way",
@@ -410,7 +676,9 @@ class MountReadService(
     /**
      * Column statistics for the SCOPED files only: the cap counts the
      * scoped provided-file count (plan row 1.3h, "stats cap applied to the
-     * scoped plan"), and only files in [files] are given rows.
+     * scoped plan"), and only the statistics rows of files in [files] are
+     * read. The statement is keyed on those files' ids, so its cost is the
+     * caller's plan and never the table's, which holds every org's files.
      */
     private fun withScopedColumnStats(
         h: Handle,
@@ -427,10 +695,9 @@ class MountReadService(
             leafFieldIds,
             request,
         )
-        val scopedIds = files.map { it.dataFile.dataFileId }.toSet()
+        val provided = files.filter { it.dataFile.statsState == StatsState.PROVIDED }.map { it.dataFile.dataFileId }
         val rowsByFile =
-            FileRepo.providedColumnStatsAt(h, pinned.catalogId, pinned.tableId, at, request.fieldIds)
-                .filterKeys { it in scopedIds }
+            FileRepo.providedColumnStatsOf(h, pinned.catalogId, pinned.tableId, provided, request.fieldIds)
         return files.map { file ->
             if (file.dataFile.statsState != StatsState.PROVIDED) return@map file
             val rows = rowsByFile[file.dataFile.dataFileId].orEmpty()
@@ -494,6 +761,12 @@ class MountReadService(
     internal fun <R> inScanTransaction(
         record: MountRecord,
         body: (Handle) -> R,
+    ): R = inScanTransaction(record.name, body)
+
+    /** The same for [label], which names the refusal's series: a mount's name or a served schema's. */
+    private fun <R> inScanTransaction(
+        label: String,
+        body: (Handle) -> R,
     ): R =
         jdbi.withHandleUnchecked { h ->
             h.inTransaction<R, RuntimeException> { txn ->
@@ -502,7 +775,7 @@ class MountReadService(
                     body(txn)
                 } catch (e: Exception) {
                     if (isStatementTimeout(e)) {
-                        Metrics.mountRefused(record.name, "mount_scan_timeout")
+                        Metrics.mountRefused(label, "mount_scan_timeout")
                         throw HoglakeException.MountScanTimeout(
                             "the export scan ran past the ${scanDeadlineMs}ms deadline; retry shortly",
                         )

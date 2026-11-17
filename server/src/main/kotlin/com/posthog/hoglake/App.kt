@@ -401,6 +401,7 @@ class App private constructor(
 
     /** Keep eager-mode service construction and gauges at boot, as before. */
     private fun initializePostgresServices() {
+        requireServedSchemaCatalogs()
         catalogService
         commitService
         alterService
@@ -424,6 +425,46 @@ class App private constructor(
         maintenanceStatusService
         maintenanceSummarySampler
         catalogMetrics
+    }
+
+    /**
+     * A served schema's source catalog must exist (HOGLAKE_SERVED_SCHEMAS_FILE):
+     * a name that is wrong would otherwise boot and answer every reader 500.
+     * Nothing is read on a server that serves none.
+     */
+    private fun requireServedSchemaCatalogs() {
+        if (cfg.servedSchemas.isEmpty) return
+        // A served path is recognised by an org-shaped catalog name
+        // (ServedSchemas.find). A catalog of this server's own with such a
+        // name would lose its namespace routes of a served name to remote
+        // readers, while routes that name the namespace in a body still
+        // reached it. A Host must hold none.
+        val shadowed =
+            jdbi.withHandle<String?, Exception> { h ->
+                h.createQuery("SELECT name FROM hog_catalog WHERE name ~ :shape ORDER BY name LIMIT 1")
+                    .bind("shape", com.posthog.hoglake.store.ServedSchemas.ORG_ID_PATTERN)
+                    .mapTo(String::class.java)
+                    .findOne()
+                    .orElse(null)
+            }
+        require(shadowed == null) {
+            "HOGLAKE_SERVED_SCHEMAS_FILE: this server holds the catalog '$shadowed', whose name has the shape of " +
+                "an org id. A path with such a catalog and a served namespace is a remote reader's, so a remote " +
+                "schema's Host must hold no catalog of that shape"
+        }
+        for (schema in cfg.servedSchemas.schemas) {
+            val exists =
+                jdbi.withHandle<Boolean, Exception> { h ->
+                    h.createQuery("SELECT EXISTS (SELECT 1 FROM hog_catalog WHERE name = :name)")
+                        .bind("name", schema.catalog)
+                        .mapTo(Boolean::class.java)
+                        .one()
+                }
+            require(exists) {
+                "HOGLAKE_SERVED_SCHEMAS_FILE: the catalog '${schema.catalog}' of the served schema " +
+                    "'${schema.name}' does not exist"
+            }
+        }
     }
 
     companion object {

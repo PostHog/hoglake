@@ -9,6 +9,7 @@ import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
+import com.posthog.hoglake.auth.requireServedSchemaReader
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -69,6 +70,9 @@ class CatalogStoreSelector(
     private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")
 
+    /** The namespaces this server serves as a remote schema's Host; none without configuration. */
+    private val served: ServedSchemas = cfg?.servedSchemas ?: ServedSchemas.NONE
+
     /**
      * The binding resolved for this request's `{catalog}`, cached so the
      * namespace gate and the handler resolve a mount once (plan row 1.3h:
@@ -99,6 +103,7 @@ class CatalogStoreSelector(
             is CatalogBinding.Mount -> throw mountRefusal(call, binding.mount.name)
             is CatalogBinding.Remote -> throw mountRefusal(call, binding.name)
             is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+            is CatalogBinding.Served -> throw remoteSchemaRefusal(call, binding.schema.name)
         }
 
     /**
@@ -116,6 +121,12 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding {
         call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
+        // A served schema's path is decided by its own caller rule, first:
+        // every refusal is then the one 404, and nothing else is consulted.
+        servedBinding(call, catalog)?.let { served ->
+            call.attributes.put(boundCatalog, catalog to Handed(served))
+            return served
+        }
         // Before any binding: a name resolves only when the caller's token allows it.
         call.requireCatalogEntitlement(catalog)
         val binding =
@@ -146,8 +157,61 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.Remote? {
+        // A served schema's path is [resolve]'s to refuse, in its own words.
+        if (servedSchema(call, catalog) != null) return null
         call.requireCatalogEntitlement(catalog)
         return remoteBinding(call, catalog)
+    }
+
+    /**
+     * The served schema this request's path names under [catalog]
+     * ([ServedSchemas.find]): from the path alone, as the auth plugin
+     * decides it. Null on a server that serves none.
+     */
+    private fun servedSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): ServedSchema? {
+        if (served.isEmpty) return null
+        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+        return if (match?.catalog == catalog) served.find(catalog, match.namespace) else null
+    }
+
+    /**
+     * The served schema this request's path names under [catalog], through
+     * [resolve]; null, and nothing resolved, for every other request. A
+     * route that parses before it resolves asks this first. For any other
+     * path the token is checked for [catalog], as it is in [remote].
+     */
+    fun served(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.Served? {
+        if (servedSchema(call, catalog) == null) {
+            call.requireCatalogEntitlement(catalog)
+            return null
+        }
+        return resolve(call, catalog) as CatalogBinding.Served
+    }
+
+    /**
+     * The binding for a served schema's path (docs/auth-tenancy.md §6.5d).
+     * The caller rule comes first and refuses everyone else with the one
+     * 404, in every auth mode. Only then is anything read: the org's record
+     * in `hog_mount`, under the name the legacy mount uses, through the same
+     * registry (the allowlist, `enabled` and the instance switch). [catalog]
+     * is the caller's org, by the rule, so no other org's record can be
+     * selected. No record, or one that does not serve, is an empty team
+     * list, which reads no file.
+     */
+    private fun servedBinding(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.Served? {
+        val schema = servedSchema(call, catalog) ?: return null
+        call.requireServedSchemaReader(catalog, schema.name)
+        val record = if (defaultPostgres() != null) mounts.find(ServedSchemas.recordName(catalog)) else null
+        return CatalogBinding.Served(catalog, schema, record?.takeIf { it.enabled }?.values.orEmpty())
     }
 
     private fun remoteBinding(
@@ -172,6 +236,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.RemoteSchema? {
+        if (servedSchema(call, catalog) != null) return null
         call.requireCatalogEntitlement(catalog)
         return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
     }

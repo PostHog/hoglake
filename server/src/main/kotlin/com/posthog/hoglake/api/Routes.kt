@@ -188,6 +188,7 @@ fun Application.installApiRoutes(
                         is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
                         // Unreachable: this path names no namespace.
                         is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+                        is CatalogBinding.Served -> throw remoteSchemaRefusal(call, binding.schema.name)
                     }
                 }
                 delete {
@@ -228,6 +229,7 @@ fun Application.installApiRoutes(
                             is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
                             // Unreachable: this path names no namespace.
                             is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+                            is CatalogBinding.Served -> throw remoteSchemaRefusal(call, binding.schema.name)
                             is CatalogBinding.Local -> {
                                 val catalogs = binding.store
                                 // A scoped caller sees only the contained
@@ -287,6 +289,15 @@ fun Application.installApiRoutes(
                                 )
                             is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
+                            // A remote schema this server serves (docs/auth-tenancy.md §6.5d).
+                            is CatalogBinding.Served ->
+                                call.respond(
+                                    checkNotNull(mountRead()).servedNamespace(
+                                        binding,
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).toDto(),
+                                )
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -346,6 +357,16 @@ fun Application.installApiRoutes(
                                     )
                                 is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
                                 is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
+                                // Every table of the served namespace, with SCOPED totals.
+                                is CatalogBinding.Served ->
+                                    call.respond(
+                                        checkNotNull(mountRead()).servedTables(
+                                            call.hoglakeAuth.callerOrNull,
+                                            binding,
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
                                 is CatalogBinding.Local ->
                                     call.respond(
                                         binding.store.listTables(
@@ -390,6 +411,16 @@ fun Application.installApiRoutes(
                                         binding.host.table(call, binding.name, call.namespace(), call.table())
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
+                                    // A table of the served namespace, totals omitted.
+                                    is CatalogBinding.Served ->
+                                        call.respond(
+                                            checkNotNull(mountRead()).servedTable(
+                                                binding,
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).toDto(),
+                                        )
                                     is CatalogBinding.Local ->
                                         call.respond(
                                             binding.store.getTable(
@@ -851,6 +882,9 @@ fun Application.installScanRoutes(
             selector.remoteSchema(call, call.catalog())?.let { schema ->
                 return@get schema.host.schemaScan(call, schema, call.table())
             }
+            // A served schema's caller rule comes before the query is parsed,
+            // so a refused caller gets its 404 and never a 400.
+            selector.served(call, call.catalog())
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
             val files =
                 when (val binding = selector.resolve(call, call.catalog())) {
@@ -874,6 +908,18 @@ fun Application.installScanRoutes(
                             call.hoglakeAuth.callerOrNull,
                             binding.mount,
                             call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                    // A served schema's scoped scan: the same plan, for a
+                    // table of the served namespace (docs/auth-tenancy.md §6.5d).
+                    is CatalogBinding.Served ->
+                        checkNotNull(mountRead()).servedScan(
+                            call.hoglakeAuth.callerOrNull,
+                            binding,
                             call.table(),
                             call.longQuery("snapshot"),
                             call.instantQuery("at_timestamp"),

@@ -453,6 +453,16 @@ object Metrics {
     fun mountIntegrityError() = increment("hoglake_mount_integrity_errors_total", 1.0)
 
     /**
+     * hoglake_served_schema_unscopable_tables_total{schema} — tables left
+     * out of a served schema's table listing (docs/auth-tenancy.md §6.5d)
+     * because their layout and specs disagree, one count per table per
+     * listing. Each is also on [mountIntegrityError]. `schema` is a
+     * configured name: never an org, a catalog or a table.
+     */
+    fun servedTableUnscopable(schema: String) =
+        increment("hoglake_served_schema_unscopable_tables_total", 1.0, "schema", schema)
+
+    /**
      * hoglake_hydrator_claim_timeouts_total{catalog} — sweeps in which
      * this catalog's claim exceeded the hydrator's claim timeout and
      * was skipped (#269: the catalog lost its share of that sweep; no

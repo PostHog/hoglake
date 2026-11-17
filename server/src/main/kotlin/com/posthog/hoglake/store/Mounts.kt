@@ -107,6 +107,27 @@ sealed interface CatalogBinding {
         val schema: String,
         val host: MountHostClient,
     ) : CatalogBinding
+
+    /**
+     * A remote schema this server serves as its Host (docs/auth-tenancy.md
+     * §6.5d): the request's path names the served namespace [schema] under
+     * the catalog [catalog], which is the caller's org. Built only once the
+     * caller rule has passed (auth/StoreEntitlement.kt). No catalog named
+     * [catalog] is ever consulted: the four read routes are served from
+     * [schema]'s source catalog, and every other route refuses
+     * ([remoteSchemaRefusal]).
+     */
+    data class Served(
+        val catalog: String,
+        val schema: ServedSchema,
+        /**
+         * The org boundary: the team ids of [catalog]'s record in
+         * `hog_mount`, empty when it has none or the record does not serve.
+         * [ReadScope] intersects the caller's grant with these, so an empty
+         * list reads no file.
+         */
+        val teams: List<Long>,
+    ) : CatalogBinding
 }
 
 /** #291's `CatalogRegistry.resolve`: a mount name resolves before any backend lookup. */

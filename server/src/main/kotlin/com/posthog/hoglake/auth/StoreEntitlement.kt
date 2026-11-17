@@ -128,3 +128,68 @@ internal fun ApplicationCall.requireRemoteSchemaEntitlement(
     }
     throw refusal
 }
+
+/**
+ * The caller rule of a remote schema this server serves as its Host
+ * (docs/auth-tenancy.md §6.5d): may this caller read the served schema
+ * [schema] through the path catalog [catalog]? All four must hold:
+ *
+ * - the caller is scoped;
+ * - its `remote_schemas` names [schema] (the verifier admits only `read`);
+ * - its `cat` allows `read` on [catalog];
+ * - its `org` is [catalog]: a Client's catalog is named by its org's id, so
+ *   a token reads only through its own org's catalog, and the org's record
+ *   is the one looked up.
+ *
+ * Deny by default: false for no caller, a tenant and an operator. It reads
+ * nothing but the token. The token's `rtg` is not consulted: it places the
+ * caller's own catalog on the Client, and a served schema is never read from
+ * a backend it could name.
+ */
+internal fun Caller?.readsServedSchema(
+    catalog: String,
+    schema: String,
+): Boolean =
+    this != null && kind == Caller.Kind.SCOPED && schema in remoteSchemas &&
+        catalogClaimAllows(catalog, Scope.READ) && orgId == catalog
+
+/**
+ * The one answer to a caller [readsServedSchema] refuses, whichever
+ * condition failed: the 404 of a missing namespace, in the namespace gate's
+ * words. It depends on the path alone. Counted against [schema] on the mount
+ * series (a configured name, never request input), so build it only to
+ * answer with it.
+ */
+internal fun servedSchemaRefusal(
+    catalog: String,
+    schema: String,
+): HoglakeException {
+    Metrics.mountRefused(schema, "not_found")
+    return HoglakeException.NotFound("namespace '$schema' in catalog '$catalog'")
+}
+
+/**
+ * `CatalogStoreSelector` asks here before it hands out the binding of the
+ * served schema [schema] for the path catalog [catalog], and before it reads
+ * anything: the org's record, a catalog row, a store. The plugin has asked
+ * the same rule for a verified caller; this is the check at the point of
+ * use, and the only one under `off` and for a request `warn` let through
+ * without a caller. It refuses in every mode: nothing is behind it to let a
+ * request through to. Counted and audited once per request.
+ */
+internal fun ApplicationCall.requireServedSchemaReader(
+    catalog: String,
+    schema: String,
+) {
+    val auth = hoglakeAuth
+    val caller = auth.callerOrNull
+    if (caller.readsServedSchema(catalog, schema)) return
+    val refusal = servedSchemaRefusal(catalog, schema)
+    if (auth !is AuthState.Off && !attributes.contains(RefusalCountedKey)) {
+        attributes.put(RefusalCountedKey, Unit)
+        val service = application.attributes[AuthServiceKey]
+        val match = attributes.getOrNull(RouteMatchKey)
+        countRefusal(service, service.clientClass(this), caller, match, refusal, true, catalog, at = "served_schema")
+    }
+    throw refusal
+}

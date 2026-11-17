@@ -11,6 +11,8 @@ import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.ServedSchema
+import com.posthog.hoglake.store.ServedSchemas
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -127,6 +129,30 @@ data class Config(
      * the session profile can name a remote schema.
      */
     val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
+    /**
+     * Host mode for remote schemas (docs/auth-tenancy.md §6.5d). Optional
+     * JSON file naming each namespace this server serves to remote readers,
+     * and the catalog of this process's PostgreSQL it lives in:
+     * {"schemas": [{"name": "posthog", "catalog": CATALOG}]}.
+     * `name` is the namespace's real name: it is what a Client relays (its
+     * hosts-file entry's `remote_name`, or `name` when it has no alias) and
+     * what a token's `remote_schemas` names. Every table of the namespace is
+     * served under its real name. Optional key: team_field (default
+     * `team_id`), the column a table's rows are filtered on; a table is
+     * served only when its object-prefix field is a column of that name.
+     *
+     * Empty (the default), or an empty list: nothing is served and every
+     * route answers as before. With entries, a request whose path names an
+     * org-shaped catalog (a UUID) and a served namespace is a remote
+     * reader's: it is held to the caller rule and never reaches a catalog of
+     * that name. Refused at boot with [mountHostsFile] (a server is a Host
+     * or a Client), without PostgreSQL as the default backend, without
+     * [authSessionProfile] `on` unless auth is `off` (only a token carrying
+     * the session profile can name a remote schema), for a name that is not
+     * a namespace name or is listed twice, and for a catalog that does not
+     * exist.
+     */
+    val servedSchemasFile: String = env("HOGLAKE_SERVED_SCHEMAS_FILE", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -1503,6 +1529,9 @@ data class Config(
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
 
+    /** The namespaces of [servedSchemasFile]; empty when this server is not a remote schema's Host. */
+    val servedSchemas: ServedSchemas = readServedSchemas(servedSchemasFile)
+
     /**
      * [reservedNamespaceNames], checked at boot: each must be a valid
      * namespace name. Every remote schema [mountHosts] configures is
@@ -1624,6 +1653,21 @@ data class Config(
             require(authSessionProfileEnabled || mountHosts.none { it.match is MountMatch.Namespace }) {
                 "a namespace entry in HOGLAKE_MOUNT_HOSTS_FILE (a remote schema) requires " +
                     "HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying the session profile can read one"
+            }
+        }
+        if (!servedSchemas.isEmpty) {
+            require(mountHosts.isEmpty()) {
+                "HOGLAKE_SERVED_SCHEMAS_FILE (this server is a remote schema's Host) cannot be set with " +
+                    "HOGLAKE_MOUNT_HOSTS_FILE (this server is a Client): a server is one or the other"
+            }
+            require(defaultBackend == "postgres") {
+                "HOGLAKE_SERVED_SCHEMAS_FILE requires HOGLAKE_DEFAULT_BACKEND=postgres: a served schema is read " +
+                    "from this process's PostgreSQL"
+            }
+            // Off, no token can carry `remote_schemas`, so nothing could read a served schema.
+            require(authSessionProfileEnabled || authMode.trim().lowercase() == "off") {
+                "HOGLAKE_SERVED_SCHEMAS_FILE requires HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying " +
+                    "the session profile can read a remote schema"
             }
         }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
@@ -2216,6 +2260,41 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
             )
     }
     return result
+}
+
+/**
+ * Parse HOGLAKE_SERVED_SCHEMAS_FILE, as strictly as [readMountHosts] parses
+ * its file: an unknown key is refused, and each entry's names are checked by
+ * [ServedSchema] and [ServedSchemas].
+ */
+private fun readServedSchemas(file: String): ServedSchemas {
+    if (file.isBlank()) return ServedSchemas.NONE
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root != null && root.isObject && root.properties().map { it.key }.toSet() == setOf("schemas")) {
+        "HOGLAKE_SERVED_SCHEMAS_FILE must contain only a schemas array"
+    }
+    val entries = root.get("schemas")
+    require(entries.isArray) { "schemas must be an array" }
+    return ServedSchemas(
+        entries.map { entry ->
+            require(entry.isObject) { "served schema entry must be an object" }
+            require(entry.properties().all { it.key in setOf("name", "catalog", "team_field") }) {
+                "served schema entry has unknown fields"
+            }
+
+            fun text(key: String): String? {
+                val value = entry.get(key) ?: return null
+                require(value.isTextual) { "served schema $key must be a string" }
+                return value.asText()
+            }
+            ServedSchema(
+                name = requireNotNull(text("name")) { "served schema requires a string name" },
+                catalog = requireNotNull(text("catalog")) { "served schema requires a string catalog" },
+                teamField = text("team_field") ?: ServedSchema.DEFAULT_TEAM_FIELD,
+            )
+        },
+    )
 }
 
 /**

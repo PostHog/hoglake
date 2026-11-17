@@ -39,6 +39,37 @@ class RoutingClaimTest {
     }
 
     @Test
+    fun `an ignored placement is understood in full and then carried nowhere`() {
+        fun ignoring(rtg: String): Caller =
+            JwtVerifier(
+                TestTokens.ISSUER,
+                TestTokens.AUDIENCE,
+                StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
+                predicateFields = setOf("team_id"),
+                // This server configures no backend: the placement is another server's.
+                backends = emptyMap(),
+                clock = { 1_700_000_001 },
+            ).verify(
+                TestTokens.mint(pair, TestTokens.scopedClaims().dropLast(1) + ",\"rtg\":$rtg}"),
+                ignoreRouting = true,
+            )
+
+        val caller = ignoring(routing)
+        assertThat(caller.routing).isNull()
+        assertThat(caller.kind).isEqualTo(Caller.Kind.SCOPED)
+        assertThat(caller.catalogScopes.keys).containsExactly("lake")
+        // Its shape is still checked: a claim this server cannot read refuses the token.
+        for (bad in listOf("{}", "[]", """{"b":"hoglite"}""", routing.dropLast(1) + ",\"future\":true}")) {
+            assertThatThrownBy { ignoring(bad) }.describedAs(bad)
+                .isInstanceOfSatisfying(
+                    JwtViolation::class.java,
+                ) { assertThat(it.reason).isEqualTo(JwtViolation.MALFORMED) }
+        }
+        // Not ignored, the same token is refused for its backend, as before.
+        refused(routing, JwtViolation.UNKNOWN_BACKEND, backends = emptyMap())
+    }
+
+    @Test
     fun `absent placement keeps legacy callers unchanged`() {
         assertThat(verify(rtg = null).routing).isNull()
         val caller = verify(rtg = null, claims = TestTokens.operatorClaims())

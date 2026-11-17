@@ -5,6 +5,7 @@ import com.posthog.hoglake.api.errorBody
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.store.ServedSchemas
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
@@ -48,6 +49,13 @@ class AuthService(
      * publishes no key it does not own.
      */
     val localJwks: String? = null,
+    /**
+     * The namespaces this server serves as a remote schema's Host
+     * (`HOGLAKE_SERVED_SCHEMAS_FILE`, docs/auth-tenancy.md §6.5d). A request
+     * whose path names one is decided by the served schema's caller rule,
+     * not by the route table.
+     */
+    val servedSchemas: ServedSchemas = ServedSchemas.NONE,
 ) {
     /** This request's `client` label: [clientClass] with this deployment's extra classes. */
     fun clientClass(call: ApplicationCall): String = clientClass(call, clientClasses)
@@ -75,7 +83,14 @@ class AuthService(
             requireNotNull(verifier) {
                 "HOGLAKE_PUBLIC_PORT requires HOGLAKE_AUTH_MODE warn or enforce: the public listener always enforces"
             }
-        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true, clientClasses = clientClasses, localJwks = localJwks)
+        return AuthService(
+            AuthMode.ENFORCE,
+            v,
+            tenantOnly = true,
+            clientClasses = clientClasses,
+            localJwks = localJwks,
+            servedSchemas = servedSchemas,
+        )
     }
 
     companion object {
@@ -86,7 +101,9 @@ class AuthService(
          */
         fun fromConfig(cfg: com.posthog.hoglake.Config): AuthService {
             val mode = AuthMode.parse("HOGLAKE_AUTH_MODE", cfg.authMode)
-            if (mode == AuthMode.OFF) return AuthService(mode, null, clientClasses = cfg.authClientClasses)
+            if (mode == AuthMode.OFF) {
+                return AuthService(mode, null, clientClasses = cfg.authClientClasses, servedSchemas = cfg.servedSchemas)
+            }
             if (mode == AuthMode.LOCAL) return local(cfg)
 
             val issuer = cfg.authIssuer.trim()
@@ -104,6 +121,7 @@ class AuthService(
             return AuthService(
                 mode = mode,
                 clientClasses = cfg.authClientClasses,
+                servedSchemas = cfg.servedSchemas,
                 verifier =
                     JwtVerifier(
                         issuer = issuer,
@@ -141,6 +159,7 @@ class AuthService(
             return AuthService(
                 mode = AuthMode.LOCAL,
                 clientClasses = cfg.authClientClasses,
+                servedSchemas = cfg.servedSchemas,
                 localJwks = key.publicJwks(),
                 verifier =
                     JwtVerifier(
@@ -334,13 +353,17 @@ val HoglakeAuth =
             // Kept for the store's check (StoreEntitlement.kt), which asks for what this route demands.
             match?.let { call.attributes.put(RouteMatchKey, it) }
             val token = bearerToken(call)
+            // A remote schema this server serves, named by the path
+            // (docs/auth-tenancy.md §6.5d). Known before the token is read.
+            val served = match?.let { service.servedSchemas.find(it.catalog, it.namespace) }
 
             var caller: Caller? = null
             var failure: HoglakeException? = null
 
             if (token != null) {
                 try {
-                    caller = service.verifier!!.verify(token)
+                    // A served path never reaches a backend, so the token's placement is not looked up.
+                    caller = service.verifier!!.verify(token, ignoreRouting = served != null)
                 } catch (v: JwtViolation) {
                     // Detail to the log, reason to the client; see JwtViolation.
                     AuthLog.debug(v) { "token refused for ${call.request.path()}" }
@@ -364,6 +387,26 @@ val HoglakeAuth =
                     AuthState.Authenticated(it, token?.let(::VerifiedBackendAuthority))
                 } ?: AuthState.Anonymous,
             )
+
+            // A served path is decided by the served schema's caller rule and
+            // nothing else: the route table's answers for the catalog (a 404
+            // worded as a missing catalog, a 403 for a scope) would tell the
+            // refusals apart. Every refusal is the one 404 of a missing
+            // namespace, in every mode, and the selector asks the same rule
+            // again before anything is read. With no caller the request is
+            // decided below as on any route.
+            if (served != null && caller != null) {
+                val catalog = checkNotNull(match?.catalog)
+                if (caller.readsServedSchema(catalog, served.name)) {
+                    Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
+                    return@onCall
+                }
+                val refusal = servedSchemaRefusal(catalog, served.name)
+                countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
+                call.attributes.put(RefusalCountedKey, Unit)
+                call.respondRefusal(refusal)
+                return@onCall
+            }
 
             // One decision, for every mode and every route shape. A PUBLIC route
             // answers Allow even for an anonymous caller, which is also what makes

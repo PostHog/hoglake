@@ -184,7 +184,10 @@ conforms to this section and to `server/src/test/resources/oauth/session-profile
 (generated here, like the contract vectors; verified with the profile on).
 The verifier's half is built, and so is the Client side of remote schemas
 ([auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client)),
-which serves a schema the token names only to a `scoped` token.
+which serves a schema the token names only to a `scoped` token. The deployment
+that holds the schema ([auth-tenancy.md §6.5d](auth-tenancy.md#65d-remote-schemas-on-the-host))
+checks the same claim again, and serves only a `scoped` token whose `org` is
+the catalog in the path and whose `cat` reads it; it ignores `rtg` there.
 
 What the server does with such a token is deliberately small. It verifies the
 profile's shape, records the read-only remote schemas the token authorizes,
