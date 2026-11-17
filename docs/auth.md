@@ -153,7 +153,7 @@ deployment needs them; hoglake applies them without knowing what they mean:
 | `dlg` | the caller may set `author` on a commit to a name other than its own `sub` |
 | `prd` | on a `scoped` token: `{"<field>": {"<value>": "read" \| "write", …}}`, or `{"<field>": {"*": …}}`. The field must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. hoglake filters metadata by `field ∈ values` and refuses commits whose files are attributed to a value the token may not write. This is how a multi-tenant issuer narrows one catalog to one tenant; PostHog's field is `team_id` |
 | `usr` | on a `scoped` token: an opaque end-user name for access logs, never used for authorization |
-| `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend` |
+| `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend`. Exception: on a Host with served namespaces, a scoped token's `rtg` naming an unknown backend is ignored; such a token can read only served namespaces and gets 404 for everything else |
 
 ### Backends that verify the token themselves
 

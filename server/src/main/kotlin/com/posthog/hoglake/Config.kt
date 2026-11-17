@@ -13,6 +13,7 @@ import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.ServedNamespace
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -32,6 +33,8 @@ class SecretString(
 
     override fun hashCode(): Int = value.hashCode()
 }
+
+private val servedNamespacesLog = KotlinLogging.logger {}
 
 /** Process configuration, with an optional backend allowlist file. */
 data class Config(
@@ -1665,6 +1668,13 @@ data class Config(
             require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
                 "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
                     "a served namespace serves only verified callers"
+            }
+            if (authMode.trim().lowercase() == "warn") {
+                servedNamespacesLog.warn {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE is set with HOGLAKE_AUTH_MODE=warn: under warn, anonymous and " +
+                        "tenant callers are let through on /v1/catalogs/<source_catalog>/, so every team's imports " +
+                        "in the source catalog are readable without a scoped token. Run a Host with enforce."
+                }
             }
             require(authSessionProfileEnabled) {
                 "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying " +

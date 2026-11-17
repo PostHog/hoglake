@@ -1403,6 +1403,10 @@ PostgreSQL, such as the imports.
   `rtg`, a known backend of another kind, and every other token kind are
   refused as before, and a server that serves no namespace refuses an unknown
   backend as before.
+  The ignored `rtg` leaves the caller with no placement
+  (`Caller.routingIgnored`), so it never reaches this server's default
+  backend, a mount or a mount Host: on every path but a served namespace it
+  gets the 404 of a catalog its token cannot see, and it lists no catalogs.
 - **Caller rule.** In every auth mode, `warn` included. Each failure is the
   404 of a missing namespace, counted and audited once per request
   (`at=served_namespace`), and nothing of the source is read for a caller
@@ -1417,6 +1421,11 @@ PostgreSQL, such as the imports.
      caller's org.
   A namespace dropped from the source stops being served, for a pinned read
   too: liveness is checked at head.
+- **Auth mode.** Boot accepts `warn` (dev runs it) and logs a WARN. Under
+  `warn` an anonymous or tenant caller is let through on
+  `/v1/catalogs/<source_catalog>/`, so the source catalog, every team's
+  imports, is open to unauthenticated and tenant reads. Run a Host with
+  `enforce`.
 - **What is served.** The four relayed routes, from the source catalog's own
   snapshots: the namespace (its name only: no containment and no
   `namespace_id`, which is a counter of the shared source catalog), its

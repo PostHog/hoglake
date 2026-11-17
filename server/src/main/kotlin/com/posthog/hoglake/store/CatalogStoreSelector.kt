@@ -7,6 +7,7 @@ import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.refuseIgnoredRouting
 import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
@@ -128,6 +129,7 @@ class CatalogStoreSelector(
         // Before every other binding: a served namespace ignores the token's placement (`rtg`) too.
         val binding =
             servedBinding(call, catalog) ?: remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
+                requirePlaced(call, catalog)
                 val routing = call.hoglakeAuth.callerOrNull?.routing
                 val routed = routing != null && routing.catalog == catalog
                 val store = if (routed) routed(call, checkNotNull(routing)) else fallback(catalog)
@@ -136,6 +138,18 @@ class CatalogStoreSelector(
         val handed = asView(call, catalog, binding)
         call.attributes.put(boundCatalog, catalog to handed)
         return handed.binding
+    }
+
+    /**
+     * A caller whose `rtg` was ignored has no placement: only a served
+     * namespace is open to it, so every other binding answers as a catalog
+     * its token cannot see, before a mount, a remote or the default backend.
+     */
+    private fun requirePlaced(
+        call: ApplicationCall,
+        catalog: String,
+    ) {
+        call.refuseIgnoredRouting(catalog)
     }
 
     /**
@@ -200,6 +214,7 @@ class CatalogStoreSelector(
     ): CatalogBinding.Remote? {
         val caller = call.hoglakeAuth.callerOrNull
         val host = mountHosts.resolve(caller, catalog) ?: return null
+        requirePlaced(call, catalog)
         requireMountReader(caller, catalog) { reason ->
             if (reason != "not_found") Metrics.mountRefused(catalog, reason)
         }
@@ -321,6 +336,7 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding.Mount? {
         val record = record(catalog) ?: return null
+        requirePlaced(call, catalog)
         requireMountReader(call.hoglakeAuth.callerOrNull, record)
         return CatalogBinding.Mount(record)
     }
@@ -334,6 +350,10 @@ class CatalogStoreSelector(
         val caller = call.hoglakeAuth.callerOrNull
         val routing = caller?.routing
         val mounts = mountVisibility(caller)
+        if (caller?.routingIgnored == true) {
+            // No placement, so no catalog of this instance to list.
+            return Listing(listed(call, fallback("")), emptySet(), usePostgresTotals = true, mounts = emptySet())
+        }
         return if (routing != null) {
             Listing(
                 listed(call, routed(call, routing)),

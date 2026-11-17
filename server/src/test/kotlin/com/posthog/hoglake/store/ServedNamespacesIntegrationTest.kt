@@ -1,5 +1,8 @@
 package com.posthog.hoglake.store
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.TestTokens
@@ -11,6 +14,7 @@ import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.wireObjectMapper
@@ -49,6 +53,9 @@ class ServedNamespacesIntegrationTest {
     private val orgB = "02b2f6ef-2bd6-0000-f64f-e3a0b88efbf5"
     private val source = "imports"
     private val cust = "cust"
+
+    // An enabled mount record for this name, so only a caller's ignored placement stands between it and the mount.
+    private val mount = "0194f2f6-8c5d-7a4e-9b1f-3c2d1e0f9a8b-events"
 
     // The customer's own Hoglite backend: this server's backends file does not list it.
     private val hogliteId = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
@@ -104,7 +111,15 @@ class ServedNamespacesIntegrationTest {
                 authSessionProfile = "on",
                 servedNamespacesFile = served.toString(),
             )
-        app = App.build(cfg, db.jdbi)
+        db.jdbi.useHandle<Exception> { it.execute("UPDATE hog_mount_switch SET enabled = true") }
+        app =
+            App.build(
+                cfg, db.jdbi,
+                mountRegistry =
+                    MountRegistry {
+                        if (it == mount) MountRecord(mount, 1, true, listOf(42)) else null
+                    },
+            )
         server = embeddedServer(Netty, configure = { configureApiListener(cfg) }) { app.module(this) }
         server.start(wait = false)
         port = runBlocking { server.engine.resolvedConnectors().first().port }
@@ -205,6 +220,8 @@ class ServedNamespacesIntegrationTest {
         assertThat(body["name"].asText()).isEqualTo("team_42")
         // The org mark and field are the Host's own.
         assertThat(namespace.body()).doesNotContain("containment", orgA)
+        // No namespace_id, so it is a remote namespace by the OpenAPI invariant.
+        assertThat(body["remote"].asBoolean()).describedAs(namespace.body()).isTrue()
 
         val tables = send("GET", "$ns/tables", scoped())
         assertThat(tables.statusCode()).describedAs(tables.body()).isEqualTo(200)
@@ -244,6 +261,65 @@ class ServedNamespacesIntegrationTest {
             val response = send("GET", path, scoped(rtg = rtg))
             assertThat(response.statusCode()).describedAs("%s: %s", path, response.body()).isEqualTo(200)
         }
+    }
+
+    @Test
+    fun `a token with an unlisted rtg is served the namespace and gets a missing catalog everywhere else`() {
+        val rtg = """{"b":"hoglite","be":"$hogliteId","t":"opaque_1"}"""
+        val held = "held"
+        catalogs.createCatalog(held, "s3://bucket/$held")
+        catalogs.createNamespace(held, "team_77")
+        // Contained for the token's team with no org mark: without the guard this is a plain local namespace it may write.
+        catalogs.setNamespaceContainment(held, "team_77", NamespaceContainment("team_id", 42))
+        val writePrd = """{"team_id":{"42":"write"}}"""
+        val heldBefore = catalogs.getCatalog(held).headSnapshotId
+        val create = """{"name":"made","columns":[{"name":"v","type":"long"}]}"""
+        val elsewhere =
+            listOf(
+                // A name nothing here configures, a catalog this Host holds, and a mount's reserved name.
+                scoped(prd = writePrd, catalog = "nothing", rtg = rtg, scope = "write") to "nothing",
+                scoped(prd = writePrd, catalog = held, rtg = rtg, scope = "write") to held,
+                scoped(prd = writePrd, catalog = mount, rtg = rtg, scope = "read\",\"write") to mount,
+            )
+        for ((token, name) in elsewhere) {
+            val base = "/v1/catalogs/$name"
+            for (path in listOf(
+                "$base/namespaces",
+                "$base/namespaces/team_77",
+                "$base/namespaces/team_77/tables",
+            )) {
+                val response = send("GET", path, token)
+                assertThat(response.statusCode()).describedAs("%s: %s", path, response.body()).isEqualTo(404)
+                assertThat(response.body()).describedAs(path).doesNotContain("a.parquet", orgA)
+                assertThat(code(response)).describedAs(path).isEqualTo("not_found")
+                assertThat(response.body()).describedAs(path).contains("catalog '$name' not found")
+            }
+            val made = send("POST", "$base/namespaces/team_77/tables", token, create)
+            assertThat(made.statusCode()).describedAs("%s: %s", name, made.body()).isEqualTo(404)
+            assertThat(made.body()).describedAs(name).contains("catalog '$name' not found")
+            val listing = send("GET", "/v1/catalogs", token)
+            assertThat(listing.statusCode()).describedAs("listing: %s", listing.body()).isEqualTo(200)
+            assertThat(mapper.readTree(listing.body()).size()).describedAs("listing").isEqualTo(0)
+        }
+        // A write to the catalog the Host holds did not land.
+        assertThat(catalogs.getCatalog(held).headSnapshotId).isEqualTo(heldBefore)
+        assertThat(catalogs.listTables(held, "team_77")).isEmpty()
+        // A route outside the namespace gate is refused and recorded as a refusal, not a bare ok.
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val audit = org.slf4j.LoggerFactory.getLogger(Audit.LOGGER_NAME) as Logger
+        audit.addAppender(capture)
+        try {
+            val commit = send("POST", "/v1/catalogs/$held/commit", elsewhere[1].first, """{"appends":[]}""")
+            assertThat(commit.statusCode()).describedAs(commit.body()).isEqualTo(404)
+            assertThat(capture.list.map { it.formattedMessage + it.toString() + (it.argumentArray?.toList() ?: "") })
+                .anyMatch { it.contains("auth_refused") }
+        } finally {
+            audit.detachAppender(capture)
+        }
+        // The same kind of token still reads the served namespace.
+        for (path in relayed) assertThat(
+            send("GET", path, scoped(rtg = rtg)).statusCode(),
+        ).describedAs(path).isEqualTo(200)
     }
 
     @Test
@@ -419,7 +495,7 @@ class ServedNamespacesIntegrationTest {
             """{"appends":[{"namespace":"team_42","table":"events","files":[{"path":"$filePath","record_count":1,""" +
                 """"file_size_bytes":1}]}]}"""
         val committed = send("POST", "/v1/catalogs/$cust/commit", writer, commit)
-        assertThat(committed.statusCode()).describedAs(committed.body()).isIn(403, 404)
+        assertThat(committed.statusCode()).describedAs(committed.body()).isEqualTo(404)
 
         val files = send("GET", "$ns/tables/events/files", scoped())
         assertThat(files.statusCode()).describedAs(files.body()).isEqualTo(501)
@@ -429,6 +505,17 @@ class ServedNamespacesIntegrationTest {
         assertThat(catalogs.listTables(source, "team_42").map { it.name }).containsExactly("events")
         assertThat(catalogs.getNamespace(source, "team_42").containment)
             .isEqualTo(NamespaceContainment("team_id", 42, orgA))
+    }
+
+    @Test
+    fun `a caller of another org gets a missing namespace on a write and a non-relayed read too`() {
+        val before = head()
+        val other = scoped(org = orgB, prd = """{"team_id":{"42":"write"}}""", scope = "write")
+        val create = """{"name":"made","columns":[{"name":"v","type":"long"}]}"""
+        assertMissingNamespace(send("POST", "$ns/tables", other, create), "create table")
+        assertMissingNamespace(send("DELETE", "$ns/tables/events", other), "drop table")
+        assertMissingNamespace(send("GET", "$ns/tables/events/files", other), "files")
+        assertThat(head()).isEqualTo(before)
     }
 
     @Test

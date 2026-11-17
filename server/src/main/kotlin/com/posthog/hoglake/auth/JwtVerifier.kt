@@ -453,6 +453,8 @@ class JwtVerifier(
         val kindText = if (claims.has("ten")) Jwt.text(claims, "ten") else null
         val clientName = Jwt.textOrNull(claims, "cli")
         val routing = routing(claims)
+        // routing() is null with an `rtg` present only when it was ignored as unknown.
+        val routingIgnored = routing == null && claims.has("rtg")
 
         // The profile is checked for EVERY kind, operator included, so an
         // operator token carrying credentials is refused rather than ignored.
@@ -470,7 +472,7 @@ class JwtVerifier(
                     routing = routing,
                 )
 
-            "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing)
+            "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing, routingIgnored)
 
             "tenant", null -> {
                 // A token that carries a predicate but no `ten` is a scoped
@@ -697,6 +699,7 @@ class JwtVerifier(
         tokenId: String,
         clientName: String?,
         routing: Routing?,
+        routingIgnored: Boolean,
     ): Caller {
         if (predicateFields.isEmpty()) {
             throw JwtViolation(JwtViolation.INVALID_PREDICATE, "this instance accepts no scoped tokens")
@@ -742,6 +745,7 @@ class JwtVerifier(
             predicates = predicates(claims.get("prd")),
             user = user,
             routing = routing,
+            routingIgnored = routingIgnored,
             remoteSchemas = profile?.remoteSchemas ?: emptySet(),
         )
     }

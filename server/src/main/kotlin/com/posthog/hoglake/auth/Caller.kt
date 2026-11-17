@@ -47,6 +47,13 @@ data class Caller(
     /** Verified placement for one catalog. Endpoints come only from server configuration. */
     val routing: Routing? = null,
     /**
+     * The token carried an `rtg` this instance does not know and ignored it
+     * (a Host serving namespaces, [Routing]). Such a caller may read a
+     * served namespace and nothing else: it has no placement, so it must
+     * never fall through to this instance's default backend.
+     */
+    val routingIgnored: Boolean = false,
+    /**
      * `remote_schemas`, on a token carrying the session profile: the read-only
      * remote schemas of the primary catalog this caller may use. Empty on every
      * other token. The profile's credentials are never carried here.

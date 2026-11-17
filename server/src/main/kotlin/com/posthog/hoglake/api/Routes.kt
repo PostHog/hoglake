@@ -314,6 +314,7 @@ fun Application.installApiRoutes(
                                 call.respond(
                                     // No id: it is a counter of the shared source catalog.
                                     NamespaceDto(
+                                        remote = true,
                                         name =
                                             binding.reader.namespace(
                                                 call.longQuery("snapshot"),

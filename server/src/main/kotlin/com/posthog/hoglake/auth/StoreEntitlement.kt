@@ -43,6 +43,32 @@ internal fun ApplicationCall.requireCatalogEntitlement(catalog: String) {
 }
 
 /**
+ * A caller whose `rtg` was ignored ([Caller.routingIgnored]) has no placement,
+ * so every store but a served namespace is refused as a catalog its token
+ * cannot see. Counted and audited as [requireCatalogEntitlement] does: once
+ * per request, and always answered, in every auth mode.
+ */
+internal fun ApplicationCall.refuseIgnoredRouting(catalog: String) {
+    val caller = hoglakeAuth.callerOrNull?.takeIf { it.routingIgnored } ?: return
+    val refusal = unknownCatalog(catalog)
+    if (!attributes.contains(RefusalCountedKey)) {
+        attributes.put(RefusalCountedKey, Unit)
+        val service = application.attributes[AuthServiceKey]
+        countRefusal(
+            service,
+            service.clientClass(this),
+            caller,
+            attributes.getOrNull(RouteMatchKey),
+            refusal,
+            enforced = true,
+            catalog = catalog,
+            at = "ignored_routing",
+        )
+    }
+    throw refusal
+}
+
+/**
  * What stands against handing [caller] the store of [catalog] on the route
  * [match], as the plugin would answer it; null when nothing does.
  *
