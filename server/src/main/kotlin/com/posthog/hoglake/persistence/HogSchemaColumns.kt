@@ -64,12 +64,12 @@ object HogSchemaColumns {
             // V35: MountStore.
             "hog_mount" to setOf("name", "revision", "enabled", "mount_values"),
             // NamespaceRepo.
-            // V33: contained_field/contained_value, read by NamespaceRepo and
+            // V33/V37: contained_field/contained_value/contained_org, read by NamespaceRepo and
             // CommitTail.READ_SQL's `contained` CTE.
             "hog_namespace" to
                 setOf(
                     "catalog_id", "namespace_id", "name", "dropped", "created_at",
-                    "contained_field", "contained_value",
+                    "contained_field", "contained_value", "contained_org",
                 ),
             // TableRepo (identity + drop marking).
             "hog_table" to

@@ -689,6 +689,8 @@ data class CatalogInfo(
     /** Expiry never passes the min consumer offset when true. */
     val consumerFloor: Boolean = true,
     val earliestSnapshotId: Long = 0,
+    /** False on a backend that cannot store a namespace's org mark; gates the `org-marked-containment-v1` capability. */
+    val orgMarkedContainment: Boolean = true,
 )
 
 /**
@@ -787,13 +789,17 @@ data class NamespaceInfo(
 
 /**
  * A namespace marked contained for `field = value`: its tables register
- * files only under `<data_path>/data/<namespace>/`, and no other table
- * registers files there. What a `ten: scoped` caller holding `value` for
- * `field` is given; operator-managed.
+ * files only under its prefix ([Containment.namespaceRoot]), and no other
+ * table registers files there. What a `ten: scoped` caller holding `value`
+ * for `field` is given; operator-managed.
+ *
+ * [org] is the optional org mark: it moves the prefix to
+ * `<data_path>/org_id=<org>/<field>=<value>/` and is permanent once set.
  */
 data class NamespaceContainment(
     val field: String,
     val value: Long,
+    val org: String? = null,
 )
 
 /**

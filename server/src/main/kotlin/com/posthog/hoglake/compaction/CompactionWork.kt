@@ -1,6 +1,7 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.SortFieldDef
@@ -78,6 +79,11 @@ internal object CompactionWork {
          * when the option is off.
          */
         val prefixKeyIndex: Map<Long, Int?> = emptyMap(),
+        /**
+         * The namespace's containment at the planning head. An org mark
+         * roots the output paths under its prefix ([ObjectPrefix.dataFilePath]).
+         */
+        val containment: NamespaceContainment? = null,
     )
 
     data class PlanWithContext(

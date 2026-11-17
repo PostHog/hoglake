@@ -132,6 +132,7 @@ internal object BoundStoreCalls {
                     "dropNamespace" to Rule.CLOSED,
                     "setNamespaceContainment" to Rule.CLOSED,
                     "liveContainment" to Rule.LOOKUP,
+                    "liveContainedFor" to Rule.LOOKUP,
                     "createTable" to Rule.WRITE,
                     "getTable" to Rule.READ,
                     "listTables" to Rule.READ,
@@ -357,6 +358,9 @@ internal class RecordingStores(
             calls += Call("${type.simpleName}.${method.name}", given)
             when {
                 method.name == "liveContainment" -> contained[given[1]]
+                method.name == "liveContainedFor" ->
+                    contained.entries.firstOrNull { it.value.field == given[1] && it.value.value == given[2] }
+                        ?.let { it.key to it.value }
                 method.name == "getCatalog" -> CatalogInfo(1, given[0] as String, BoundStoreCalls.DATA_PATH, 0, 0)
                 method.name == "listNamespaces" ->
                     namespaces.mapIndexed { i, name -> NamespaceInfo(i.toLong(), name, contained[name]) }

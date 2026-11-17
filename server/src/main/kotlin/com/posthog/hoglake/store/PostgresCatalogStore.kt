@@ -111,6 +111,12 @@ class PostgresCatalogStore(
         namespace: String,
     ): NamespaceContainment? = catalogs.liveContainment(catalog, namespace)
 
+    override fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? = catalogs.liveContainedFor(catalog, field, value)
+
     override fun createTable(
         catalog: String,
         namespace: String,

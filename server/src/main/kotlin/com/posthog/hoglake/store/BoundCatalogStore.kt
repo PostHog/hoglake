@@ -129,6 +129,12 @@ internal class BoundCatalogStore(
         namespace: String,
     ): NamespaceContainment? = grant.containment(catalog, namespace)
 
+    override fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? = grant.containedFor(catalog, field, value)
+
     // ---- tables ----------------------------------------------------------
 
     override fun createTable(

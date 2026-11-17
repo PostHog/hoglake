@@ -765,6 +765,9 @@ class HogliteCatalogStore(
                     throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
                 }
                 if (it.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
+                if (it.org != null) {
+                    throw HoglakeException.Validation("org-marked containment needs the Postgres backend")
+                }
             }
             val liveId = "(SELECT id FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL)"
             val pre =
@@ -2430,6 +2433,7 @@ class HogliteCatalogStore(
                 snapshotRetentionSeconds = retentionSeconds,
                 consumerFloor = consumerFloor,
                 earliestSnapshotId = earliestSnapshotId,
+                orgMarkedContainment = false,
             )
     }
 

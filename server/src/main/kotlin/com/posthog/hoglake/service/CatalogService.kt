@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ChangesPlan
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileColumnStats
@@ -67,6 +68,7 @@ class CatalogService(private val jdbi: Jdbi) {
         /** The prefix scan's bound when marking a namespace contained; see setNamespaceContainment. */
         const val CONTAINMENT_SCAN_TIMEOUT_MS = 10_000L
         private val CONTAINMENT_FIELD = Regex("^[a-z][a-z0-9_]{0,62}$")
+        private val CONTAINMENT_ORG = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
 
         /**
          * Ceiling on a catalog's `data_path`.
@@ -430,7 +432,9 @@ class CatalogService(private val jdbi: Jdbi) {
      * - no other live namespace to hold the same `field = value`.
      *
      * Marking the same containment again is a no-op; changing it means
-     * clearing first. Clearing requires no live table or view.
+     * clearing first. Clearing requires no live table or view. An org mark
+     * is permanent: it is neither changed nor cleared (`commit_conflict`),
+     * and the namespace is dropped instead.
      *
      * SCALE. The prefix check reads the catalog's file rows, so it runs
      * BEFORE the commit lock, bounded by [CONTAINMENT_SCAN_TIMEOUT_MS]; a
@@ -453,7 +457,7 @@ class CatalogService(private val jdbi: Jdbi) {
             if (containment == null) "namespace_containment_clear" else "namespace_containment_set",
             catalog,
             namespace,
-            detail = { "containment=${containment?.let { "${it.field}=${it.value}" }}" },
+            detail = { "containment=${containment?.let(::auditDetail)}" },
             actor = { author },
         ) {
             containment?.let {
@@ -461,8 +465,11 @@ class CatalogService(private val jdbi: Jdbi) {
                     throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
                 }
                 if (it.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
+                if (it.org != null && !CONTAINMENT_ORG.matches(it.org)) {
+                    throw HoglakeException.Validation("containment org must match ${CONTAINMENT_ORG.pattern}")
+                }
             }
-            val (cat, scannedFrom) =
+            val (cat, scannedFrom, scannedPrefix) =
                 jdbi.inTransactionUnchecked { h ->
                     val cat = requireCatalog(h, catalog)
                     val ns = requireNamespace(h, cat, namespace)
@@ -480,18 +487,34 @@ class CatalogService(private val jdbi: Jdbi) {
                     // The cheap refusals first, so a namespace that holds
                     // tables is told so rather than that its own files sit
                     // under its prefix. Repeated under the lock below.
+                    var scanned: String? = null
                     if (containment != null && ns.containment == null) {
                         requireNeverHeld(h, cat.catalogId, ns)
-                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, null)?.let {
+                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, containment, null)?.let {
                             throw prefixTaken(namespace, it)
                         }
+                        scanned = Containment.namespaceRoot(cat.dataPath, namespace, containment)
                     }
-                    cat to from
+                    Triple(cat, from, scanned)
                 }
             jdbi.inTransactionUnchecked { h ->
                 Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 val ns = requireNamespace(h, cat, namespace)
                 if (ns.containment == containment) return@inTransactionUnchecked ns
+                // The org mark outlives every file registered under its prefix
+                // and every reader token minted against it, so neither a
+                // different mark nor none replaces it.
+                if (ns.containment?.org != null) {
+                    throw HoglakeException.CommitConflict(
+                        if (containment == null) {
+                            "namespace '$namespace' carries an org mark, which is permanent; " +
+                                "drop the empty namespace instead"
+                        } else {
+                            "namespace '$namespace' carries an org mark, which is permanent; " +
+                                "it cannot be marked differently"
+                        },
+                    )
+                }
                 if (containment != null) {
                     if (ns.containment != null) {
                         throw HoglakeException.CommitConflict(
@@ -499,8 +522,17 @@ class CatalogService(private val jdbi: Jdbi) {
                                 "${ns.containment.field} = ${ns.containment.value}; clear it first",
                         )
                     }
+                    // The locked pass reads only what was allocated since the
+                    // watermark, so it stands in for the full scan of THIS prefix
+                    // alone. A namespace that was marked, or marked for another
+                    // prefix, when the scan was decided has had no such scan.
+                    if (scannedPrefix != Containment.namespaceRoot(cat.dataPath, namespace, containment)) {
+                        throw HoglakeException.CommitConflict(
+                            "namespace '$namespace' containment changed concurrently; retry",
+                        )
+                    }
                     requireNeverHeld(h, cat.catalogId, ns)
-                    foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, scannedFrom)?.let {
+                    foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, containment, scannedFrom)?.let {
                         throw prefixTaken(namespace, it)
                     }
                 } else {
@@ -518,9 +550,13 @@ class CatalogService(private val jdbi: Jdbi) {
             }
         }
 
+    private fun auditDetail(containment: NamespaceContainment): String =
+        "${containment.field}=${containment.value}" + (containment.org?.let { " org=$it" } ?: "")
+
     /**
      * Another table's file, DV, live upload claim or undrained removal
-     * under [namespace]'s prefix, in any spelling a percent-decoding reader
+     * under [namespace]'s prefix ([Containment.namespaceRoot] of
+     * [containment]), in any spelling a percent-decoding reader
      * resolves to it (what [com.posthog.hoglake.model.Containment.segments]
      * compares at commit), or null.
      *
@@ -539,10 +575,19 @@ class CatalogService(private val jdbi: Jdbi) {
         catalogId: Long,
         dataPath: String,
         namespace: String,
+        containment: NamespaceContainment,
         from: ScanWatermark?,
     ): String? {
         val fromFileId = from?.fileId
         val root = dataPath.trimEnd('/') + "/"
+        val prefix = Containment.namespaceRoot(dataPath, namespace, containment)
+        val spelled =
+            if (containment.org == null) {
+                "^" + spelledAs("data") + "/" + spelledAs(namespace) + "/"
+            } else {
+                "^" + spelledAs("org_id=${containment.org}") + "/" +
+                    spelledAs("${containment.field}=${containment.value}") + "/"
+            }
         val ids = if (fromFileId == null) "" else "AND %s >= :from"
         // The literal prefix, or a path with a `%` whose `<dir>/<segment>/`
         // spells `data/<namespace>/`. Nothing broader: an unrelated escaped
@@ -584,14 +629,14 @@ class CatalogService(private val jdbi: Jdbi) {
                     ${if (fromFileId == null) unlockedOnly else lockedRemovals}
                 ) hit LIMIT 1
                 """,
-            ).bind("c", catalogId).bind("prefix", root + "data/" + namespace + "/").bind("root", root)
-                .bind("spelled", "^" + spelledAs("data") + "/" + spelledAs(namespace) + "/")
+            ).bind("c", catalogId).bind("prefix", prefix).bind("root", root)
+                .bind("spelled", spelled)
                 .also { q -> from?.let { q.bind("from", it.fileId).bind("fromRemoval", it.removalId) } }
                 .mapTo(String::class.java).findOne().orElse(null)
         } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
             if (Pg.isQueryCanceled(e)) {
                 throw HoglakeException.ContainmentUnverified(
-                    "could not check ${root}data/$namespace/ for other tables' files within its time bound; " +
+                    "could not check $prefix for other tables' files within its time bound; " +
                         "the namespace was not marked",
                 )
             }
@@ -724,6 +769,20 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = CatalogRepo.findByName(h, catalog) ?: return@withHandleUnchecked null
             NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)?.containment
+        }
+
+    /** The live namespace contained for `field = value`, by `hog_namespace_live_containment`; null when none. */
+    fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? =
+        jdbi.withHandleUnchecked { h ->
+            val cat = CatalogRepo.findByName(h, catalog) ?: return@withHandleUnchecked null
+            NamespaceRepo.findLiveContained(h, cat.catalogId, field, value)?.let {
+                    ns ->
+                ns.containment?.let { ns.name to it }
+            }
         }
 
     fun getNamespace(

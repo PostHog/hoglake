@@ -39,6 +39,7 @@ import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.entry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.security.interfaces.ECPublicKey
@@ -166,7 +167,7 @@ class BoundStoreTest {
             assertThat(type.declaredMemberFunctions.map { it.name }).describedAs(type.simpleName)
                 .containsExactlyInAnyOrderElementsOf(byName.keys)
         }
-        assertThat(ops).hasSize(54)
+        assertThat(ops).hasSize(55)
         // Every sub-backend interface the selector hands out per catalog is one of them.
         val handedOut =
             CatalogStoreSelector::class.java.methods
@@ -528,6 +529,22 @@ class BoundStoreTest {
     }
 
     @Test
+    fun `the lookup by value answers a scoped caller only for a value it may read`() {
+        val found = mutableMapOf<Long, Pair<String, NamespaceContainment>?>()
+        request(AuthMode.ENFORCE, scoped(), RecordingStores(contained)) { views ->
+            val store = views.view<CatalogStore>()
+            // MUTATION: drop the read filter in StoreGrant.containedFor and team 99 is answered.
+            for (value in listOf(42L, 7L, 99L, 5L)) found[value] = store.liveContainedFor("alpha", "team_id", value)
+        }
+        assertThat(found).containsExactly(
+            entry(42L, "mine" to contained.getValue("mine")),
+            entry(7L, "shared" to contained.getValue("shared")),
+            entry(99L, null),
+            entry(5L, null),
+        )
+    }
+
+    @Test
     fun `an upload claim is held to the namespace its prefix spells`() {
         val stores = RecordingStores(contained)
         val refusals = mutableListOf<Throwable?>()
@@ -547,7 +564,9 @@ class BoundStoreTest {
             uploads.renew("alpha", id)
             uploads.abandon("alpha", id, listOf("$DATA_PATH/data/theirs/x"))
         }
-        val under = "a scoped credential's upload must be claimed under $DATA_PATH/data/<namespace>/"
+        val under =
+            "a scoped credential's upload must be claimed under $DATA_PATH/data/<namespace>/, " +
+                "or under its namespace's org prefix"
         assertThat(refusals.map { it?.message }).containsExactly("namespace 'theirs' in catalog 'alpha'", under, under)
         assertThat(refusals.map { it!!::class })
             .containsExactly(

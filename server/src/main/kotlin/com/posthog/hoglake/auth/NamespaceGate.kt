@@ -75,6 +75,9 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
             ->
             selector.forCatalog(call, catalog).liveContainment(catalog, namespace)
         },
+        containedFor = { call, catalog, field, value ->
+            selector.forCatalog(call, catalog).liveContainedFor(catalog, field, value)
+        },
         // A mount (export) resolves here as it does on the handler, cached
         // per request; its isolation is ReadScope in the scan, not
         // containment, so the gate lets every namespace through (plan row
@@ -92,6 +95,12 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
 private fun Application.installCallNamespaceGate(
     dataPath: (ApplicationCall, String) -> String?,
     containment: (ApplicationCall, String, String) -> NamespaceContainment?,
+    containedFor: (
+        ApplicationCall,
+        String,
+        String,
+        Long,
+    ) -> Pair<String, NamespaceContainment>? = { _, _, _, _ -> null },
     isExport: (ApplicationCall, String) -> Boolean = { _, _ -> false },
     refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
 ) {
@@ -103,7 +112,7 @@ private fun Application.installCallNamespaceGate(
         NamespaceGatePhase,
     )
     attributes.put(NamespaceGateKey, Unit)
-    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath, refuseRemoteSchemas))
+    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath, containedFor, refuseRemoteSchemas))
     intercept(NamespaceGatePhase) {
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull

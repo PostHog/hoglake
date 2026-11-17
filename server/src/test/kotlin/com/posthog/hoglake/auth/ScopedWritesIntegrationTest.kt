@@ -47,6 +47,7 @@ class ScopedWritesIntegrationTest {
     private val cat = "scopedw"
     private val dataPath = "s3://bucket/$cat"
     private val columns = listOf(ColumnDef("v", ColType.LONG))
+    private val org = "01a1e5de-1ac5-0000-e53e-d2f9a77deae4"
     private val driven = mutableSetOf<Pair<String, String>>()
     private var serial = 0
 
@@ -59,8 +60,16 @@ class ScopedWritesIntegrationTest {
             catalogs.createNamespace(cat, ns)
             catalogs.setNamespaceContainment(cat, ns, NamespaceContainment("team_id", value))
         }
+        catalogs.createNamespace(cat, "team_9400")
+        catalogs.setNamespaceContainment(cat, "team_9400", NamespaceContainment("team_id", 9400, org))
         catalogs.createNamespace(cat, "main")
-        for (ns in listOf("team_42", "team_7", "team_9", "main")) catalogs.createTable(cat, ns, "t", columns)
+        for (ns in listOf(
+            "team_42",
+            "team_7",
+            "team_9",
+            "team_9400",
+            "main",
+        )) catalogs.createTable(cat, ns, "t", columns)
     }
 
     @AfterAll
@@ -357,6 +366,35 @@ class ScopedWritesIntegrationTest {
                 val r = claim(prefix)
                 assertThat(r.statusCode()).describedAs("%s: %s", prefix, r.body()).isIn(403, 404)
             }
+            // An org-marked namespace's prefix is the org one, spelled literally, and not data/<ns>/.
+            val orgToken = scoped("""{"team_id":{"42":"write","9400":"write"}}""")
+
+            fun orgClaim(
+                prefix: String,
+                as_: String = orgToken,
+            ) = call(
+                port,
+                as_,
+                "PUT",
+                "/uploads/${UUID.randomUUID()}",
+                """{"owner":"$owner","prefix":"$prefix","file_kind":"data"}""",
+                "/uploads/{upload}",
+            )
+            for (allowed in listOf("$dataPath/org_id=$org/team_id=9400/t", "$dataPath/org_id=$org/team_id=9400")) {
+                val r = orgClaim(allowed)
+                assertThat(r.statusCode()).describedAs("%s: %s", allowed, r.body()).isEqualTo(200)
+            }
+            for (refused in listOf(
+                "$dataPath/data/team_9400/t",
+                "$dataPath/org_id=other/team_id=9400/t",
+                "$dataPath/org_id=$org/team_id=9401/t",
+                "$dataPath/org_id%3D$org/team_id=9400/t",
+                "$dataPath/org_id=$org/team%5Fid=9400/t",
+            )) {
+                assertThat(orgClaim(refused).statusCode()).describedAs(refused).isIn(403, 404)
+            }
+            // A token without the value cannot claim under that org's prefix.
+            assertThat(orgClaim("$dataPath/org_id=$org/team_id=9400/t", token).statusCode()).isIn(403, 404)
             // Renew and abandon name no namespace.
             assertThat(call(port, token, "POST", "/uploads/renew", """{"owner":"$owner"}""").statusCode())
                 .isEqualTo(200)
@@ -364,6 +402,51 @@ class ScopedWritesIntegrationTest {
                 call(port, token, "POST", "/uploads/abandon", """{"owner":"$owner","paths":[]}""").statusCode(),
             ).isEqualTo(200)
             assertThat(call(port, token, "POST", "/uploads/schedule-expired").statusCode()).isEqualTo(403)
+        }
+    }
+
+    @Test
+    fun `the containment route carries the org mark through the API`() {
+        catalogs.createNamespace(cat, "team_9700")
+        withServer(AuthMode.ENFORCE) { port ->
+            val operator = TestTokens.mint(pair, TestTokens.operatorClaims())
+            val path = "/namespaces/team_9700/containment"
+
+            fun put(body: String) = call(port, operator, "PUT", path, body)
+
+            fun containment() =
+                json.readTree(call(port, operator, "GET", "/namespaces/team_9700").body()).path("containment")
+            val marked = put("""{"field":"team_id","value":9700,"org":"$org"}""")
+            assertThat(marked.statusCode()).describedAs(marked.body()).isEqualTo(200)
+            assertThat(json.readTree(marked.body()).path("containment").path("org").asText()).isEqualTo(org)
+            assertThat(containment().path("org").asText()).isEqualTo(org)
+            assertThat(containment().path("value").asLong()).isEqualTo(9700)
+            // Identical is a no-op; anything else, and clearing, is the permanent mark's 409.
+            assertThat(put("""{"field":"team_id","value":9700,"org":"$org"}""").statusCode()).isEqualTo(200)
+            assertThat(put("""{"field":"team_id","value":9700,"org":"other"}""").statusCode()).isEqualTo(409)
+            assertThat(put("""{"field":"team_id","value":9700}""").statusCode()).isEqualTo(409)
+            assertThat(call(port, operator, "DELETE", path).statusCode()).isEqualTo(409)
+            assertThat(containment().path("org").asText()).isEqualTo(org)
+            catalogs.createNamespace(cat, "team_9701")
+            assertThat(
+                call(
+                    port,
+                    operator,
+                    "PUT",
+                    "/namespaces/team_9701/containment",
+                    """{"field":"team_id","value":9701,"org":"UPPER"}""",
+                ).statusCode(),
+            ).isEqualTo(422)
+            // An unmarked response carries no org key.
+            val plain =
+                call(
+                    port,
+                    operator,
+                    "PUT",
+                    "/namespaces/team_9701/containment",
+                    """{"field":"team_id","value":9701}""",
+                )
+            assertThat(json.readTree(plain.body()).path("containment").has("org")).isFalse()
         }
     }
 

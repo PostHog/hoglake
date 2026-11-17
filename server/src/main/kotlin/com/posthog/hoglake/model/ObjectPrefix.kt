@@ -177,6 +177,11 @@ object ObjectPrefix {
      * `<idempotency_key>/`, millrace under `<build>/`, DuckDB INSERT under
      * hive `<col>=<value>/` directories), so a path's shape does not show
      * whether it predates the layout.
+     *
+     * A table in an org-marked namespace ([containment]) without the layout
+     * is rooted under the namespace's prefix instead of `data/<ns>/`. With
+     * the layout the org mark is not supported: the path stays under
+     * `data/<ns>/`, and the commit refuses it.
      */
     fun dataFilePath(
         dataPath: String,
@@ -185,9 +190,16 @@ object ObjectPrefix {
         layout: ObjectPrefixLayout?,
         value: String?,
         uuid: UUID = UUID.randomUUID(),
+        containment: NamespaceContainment? = null,
     ): String =
         if (layout == null) {
-            tableRoot(dataPath, namespace, table) + "$uuid.parquet"
+            val root =
+                if (containment?.org != null) {
+                    Containment.namespaceRoot(dataPath, namespace, containment) + "$table/"
+                } else {
+                    tableRoot(dataPath, namespace, table)
+                }
+            root + "$uuid.parquet"
         } else {
             val prefixValue = requireNotNull(value) { "an object-prefix file needs a value" }
             prefix(dataPath, namespace, table, layout, prefixValue) + "$uuid.parquet"
@@ -252,18 +264,46 @@ object ObjectPrefix {
 }
 
 /**
- * Namespace containment (V33): which `data/<segment>/` a path names, and
- * whether a table may register it.
+ * Namespace containment (V33): which prefix a path names, and whether a
+ * table may register it.
  *
- * A contained namespace `n` owns `<data_path>/data/n/`: its tables register
- * files only there, and no other table registers files there. A contained
- * table's files must spell `data/n/` literally. Everyone else's are also
- * compared DECODED, both the `data` directory and the segment after it,
- * because a reader that percent-decodes a URI resolves `d%61ta/team%5F42/x`
- * to `data/team_42/x`. (The catalog's own `data_path` prefix is matched
- * literally by commit validation, so only what follows it can vary.)
+ * A contained namespace `n` owns its prefix ([namespaceRoot]): its tables
+ * register files only there, and no other table registers files there.
+ * Without an org mark the prefix is `<data_path>/data/n/`, and a contained
+ * table's files must spell it literally; everyone else's are also compared
+ * DECODED, both the `data` directory and the segment after it, because a
+ * reader that percent-decodes a URI resolves `d%61ta/team%5F42/x` to
+ * `data/team_42/x`. With an org mark (V37) the prefix is
+ * `<data_path>/org_id=<org>/<field>=<value>/`, compared the same way: a
+ * foreign table's first two segments are matched raw and decoded. (The
+ * catalog's own `data_path` prefix is matched literally by commit
+ * validation, so only what follows it can vary.)
  */
 object Containment {
+    private val ORG_SEGMENT = Regex("^org_id=([a-z0-9][a-z0-9-]{0,63})$")
+    private val VALUE_SEGMENT = Regex("^([a-z][a-z0-9_]{0,62})=([1-9][0-9]{0,18})$")
+
+    /** A path's first two segments read as `org_id=<org>/<field>=<value>/`. */
+    data class HiveHead(val org: String, val field: String, val value: Long)
+
+    /**
+     * The prefix [namespace] owns, given its [containment]: `data/<namespace>/`
+     * under [dataPath], or `org_id=<org>/<field>=<value>/` when it carries
+     * an org mark.
+     */
+    fun namespaceRoot(
+        dataPath: String,
+        namespace: String,
+        containment: NamespaceContainment,
+    ): String {
+        val root = dataPath.trimEnd('/') + "/"
+        return if (containment.org == null) {
+            "${root}data/$namespace/"
+        } else {
+            "${root}org_id=${containment.org}/${containment.field}=${containment.value}/"
+        }
+    }
+
     /** The two segments after `<dataPath>/`, raw, or null when the path has fewer. */
     private fun head(
         dataPath: String,
@@ -304,24 +344,80 @@ object Containment {
     }
 
     /**
+     * Every `org_id=<org>/<field>=<value>/` the first two segments of [path]
+     * can spell, each segment raw or percent-decoded.
+     */
+    fun hiveHeads(
+        dataPath: String,
+        path: String,
+    ): Set<HiveHead> {
+        val (dir, seg) = head(dataPath, path) ?: return emptySet()
+        val orgs = setOfNotNull(dir, decode(dir)).mapNotNull { ORG_SEGMENT.matchEntire(it)?.groupValues?.get(1) }
+        if (orgs.isEmpty()) return emptySet()
+        val values =
+            setOfNotNull(seg, decode(seg)).mapNotNull { VALUE_SEGMENT.matchEntire(it) }
+                .mapNotNull { m -> m.groupValues[2].toLongOrNull()?.let { m.groupValues[1] to it } }
+        return orgs.flatMap { org -> values.map { (field, value) -> HiveHead(org, field, value) } }.toSet()
+    }
+
+    /** [path]'s first two segments read as `org_id=<org>/<field>=<value>/`, spelled literally, or null. */
+    fun literalHiveHead(
+        dataPath: String,
+        path: String,
+    ): HiveHead? {
+        val (dir, seg) = head(dataPath, path) ?: return null
+        val org = ORG_SEGMENT.matchEntire(dir)?.groupValues?.get(1) ?: return null
+        val m = VALUE_SEGMENT.matchEntire(seg) ?: return null
+        val value = m.groupValues[2].toLongOrNull() ?: return null
+        return HiveHead(org, m.groupValues[1], value)
+    }
+
+    /**
      * Why [path] may not be registered for a table in [namespace], or null
      * when it may. [contained] holds the live contained namespaces among
-     * every name the commit asked about.
+     * every name the commit asked about, and those holding the
+     * `(field, value)` of a hive head the paths spell.
      */
     fun violation(
         dataPath: String,
         namespace: String,
         path: String,
-        contained: Set<String>,
+        contained: Map<String, NamespaceContainment>,
     ): String? {
-        if (namespace in contained && rawSegment(dataPath, path) != namespace) {
-            return "namespace '$namespace' is contained: its files must live under " +
-                "${dataPath.trimEnd('/')}/data/$namespace/"
+        contained[namespace]?.let { own ->
+            val root = namespaceRoot(dataPath, namespace, own)
+            val inside =
+                if (own.org == null) {
+                    rawSegment(dataPath, path) == namespace
+                } else {
+                    path.startsWith(root) && path.length > root.length
+                }
+            if (!inside) return "namespace '$namespace' is contained: its files must live under $root"
         }
-        val foreign = segments(dataPath, path).firstOrNull { it in contained && it != namespace }
+        val foreign =
+            segments(dataPath, path).firstOrNull { it != namespace && contained[it]?.org == null && it in contained }
         if (foreign != null) {
             return "${dataPath.trimEnd('/')}/data/$foreign/ belongs to contained namespace '$foreign'"
         }
+        val heads = hiveHeads(dataPath, path)
+        if (heads.isNotEmpty()) {
+            val owner =
+                contained.entries.firstOrNull { (name, c) ->
+                    name != namespace && c.org != null && HiveHead(c.org, c.field, c.value) in heads
+                }
+            if (owner != null) {
+                return "${namespaceRoot(dataPath, owner.key, owner.value)} belongs to contained namespace " +
+                    "'${owner.key}'"
+            }
+        }
         return null
     }
+
+    /** [violation] for a backend that has no org marks: [contained] names plain containments. */
+    fun violation(
+        dataPath: String,
+        namespace: String,
+        path: String,
+        contained: Set<String>,
+    ): String? = violation(dataPath, namespace, path, contained.associateWith { NamespaceContainment("", 0) })
 }

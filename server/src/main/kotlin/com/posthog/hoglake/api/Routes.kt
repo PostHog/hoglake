@@ -314,7 +314,7 @@ fun Application.installApiRoutes(
                             catalogs.setNamespaceContainment(
                                 call.catalog(),
                                 call.namespace(),
-                                NamespaceContainment(req.field, req.value),
+                                NamespaceContainment(req.field, req.value, req.org),
                                 call.actorOrRefuse(null),
                             ).toDto(),
                         )

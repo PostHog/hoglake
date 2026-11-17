@@ -123,6 +123,18 @@ interface CatalogStore {
         namespace: String,
     ): NamespaceContainment?
 
+    /**
+     * The live namespace contained for `field = value`, with its
+     * containment, or null. An org-marked prefix names no namespace, so a
+     * scoped upload claim under one is attributed to its namespace by this.
+     * A backend without org marks has none to find.
+     */
+    fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? = null
+
     // ---- tables ----------------------------------------------------------
 
     fun createTable(

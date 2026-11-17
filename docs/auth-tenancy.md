@@ -708,6 +708,23 @@ is any lowercase identifier, the value a positive id, and the convention that
 - **Operators only.** Marking and clearing are operator routes; a tenant
   token cannot drop a contained namespace (403). Clearing requires the
   namespace to be empty.
+- **Org mark.** The body may also carry `"org": "<org>"` (`^[a-z0-9][a-z0-9-]{0,63}$`;
+  capability `org-marked-containment-v1`, Postgres catalogs only, 422 on
+  hoglite). It moves the namespace's prefix to
+  `<data_path>/org_id=<org>/<field>=<value>/`: its tables register files only
+  there (literally spelled), table creation's `write_path` is
+  `<prefix><uuid>/`, a scoped upload claim must spell the prefix, and a
+  compacted output lands in `<prefix><table>/`. `data/<n>/` is then no
+  prefix of its own. No other table registers a path whose first two
+  segments are `org_id=<org>` and `<field>=<value>`, compared raw and
+  percent-decoded per segment; the commit finds the owner by
+  `(field, value)` and compares its org, so the same value under another org
+  is not foreign. Marking scans for foreign files under the hive prefix as
+  it does under `data/<n>/`. The org mark is permanent: re-marking with
+  anything but the identical containment, and clearing, are `commit_conflict`;
+  drop the empty namespace instead. A table with the object-prefix layout in
+  an org-marked namespace is unsupported (compaction keeps its path, the
+  commit refuses it).
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
 
