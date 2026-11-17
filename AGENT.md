@@ -186,7 +186,7 @@ path-scoped per component, posthog-monorepo style:
 | `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | on a PR that changes the codec's source, `codec-version` (a new or `.dev` codec version). pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. millrace: uv sync, ruff, mypy, pytest, and the mutmut survivors gate. When `pyhoglake-variant-codec/**`, `uv.lock` or the codec's wheel workflow or scripts changed, `variant-codec-wheels.yml` too, for the manylinux wheels and the sdist. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake as a uv workspace member from the root `uv.lock`, so the root manifest, the lock, pyhoglake and every member's `pyproject.toml` must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `millrace-image.yml` | `millrace/**` `pyhoglake/**` `pyhoglake-variant-codec/**` root `pyproject.toml` `uv.lock` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) for amd64 and, under QEMU, arm64, and smokes each — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's, and the Rust VARIANT codec (cross-built by zig in a `$BUILDPLATFORM` stage) is installed, off by default (`PYHOGLAKE_VARIANT_CODEC=python`), and with `native` encodes as the Python codec does. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
-| `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the Kargo path for the customer hoglake instance, ADDITIVE to the gigahog CD below. A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
+| `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the gigahog CD entry point: it makes the images the Kargo Warehouse turns into Freight (CD paragraph below). A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
 | `python-live.yml` | reusable: server, Python checks, benchmark image, millrace image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark and millrace image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags (not `pyhoglake-variant-codec-v*`); PRs touching the workflow | `pyhoglake-checks.yml`, then the built wheel with its `variant-codec` extra in a clean env, the pinned codec from PyPI (`ci/variant_codec_smoke.py`), and the variant suites through it, so a pin not on PyPI fails every run; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `variant-codec-wheels.yml` | reusable: Python checks (manylinux only), codec publishing (every platform, on a tag or a manual run) | `pyhoglake-variant-codec`'s abi3 wheels (manylinux_2_28 and musllinux_1_2 x86_64/aarch64 through zig, macOS arm64/x86_64, Windows x86_64) and sdist, each installed into pyhoglake's locked env on its own platform (`ci/variant-codec-wheel.sh`: the parity smoke `ci/variant_codec_smoke.py`, then the variant suites except on Windows) and uploaded as an artifact |
@@ -230,30 +230,73 @@ them. Two rules fall out: a PR that adds a gate merges green on that
 gate, and no suite in this repo lives outside CI (a suite that only
 runs locally rots; the live suites did for four releases).
 
-CD is the charts state-file mechanism (same as duckgres, millpond,
-viaduck): a push to main touching `server/**` or `webui/**` runs the
-`deploy` job of `server.yml` / `webui.yml`, which builds a
-**multi-arch** image (build stages are pinned to `$BUILDPLATFORM`; the
-mw fleet runs Graviton), push `ghcr.io/posthog/hoglake-server|-webui`,
-and dispatch `commit_state_update` with the multi-arch MANIFEST digest
-(never a per-arch digest) to `state/gigahog-server.yaml` /
-`state/gigahog-webui.yaml`. Dev auto-promotes; prod goes through the
-charts `promote-to-prod.yml` workflow behind the
-`prod-promote-managed-warehouse` approval gate. Unlike millpond and
-duckgres (where CD runs in parallel with CI), the deploy job is GATED:
-it `needs` the test jobs, so a red main push never builds, publishes,
-or dispatches (decided 2026-09-11). A flaky-failure rerun that goes
-green deploys on the rerun — the procedure in
-millpond's AGENT.md applies verbatim with `app=gigahog-server` /
-`app=gigahog-webui`.
+CD is Kargo: project `gigahog` in PostHog/charts
+(`argocd/gigahog/kargo/manifests/`). Nothing in this repo dispatches to
+charts; the charts state files `state/gigahog-*.yaml` and the
+`promote-to-prod.yml` path no longer apply to gigahog. A main push
+becomes Freight in three steps. (1) `Server` and `Webui` run on every
+main push, and each completion starts `ecr-release.yml` (table above);
+its gate publishes once neither `server-checks` nor `webui-test`
+failed and at least one passed, so a red main push never publishes and
+a push touching neither tree publishes nothing. (2) `publish` builds
+BOTH **multi-arch** images (build stages are pinned to
+`$BUILDPLATFORM`; the mw fleet runs Graviton) and pushes both to the
+shared-services ECR (`hoglake-server`, `hoglake-webui`, us-east-1)
+under ONE tag, `r<UTC minute>-<sha6>`. (3) The Warehouse
+`gigahog-release` polls every 5m the two repositories in BOTH
+us-east-1 and eu-central-1 (`Lexical`, `discoveryLimit: 1`, tags
+`^r[0-9]{12}-[0-9a-f]{6}$`) plus the gigahog paths of charts `main`,
+and makes Freight only when all four images have the same tag, the
+same 40-hex `org.opencontainers.image.revision` whose first six
+characters are the tag suffix, `source` = this repository, and the
+same digest per image in both regions. This repo pushes only
+us-east-1; the eu-central-1 copies arrive outside it, and until they
+match there is no Freight. A charts commit to a watched path also
+makes new Freight (same images, new charts commit).
 
-The customer hoglake instance uses a second, separate path:
-`ecr-release.yml` (table above) publishes both images to ECR for a
-Kargo Warehouse in PostHog/charts. It does not replace or gate the
-ghcr push or the state-file dispatch. A change to the `deploy` jobs
-must keep the gigahog path working without it. Keep the `name:` fields
-`Server` and `Webui` and the job names `changes`, `server-checks` and
-`webui-test`: the ECR gate reads them by name.
+There are nine Stages, `gigahog-{server,webui,maintenance}-{dev,prod-us,prod-eu}`.
+Each promotion runs the `materialize-release-v3` ClusterPromotionTask:
+it renders `charts/posthog-app` into PostHog/k8s-rendered-manifests
+(`kargo/rendered/gigahog/<app>/<stage>`) with the Freight digest of the
+regional repository named by
+`shared/gigahog/kargo-image.<server|webui>.<region>.yaml`; the Argo CD
+Applications (`argocd/gigahog/application.*`) have automated sync off
+and name their Stage in `kargo.akuity.io/authorized-stage`.
+`gigahog-maintenance` has no image of its own: it runs the
+`hoglake-server` image with `apps/gigahog-maintenance/` values. dev and
+prod-us read us-east-1, prod-eu reads eu-central-1. The three dev
+Stages take Freight directly from the Warehouse and auto-promote the
+newest (`project-config.yaml`). The six prod Stages are manual and
+request only Freight that has passed the SAME app's dev Stage
+(`sources.stages: [gigahog-<app>-dev]`; server-prod needs server-dev,
+not webui-dev). Promote prod in the Kargo UI (project `gigahog`) or
+with `kargo promote --project gigahog --stage <stage> --freight <name>`,
+one Stage at a time: `gigahog-server-prod-us`, `gigahog-webui-prod-us`,
+`gigahog-maintenance-prod-us`, then the same three `-prod-eu`. Nothing
+enforces promoting the three from the same Freight;
+`argocd/gigahog/release-group.yaml` (platformctl) lists them as one
+group. The `gigahog-kargo-project` Application ignores drift on
+`autoPromotionEnabled`, so the live policy can differ from git: check
+the Kargo UI, not the file.
+
+A flaky-failure rerun: rerun the failed jobs of `Server` or `Webui`;
+the completed run starts `ecr-release.yml` again, the gate reads the
+latest attempt, the release publishes, and dev auto-promotes the new
+Freight. A rerun of `ecr-release.yml` reuses the commit's existing tag
+and pushes only a missing image. A commit that first publishes late
+gets a LATER minute in its tag than newer commits already published,
+so the Warehouse (`Lexical`, newest tag only) makes Freight from the
+OLDER commit and dev auto-promotes it. A manual dispatch on main
+releases the head of main, not an older commit.
+
+The `deploy` jobs of `server.yml` / `webui.yml` deploy nothing. Gated
+on `server-checks` / `webui-test`, they push multi-arch
+`ghcr.io/posthog/hoglake-server|-webui` (sha + `latest`) for test and
+benchmark consumers, and their builds fill the GHA cache scopes
+`server` / `webui` that `ecr-release.yml` reads (never writes). The ECR
+gate does not read them, so a GHCR failure does not block CD. Keep the
+`name:` fields `Server` and `Webui` and the job names `changes`,
+`server-checks` and `webui-test`: the ECR gate reads them by name.
 
 ### Versioning
 
@@ -1747,9 +1790,8 @@ ran on the local stack and what it showed.
   now true. (It would not take production down: the chart sets
   `maxUnavailable: 0`, so the old ReplicaSet keeps serving and the
   failure is a STALLED ROLLOUT plus a Degraded Application paging
-  `#alerts-managed-warehouse`, in dev only — prod is behind
-  `require_prod_approval` and the `prod-promote-managed-warehouse`
-  reviewer gate.) A positive value is refused because it is an operator
+  `#alerts-managed-warehouse`, in dev only — the prod Kargo Stages
+  are manual promotions of Freight that has passed dev.) A positive value is refused because it is an operator
   asking for invariant checks that no longer exist, and silence there
   would leave them believing a catalog is being scrubbed.
   `RemovedEnvConfigTest` pins both tiers; neither had a test before.
