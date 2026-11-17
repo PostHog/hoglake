@@ -861,26 +861,6 @@ class CommitService(
                 )
             }
         }
-        // 3c. A replacement never re-registers a path the catalog has recorded,
-        // live or ended. Paths are deterministic, so A ending Y and appending X,
-        // then B ending X and appending Y, would overwrite Y's bytes while
-        // snapshots before A still read Y: time travel would return wrong
-        // bytes, and cleanup of the ended row would hit a live reference.
-        if (resolvedEnds.isNotEmpty() && mergedAppends.isNotEmpty()) {
-            val reused =
-                h.createQuery(
-                    """
-                    SELECT path FROM hog_data_file
-                     WHERE catalog_id = :catalogId AND path = ANY(CAST(:paths AS text[]))
-                     LIMIT 1
-                    """,
-                )
-                    .bind("catalogId", catalogId)
-                    .bindArray("paths", String::class.java, mergedAppends.values.flatMap { f -> f.map { it.path } })
-                    .mapTo(String::class.java)
-                    .findFirst()
-            if (reused.isPresent) throw FileEnds.recordedPathRefusal(reused.get())
-        }
         val validatedAppends = resolvedAppends.map { validateFiles(it, read.columns[it.tableId].orEmpty()) }
         validateDeleteRegistrations(resolvedDeletes)
         // 4a. The object-prefix layout, on the SANITIZED stats, and after
@@ -898,6 +878,29 @@ class CommitService(
         resolvedDeletes.forEach {
                 d ->
             checkContainment(dataPath, d.namespace, d.table, d.files.map { it.path }, read.contained)
+        }
+        // 3c. A replacement never re-registers a path the catalog has recorded,
+        // live or ended. Paths are deterministic, so A ending Y and appending X,
+        // then B ending X and appending Y, would overwrite Y's bytes while
+        // snapshots before A still read Y: time travel would return wrong
+        // bytes, and cleanup of the ended row would hit a live reference.
+        // After containment (4a'), as on hoglite: an appended path outside the
+        // namespace it is registered in is refused first, so this answer never
+        // depends on what is recorded elsewhere in the catalog.
+        if (resolvedEnds.isNotEmpty() && mergedAppends.isNotEmpty()) {
+            val reused =
+                h.createQuery(
+                    """
+                    SELECT path FROM hog_data_file
+                     WHERE catalog_id = :catalogId AND path = ANY(CAST(:paths AS text[]))
+                     LIMIT 1
+                    """,
+                )
+                    .bind("catalogId", catalogId)
+                    .bindArray("paths", String::class.java, mergedAppends.values.flatMap { f -> f.map { it.path } })
+                    .mapTo(String::class.java)
+                    .findFirst()
+            if (reused.isPresent) throw FileEnds.recordedPathRefusal(reused.get())
         }
 
         // 4b. Upload claims, then the removal-queue collision check, and

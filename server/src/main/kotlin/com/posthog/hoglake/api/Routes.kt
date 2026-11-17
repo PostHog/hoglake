@@ -23,6 +23,7 @@ import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.MountReadService
+import com.posthog.hoglake.store.remoteSchemaRefusal
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Parameters
 import io.ktor.server.application.Application
@@ -185,6 +186,8 @@ fun Application.installApiRoutes(
                         is CatalogBinding.Local -> call.respond(binding.store.getCatalog(call.catalog()).toDto())
                         is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
                         is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
+                        // Unreachable: this path names no namespace.
+                        is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
                     }
                 }
                 delete {
@@ -223,23 +226,36 @@ fun Application.installApiRoutes(
                                     ).map { it.toDto() },
                                 )
                             is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
+                            // Unreachable: this path names no namespace.
+                            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
                             is CatalogBinding.Local -> {
                                 val catalogs = binding.store
                                 // A scoped caller sees only the contained
                                 // namespaces it may use (AuthPolicy.SCOPED_ROUTES);
                                 // everyone else, everything.
                                 val scoped = call.hoglakeAuth.callerOrNull?.takeIf { it.kind == Caller.Kind.SCOPED }
+                                // A remote schema's name is never a local
+                                // namespace: one of that name is left out, and
+                                // the schemas the token allows follow, from
+                                // configuration alone. No Host is asked, so its
+                                // outage cannot fail the listing.
                                 call.respond(
                                     catalogs.listNamespaces(
                                         catalog,
                                         call.longQuery("snapshot"),
                                         call.instantQuery("at_timestamp"),
                                     ).filter { ns ->
-                                        scoped == null ||
-                                            ns.containment?.let {
-                                                scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
-                                            } == true
-                                    }.map { it.toDto() },
+                                        !selector.isRemoteSchema(ns.name) &&
+                                            (
+                                                scoped == null ||
+                                                    ns.containment?.let {
+                                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
+                                                    } == true
+                                            )
+                                    }.map { it.toDto() } +
+                                        selector.visibleRemoteSchemas(call, catalog).map {
+                                            NamespaceDto(name = it, remote = true)
+                                        },
                                 )
                             }
                         }
@@ -270,6 +286,7 @@ fun Application.installApiRoutes(
                                     ).toDto(),
                                 )
                             is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
+                            is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -328,6 +345,7 @@ fun Application.installApiRoutes(
                                         ).map { it.toDto() },
                                     )
                                 is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
+                                is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
                                 is CatalogBinding.Local ->
                                     call.respond(
                                         binding.store.listTables(
@@ -370,6 +388,8 @@ fun Application.installApiRoutes(
                                         )
                                     is CatalogBinding.Remote ->
                                         binding.host.table(call, binding.name, call.namespace(), call.table())
+                                    is CatalogBinding.RemoteSchema ->
+                                        binding.host.schemaTable(call, binding, call.table())
                                     is CatalogBinding.Local ->
                                         call.respond(
                                             binding.store.getTable(
@@ -728,33 +748,43 @@ fun Application.installApiRoutes(
 
                 get("/consumers") {
                     val catalogs = selector.forCatalog(call, call.catalog())
+                    // An offset on a table of a namespace a remote schema
+                    // hides is not listed: its row would name the namespace.
                     call.respond(
-                        catalogs.listConsumers(call.catalog()).toConsumerListDto(),
+                        catalogs.listConsumers(call.catalog())
+                            .filterNot { it.namespace?.let(selector::isRemoteSchema) == true }
+                            .toConsumerListDto(),
                     )
                 }
 
                 route("/consumers/{consumer}/offsets") {
                     get {
                         val catalogs = selector.forCatalog(call, call.catalog())
+                        val hidden = selector.hiddenTables(catalogs, call.catalog())
                         call.respond(
                             catalogs.listOffsets(call.catalog(), call.consumer())
+                                .filterNot { it.tableUuid in hidden }
                                 .map { it.toDto() },
                         )
                     }
                     get("/{tableUuid}") {
                         val catalogs = selector.forCatalog(call, call.catalog())
-                        call.respond(
-                            catalogs.getOffset(
-                                call.catalog(),
-                                call.consumer(),
-                                call.uuidPath("tableUuid"),
-                            ).toDto(),
-                        )
+                        val tableUuid = call.uuidPath("tableUuid")
+                        call.refuseHiddenTable(selector, catalogs, tableUuid) {
+                            HoglakeException.NotFound(
+                                "no offset for consumer '${call.consumer()}' on table $tableUuid " +
+                                    "in catalog '${call.catalog()}'",
+                            )
+                        }
+                        call.respond(catalogs.getOffset(call.catalog(), call.consumer(), tableUuid).toDto())
                     }
                     put("/{tableUuid}") {
                         val catalogs = selector.forCatalog(call, call.catalog())
                         val tableUuid = call.uuidPath("tableUuid")
                         val req = call.receive<CommitOffsetRequestDto>()
+                        call.refuseHiddenTable(selector, catalogs, tableUuid) {
+                            HoglakeException.Validation("unknown table_uuid $tableUuid in catalog '${call.catalog()}'")
+                        }
                         call.respond(
                             catalogs.commitOffset(
                                 call.catalog(),
@@ -767,6 +797,29 @@ fun Application.installApiRoutes(
                 }
             }
         }
+    }
+}
+
+/**
+ * Refuse a request that addresses, by UUID alone, a table of a namespace a
+ * remote schema hides, as a request naming that namespace is refused
+ * ([CatalogStoreSelector.refuseRemoteSchemas]). The request named no
+ * namespace, so where that answer is "no such namespace" the caller gets
+ * [unknown] instead: what this route answers for a UUID the catalog does
+ * not have, in the stores' own words. A no-op, with nothing read, on a
+ * server that configures no remote schema.
+ */
+private fun ApplicationCall.refuseHiddenTable(
+    selector: CatalogStoreSelector,
+    catalogs: CatalogStore,
+    tableUuid: UUID,
+    unknown: () -> HoglakeException,
+) {
+    val namespace = selector.hiddenTables(catalogs, catalog())[tableUuid] ?: return
+    try {
+        selector.refuseRemoteSchemas(this, catalog(), listOf(namespace))
+    } catch (_: HoglakeException.NotFound) {
+        throw unknown()
     }
 }
 
@@ -794,10 +847,15 @@ fun Application.installScanRoutes(
             selector.remote(call, call.catalog())?.let { remote ->
                 return@get remote.host.scan(call, remote.name, call.namespace(), call.table())
             }
+            // A remote schema's scan is relayed the same way.
+            selector.remoteSchema(call, call.catalog())?.let { schema ->
+                return@get schema.host.schemaScan(call, schema, call.table())
+            }
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
             val files =
                 when (val binding = selector.resolve(call, call.catalog())) {
-                    is CatalogBinding.Remote -> error("a remote binding is relayed before the scan is parsed")
+                    is CatalogBinding.Remote, is CatalogBinding.RemoteSchema ->
+                        error("a remote binding is relayed before the scan is parsed")
                     is CatalogBinding.Local ->
                         binding.store.planScan(
                             call.catalog(),
