@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionFieldDef
@@ -149,8 +150,9 @@ class TableCreationService(
 
     /**
      * Where a creation's files go: `<data_path>/data/<uuid>/`, or, in a
-     * contained namespace (V33), `<data_path>/data/<namespace>/<uuid>/`,
-     * the only place its files may be registered. A namespace marked
+     * contained namespace (V33), `<uuid>/` under the namespace's prefix
+     * ([Containment.namespaceRoot]), the only place its files may be
+     * registered. A namespace marked
      * after prepare fails the publish with `containment_violation`, and
      * the writer re-prepares.
      */
@@ -160,7 +162,7 @@ class TableCreationService(
         uuid: UUID,
     ): String =
         if (ns.containment != null) {
-            dataPath.trimEnd('/') + "/data/${ns.name}/$uuid/"
+            Containment.namespaceRoot(dataPath, ns.name, ns.containment) + "$uuid/"
         } else {
             dataPath.trimEnd('/') + "/data/$uuid/"
         }

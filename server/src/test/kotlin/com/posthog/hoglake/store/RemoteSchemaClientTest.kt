@@ -39,6 +39,7 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.RequestId
 import com.posthog.hoglake.service.HydratorMaintenanceBackend
 import com.posthog.hoglake.service.PartitionStatsBackend
+import com.posthog.hoglake.service.TeamNamespaces
 import com.posthog.hoglake.wireObjectMapper
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
@@ -372,7 +373,7 @@ class RemoteSchemaClientTest {
                 matches.map {
                     val at = (it as? MountMatch.Namespace)?.let { schema -> origins[schema.name] } ?: origin
                     // The stub Hosts speak http, which a remote schema's entry must opt in to.
-                    val http = it is MountMatch.Namespace
+                    val http = it is MountMatch.RemoteSchemaMatch
                     MountHost(
                         UUID.randomUUID(),
                         it,
@@ -1313,6 +1314,71 @@ class RemoteSchemaClientTest {
         }
     }
 
+    private val family = listOf<MountMatch>(MountMatch.NamespaceFamily("team"))
+
+    private fun team(
+        name: String,
+        vararg tail: String,
+    ) = "/v1/catalogs/lake/namespaces/$name" + tail.joinToString("") { "/$it" }
+
+    private fun teamRoutes(name: String) =
+        listOf(team(name), team(name, "tables"), team(name, "tables", "events"), team(name, "tables", "events", "scan"))
+
+    private fun familyToken(
+        prd: String = """{"team_id":{"42":"write","7":"read"}}""",
+        schemas: String? = """{"team":["read"]}""",
+    ): String =
+        TestTokens.mint(
+            pair,
+            TestTokens.scopedClaims(
+                prd = prd,
+                catalogs = """{"lake":["read"]}""",
+                extra = schemas?.let { TestTokens.sessionProfile("lake", it) } ?: "",
+            ),
+        )
+
+    private fun teamNamed() =
+        calls.filter { (_, args) -> args.any { (it as? String)?.let(TeamNamespaces::hasShape) == true } }
+
+    @Test
+    fun `the team family relays the team schemas the caller's prd holds and no other`() {
+        StubHost().use { host ->
+            client(host, matches = family) {
+                val token = familyToken()
+                for (name in listOf("team_42", "team_7")) {
+                    for (path in teamRoutes(name)) {
+                        assertThat(get(path, token).status).describedAs(path).isEqualTo(HttpStatusCode.OK)
+                    }
+                }
+                assertThat(host.seen.map { it.rawPath }).isEqualTo(teamRoutes("team_42") + teamRoutes("team_7"))
+                for (seen in host.seen) assertThat(seen.headers["authorization"]).containsExactly("Bearer $token")
+                host.seen.clear()
+
+                // A team the family entry is there for but the prd does not hold is a missing namespace, unsent.
+                for (path in teamRoutes("team_43")) {
+                    val response = get(path, token)
+                    assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                    assertThat(response.bodyAsText()).contains("namespace 'team_43' in catalog 'lake'")
+                }
+                // No family entry, no schema: the prd alone grants nothing.
+                for (path in teamRoutes("team_42")) {
+                    val response = get(path, familyToken(schemas = null))
+                    assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                    val other = get(path, familyToken(schemas = """{"posthog":["read"]}"""))
+                    assertThat(other.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                }
+                // A tenant and an operator hold no remote schema at all.
+                for (path in teamRoutes("team_42")) {
+                    for (who in listOf(tenant(), tenantSession(), operator())) {
+                        assertThat(get(path, who).status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                    }
+                }
+                assertThat(host.seen).isEmpty()
+            }
+            assertThat(teamNamed()).isEmpty()
+        }
+    }
+
     @Test
     fun `an aliased answer that is not one object naming the host's schema is refused whole`() {
         StubHost().use { host ->
@@ -1379,6 +1445,32 @@ class RemoteSchemaClientTest {
                     HttpStatusCode.BadGateway,
                     HttpStatusCode.OK,
                 )
+            }
+        }
+    }
+
+    @Test
+    fun `a wildcard prd holds every team's schema, and a per-name entry still relays its own`() {
+        StubHost().use { host ->
+            client(host, matches = family) {
+                val star = familyToken(prd = """{"team_id":{"*":"read"}}""")
+                for (name in listOf("team_43", "team_9000000000")) {
+                    for (path in teamRoutes(name)) {
+                        assertThat(get(path, star).status).describedAs(path).isEqualTo(HttpStatusCode.OK)
+                    }
+                }
+                assertThat(host.seen).hasSize(8)
+                host.seen.clear()
+
+                // The #628 form: the named schema is relayed to a token whose prd names other teams.
+                val named = familyToken(schemas = """{"team_43":["read"]}""")
+                for (path in teamRoutes("team_43")) {
+                    assertThat(get(path, named).status).describedAs(path).isEqualTo(HttpStatusCode.OK)
+                }
+                for (path in teamRoutes("team_44")) {
+                    assertThat(get(path, named).status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                }
+                assertThat(host.seen).hasSize(4)
             }
         }
     }
@@ -1461,6 +1553,40 @@ class RemoteSchemaClientTest {
     }
 
     @Test
+    fun `only the canonical team name is relayed, and a variant is neither local nor sent`() {
+        StubHost().use { host ->
+            client(host, matches = family) {
+                val tokens =
+                    listOf(
+                        familyToken(prd = """{"team_id":{"*":"read"}}"""),
+                        familyToken(
+                            prd = """{"team_id":{"*":"read"}}""",
+                            schemas = """{"team":["read"],"team_007":["read"],"TEAM_42":["read"]}""",
+                        ),
+                        tenant(),
+                        operator(),
+                    )
+                val names =
+                    listOf("team_007", "TEAM_42", "Team_7", "team_00", "team_99999999999999999999")
+                for (name in names) {
+                    for (token in tokens) {
+                        for (path in teamRoutes(name)) {
+                            val response = get(path, token)
+                            assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                            assertThat(response.bodyAsText()).contains("namespace '$name' in catalog 'lake'")
+                        }
+                    }
+                }
+                // Not a team's name at all: an ordinary local namespace.
+                for (name in listOf("team_x", "teams", "team_", "team7")) {
+                    assertThat(get(team(name), operator()).status).describedAs(name).isEqualTo(HttpStatusCode.OK)
+                }
+            }
+            assertThat(host.seen).isEmpty()
+        }
+    }
+
+    @Test
     fun `an aliased answer is rewritten as it streams, at any size, and its numbers keep their text`() {
         // Numbers a re-encoding would change. Compact and unescaped, so only the one field may differ.
         val numbers = """"a":1e10,"b":-0.0,"c":-0,"d":1.10,"e":1E-7,"f":123456789012345678901234567890,"g":2.5e+3"""
@@ -1480,6 +1606,42 @@ class RemoteSchemaClientTest {
                 assertThat(large.body())
                     .isEqualTo(table.replaceFirst(""""namespace":"shared"""", """"namespace":"posthog""""))
             }
+        }
+    }
+
+    @Test
+    fun `the listing shows the explicit teams of a family holder, in numeric order, and none for a wildcard`() {
+        StubHost().use { host ->
+            client(host, matches = family) {
+                suspend fun names(token: String) =
+                    mapper.readTree(get("/v1/catalogs/lake/namespaces", token).bodyAsText()).map { it["name"].asText() }
+
+                // `team_7` is a local namespace here too: it is hidden, and the remote one takes its place.
+                val held = familyToken(prd = """{"team_id":{"100":"read","9":"read","42":"write"}}""")
+                assertThat(names(held)).containsExactly("posthog", "PostHog", "team_9", "team_42", "team_100")
+                val entries = mapper.readTree(get("/v1/catalogs/lake/namespaces", held).bodyAsText())
+                assertThat(mapper.writeValueAsString(entries.last())).isEqualTo("""{"name":"team_100","remote":true}""")
+
+                // `*` names no id: nothing is listed, and the schemas are still readable.
+                assertThat(
+                    names(familyToken(prd = """{"team_id":{"*":"read"}}""")),
+                ).containsExactly("posthog", "PostHog")
+                // Without the family entry, or by name alone, no team is listed.
+                assertThat(names(familyToken(schemas = null))).containsExactly("posthog", "PostHog")
+                assertThat(
+                    names(familyToken(schemas = """{"team_42":["read"]}""")),
+                ).containsExactly("posthog", "PostHog")
+                for (token in listOf(tenant(), operator())) {
+                    assertThat(names(token)).containsExactly("posthog", "PostHog", "other")
+                }
+            }
+            // A server with no team family entry lists no team schema, whatever the token holds.
+            client(host, matches = listOf(MountMatch.Namespace("posthog"))) {
+                val held = familyToken(schemas = """{"team":["read"],"posthog":["read"]}""")
+                val listed = mapper.readTree(get("/v1/catalogs/lake/namespaces", held).bodyAsText())
+                assertThat(listed.map { it["name"].asText() }).containsExactly("team_7", "posthog")
+            }
+            assertThat(host.seen).isEmpty()
         }
     }
 
@@ -1559,6 +1721,81 @@ class RemoteSchemaClientTest {
             }
             assertThat(host.seen).hasSize(5)
             assertThat(touched()).isEmpty()
+        }
+    }
+
+    @Test
+    fun `a commit and a namespace parameter name a team schema the way they name a named one`() {
+        StubHost().use { host ->
+            client(host, matches = family) {
+                val write = """{"lake":["write"]}"""
+
+                fun commit(name: String) =
+                    """{"appends":[{"namespace":"data_1","table":"t","files":[]},""" +
+                        """{"namespace":"$name","table":"events","files":[]}],""" +
+                        """"idempotency_key":"00000000-0000-0000-0000-000000000001","read_snapshot":1}"""
+
+                fun writer(schemas: String?) =
+                    TestTokens.mint(
+                        pair,
+                        TestTokens.scopedClaims(
+                            prd = """{"team_id":{"42":"write"}}""",
+                            catalogs = write,
+                            extra = schemas?.let { TestTokens.sessionProfile("lake", it) } ?: "",
+                        ),
+                    )
+                // A holder is told the schema is read-only; anyone else, and every variant, gets the missing namespace.
+                val held =
+                    send(
+                        HttpMethod.Post,
+                        "/v1/catalogs/lake/commit",
+                        writer("""{"team":["read"]}"""),
+                        commit("team_42"),
+                    )
+                assertThat(held.status).isEqualTo(HttpStatusCode.Forbidden)
+                assertThat(code(held.bodyAsText())).isEqualTo("read_only_catalog")
+                val others =
+                    listOf(
+                        writer("""{"team":["read"]}""") to "team_43",
+                        writer("""{"team":["read"]}""") to "TEAM_42",
+                        writer("""{"team":["read"]}""") to "team_042",
+                        writer(null) to "team_42",
+                        tenant() to "team_42",
+                        operator() to "team_5",
+                    )
+                for ((token, name) in others) {
+                    val response = send(HttpMethod.Post, "/v1/catalogs/lake/commit", token, commit(name))
+                    assertThat(response.status).describedAs(name).isEqualTo(HttpStatusCode.NotFound)
+                    assertThat(response.bodyAsText()).contains("in catalog 'lake'")
+                }
+                for (name in listOf("team_5", "TEAM_5", "team_005")) {
+                    val stats = get("/v1/catalogs/lake/stats/partitions?namespace=$name", operator())
+                    assertThat(stats.status).describedAs(name).isEqualTo(HttpStatusCode.NotFound)
+                }
+                // The catalog-wide report leaves the team schemas out; a name of another shape stays.
+                val report = mapper.readTree(get("/v1/catalogs/lake/stats/partitions", operator()).bodyAsText())
+                assertThat(report["partitions"].map { it["namespace"].asText() }).containsExactly("posthog", "PostHog")
+            }
+            assertThat(host.seen).isEmpty()
+            assertThat(calls.map { it.first }).doesNotContain("commit")
+        }
+    }
+
+    @Test
+    fun `proxied requests and refusals for a team schema are labelled by the family, never by the team`() {
+        StubHost().use { host ->
+            val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
+            client(host, matches = family) {
+                get(team("team_42"), familyToken())
+                get(team("team_7"), familyToken())
+                get(team("team_43"), familyToken())
+                get(team("TEAM_42"), familyToken())
+                send(HttpMethod.Post, team("team_42", "tables"), familyToken())
+                get(team("team_42", "tables", "events", "files"), familyToken())
+            }
+            val mountMeters = registry.meters.filter { it.id.name.startsWith("hoglake_mount_") }
+            assertThat(mountMeters.map { it.id.getTag("catalog") }.toSet()).containsExactly("team_*")
+            assertThat(registry.find("hoglake_mount_proxy_requests_total").counters().single().count()).isEqualTo(2.0)
         }
     }
 }

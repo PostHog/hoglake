@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.StatsSanity
@@ -339,8 +340,15 @@ class CommitService(
         validatePathsUnderDataPath(dataPath, request)
         // Containment (V33). Its own statement: table creation does not run
         // the commit's READ_SQL. The caller holds the catalog lock.
-        val names = containmentNames(dataPath, listOf(namespace), files.map { it.path })
-        checkContainment(dataPath, namespace, table, files.map { it.path }, containedAmong(h, catalogId, names))
+        val paths = files.map { it.path }
+        val heads = hiveHeads(dataPath, paths)
+        checkContainment(
+            dataPath,
+            namespace,
+            table,
+            paths,
+            containedAmong(h, catalogId, containmentNames(dataPath, listOf(namespace), paths), heads),
+        )
         // No object-prefix layout, and none to read: the table was created
         // in THIS transaction, a creation definition cannot carry the
         // option, and replacing a table that has it is refused at prepare
@@ -572,6 +580,12 @@ class CommitService(
         // and allocator, the conflict rows, the upload claims (locked), the
         // removal queue's claims on these paths, and every DV target and its
         // live vector. See CommitTail for why one snapshot serves them all.
+        val registeredPaths =
+            (
+                mergedAppends.values.flatMap { files -> files.map { it.path } } +
+                    mergedDeletes.values.flatMap { files -> files.map { it.path } }
+            ).distinct()
+        val registeredHeads = hiveHeads(dataPath, registeredPaths)
         val read =
             CommitTail.read(
                 h,
@@ -580,22 +594,14 @@ class CommitService(
                     idempotencyKey = req.idempotencyKey,
                     tables = tableKeys,
                     readSnapshot = req.readSnapshot,
-                    paths =
-                        (
-                            mergedAppends.values.flatMap { files -> files.map { it.path } } +
-                                mergedDeletes.values.flatMap { files -> files.map { it.path } }
-                        ).distinct(),
+                    paths = registeredPaths,
                     targetIds =
                         mergedDeletes.values.flatMap { files ->
                             files.filter { it.dataFilePath == null }.map { it.dataFileId }
                         }.distinct(),
-                    containmentNames =
-                        containmentNames(
-                            dataPath,
-                            tableKeys.map { it.namespace },
-                            mergedAppends.values.flatMap { files -> files.map { it.path } } +
-                                mergedDeletes.values.flatMap { files -> files.map { it.path } },
-                        ),
+                    containmentNames = containmentNames(dataPath, tableKeys.map { it.namespace }, registeredPaths),
+                    hiveFields = registeredHeads.map { it.field },
+                    hiveValues = registeredHeads.map { it.value },
                 ),
             )
 
@@ -1329,20 +1335,47 @@ class CommitService(
         paths: List<String>,
     ): List<String> = (namespaces + paths.flatMap { Containment.segments(dataPath, it) }).distinct()
 
-    /** Which of [names] are live contained namespaces; READ_SQL's `contained` CTE, alone. */
+    /** The distinct `(field, value)` pairs of every hive head [paths] can spell. */
+    private fun hiveHeads(
+        dataPath: String,
+        paths: List<String>,
+    ): List<Containment.HiveHead> =
+        paths.flatMap { Containment.hiveHeads(dataPath, it) }.distinctBy { it.field to it.value }
+
+    /**
+     * Which of [names] are live contained namespaces, and which namespaces
+     * hold a `(field, value)` of [heads]; READ_SQL's `contained` CTE, alone.
+     */
     private fun containedAmong(
         h: Handle,
         catalogId: Long,
         names: List<String>,
-    ): Set<String> =
+        heads: List<Containment.HiveHead>,
+    ): Map<String, NamespaceContainment> =
         h.createQuery(
             """
-            SELECT name FROM hog_namespace
-             WHERE catalog_id = :catalogId AND NOT dropped AND contained_field IS NOT NULL
-               AND name = ANY(CAST(:names AS text[]))
+            SELECT n.name, n.contained_field, n.contained_value, n.contained_org
+              FROM hog_namespace n
+             WHERE n.catalog_id = :catalogId AND NOT n.dropped AND n.contained_field IS NOT NULL
+               AND n.name = ANY(CAST(:names AS text[]))
+            UNION
+            SELECT n.name, n.contained_field, n.contained_value, n.contained_org
+              FROM unnest(CAST(:hiveFields AS text[]), CAST(:hiveValues AS bigint[])) AS h(field, value)
+              JOIN hog_namespace n
+                ON n.catalog_id = :catalogId AND n.contained_field = h.field AND n.contained_value = h.value
+             WHERE NOT n.dropped
             """,
         ).bind("catalogId", catalogId).bindArray("names", String::class.java, names)
-            .mapTo(String::class.java).set()
+            .bindArray("hiveFields", String::class.java, heads.map { it.field })
+            .bindArray("hiveValues", Long::class.javaObjectType, heads.map { it.value })
+            .map { rs, _ ->
+                rs.getString("name") to
+                    NamespaceContainment(
+                        rs.getString("contained_field"),
+                        rs.getLong("contained_value"),
+                        rs.getString("contained_org"),
+                    )
+            }.list().toMap()
 
     /**
      * Refuse any of [paths] that containment (V33) does not admit for a
@@ -1355,7 +1388,7 @@ class CommitService(
         namespace: String,
         table: String,
         paths: List<String>,
-        contained: Set<String>,
+        contained: Map<String, NamespaceContainment>,
     ) {
         if (contained.isEmpty()) return
         val refused =

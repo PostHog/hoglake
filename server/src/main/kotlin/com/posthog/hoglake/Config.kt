@@ -5,12 +5,16 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
+import com.posthog.hoglake.service.TeamNamespaces
 import com.posthog.hoglake.storage.BrokerUrls
 import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.ServedFamily
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -30,6 +34,8 @@ class SecretString(
 
     override fun hashCode(): Int = value.hashCode()
 }
+
+private val servedNamespacesLog = KotlinLogging.logger {}
 
 /** Process configuration, with an optional backend allowlist file. */
 data class Config(
@@ -98,7 +104,14 @@ data class Config(
      * {"type": "catalog", "name": NAME} (one mount name) or
      * {"type": "namespace", "name": NAME} (a remote schema: the namespace
      * NAME of every catalog this server holds itself, read-only, relayed to
-     * the host; NAME is then reserved as [reservedNamespaceNames] are).
+     * the host; NAME is then reserved as [reservedNamespaceNames] are) or
+     * {"type": "namespace_family", "family": "team"} (every canonical
+     * `team_<id>` namespace, relayed as a `namespace` entry is; every
+     * `team_<digits>` name, in any case and with any leading zeros, is then
+     * reserved, and a `namespace` entry of such a name is refused as an
+     * overlap). The caller reaches a team schema through the `team` entry of
+     * its `remote_schemas` claim and a `team_id` in its `prd`. Only the
+     * family `team` exists.
      * `kind` is what the host speaks (only `hoglake`), `auth` how this
      * server authenticates to it (only `forward`: the caller's bearer
      * token, unchanged). Optional
@@ -127,6 +140,25 @@ data class Config(
      * the session profile can name a remote schema.
      */
     val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
+    /**
+     * HOGLAKE_SERVED_NAMESPACES_FILE: this server is a Host that serves
+     * namespaces to a Client's relayed readers (docs/auth-tenancy.md §6.5d).
+     * A JSON object with exactly a `families` array of
+     * `{"family": "team", "source_catalog": "<catalog>", "predicate_field":
+     * "<field>"}`: a read of a canonical `team_<id>` under a catalog this
+     * server does not hold is answered from the namespace of the same name in
+     * the source catalog, read-only, when that namespace is marked
+     * `predicate_field = <id>` for the caller's org and a scoped
+     * session-profile caller of that org holds the team. `predicate_field`
+     * must be one of [authPredicateFields]. Unknown keys, a second entry for
+     * a family, and the former `namespaces` list are refused. Empty (the
+     * default): nothing is served. Refused at boot under
+     * `HOGLAKE_AUTH_MODE=off`, without [authSessionProfile] `on` or
+     * [authPredicateFields], with
+     * [mountHostsFile] (a server is a Host or a Client), or when PostgreSQL
+     * is not the default backend.
+     */
+    val servedNamespacesFile: String = env("HOGLAKE_SERVED_NAMESPACES_FILE", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -435,6 +467,14 @@ data class Config(
      * schema its Trino connector serves from the org's events mount.
      */
     val reservedNamespaceNames: Set<String> = nameList(env("HOGLAKE_RESERVED_NAMESPACES", "")),
+    /**
+     * Catalogs, comma-separated, where only an operator creates a namespace
+     * named `team_<digits>` (any case, any leading zeros). Empty, the
+     * default, lists none. A per-team scoped writer reaches such a
+     * namespace through an operator's org mark; this keeps a tenant from
+     * creating the name first.
+     */
+    val operatorTeamNamespaceCatalogs: Set<String> = nameList(env("HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS", "")),
     /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
@@ -1503,13 +1543,22 @@ data class Config(
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
 
+    /** The families of [servedNamespacesFile]; empty when this server serves none. */
+    val servedFamilies: List<ServedFamily> = readServedFamilies(servedNamespacesFile)
+
     /**
      * [reservedNamespaceNames], checked at boot: each must be a valid
      * namespace name. Every remote schema [mountHosts] configures is
      * reserved with them: its name always means the remote schema.
      */
     val reservedNamespaces: ReservedNamespaces =
-        ReservedNamespaces(reservedNamespaceNames + mountHosts.mapNotNull { (it.match as? MountMatch.Namespace)?.name })
+        ReservedNamespaces(
+            reservedNamespaceNames + mountHosts.mapNotNull { (it.match as? MountMatch.Namespace)?.name },
+            teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
+        )
+
+    /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
+    val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
 
     /** The storage credential provider kinds `HOGLAKE_STORAGE_PROVIDER` names. */
     enum class StorageProviderKind(val wire: String) {
@@ -1620,10 +1669,59 @@ data class Config(
                 "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS (the hosts' own): a mount serves " +
                     "only scoped tokens, and none verifies without them"
             }
+            require(
+                mountHosts.none { it.match is MountMatch.NamespaceFamily } ||
+                    TeamNamespaces.PREDICATE_FIELD in authPredicateFields.split(',').map { it.trim() },
+            ) {
+                "a namespace_family entry in HOGLAKE_MOUNT_HOSTS_FILE requires " +
+                    "'${TeamNamespaces.PREDICATE_FIELD}' in HOGLAKE_AUTH_PREDICATE_FIELDS: the team family is held " +
+                    "through that field"
+            }
             // Off, no token can carry `remote_schemas`: the name would be reserved and never readable.
-            require(authSessionProfileEnabled || mountHosts.none { it.match is MountMatch.Namespace }) {
+            require(authSessionProfileEnabled || mountHosts.none { it.match is MountMatch.RemoteSchemaMatch }) {
                 "a namespace entry in HOGLAKE_MOUNT_HOSTS_FILE (a remote schema) requires " +
                     "HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying the session profile can read one"
+            }
+        }
+        if (servedFamilies.isNotEmpty()) {
+            require(mountHosts.isEmpty()) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE (this server is a Host) cannot be set with " +
+                    "HOGLAKE_MOUNT_HOSTS_FILE (this server is a Client): a server is one or the other"
+            }
+            require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
+                    "a served namespace serves only verified callers"
+            }
+            if (authMode.trim().lowercase() == "warn") {
+                servedNamespacesLog.warn {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE is set with HOGLAKE_AUTH_MODE=warn: under warn, anonymous and " +
+                        "tenant callers are let through on /v1/catalogs/<source_catalog>/, so every team's imports " +
+                        "in the source catalog are readable without a scoped token. Run a Host with enforce."
+                }
+            }
+            require(authSessionProfileEnabled) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying " +
+                    "the session profile can name a served namespace"
+            }
+            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS: a served namespace is " +
+                    "read only through a scoped token's predicate"
+            }
+            val predicateFields = authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            servedFamilies.forEach { family ->
+                require(family.predicateField == TeamNamespaces.PREDICATE_FIELD) {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE predicate_field for the '${family.family}' family must be " +
+                        "'${TeamNamespaces.PREDICATE_FIELD}', got '${family.predicateField}': a token's team " +
+                        "schema is held through that field"
+                }
+                require(family.predicateField in predicateFields) {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE predicate_field '${family.predicateField}' is not one of " +
+                        "HOGLAKE_AUTH_PREDICATE_FIELDS"
+                }
+            }
+            require(defaultBackend == "postgres") {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_DEFAULT_BACKEND=postgres: the source catalog is " +
+                    "read from this process's PostgreSQL"
             }
         }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
@@ -2219,6 +2317,45 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
 }
 
 /**
+ * Parse HOGLAKE_SERVED_NAMESPACES_FILE, as strictly as [readMountHosts] parses
+ * its file: an unknown key or a second entry for a family is refused, and the
+ * per-name `namespaces` list it once took is refused by name.
+ */
+private fun readServedFamilies(file: String): List<ServedFamily> {
+    if (file.isBlank()) return emptyList()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root == null || !root.isObject || !root.has("namespaces")) {
+        "HOGLAKE_SERVED_NAMESPACES_FILE no longer takes a namespaces list: serve the team schemas with " +
+            """{"families":[{"family":"team","source_catalog":"...","predicate_field":"team_id"}]}"""
+    }
+    require(root != null && root.isObject && root.properties().map { it.key }.toSet() == setOf("families")) {
+        "HOGLAKE_SERVED_NAMESPACES_FILE must contain only a families array"
+    }
+    val entries = root.get("families")
+    require(entries.isArray) { "families must be an array" }
+    val result = mutableListOf<ServedFamily>()
+    for (entry in entries) {
+        require(
+            entry.isObject && entry.properties().map { it.key }.toSet() ==
+                setOf("family", "source_catalog", "predicate_field"),
+        ) {
+            "a served family entry is an object with exactly a family, a source_catalog and a predicate_field"
+        }
+
+        fun text(key: String): String {
+            val value = entry.get(key)
+            require(value != null && value.isTextual) { "a served family requires a string $key" }
+            return value.asText()
+        }
+        val served = ServedFamily(text("family"), text("source_catalog"), text("predicate_field"))
+        require(result.none { it.family == served.family }) { "duplicate served family '${served.family}'" }
+        result += served
+    }
+    return result
+}
+
+/**
  * Parse HOGLAKE_MOUNT_HOSTS_FILE, as strictly as [readBackends] parses its
  * file: an unknown key, kind, auth mode or matcher is refused, so a host
  * this server cannot serve correctly never boots half-understood.
@@ -2288,13 +2425,19 @@ private fun readMountHosts(file: String): List<MountHost> {
                     }
                     MountMatch.Namespace(text(matcher, "name"))
                 }
+                "namespace_family" -> {
+                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "family")) {
+                        "a namespace_family match takes exactly a family"
+                    }
+                    MountMatch.NamespaceFamily(text(matcher, "family"))
+                }
                 else ->
                     throw IllegalArgumentException(
-                        "mount host match type must be events, catalog or namespace, got '$type'",
+                        "mount host match type must be events, catalog, namespace or namespace_family, got '$type'",
                     )
             }
         // Not a general switch: the key itself is refused where it would mean nothing.
-        require(insecure == null || match is MountMatch.Namespace) {
+        require(insecure == null || match is MountMatch.RemoteSchemaMatch) {
             "allow_insecure_http is only for a mount host that matches a namespace"
         }
         val kindText = text(entry, "kind")

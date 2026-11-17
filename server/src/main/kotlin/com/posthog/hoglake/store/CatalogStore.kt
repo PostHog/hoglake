@@ -74,11 +74,17 @@ interface CatalogStore {
 
     // ---- namespaces ------------------------------------------------------
 
+    /**
+     * A non-null [containment] creates the namespace already marked, in the one
+     * transaction: it is never visible unmarked, and a refused mark creates
+     * nothing. Operator-only: the route refuses other callers.
+     */
     fun createNamespace(
         catalog: String,
         name: String,
         author: String? = null,
         message: String? = null,
+        containment: NamespaceContainment? = null,
     ): NamespaceInfo
 
     fun listNamespaces(
@@ -122,6 +128,18 @@ interface CatalogStore {
         catalog: String,
         namespace: String,
     ): NamespaceContainment?
+
+    /**
+     * The live namespace contained for `field = value`, with its
+     * containment, or null. An org-marked prefix names no namespace, so a
+     * scoped upload claim under one is attributed to its namespace by this.
+     * A backend without org marks has none to find.
+     */
+    fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? = null
 
     // ---- tables ----------------------------------------------------------
 

@@ -25,6 +25,7 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
     private val db =
         PgTestSupport.freshDatabaseAt("31", productionSession = true).also {
             PgTestSupport.applyMigrationFile(it, "V33__namespace_containment.sql")
+            PgTestSupport.applyMigrationFile(it, "V37__namespace_containment_org.sql")
         }
     private val f = PartitionLookupFixture(db)
     private val neighbour = PartitionLookupFixture(db)
