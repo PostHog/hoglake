@@ -51,7 +51,8 @@ sealed interface MountMatch {
      * for this namespace go to the host ([MountHostResolver.remoteSchemas]).
      * [covers] folds ASCII case as the reserved-name check does
      * ([ReservedNamespaces]), so no case variant of the name is a local
-     * namespace; only the exact [name] is relayed.
+     * namespace; only the exact [name] is relayed. [name] is the local
+     * name; the host may know the schema by another ([MountHost.remoteName]).
      */
     data class Namespace(
         val name: String,
@@ -102,6 +103,14 @@ data class MountHost(
      * it without transport encryption.
      */
     val allowInsecureHttp: Boolean = false,
+    /**
+     * `remote_name`, for a [MountMatch.Namespace] entry only: the schema's
+     * name on the host, when it is not the local name (an alias). The
+     * relayed path and the token check use it; the reserved name, the
+     * hidden local namespace and every answer to the caller use the local
+     * name. Null: the same name on both sides.
+     */
+    val remoteName: String? = null,
 ) {
     /** What the host speaks. Each kind needs its own reader; only a hoglake's exists. */
     enum class Kind(val wire: String) {
@@ -133,6 +142,12 @@ data class MountHost(
         require(match !is MountMatch.Namespace || origin.scheme == "https" || allowInsecureHttp) {
             "a mount host that matches a namespace must be an https origin: the token it is sent can carry " +
                 "storage credentials. Set \"allow_insecure_http\": true on the entry to send it over http"
+        }
+        require(remoteName == null || match is MountMatch.Namespace) {
+            "remote_name is only for a mount host that matches a namespace"
+        }
+        require(remoteName == null || Regex(Identifiers.PATTERN).matches(remoteName)) {
+            "a mount host's remote_name must be a namespace name (${Identifiers.PATTERN}), got '$remoteName'"
         }
         require(timeoutMs >= 1) { "timeout_ms must be >= 1, got $timeoutMs" }
         require(maxResponseBytes >= 1) { "max_response_bytes must be >= 1, got $maxResponseBytes" }
@@ -175,6 +190,9 @@ data class MountHost(
         /**
          * No id may name two of [hosts], and no catalog or namespace name
          * may match two: which host answers must never depend on their order.
+         * Nor may two namespace entries have one name on their hosts, on one
+         * host or two: a `remote_schemas` claim names a schema by that name
+         * alone, exactly, so one key would open both.
          */
         fun requireDisjoint(hosts: List<MountHost>) {
             require(hosts.map { it.id }.toSet().size == hosts.size) { "duplicate mount host id" }
@@ -184,9 +202,17 @@ data class MountHost(
                         val what = if (a.match is MountMatch.Namespace) "namespace" else "catalog"
                         "two mount hosts match the same $what name (${describe(a.match)} and ${describe(b.match)})"
                     }
+                    require(a.remoteSchema == null || a.remoteSchema != b.remoteSchema) {
+                        "two mount hosts relay to the same schema name '${a.remoteSchema}' on their hosts " +
+                            "(${describe(a.match)} and ${describe(b.match)})"
+                    }
                 }
             }
         }
+
+        /** A namespace entry's schema name on its host; null for a mount entry. */
+        private val MountHost.remoteSchema: String?
+            get() = (match as? MountMatch.Namespace)?.let { remoteName ?: it.name }
 
         private fun overlap(
             a: MountMatch,
@@ -245,8 +271,11 @@ class RemoteSchemaHost(
     val match: MountMatch.Namespace,
     val host: MountHostClient,
 ) {
-    /** The schema's name as configured: the one name that is relayed, and its label in metrics. */
+    /** The schema's local name: the one name a request may use, and its label in metrics. */
     val name: String get() = match.name
+
+    /** The schema's name on the host: what is relayed and what the token's `remote_schemas` names. */
+    val remoteName: String get() = host.host.remoteName ?: match.name
 }
 
 /** The resolver over static server configuration: each configured host, by id and by the names it matches. */

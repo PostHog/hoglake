@@ -70,7 +70,8 @@ private fun storeRefusal(
  * A remote schema (docs/auth-tenancy.md §6.5c) is handed out by the same
  * rule: only to a caller whose token allows it. That is a scoped caller
  * whose `cat` allows `read` on [catalog] and whose `remote_schemas` names
- * [schema]. Deny by default: false for every other caller and for none. A
+ * [schema], by the schema's name on its host (a local alias never reaches
+ * the claim). Deny by default: false for every other caller and for none. A
  * token that places the catalog on hoglite is not refused for it, as a
  * mount's reader is: the catalog is the caller's own.
  */
@@ -80,15 +81,20 @@ internal fun Caller?.readsRemoteSchema(
 ): Boolean =
     this != null && kind == Caller.Kind.SCOPED && catalogClaimAllows(catalog, Scope.READ) && schema in remoteSchemas
 
-/** The names among [schemas] a namespace listing of [catalog] shows this caller: those it [readsRemoteSchema]. */
+/**
+ * The local names a namespace listing of [catalog] shows this caller, among
+ * [schemas] (each local name to its name on the host): those whose host name
+ * it [readsRemoteSchema].
+ */
 internal fun Caller?.remoteSchemasAmong(
     catalog: String,
-    schemas: Collection<String>,
-): List<String> = schemas.filter { readsRemoteSchema(catalog, it) }.sorted()
+    schemas: Map<String, String>,
+): List<String> = schemas.filterValues { readsRemoteSchema(catalog, it) }.keys.sorted()
 
 /**
  * `CatalogStoreSelector` asks here before it hands out the binding of the
- * remote schema [schema] to a request that named [namespace]. The catalog
+ * remote schema [schema] (its local name; [remoteName] on its host) to a
+ * request that named [namespace]. The catalog
  * comes first ([requireCatalogEntitlement]), so a caller refused for
  * [catalog] gets that answer and the schema is never looked at. Then a
  * caller that does not [readsRemoteSchema] gets the 404 of a missing
@@ -105,11 +111,12 @@ internal fun ApplicationCall.requireRemoteSchemaEntitlement(
     catalog: String,
     schema: String,
     namespace: String,
+    remoteName: String,
 ) {
     requireCatalogEntitlement(catalog)
     val auth = hoglakeAuth
     val caller = auth.callerOrNull
-    if (namespace == schema && caller.readsRemoteSchema(catalog, schema)) return
+    if (namespace == schema && caller.readsRemoteSchema(catalog, remoteName)) return
     // The gate's and the body check's wording for a missing namespace, to the letter.
     val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
     Metrics.mountRefused(schema, "not_found")

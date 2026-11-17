@@ -1163,6 +1163,29 @@ unchanged and still describe the mount.
   Entries of the `events` and `catalog` types behave as before, with the
   profile on or off and with `http` or `https`, and one file may hold all
   three.
+- **A local name (alias).** The server that holds the catalog chooses the
+  name it shows. A `namespace` entry may set `"remote_name"`, the schema's
+  name on the Host (a namespace name; default: `name`):
+
+  ```json
+  {"id": "6d1d7e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f",
+   "match": {"type": "namespace", "name": "analytics"},
+   "remote_name": "shared",
+   "kind": "hoglake", "url": "https://host-hoglake.example", "auth": "forward"}
+  ```
+
+  Readers see `<catalog>.analytics`; the Host serves its schema `shared`. The
+  local name is the one every rule below uses: what is shown, reserved and
+  hidden, and the only name a request may use. The Host's name is used in
+  four places: the namespace segment of the relayed path; the token check
+  (the `remote_schemas` claim names `shared`); the Host's answers, whose
+  namespace field must be `shared` and is shown as `analytics` (see "What is
+  relayed"); and the boot check below. `shared` is not reserved here, so a
+  local namespace of that name stays an ordinary one. `remote_name` is refused
+  on an `events` or `catalog` entry. Two `namespace` entries whose Host names
+  are equal are refused at boot, whether they name one Host or two, comparing
+  names exactly as the claim does: a `remote_schemas` key names exactly one
+  configured schema on a server, so one claim never opens two.
 - **The name always means the remote schema.** On a server that configures
   `analytics`:
   - creating a namespace of that name is refused (§6.2c), without listing it
@@ -1173,10 +1196,12 @@ unchanged and still describe the mount.
 
   The same holds for a case variant (`Analytics`): it is not a local namespace
   and it is not the remote schema either, so every request for it answers 404.
-  Only the exact configured name is relayed.
+  Only a request for the exact local name is relayed, under the Host's name.
 - **Caller rule, before anything is sent.** Access is off unless the token
   allows it. The caller is `scoped`, its `cat` allows `read` on the catalog,
-  and its `remote_schemas` claim names the schema. The claim is part of the
+  and its `remote_schemas` claim names the schema, by its name on the Host
+  ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)): an
+  issuer never needs to know a local name. The claim is part of the
   session profile, whose `cat` names one catalog, so a token reads a remote
   schema only in that catalog. Anyone else (a tenant, with or without the
   claim; an operator; a scoped token without the claim; no caller) gets 404
@@ -1208,12 +1233,27 @@ unchanged and still describe the mount.
   catalog, and nothing is sent to the Host.
 - **What is relayed.** Four routes, `GET` only: the namespace, its tables, one
   table, and the scan. The request goes to the Host with the same path
-  (`/v1/catalogs/<catalog>/namespaces/<schema>/...`), the same query and the
+  (`/v1/catalogs/<catalog>/namespaces/<schema>/...`, `<schema>` being the
+  Host's name), the same query and the
   caller's `Authorization` header, unchanged. As for a mount (§6.5b), a query
   parameter named `catalog`, `namespace` or `table` is not sent: route values
-  come from the path only. The Client holds no Host-side
-  name and no table list: the Host derives what to serve from the catalog in
-  the path, the schema and the token. A 200 comes back byte for byte. The
+  come from the path only. The Client holds no table list: the Host derives
+  what to serve from the catalog in the path, the schema and the token. A 200
+  comes back byte for byte, with one exception for an alias: the namespace's
+  `name` and the table's `namespace` carry the Host's name, and are rewritten
+  to the local name. Such an answer is parsed as it streams, under the same
+  `max_response_bytes`, and written out token by token: every value is kept
+  (a number by its text, so `1e10` stays `1e10`), while whitespace and string
+  escapes may change. It is refused as `mount_host_invalid_response` unless it
+  is one JSON object, with no key twice in any object and nothing after it,
+  whose top-level field is the Host's name. A refusal found in the first 64 KiB
+  is the 502, and none of the answer is sent; one found later closes the
+  caller's connection instead of finishing the answer, as a body over the size
+  cap does. Nothing else
+  changes: table names, ids, snapshots, file paths (which can hold the Host's
+  name), the tables listing and the scan pass as the Host sent them. A
+  refusal from the Host keeps its status, code and detail, so its detail may
+  name the schema by its Host name, which the caller's own token holds. The
   scan is relayed before this server parses its parameters. Timeouts, the
   size limit, the concurrency limit and the error mapping are the mount
   Client's (§6.5b).
@@ -1243,7 +1283,8 @@ unchanged and still describe the mount.
   lacks `write` gets the route table's 403 `forbidden` first.
 - **The listing.** `GET /v1/catalogs/{c}/namespaces` returns the local
   namespaces, without one that has a remote schema's name, then one entry for
-  each remote schema the token allows: `{"name": "<schema>", "remote": true}`.
+  each remote schema the token allows: `{"name": "<schema>", "remote": true}`,
+  under its local name (the claim is checked by the Host's name).
   The entry has no `namespace_id`, because the namespace has no id on this
   server. The listing is built from configuration and the token. No Host is
   asked, so a Host outage does not fail it.
@@ -1259,7 +1300,7 @@ unchanged and still describe the mount.
   consumer offset on a table of the namespace that has since been dropped is
   still read by its UUID. Look for one before configuring a name, with the
   queries of §6.2c.
-- **Metrics.** The mount Client's series (§6.5b), with the schema's configured
+- **Metrics.** The mount Client's series (§6.5b), with the schema's local
   name in the `catalog` label. The label never holds an org, a catalog, or a
   name taken from a request. A caller the rule refuses is counted as
   `not_found` on `hoglake_mount_refusals_total`.
@@ -1678,8 +1719,8 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
-| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds, or on a mount Client one a verified `cat` names, or a remote schema's configured name (§6.5c) |
-| `hoglake_mount_proxy_requests_total{catalog}`, `_seconds`, `hoglake_mount_proxy_upstream_errors_total{catalog,reason}` | a mount Client's requests to its hosts (§6.5b): count, latency, and the ones a host did not serve, by a closed `reason`. For a remote schema (§6.5c) `catalog` holds the schema's configured name |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds, or on a mount Client one a verified `cat` names, or a remote schema's local name (§6.5c) |
+| `hoglake_mount_proxy_requests_total{catalog}`, `_seconds`, `hoglake_mount_proxy_upstream_errors_total{catalog,reason}` | a mount Client's requests to its hosts (§6.5b): count, latency, and the ones a host did not serve, by a closed `reason`. For a remote schema (§6.5c) `catalog` holds the schema's local name |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |

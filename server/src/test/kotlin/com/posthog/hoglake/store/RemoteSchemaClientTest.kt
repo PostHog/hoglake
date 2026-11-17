@@ -3,6 +3,7 @@ package com.posthog.hoglake.store
 import ch.qos.logback.classic.Logger
 import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.core.read.ListAppender
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
@@ -54,12 +55,16 @@ import io.ktor.http.contentType
 import io.ktor.serialization.jackson.jackson
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
+import kotlinx.coroutines.runBlocking
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -356,6 +361,9 @@ class RemoteSchemaClientTest {
         engine: String = "http://127.0.0.1:9",
         /** `none` is a server with no PostgreSQL catalogs: only a routed token has a backend. */
         defaultBackend: String = "postgres",
+        /** A remote schema's name on its host, by local name (`remote_name`); absent is the same name. */
+        remoteNames: Map<String, String> = emptyMap(),
+        maxResponseBytes: Long = MountHost.DEFAULT_MAX_RESPONSE_BYTES,
         block: suspend ApplicationTestBuilder.() -> Unit,
     ) = testApplication {
         val cfg = config(engine, defaultBackend)
@@ -372,7 +380,9 @@ class RemoteSchemaClientTest {
                         at,
                         MountHost.Auth.FORWARD,
                         5_000,
+                        maxResponseBytes,
                         allowInsecureHttp = http,
+                        remoteName = (it as? MountMatch.Namespace)?.let { schema -> remoteNames[schema.name] },
                     )
                 },
             )
@@ -1201,6 +1211,354 @@ class RemoteSchemaClientTest {
                 assertThat(host.seen.single().rawPath).isEqualTo(path)
             }
             assertThat(calls).isEmpty()
+        }
+    }
+
+    // ---- an alias: local `posthog` is the host's `shared` ---------------------------
+
+    private val alias = mapOf("posthog" to "shared")
+
+    /** A token whose claim names the schema by its host's name, as the claim always does. */
+    private fun sharedReader() = scoped(schemas = """{"shared":["read"]}""")
+
+    private fun names(listing: String) = mapper.readTree(listing).map { it["name"].asText() }
+
+    @Test
+    fun `an alias is relayed under the host's name, and only the namespace field is rewritten`() {
+        val shared = "/v1/catalogs/lake/namespaces/shared"
+        // Numbers this server has no type for, and the host's name where it is not the namespace field.
+        val namespace =
+            """{ "name":"shared", "remote":true, "snapshot_id":41, "big":123456789012345678901234567890, """ +
+                """"ratio":1.10, "future_field":{"name":"shared"} }"""
+        val table =
+            """{"name":"events","namespace":"shared","table_uuid":"$hiddenTable","columns":[],""" +
+                """"read_snapshot_id":41,"properties":{"source":"shared.events"}}"""
+        // The listing and the scan have no namespace field: a table named like the schema, and a path, stay.
+        val listing = """[ {"name":"shared", "table_uuid":"$hiddenTable"} ]"""
+        val scan = """[ {"data_file":{"path":"s3://bucket/data/shared/events/f.parquet"}} ]"""
+        StubHost().use { host ->
+            host.answer = { exchange ->
+                val path = exchange.requestURI.rawPath
+                val body =
+                    when {
+                        path.endsWith("/scan") -> scan
+                        path.endsWith("/tables") -> listing
+                        path.endsWith("/tables/events") -> table
+                        else -> namespace
+                    }
+                exchange.json(200, body)
+            }
+            client(host, remoteNames = alias) {
+                val answers = relayed.map { get(it, sharedReader()) }
+                assertThat(answers.map { it.status }).containsOnly(HttpStatusCode.OK)
+                // The namespace segment is the host's name, and nothing else of the path or query changes.
+                assertThat(get("${relayed[3]}?snapshot=41&namespace=posthog", sharedReader()).status)
+                    .isEqualTo(HttpStatusCode.OK)
+                val sent = listOf(shared, "$shared/tables", "$shared/tables/events", "$shared/tables/events/scan")
+                assertThat(host.seen.map { it.rawPath }).isEqualTo(sent + sent[3])
+                assertThat(host.seen.map { it.rawQuery }).isEqualTo(listOf(null, null, null, null, "snapshot=41"))
+
+                fun rewritten(
+                    body: String,
+                    field: String,
+                ) = (mapper.readTree(body) as ObjectNode).put(field, "posthog")
+                assertThat(mapper.readTree(answers[0].bodyAsText())).isEqualTo(rewritten(namespace, "name"))
+                assertThat(mapper.readTree(answers[2].bodyAsText())).isEqualTo(rewritten(table, "namespace"))
+                // Parsed and written again, every value is as the host wrote it.
+                assertThat(answers[0].bodyAsText()).contains("123456789012345678901234567890", "1.10")
+                assertThat(answers[1].bodyAsText()).isEqualTo(listing)
+                assertThat(answers[3].bodyAsText()).isEqualTo(scan)
+                for (answer in answers) {
+                    assertThat(answer.headers[HttpHeaders.ContentType]).startsWith("application/json")
+                }
+            }
+            assertThat(touched()).isEmpty()
+        }
+    }
+
+    @Test
+    fun `the token names an aliased schema by its host's name, and the listing by its local name`() {
+        StubHost().use { host ->
+            host.answer = { it.json(200, """{"name":"shared"}""") }
+            client(host, remoteNames = alias) {
+                // A claim for the local name alone is the claim of another schema: refused, nothing sent.
+                for (token in listOf(scoped(), scoped(schemas = """{"posthog":["read"],"PostHog":["read"]}"""))) {
+                    for (path in relayed) {
+                        val response = get(path, token)
+                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                        assertThat(response.bodyAsText()).contains("namespace 'posthog' in catalog 'lake'")
+                    }
+                    assertThat(names(get("/v1/catalogs/lake/namespaces", token).bodyAsText()))
+                        .containsExactly("team_7")
+                }
+                assertThat(host.seen).isEmpty()
+                // A claim for the host's name: served under the local name, and listed under it.
+                assertThat(mapper.readTree(get(schema, sharedReader()).bodyAsText())["name"].asText())
+                    .isEqualTo("posthog")
+                val listed = get("/v1/catalogs/lake/namespaces", sharedReader()).bodyAsText()
+                assertThat(names(listed)).containsExactly("team_7", "posthog")
+                assertThat(mapper.writeValueAsString(mapper.readTree(listed)[1]))
+                    .isEqualTo("""{"name":"posthog","remote":true}""")
+                // A body that names the schema is the read-only refusal for that reader, the 404 for the other.
+                val commit = """{"appends":[{"namespace":"posthog","table":"events","files":[]}]}"""
+                val write = scoped(cat = """{"lake":["write"]}""", schemas = """{"shared":["read"]}""")
+                assertThat(code(send(HttpMethod.Post, "/v1/catalogs/lake/commit", write, commit).bodyAsText()))
+                    .isEqualTo("read_only_catalog")
+                val other = scoped(cat = """{"lake":["write"]}""")
+                assertThat(code(send(HttpMethod.Post, "/v1/catalogs/lake/commit", other, commit).bodyAsText()))
+                    .isEqualTo("not_found")
+            }
+            assertThat(host.seen.map { it.rawPath }).containsExactly("/v1/catalogs/lake/namespaces/shared")
+            assertThat(touched()).isEmpty()
+        }
+    }
+
+    @Test
+    fun `an aliased answer that is not one object naming the host's schema is refused whole`() {
+        StubHost().use { host ->
+            client(host, remoteNames = alias) {
+                for (body in listOf(
+                    """{"name":"other"}""",
+                    """{"name":"posthog"}""",
+                    """{"name":"SHARED"}""",
+                    """{"name":7}""",
+                    """{"namespace":"shared"}""",
+                    """{"name":"shared"} {"name":"shared"}""",
+                    """{"name":"shared"} x""",
+                    """{"name":"shared","name":"shared"}""",
+                    """{"name":"shared","o":{"a":1,"a":1}}""",
+                    """[{"name":"shared"}]""",
+                    """{"name":"shared"""",
+                    "null",
+                    "",
+                )) {
+                    host.answer = { it.json(200, body) }
+                    val response = get(schema, sharedReader())
+                    assertThat(response.status).describedAs(body).isEqualTo(HttpStatusCode.BadGateway)
+                    assertThat(code(response.bodyAsText())).isEqualTo("mount_host_invalid_response")
+                    assertThat(response.bodyAsText()).describedAs(body).doesNotContain("shared")
+                }
+                // The table's field is `namespace`: a `name` that is the host's name does not stand in for it.
+                host.answer = { it.json(200, """{"name":"shared","table_uuid":"$hiddenTable"}""") }
+                assertThat(get("$schema/tables/events", sharedReader()).status).isEqualTo(HttpStatusCode.BadGateway)
+                // The relay's own checks come first: a 200 that is not JSON.
+                host.answer = { exchange ->
+                    exchange.responseHeaders.add("Content-Type", "text/html")
+                    exchange.sendResponseHeaders(200, 0)
+                    exchange.responseBody.use { it.write("""{"name":"shared"}""".toByteArray()) }
+                }
+                assertThat(get(schema, sharedReader()).status).isEqualTo(HttpStatusCode.BadGateway)
+                // The host's refusal keeps its words, its name for the schema included.
+                host.answer = { it.json(404, """{"error":"not_found","detail":"table 'shared.nope'"}""") }
+                assertThat(get("$schema/tables/nope", sharedReader()).bodyAsText()).contains("table 'shared.nope'")
+            }
+            assertThat(touched()).isEmpty()
+        }
+    }
+
+    @Test
+    fun `with no alias, or an alias that is the local name, no answer is parsed`() {
+        // Not JSON a parser would take: relayed as it came, as without an alias.
+        val body = """{ "name":"posthog", "name":"x", "unclosed":[1,2 """
+        StubHost().use { host ->
+            host.answer = { it.json(200, body) }
+            for (aliases in listOf(emptyMap(), mapOf("posthog" to "posthog"))) {
+                client(host, remoteNames = aliases) {
+                    for (path in relayed) {
+                        val response = get(path, scoped())
+                        assertThat(response.status).describedAs("%s %s", aliases, path).isEqualTo(HttpStatusCode.OK)
+                        assertThat(response.bodyAsText()).isEqualTo(body)
+                    }
+                }
+            }
+            // With an alias, the tables listing and the scan are still relayed unparsed.
+            client(host, remoteNames = alias) {
+                assertThat(relayed.map { get(it, sharedReader()).status }).containsExactly(
+                    HttpStatusCode.BadGateway,
+                    HttpStatusCode.OK,
+                    HttpStatusCode.BadGateway,
+                    HttpStatusCode.OK,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `under an alias the local name is hidden, and the host's name is an ordinary local namespace`() {
+        StubHost().use { host ->
+            host.answer = { it.json(200, """{"name":"other"}""") }
+            // The host calls the schema `other`, which is also a local namespace of `lake` here.
+            client(host, remoteNames = mapOf("posthog" to "other")) {
+                val reader = scoped(schemas = """{"other":["read"]}""")
+                assertThat(mapper.readTree(get(schema, reader).bodyAsText())["name"].asText()).isEqualTo("posthog")
+                assertThat(host.seen.single().rawPath).isEqualTo("/v1/catalogs/lake/namespaces/other")
+                // The local name and its case variants are never the local namespaces of those names.
+                for (token in listOf(tenant(), operator(), scoped(), reader)) {
+                    for (name in listOf("posthog", "PostHog").filter { token != reader || it != "posthog" }) {
+                        val response = get("/v1/catalogs/lake/namespaces/$name", token)
+                        assertThat(response.status).describedAs(name).isEqualTo(HttpStatusCode.NotFound)
+                    }
+                }
+                // `other` is read from the store, for every caller, the schema's reader included.
+                for (token in listOf(operator(), tenant(), reader)) {
+                    val local = get("/v1/catalogs/lake/namespaces/other", token)
+                    assertThat(local.status).isEqualTo(HttpStatusCode.OK)
+                    assertThat(mapper.readTree(local.bodyAsText())["namespace_id"].asLong()).isEqualTo(2)
+                }
+                assertThat(names(get("/v1/catalogs/lake/namespaces", operator()).bodyAsText()))
+                    .containsExactly("team_7", "other")
+            }
+            assertThat(host.seen).hasSize(1)
+            assertThat(touched()).isEmpty()
+            assertThat(calls.filter { it.first == "getNamespace" }.map { it.second[1] }).containsOnly("other")
+        }
+    }
+
+    /**
+     * [block] against the Client on a real listener, with the alias, reading
+     * as [sharedReader]: an answer past the 64 KiB read before the response
+     * starts streams, and only an engine that awaits the stream (Netty, as in
+     * production) keeps the host's body open while it does.
+     */
+    private fun <T> onNetty(
+        host: StubHost,
+        maxResponseBytes: Long = MountHost.DEFAULT_MAX_RESPONSE_BYTES,
+        block: (fetch: (String) -> java.net.http.HttpResponse<String>) -> T,
+    ): T {
+        val cfg = config()
+        val entry =
+            MountHost(
+                UUID.randomUUID(),
+                MountMatch.Namespace("posthog"),
+                MountHost.Kind.HOGLAKE,
+                host.origin,
+                MountHost.Auth.FORWARD,
+                5_000,
+                maxResponseBytes,
+                allowInsecureHttp = true,
+                remoteName = alias.getValue("posthog"),
+            )
+        val hosts = StaticMountHosts(listOf(entry))
+        val selector = CatalogStoreSelector(postgres, cfg, MountRegistry.NONE, hosts)
+        val server =
+            embeddedServer(Netty, port = 0, host = "127.0.0.1") { clientModule(selector, AuthMode.ENFORCE, cfg) }
+        try {
+            server.start(wait = false)
+            val port = runBlocking { server.engine.resolvedConnectors().first().port }
+            return java.net.http.HttpClient.newHttpClient().use { http ->
+                block { path ->
+                    val request =
+                        java.net.http.HttpRequest.newBuilder(URI("http://127.0.0.1:$port$path"))
+                            .header(HttpHeaders.Authorization, "Bearer ${sharedReader()}")
+                            .build()
+                    http.send(request, java.net.http.HttpResponse.BodyHandlers.ofString())
+                }
+            }
+        } finally {
+            server.stop(0, 1000)
+            hosts.close()
+        }
+    }
+
+    @Test
+    fun `an aliased answer is rewritten as it streams, at any size, and its numbers keep their text`() {
+        // Numbers a re-encoding would change. Compact and unescaped, so only the one field may differ.
+        val numbers = """"a":1e10,"b":-0.0,"c":-0,"d":1.10,"e":1E-7,"f":123456789012345678901234567890,"g":2.5e+3"""
+        // Larger than 4 MiB: 300 columns, each with a 16,000-character comment.
+        val comment = "c".repeat(16_000)
+        val columns = (1..300).joinToString(",") { """{"name":"c$it","comment":"$comment","field_id":$it}""" }
+        val table = """{"name":"events","namespace":"shared","columns":[$columns],$numbers}"""
+        val namespace = """{"name":"shared","remote":true,$numbers,"o":{"name":"shared"}}"""
+        assertThat(table.length).isGreaterThan(4 shl 20)
+        StubHost().use { host ->
+            host.answer = { it.json(200, if (it.requestURI.rawPath.endsWith("/events")) table else namespace) }
+            onNetty(host) { fetch ->
+                assertThat(fetch(schema).body())
+                    .isEqualTo(namespace.replaceFirst(""""name":"shared"""", """"name":"posthog""""))
+                val large = fetch("$schema/tables/events")
+                assertThat(large.statusCode()).isEqualTo(200)
+                assertThat(large.body())
+                    .isEqualTo(table.replaceFirst(""""namespace":"shared"""", """"namespace":"posthog""""))
+            }
+        }
+    }
+
+    @Test
+    fun `an aliased answer is held to the host's max_response_bytes, and refused whole while it can be`() {
+        fun answer(size: Int) = """{"name":"shared","pad":"""" + "x".repeat(size - 26) + "\"}"
+        StubHost().use { host ->
+            val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
+            // A bound under the 64 KiB read before the response starts: the whole answer, or the 502.
+            client(host, remoteNames = alias, maxResponseBytes = 1_000) {
+                host.answer = { it.json(200, answer(1_000)) }
+                assertThat(get(schema, sharedReader()).bodyAsText())
+                    .isEqualTo(answer(1_000).replace("shared", "posthog"))
+                host.answer = { it.json(200, answer(1_001)) }
+                val over = get(schema, sharedReader())
+                assertThat(over.status).isEqualTo(HttpStatusCode.BadGateway)
+                assertThat(over.bodyAsText()).contains("larger than this server forwards")
+            }
+            // A bound past it: the answer streams, and one byte over cuts the connection, never ending the answer.
+            onNetty(host, maxResponseBytes = 100_000) { fetch ->
+                host.answer = { it.json(200, answer(100_000)) }
+                assertThat(fetch(schema).body()).isEqualTo(answer(100_000).replace("shared", "posthog"))
+                host.answer = { it.json(200, answer(100_001)) }
+                assertThatThrownBy { fetch(schema) }.isInstanceOf(java.io.IOException::class.java)
+            }
+            val errors = registry.find("hoglake_mount_proxy_upstream_errors_total").tag("reason", "response_too_large")
+            // At least once more: a client whose connection closed before any byte arrived may ask again.
+            assertThat(errors.counters().sumOf { it.count() }).isGreaterThanOrEqualTo(2.0)
+            // Refused in the first 64 KiB: the 502. Refused after it, at the end: the connection is cut.
+            onNetty(host) { fetch ->
+                host.answer = { it.json(200, answer(100_000).replace("shared", "other")) }
+                assertThat(fetch(schema).statusCode()).isEqualTo(502)
+                host.answer = { it.json(200, answer(100_000).replace(""""name":"shared",""", "")) }
+                assertThatThrownBy { fetch(schema) }.isInstanceOf(java.io.IOException::class.java)
+                // Whole by its framing, not by its JSON: the object never closes, so the answer is not finished.
+                host.answer = { it.json(200, answer(100_000).dropLast(1)) }
+                assertThatThrownBy { fetch(schema) }.isInstanceOf(java.io.IOException::class.java)
+            }
+        }
+    }
+
+    @Test
+    fun `two aliased schemas of one host are each relayed under the host's name and shown under their own`() {
+        val aliases = mapOf("posthog" to "shared", "imports" to "raw")
+        StubHost().use { host ->
+            host.answer = { exchange ->
+                // /v1/catalogs/lake/namespaces/<the host's name>[/tables/events]
+                val segments = exchange.requestURI.rawPath.split('/')
+                val name = segments[5]
+                val table = segments.size > 6
+                exchange.json(200, if (table) """{"name":"events","namespace":"$name"}""" else """{"name":"$name"}""")
+            }
+            val matches = listOf(MountMatch.Namespace("posthog"), MountMatch.Namespace("imports"))
+            client(host, matches = matches, remoteNames = aliases) {
+                val both = scoped(schemas = """{"shared":["read"],"raw":["read"]}""")
+                for (local in aliases.keys) {
+                    val path = "/v1/catalogs/lake/namespaces/$local"
+                    assertThat(get(path, both).bodyAsText()).isEqualTo("""{"name":"$local"}""")
+                    assertThat(get("$path/tables/events", both).bodyAsText())
+                        .isEqualTo("""{"name":"events","namespace":"$local"}""")
+                }
+                assertThat(host.seen.map { it.rawPath }).containsExactly(
+                    "/v1/catalogs/lake/namespaces/shared",
+                    "/v1/catalogs/lake/namespaces/shared/tables/events",
+                    "/v1/catalogs/lake/namespaces/raw",
+                    "/v1/catalogs/lake/namespaces/raw/tables/events",
+                )
+                assertThat(names(get("/v1/catalogs/lake/namespaces", both).bodyAsText()))
+                    .containsExactly("team_7", "imports", "posthog")
+                // Each claim opens its own schema, under its own local name, and no other.
+                val raw = scoped(schemas = """{"raw":["read"]}""")
+                assertThat(get(schema, raw).status).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(get("/v1/catalogs/lake/namespaces/imports", raw).bodyAsText())
+                    .isEqualTo("""{"name":"imports"}""")
+                assertThat(names(get("/v1/catalogs/lake/namespaces", raw).bodyAsText()))
+                    .containsExactly("team_7", "imports")
+            }
+            assertThat(host.seen).hasSize(5)
+            assertThat(touched()).isEmpty()
         }
     }
 }
