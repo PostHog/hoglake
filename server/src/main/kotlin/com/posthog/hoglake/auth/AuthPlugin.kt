@@ -115,6 +115,7 @@ class AuthService(
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
                         sessionProfile = cfg.authSessionProfileEnabled,
+                        ignoreUnknownScopedRouting = cfg.servedNamespaces.isNotEmpty(),
                     ),
             )
         }
@@ -153,6 +154,7 @@ class AuthService(
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
                         sessionProfile = cfg.authSessionProfileEnabled,
+                        ignoreUnknownScopedRouting = cfg.servedNamespaces.isNotEmpty(),
                     ),
             )
         }

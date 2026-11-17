@@ -1,6 +1,7 @@
 package com.posthog.hoglake.auth
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
 import io.ktor.server.application.ApplicationCall
 
@@ -114,17 +115,56 @@ internal fun ApplicationCall.requireRemoteSchemaEntitlement(
     remoteName: String,
 ) {
     requireCatalogEntitlement(catalog)
+    if (namespace == schema && hoglakeAuth.callerOrNull.readsRemoteSchema(catalog, remoteName)) return
+    refuseMissingNamespace(catalog, schema, namespace, "remote_schema")
+}
+
+/**
+ * `CatalogStoreSelector` asks here before it hands out the binding of the
+ * served namespace [namespace] (docs/auth-tenancy.md §6.5d) of the caller's
+ * own [catalog], which this server does not hold. In order, each failure the
+ * 404 of a missing namespace, in every auth mode: the token names [catalog]
+ * ([requireCatalogEntitlement]); the caller [readsRemoteSchema]; the stored
+ * namespace ([containment], read only for a caller that got this far) is
+ * org-marked for the caller's org; and the caller's `prd` holds the mark's
+ * field and value with `read`.
+ */
+internal fun ApplicationCall.requireServedNamespaceEntitlement(
+    catalog: String,
+    namespace: String,
+    containment: () -> NamespaceContainment?,
+) {
+    requireCatalogEntitlement(catalog)
+    val caller = hoglakeAuth.callerOrNull
+    if (caller.readsRemoteSchema(catalog, namespace)) {
+        val mark = containment()
+        // `*` is a grant over every value, and is safe here only because the org
+        // comparison has already bound this namespace to the caller's own org.
+        if (caller != null && mark?.org != null && mark.org == caller.orgId &&
+            caller.holdsPredicate(mark.field, mark.value, Scope.READ)
+        ) {
+            return
+        }
+    }
+    refuseMissingNamespace(catalog, namespace, namespace, "served_namespace")
+}
+
+private fun ApplicationCall.refuseMissingNamespace(
+    catalog: String,
+    counted: String,
+    namespace: String,
+    at: String,
+): Nothing {
     val auth = hoglakeAuth
     val caller = auth.callerOrNull
-    if (namespace == schema && caller.readsRemoteSchema(catalog, remoteName)) return
     // The gate's and the body check's wording for a missing namespace, to the letter.
     val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
-    Metrics.mountRefused(schema, "not_found")
+    Metrics.mountRefused(counted, "not_found")
     if (auth !is AuthState.Off && !attributes.contains(RefusalCountedKey)) {
         attributes.put(RefusalCountedKey, Unit)
         val service = application.attributes[AuthServiceKey]
         val match = attributes.getOrNull(RouteMatchKey)
-        countRefusal(service, service.clientClass(this), caller, match, refusal, true, catalog, at = "remote_schema")
+        countRefusal(service, service.clientClass(this), caller, match, refusal, true, catalog, at = at)
     }
     throw refusal
 }

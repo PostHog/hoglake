@@ -107,6 +107,19 @@ sealed interface CatalogBinding {
         val schema: String,
         val host: MountHostClient,
     ) : CatalogBinding
+
+    /**
+     * A namespace this server serves to relayed readers (docs/auth-tenancy.md
+     * §6.5d): the request's path names [namespace], and [catalog] is the
+     * caller's own, not one this server holds. [reader] reads the source
+     * catalog's namespace of that name. Built only once the caller's token
+     * and the namespace's org mark are known to allow it.
+     */
+    data class Served(
+        val catalog: String,
+        val namespace: String,
+        val reader: ServedNamespaceReader,
+    ) : CatalogBinding
 }
 
 /** #291's `CatalogRegistry.resolve`: a mount name resolves before any backend lookup. */
@@ -223,6 +236,26 @@ internal fun remoteSchemaRefusal(
         )
     } else {
         refused(schema, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a remote schema is read-only"))
+    }
+
+/**
+ * The refusal for a request that names the served namespace [namespace] on a
+ * route that is not relayed, with [remoteSchemaRefusal]'s codes. Only for a
+ * caller the entitlement check has passed (auth/StoreEntitlement.kt); build
+ * it only to throw it.
+ */
+internal fun servedNamespaceRefusal(
+    call: ApplicationCall,
+    namespace: String,
+): HoglakeException =
+    if (AuthPolicy.match(call.request.httpMethod, call.request.path())?.requirement == Requirement.READ) {
+        refused(
+            namespace,
+            "mount_operation_unavailable",
+            HoglakeException.MountOperationUnavailable("this operation is not available on a served namespace"),
+        )
+    } else {
+        refused(namespace, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a served namespace is read-only"))
     }
 
 /**

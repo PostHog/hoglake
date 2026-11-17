@@ -12,6 +12,7 @@ import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.ServedNamespace
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -128,6 +129,21 @@ data class Config(
      * the session profile can name a remote schema.
      */
     val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
+    /**
+     * HOGLAKE_SERVED_NAMESPACES_FILE: this server is a Host that serves
+     * namespaces to a Client's relayed readers (docs/auth-tenancy.md §6.5d).
+     * A JSON object with exactly a `namespaces` array of
+     * `{"name": "<namespace>", "source_catalog": "<catalog>"}`: a read of that
+     * namespace under a catalog this server does not hold is answered from the
+     * namespace of the same name in the source catalog, read-only, for a
+     * scoped session-profile caller of the namespace's org. Unknown keys and
+     * duplicate names are refused. Empty (the default): nothing is served.
+     * Refused at boot under `HOGLAKE_AUTH_MODE=off`, without
+     * [authSessionProfile] `on` or [authPredicateFields], with
+     * [mountHostsFile] (a server is a Host or a Client), or when PostgreSQL
+     * is not the default backend.
+     */
+    val servedNamespacesFile: String = env("HOGLAKE_SERVED_NAMESPACES_FILE", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -1512,6 +1528,9 @@ data class Config(
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
 
+    /** The namespaces of [servedNamespacesFile]; empty when this server serves none. */
+    val servedNamespaces: List<ServedNamespace> = readServedNamespaces(servedNamespacesFile)
+
     /**
      * [reservedNamespaceNames], checked at boot: each must be a valid
      * namespace name. Every remote schema [mountHosts] configures is
@@ -1636,6 +1655,28 @@ data class Config(
             require(authSessionProfileEnabled || mountHosts.none { it.match is MountMatch.Namespace }) {
                 "a namespace entry in HOGLAKE_MOUNT_HOSTS_FILE (a remote schema) requires " +
                     "HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying the session profile can read one"
+            }
+        }
+        if (servedNamespaces.isNotEmpty()) {
+            require(mountHosts.isEmpty()) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE (this server is a Host) cannot be set with " +
+                    "HOGLAKE_MOUNT_HOSTS_FILE (this server is a Client): a server is one or the other"
+            }
+            require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
+                    "a served namespace serves only verified callers"
+            }
+            require(authSessionProfileEnabled) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying " +
+                    "the session profile can name a served namespace"
+            }
+            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS: a served namespace is " +
+                    "read only through a scoped token's predicate"
+            }
+            require(defaultBackend == "postgres") {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_DEFAULT_BACKEND=postgres: the source catalog is " +
+                    "read from this process's PostgreSQL"
             }
         }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
@@ -2226,6 +2267,37 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
                 circuitFailureThreshold = threshold.toInt(),
                 circuitOpenMs = positive("circuit_open_ms", 5000),
             )
+    }
+    return result
+}
+
+/**
+ * Parse HOGLAKE_SERVED_NAMESPACES_FILE, as strictly as [readMountHosts] parses
+ * its file: an unknown key or a duplicate name is refused.
+ */
+private fun readServedNamespaces(file: String): List<ServedNamespace> {
+    if (file.isBlank()) return emptyList()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root != null && root.isObject && root.properties().map { it.key }.toSet() == setOf("namespaces")) {
+        "HOGLAKE_SERVED_NAMESPACES_FILE must contain only a namespaces array"
+    }
+    val entries = root.get("namespaces")
+    require(entries.isArray) { "namespaces must be an array" }
+    val result = mutableListOf<ServedNamespace>()
+    for (entry in entries) {
+        require(entry.isObject && entry.properties().map { it.key }.toSet() == setOf("name", "source_catalog")) {
+            "a served namespace entry is an object with exactly a name and a source_catalog"
+        }
+
+        fun text(key: String): String {
+            val value = entry.get(key)
+            require(value != null && value.isTextual) { "a served namespace requires a string $key" }
+            return value.asText()
+        }
+        val served = ServedNamespace(text("name"), text("source_catalog"))
+        require(result.none { it.name == served.name }) { "duplicate served namespace name '${served.name}'" }
+        result += served
     }
     return result
 }

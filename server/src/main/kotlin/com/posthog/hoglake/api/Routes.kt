@@ -25,6 +25,7 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.MountReadService
 import com.posthog.hoglake.store.remoteSchemaRefusal
+import com.posthog.hoglake.store.servedNamespaceRefusal
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Parameters
 import io.ktor.server.application.Application
@@ -191,6 +192,7 @@ fun Application.installApiRoutes(
                         is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
                         // Unreachable: this path names no namespace.
                         is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+                        is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.namespace)
                     }
                 }
                 delete {
@@ -231,6 +233,7 @@ fun Application.installApiRoutes(
                             is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
                             // Unreachable: this path names no namespace.
                             is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+                            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.namespace)
                             is CatalogBinding.Local -> {
                                 val catalogs = binding.store
                                 // A scoped caller sees only the contained
@@ -307,6 +310,17 @@ fun Application.installApiRoutes(
                                 )
                             is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
+                            is CatalogBinding.Served ->
+                                call.respond(
+                                    // No id: it is a counter of the shared source catalog.
+                                    NamespaceDto(
+                                        name =
+                                            binding.reader.namespace(
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).name,
+                                    ),
+                                )
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -366,6 +380,13 @@ fun Application.installApiRoutes(
                                     )
                                 is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
                                 is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
+                                is CatalogBinding.Served ->
+                                    call.respond(
+                                        binding.reader.tables(
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
                                 is CatalogBinding.Local ->
                                     call.respond(
                                         binding.store.listTables(
@@ -410,6 +431,14 @@ fun Application.installApiRoutes(
                                         binding.host.table(call, binding.name, call.namespace(), call.table())
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
+                                    is CatalogBinding.Served ->
+                                        call.respond(
+                                            binding.reader.table(
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).toDto(),
+                                        )
                                     is CatalogBinding.Local ->
                                         call.respond(
                                             binding.store.getTable(
@@ -880,6 +909,14 @@ fun Application.installScanRoutes(
                         binding.store.planScan(
                             call.catalog(),
                             call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                    is CatalogBinding.Served ->
+                        binding.reader.scan(
                             call.table(),
                             call.longQuery("snapshot"),
                             call.instantQuery("at_timestamp"),

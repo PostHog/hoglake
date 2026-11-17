@@ -3,12 +3,14 @@ package com.posthog.hoglake.store
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.AuthPolicy
+import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
+import com.posthog.hoglake.auth.requireServedNamespaceEntitlement
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -63,7 +65,11 @@ class CatalogStoreSelector(
     private val objectStore: () -> ObjectStore = { error("compaction object store is not configured") },
     /** The server owns this store. Request-scoped cleanup backends only borrow it. */
     private val removalStore: () -> RemovalStore = { error("cleanup object store is not configured") },
+    /** Host mode: the namespaces served to relayed readers, by name (docs/auth-tenancy.md §6.5d). Empty is none. */
+    servedNamespaces: List<ServedNamespace> = emptyList(),
 ) : CatalogRegistry {
+    private val served = servedNamespaces.associateBy { it.name }
+
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
     private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
@@ -99,6 +105,7 @@ class CatalogStoreSelector(
             is CatalogBinding.Mount -> throw mountRefusal(call, binding.mount.name)
             is CatalogBinding.Remote -> throw mountRefusal(call, binding.name)
             is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.namespace)
         }
 
     /**
@@ -118,8 +125,9 @@ class CatalogStoreSelector(
         call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
         // Before any binding: a name resolves only when the caller's token allows it.
         call.requireCatalogEntitlement(catalog)
+        // Before every other binding: a served namespace ignores the token's placement (`rtg`) too.
         val binding =
-            remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
+            servedBinding(call, catalog) ?: remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
                 val routing = call.hoglakeAuth.callerOrNull?.routing
                 val routed = routing != null && routing.catalog == catalog
                 val store = if (routed) routed(call, checkNotNull(routing)) else fallback(catalog)
@@ -128,6 +136,42 @@ class CatalogStoreSelector(
         val handed = asView(call, catalog, binding)
         call.attributes.put(boundCatalog, catalog to handed)
         return handed.binding
+    }
+
+    /**
+     * The binding for a path that names a configured served namespace, in a
+     * catalog this server does not hold: an operator reading the source
+     * catalog itself keeps the normal local path. The name is matched
+     * exactly; a case variant is not served. The caller rule refuses in every
+     * auth mode ([requireServedNamespaceEntitlement]), and the source
+     * namespace is read once, for a caller that passes its token checks.
+     */
+    private fun servedBinding(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.Served? {
+        if (served.isEmpty() || MountNames.isReserved(catalog)) return null
+        // Only a scoped caller enters the served rule. Anyone else is handled as for any
+        // catalog this server does not hold, so no refusal can say whether a name is served.
+        if (call.hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return null
+        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+        val namespace = match?.namespace?.takeIf { match.catalog == catalog } ?: return null
+        val config = served[namespace] ?: return null
+        val store = defaultPostgres() ?: return null
+        try {
+            store.getCatalog(catalog)
+            return null
+        } catch (_: HoglakeException.NotFound) {
+            // Not a catalog here: the served namespace is the only reading this path has.
+        }
+        call.requireServedNamespaceEntitlement(catalog, namespace) {
+            store.liveContainment(config.sourceCatalog, namespace)
+        }
+        return CatalogBinding.Served(
+            catalog,
+            namespace,
+            ServedNamespaceReader(store, config.sourceCatalog, namespace, catalog),
+        )
     }
 
     /**
