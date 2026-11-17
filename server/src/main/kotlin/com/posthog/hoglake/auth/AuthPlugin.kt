@@ -518,7 +518,7 @@ internal fun countRefusal(
     enforced: Boolean,
     /** The catalog that was refused, when it is not the path's: the name a handler asked the store for. */
     catalog: String? = match?.catalog,
-    /** Where it was decided, when not by the plugin or a gate: `store` (StoreEntitlement.kt). Audit detail only. */
+    /** Where it was decided, when not by the plugin or a gate (StoreEntitlement.kt's two checks). Audit detail only. */
     at: String? = null,
 ) {
     val outcome =
