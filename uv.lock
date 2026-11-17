@@ -776,7 +776,7 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "pyarrow", specifier = ">=26.0.1" },
     { name = "pyhoglake", extras = ["fast-upload"], editable = "pyhoglake" },
-    { name = "slatedb", specifier = "==0.17.*" },
+    { name = "slatedb", specifier = "==0.18.*" },
 ]
 
 [package.metadata.requires-dev]
@@ -1425,22 +1425,22 @@ wheels = [
 
 [[package]]
 name = "slatedb"
-version = "0.17.0"
+version = "0.18.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/d8/12/879cf5768af581d37eee6db898c4a7ec7a7cb3b888252e2660d5a4e4d131/slatedb-0.17.0.tar.gz", hash = "sha256:c057a186b3a2cd733a65f173e6c1d119c5ca5e5ca837d0294e6f9c26f798b54f", size = 1108783, upload-time = "2026-09-29T16:53:47.48Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/d9/4781bc08d130d781c38f4fd1c8aa8d325af76246a764d296c4d292b21105/slatedb-0.18.1.tar.gz", hash = "sha256:e625e62e62108ef9b1144e54cb3c8cca556a0a3cd3715c906bda5abd98c7543d", size = 1275942, upload-time = "2026-11-07T23:51:36.465Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/ca/b2689cb1f681dffabfd5168ca4c1decb176d7d141fbd724a7f31fb976625/slatedb-0.17.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:d3159602b659447ebf4406258e29395c99832b590fcf75c32a6426d20de8d81f", size = 9088240, upload-time = "2026-09-29T16:53:37.422Z" },
-    { url = "https://files.pythonhosted.org/packages/08/2f/4ca146c0d933ac0292b20c4168e0f6176e2c1d8c8d4b63d59ba31ae8ed05/slatedb-0.17.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:63366b5a895e4b3cd47295fd4ce7eb2a2125804b34b548c18b3a74eded34462c", size = 10506645, upload-time = "2026-09-29T16:53:27.029Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/5b/9a697f6cdefbe2bfaf4e70516c008ba47c4b353f6b9d242ee36aa10a5aeb/slatedb-0.17.0-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:c9331beb3d20088f90668ef729329734c0e8d4ee029adab2de7b00174d87b7fc", size = 9861833, upload-time = "2026-09-29T16:53:29.41Z" },
-    { url = "https://files.pythonhosted.org/packages/ac/21/6206b1cc9e720d7c8332d5cbc9aa72f43517bda62d065c73fda2cfe8ec41/slatedb-0.17.0-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:9ea756ca3c0026c3c5af98177ef0216055da03f9a3498fbdf8855fe0c26bb5fa", size = 11077448, upload-time = "2026-09-29T16:53:33.166Z" },
-    { url = "https://files.pythonhosted.org/packages/b6/5c/32679f50df8b32a2db358dd1b37ad8c550c717c77fb13bf677fb55306a6b/slatedb-0.17.0-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:ab92d54582f4be240867ada3df3c494556950a1b6fa7f3879cd6b7a205be038a", size = 11480253, upload-time = "2026-09-29T16:53:31.356Z" },
-    { url = "https://files.pythonhosted.org/packages/75/fb/7a9189c2d9bb061a54cb3b5cd17021f2ecbe9c0e86ce1a30582359e5e458/slatedb-0.17.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:79252f859331010ef9f6532b1a244db8dc6e29367236d022e78e6fcd12d3560a", size = 10565492, upload-time = "2026-09-29T16:53:35.191Z" },
-    { url = "https://files.pythonhosted.org/packages/b0/f6/960743c9c1bfc259962b3d60a0fcd85dcd0ba94fc274a8b689fd6c1bb7ad/slatedb-0.17.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:5b088e23c4371f650d42df9944290b73ec71754d6defc7f7964c95569ad131a9", size = 10731527, upload-time = "2026-09-29T16:53:39.492Z" },
-    { url = "https://files.pythonhosted.org/packages/fd/01/97479c20398ca16bd2339decb522e8895fa848e601f42dec5a433b147e12/slatedb-0.17.0-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:9a40d2eea92d3f9d3b9cc4c5aa28c1e7c28579f843dabe4dd8657b8880ac6161", size = 10090715, upload-time = "2026-09-29T16:53:41.531Z" },
-    { url = "https://files.pythonhosted.org/packages/8a/30/236a6d5e9fe57798902676a4cfbae674dd215d5c7df2e957a3d3a0603d5a/slatedb-0.17.0-py3-none-musllinux_1_2_i686.whl", hash = "sha256:5cf4f7540f5961c1233921cdf42caf9e6592481215876529ae8838d4220f3412", size = 10772065, upload-time = "2026-09-29T16:53:43.666Z" },
-    { url = "https://files.pythonhosted.org/packages/34/c0/df6a77a9155122f664fb5290fff278ac30af46d2b9997d5236f44a3f3662/slatedb-0.17.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:92a1ef44ae0f9670d41395be00de6b82e2450bd555fcc6ea8ac6c279deea2539", size = 10942403, upload-time = "2026-09-29T16:53:45.746Z" },
-    { url = "https://files.pythonhosted.org/packages/24/7c/f623e3623897b1c6618736bc7c2650e4126886fda8ce50d2693d6abd7971/slatedb-0.17.0-py3-none-win32.whl", hash = "sha256:6e56e40b11642702c96c17ab1bb288d902a03bab7d6641136bd944a5a64ffa12", size = 8168230, upload-time = "2026-09-29T16:53:50.896Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/c1/d0e9d68383cb062ddfb53acf3b0b08b350a09eafee0f6dd7f09e78aaff4b/slatedb-0.17.0-py3-none-win_amd64.whl", hash = "sha256:e8d46942fe1b8627d7918db0b25e06ed30242a23b704781b06c43955d9609254", size = 9263577, upload-time = "2026-09-29T16:53:48.546Z" },
+    { url = "https://files.pythonhosted.org/packages/70/ba/d0492a4c44266d822116eb1895d414c47fcfa7252c5445aee4ec306be1cb/slatedb-0.18.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:9363d51b23127e774ea2743b2d57f55b78abced76d5e2df83fd873fbe9dd21ef", size = 9425633, upload-time = "2026-11-07T23:51:23.758Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/b3/937b39035c1297dc5e45d2cab79be3d100725b5cce8fc94ff0e8823bcccf/slatedb-0.18.1-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:b028fee550e678d34a6b4fcde82521b7a779673d61bdceb1877aea06cb0f9a63", size = 10851532, upload-time = "2026-11-07T23:51:11.206Z" },
+    { url = "https://files.pythonhosted.org/packages/06/a7/b95ba7d31c880f54775e1b8bea7c610f1e1031e4a6de56f3ba9a181a1401/slatedb-0.18.1-py3-none-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:276795e39b4254cab09e3e5e1820a59f4ac3a9ca3f6409dc78b51340f8d0e0a2", size = 10227567, upload-time = "2026-11-07T23:51:14.123Z" },
+    { url = "https://files.pythonhosted.org/packages/97/99/9f9b36b8dea224393c6e2685e4585f60ffcd38099bffc5fd9092669a245c/slatedb-0.18.1-py3-none-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:c8a2483a13e42bca5255eb90e4213ad47c9660c542d5cef85768c73cb85eab24", size = 11460553, upload-time = "2026-11-07T23:51:19.065Z" },
+    { url = "https://files.pythonhosted.org/packages/21/19/2c6858da9f372130ffc9ab58de49867b400b5a91da4cb07a6f50d0b1bfdc/slatedb-0.18.1-py3-none-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:521a81d2a5272965ac005ba5e6502477e671d5e5e5b1ece53e66d719de19c021", size = 12005039, upload-time = "2026-11-07T23:51:16.551Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/c6/19d21fce8a7490316c71a12237a2023f71e7728931f1fe27ffe72888b44d/slatedb-0.18.1-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ba270d5e50006b8f1bfae4f88e2c8595e1eaee8e5056b5e6e1d011ac5140b013", size = 10940024, upload-time = "2026-11-07T23:51:21.423Z" },
+    { url = "https://files.pythonhosted.org/packages/26/1e/d79a7c907afa3384cb7f25936d976fd777b4759fb62fe9019a669597d9ba/slatedb-0.18.1-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:a282438f217ff5b6a47e6c6f141181a6f4f99feea7965df5f46082318317f510", size = 11081737, upload-time = "2026-11-07T23:51:26.357Z" },
+    { url = "https://files.pythonhosted.org/packages/67/ec/95323596f0daaa4e8fe83b729f23e5c287e48a1c47027d08adf41d21abbb/slatedb-0.18.1-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:f33d40c079174965965af9901044f546637fa92151ad559b5fe428c7f47943bc", size = 10449444, upload-time = "2026-11-07T23:51:29.037Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/e2/1d3435b1efd97adc6dbcc347694a166af4b0ec14badbb821f6cee28aff3a/slatedb-0.18.1-py3-none-musllinux_1_2_i686.whl", hash = "sha256:73ae034bce7fbaad72ba0479537a52786b7cd7fa31c52cc7308387de44c741c1", size = 11142539, upload-time = "2026-11-07T23:51:31.585Z" },
+    { url = "https://files.pythonhosted.org/packages/22/e3/a302adc68a4b6ec1e1e1f1e8969c7a5870590a4447122c3ab00a34551e6c/slatedb-0.18.1-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:212128730ae19679f5cb501345a7e5f617b1d8cf1e99055f375f5a4516596d4e", size = 11293186, upload-time = "2026-11-07T23:51:34.008Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/70/96b02cd896d15ff64a2d60145ecf64abc88ab79b53214729cf84f71d1393/slatedb-0.18.1-py3-none-win32.whl", hash = "sha256:1d98b79c3b0525df439a4e3d398c978e2f0277e3ed9e80d3c9621bc530470543", size = 8461225, upload-time = "2026-11-07T23:51:41.001Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/05/8db28b9df45216d74582da464ee7f3b3ccb3bdc79066b940ed8213240885/slatedb-0.18.1-py3-none-win_amd64.whl", hash = "sha256:b9ec259fd4d5e84dd2106cc6f348617fdc443e4f201193af0a3916e3ed3f965f", size = 9616038, upload-time = "2026-11-07T23:51:38.509Z" },
 ]
 
 [[package]]
