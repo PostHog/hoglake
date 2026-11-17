@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.storage.BrokerUrls
 import com.posthog.hoglake.store.BackendKind
@@ -430,6 +431,14 @@ data class Config(
      * schema its Trino connector serves from the org's events mount.
      */
     val reservedNamespaceNames: Set<String> = nameList(env("HOGLAKE_RESERVED_NAMESPACES", "")),
+    /**
+     * Catalogs, comma-separated, where only an operator creates a namespace
+     * named `team_<digits>` (any case, any leading zeros). Empty, the
+     * default, lists none. A per-team scoped writer reaches such a
+     * namespace through an operator's org mark; this keeps a tenant from
+     * creating the name first.
+     */
+    val operatorTeamNamespaceCatalogs: Set<String> = nameList(env("HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS", "")),
     /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
@@ -1505,6 +1514,9 @@ data class Config(
      */
     val reservedNamespaces: ReservedNamespaces =
         ReservedNamespaces(reservedNamespaceNames + mountHosts.mapNotNull { (it.match as? MountMatch.Namespace)?.name })
+
+    /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
+    val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
 
     /** The storage credential provider kinds `HOGLAKE_STORAGE_PROVIDER` names. */
     enum class StorageProviderKind(val wire: String) {

@@ -74,11 +74,17 @@ interface CatalogStore {
 
     // ---- namespaces ------------------------------------------------------
 
+    /**
+     * A non-null [containment] creates the namespace already marked, in the one
+     * transaction: it is never visible unmarked, and a refused mark creates
+     * nothing. Operator-only: the route refuses other callers.
+     */
     fun createNamespace(
         catalog: String,
         name: String,
         author: String? = null,
         message: String? = null,
+        containment: NamespaceContainment? = null,
     ): NamespaceInfo
 
     fun listNamespaces(

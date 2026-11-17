@@ -573,9 +573,15 @@ class HogliteCatalogStore(
         name: String,
         author: String?,
         message: String?,
+        containment: NamespaceContainment?,
     ): NamespaceInfo =
         catalogOperation(catalog) {
             Identifiers.validate("namespace", name)
+            if (containment != null) {
+                throw HoglakeException.Validation(
+                    "creating a namespace with a containment mark needs the Postgres backend",
+                )
+            }
             meta(catalog) // 404 first, as on the Postgres path
             val tx = HogliteTx()
             tx.expectZero(

@@ -572,6 +572,16 @@ class HogliteCatalogStoreTest {
     }
 
     @Test
+    fun `creating a namespace with a containment mark is refused before any write`() {
+        seedNamespaces()
+
+        assertThat(catchThrowable { store.createNamespace("wh", "team_43", "op", null, team42) })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("needs the Postgres backend")
+        assertThat(writes()).isEmpty()
+    }
+
+    @Test
     fun `marking the same containment again and clearing an uncontained namespace send no write`() {
         val t = seedNamespaces()
         t.byId(1).apply {

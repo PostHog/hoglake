@@ -411,12 +411,29 @@ paths:
                 name:
                   type: string
                   pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+                containment:
+                  description: >
+                    Operator only. Creates the namespace already marked, as
+                    `PUT .../containment` marks one, in one transaction with
+                    the same checks: it is never visible unmarked, and a
+                    refused mark creates nothing. Another caller gets 403.
+                    Postgres catalogs only (422 elsewhere).
+                  allOf:
+                    - { $ref: "#/components/schemas/NamespaceContainment" }
       responses:
         "201":
-          description: Created
+          description: Created, with its `containment` when one was given.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
+        "403":
+          description: >-
+            A non-operator creating a `containment` mark, or a namespace named
+            `team_<digits>` (any case, any leading zeros) in a catalog listed in
+            `HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS`. Error `forbidden`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: >-
@@ -426,7 +443,9 @@ paths:
             and every backend, before any write (a mount catalog answers its
             own 403 `read_only_catalog` first); a namespace created before
             its name was reserved keeps working but cannot be created again
-            once dropped.
+            once dropped. A `containment` with an invalid field, value or org is
+            `validation` too, and creates nothing; one whose prefix already
+            holds another table's files is a 409.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }

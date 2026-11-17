@@ -227,6 +227,8 @@ data class CreateNamespaceRequestDto(
     val author: String? = null,
     @JsonDeserialize(using = OperationTextDeserializer::class)
     val message: String? = null,
+    /** Operator-only: the namespace is created already marked, as `PUT .../containment` marks one. */
+    val containment: NamespaceContainmentDto? = null,
 )
 
 // ---- tables --------------------------------------------------------------

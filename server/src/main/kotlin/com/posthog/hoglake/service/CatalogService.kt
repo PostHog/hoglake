@@ -460,30 +460,12 @@ class CatalogService(private val jdbi: Jdbi) {
             detail = { "containment=${containment?.let(::auditDetail)}" },
             actor = { author },
         ) {
-            containment?.let {
-                if (!CONTAINMENT_FIELD.matches(it.field)) {
-                    throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
-                }
-                if (it.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
-                if (it.org != null && !CONTAINMENT_ORG.matches(it.org)) {
-                    throw HoglakeException.Validation("containment org must match ${CONTAINMENT_ORG.pattern}")
-                }
-            }
+            containment?.let(::requireValidContainment)
             val (cat, scannedFrom, scannedPrefix) =
                 jdbi.inTransactionUnchecked { h ->
                     val cat = requireCatalog(h, catalog)
                     val ns = requireNamespace(h, cat, namespace)
-                    // Both read BEFORE the scan, so everything allocated
-                    // after it sits above them; see [ScanWatermark].
-                    val from =
-                        ScanWatermark(
-                            fileId =
-                                h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
-                                    .bind("c", cat.catalogId).mapTo(Long::class.java).one(),
-                            removalId =
-                                h.createQuery("SELECT coalesce(max(removal_id), 0) FROM hog_file_removal")
-                                    .mapTo(Long::class.java).one(),
-                        )
+                    val from = scanWatermark(h, cat.catalogId)
                     // The cheap refusals first, so a namespace that holds
                     // tables is told so rather than that its own files sit
                     // under its prefix. Repeated under the lock below.
@@ -546,6 +528,29 @@ class CatalogService(private val jdbi: Jdbi) {
                 ns.copy(containment = containment)
             }
         }
+
+    private fun requireValidContainment(containment: NamespaceContainment) {
+        if (!CONTAINMENT_FIELD.matches(containment.field)) {
+            throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
+        }
+        if (containment.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
+        if (containment.org != null && !CONTAINMENT_ORG.matches(containment.org)) {
+            throw HoglakeException.Validation("containment org must match ${CONTAINMENT_ORG.pattern}")
+        }
+    }
+
+    /** Read BEFORE the unlocked scan, so everything allocated after it sits above it; see [ScanWatermark]. */
+    private fun scanWatermark(
+        h: org.jdbi.v3.core.Handle,
+        catalogId: Long,
+    ) = ScanWatermark(
+        fileId =
+            h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
+                .bind("c", catalogId).mapTo(Long::class.java).one(),
+        removalId =
+            h.createQuery("SELECT coalesce(max(removal_id), 0) FROM hog_file_removal")
+                .mapTo(Long::class.java).one(),
+    )
 
     private fun auditDetail(containment: NamespaceContainment): String =
         "${containment.field}=${containment.value}" + (containment.org?.let { " org=$it" } ?: "")
@@ -748,22 +753,53 @@ class CatalogService(private val jdbi: Jdbi) {
         "cannot mark namespace '$namespace' contained: '$path' is already registered or claimed under its prefix",
     )
 
+    /**
+     * Create [name], and with a [containment] mark it in the same transaction,
+     * under the commit lock and with the checks [setNamespaceContainment]
+     * makes: it is never visible unmarked, and a refused mark leaves no
+     * namespace, snapshot or change row. The namespace is new, so it has held
+     * nothing; the prefix scan, the reused-name rule and the one-namespace-
+     * per-value index are what can refuse.
+     */
     fun createNamespace(
         catalog: String,
         name: String,
         author: String? = null,
         message: String? = null,
+        containment: NamespaceContainment? = null,
     ): NamespaceInfo =
         Audit.audited(
             "namespace_create",
             catalog,
             name,
+            detail = { created -> created.containment?.let { "containment=${auditDetail(it)}" } },
             actor = { author },
             message = { message },
         ) {
             Identifiers.validate("namespace", name)
+            containment?.let(::requireValidContainment)
+            // The scan runs before the lock, as the mark's does; under the lock
+            // only what was allocated since is re-read.
+            val scanned =
+                containment?.let {
+                    jdbi.inTransactionUnchecked { h ->
+                        val cat = requireCatalog(h, catalog)
+                        // Before the scan: an existing namespace's own files sit under its prefix.
+                        if (NamespaceRepo.findLiveByName(h, cat.catalogId, name) != null) {
+                            throw HoglakeException.AlreadyExists("namespace '$name' already exists")
+                        }
+                        val from = scanWatermark(h, cat.catalogId)
+                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, name, it, null)?.let { path ->
+                            throw prefixTaken(name, path)
+                        }
+                        cat.catalogId to from
+                    }
+                }
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
+                if (scanned != null && scanned.first != cat.catalogId) {
+                    throw HoglakeException.CommitConflict("catalog '$catalog' changed concurrently; retry")
+                }
                 Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 if (NamespaceRepo.findLiveByName(h, cat.catalogId, name) != null) {
                     throw HoglakeException.AlreadyExists("namespace '$name' already exists")
@@ -778,7 +814,14 @@ class CatalogService(private val jdbi: Jdbi) {
                     ChangeKind.NAMESPACE_CREATED,
                     namespaceId,
                 )
-                NamespaceRepo.insert(h, cat.catalogId, namespaceId, name)
+                val created = NamespaceRepo.insert(h, cat.catalogId, namespaceId, name)
+                if (containment == null) return@inTransactionUnchecked created
+                requireNeverHeld(h, cat.catalogId, created)
+                foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, name, containment, scanned?.second)?.let {
+                    throw prefixTaken(name, it)
+                }
+                NamespaceRepo.setContainment(h, cat.catalogId, namespaceId, containment)
+                created.copy(containment = containment)
             }
         }
 

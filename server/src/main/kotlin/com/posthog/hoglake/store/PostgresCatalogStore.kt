@@ -77,7 +77,8 @@ class PostgresCatalogStore(
         name: String,
         author: String?,
         message: String?,
-    ): NamespaceInfo = catalogs.createNamespace(catalog, name, author, message)
+        containment: NamespaceContainment?,
+    ): NamespaceInfo = catalogs.createNamespace(catalog, name, author, message, containment)
 
     override fun listNamespaces(
         catalog: String,

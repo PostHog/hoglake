@@ -79,9 +79,10 @@ internal class BoundCatalogStore(
         name: String,
         author: String?,
         message: String?,
+        containment: NamespaceContainment?,
     ): NamespaceInfo {
         grant.closed(catalog)
-        return inner.createNamespace(catalog, name, author, message)
+        return inner.createNamespace(catalog, name, author, message, containment)
     }
 
     override fun listNamespaces(
