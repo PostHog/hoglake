@@ -127,6 +127,26 @@ data class Caller(
         return perm.satisfies(scope)
     }
 
+    /**
+     * Does this caller's `prd` give it [scope] on `field = value`? The
+     * predicate alone: no catalog is named, so `cat` is not consulted. Only a
+     * caller whose reach has been bound to the object by some other check may
+     * rely on it, because `*` ([PredicateGrant.All]) holds for every value.
+     */
+    internal fun holdsPredicate(
+        field: String,
+        value: Long,
+        scope: Scope,
+    ): Boolean {
+        if (kind != Kind.SCOPED) return false
+        val perm =
+            when (val grant = predicates[field] ?: return false) {
+                is PredicateGrant.All -> grant.scope
+                is PredicateGrant.Values -> grant.values[value] ?: return false
+            }
+        return perm.satisfies(scope)
+    }
+
     /** Does this caller hold [scope] on [catalog] by its `cat` claim alone? Not an authorization. */
     internal fun catalogClaimAllows(
         catalog: String,

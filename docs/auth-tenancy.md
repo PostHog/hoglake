@@ -582,6 +582,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | Publications or the maintenance export on hoglite | 501 `not_supported_on_backend` |
 | A mount name (§6.5a) | Resolved first: never a store |
 | A name a mount host serves (§6.5b) | Resolved before that: forwarded to the host |
+| A configured served namespace named in the path, in a catalog this server does not hold (§6.5d) | Resolved before all of the above, whatever the token's `rtg`: read from its source catalog in PostgreSQL, or refused |
 | A remote schema named in the path, in a catalog that is none of the two above (§6.5c) | Resolved next, before any store: relayed to its host, or refused |
 
 Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
@@ -1144,12 +1145,11 @@ client, and the data comes from another deployment (the Host). The server
 that holds the catalog is the Client. For readers this replaces the separate
 mount catalog of §6.5a and §6.5b.
 
-**Only the Client side is built.** The Host does not serve the relayed paths
-yet: it has no published schemas, no rule for the `remote_schemas` claim, and
-no org filter. Until it does, a relayed request gets the Host's own refusal.
-The Host verifies the relayed token itself, so it must accept the session
-profile too. Nothing turns this on in any deployment. §6.5a and §6.5b are
-unchanged and still describe the mount.
+The Host serves the relayed paths for the namespaces it is configured to
+serve from a source catalog (§6.5d, the imports), not yet for the stream
+tables. The Host verifies the relayed token itself, so it must accept the
+session profile too. Nothing turns this on in any deployment. §6.5a and §6.5b
+are unchanged and still describe the mount.
 
 ```json
 {"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
@@ -1280,6 +1280,79 @@ unchanged and still describe the mount.
   name in the `catalog` label. The label never holds an org, a catalog, or a
   name taken from a request. A caller the rule refuses is counted as
   `not_found` on `hoglake_mount_refusals_total`.
+
+### 6.5d Served namespaces on the Host
+
+A Host reads the namespaces it is configured to serve for a Client's relayed
+requests (§6.5c). The path's catalog is the customer's own, which this server
+does not hold; the data is a namespace of a source catalog in this server's
+PostgreSQL, such as the imports.
+
+```json
+{"namespaces": [{"name": "team_9400", "source_catalog": "imports-dev"}]}
+```
+
+- **Configuration.** `HOGLAKE_SERVED_NAMESPACES_FILE` (empty, the default, is
+  off): an object with exactly a `namespaces` array, each entry exactly a
+  `name` (a namespace name) and a `source_catalog` (a catalog name). Unknown
+  keys and duplicate names are refused. The namespace in the source catalog
+  has the same name as the served one. Boot refuses it under auth `off`,
+  without `HOGLAKE_AUTH_SESSION_PROFILE=on`, without
+  `HOGLAKE_AUTH_PREDICATE_FIELDS`, with `HOGLAKE_MOUNT_HOSTS_FILE` (a server is
+  a Host or a Client), and unless PostgreSQL is the default backend.
+- **Resolution.** A request that names a configured name exactly (a case
+  variant is not served and is handled as any other namespace) under a
+  catalog this server does not hold resolves to the served namespace, before
+  a remote schema or the token's `rtg`. A mount's reserved name
+  (`<org>-events`) is never a served catalog. A catalog this server holds
+  keeps its own path: an operator reading `<source_catalog>.<name>` directly
+  is unchanged. Only a `scoped` caller enters the served rule. A tenant, an
+  operator and no caller fall through to normal handling, so the answer is
+  the one for any catalog this server does not hold, the same for a
+  configured and an unconfigured name.
+- **`rtg` is ignored.** A relayed customer token carries an `rtg.be` naming
+  the customer's own Hoglite backend, which this server does not list. On a
+  server that serves namespaces, a scoped token whose `rtg.be` is unknown
+  verifies with no routing instead of the 401 `unknown_backend`. A malformed
+  `rtg`, a known backend of another kind, and every other token kind are
+  refused as before, and a server that serves no namespace refuses an unknown
+  backend as before.
+- **Caller rule.** In every auth mode, `warn` included. Each failure is the
+  404 of a missing namespace, counted and audited once per request
+  (`at=served_namespace`), and nothing of the source is read for a caller
+  that fails an earlier step:
+  1. the token's `cat` names the path's catalog (§6.5);
+  2. the caller is `scoped`, its `cat` allows `read` on that catalog, and its
+     `remote_schemas` names the namespace;
+  3. the stored namespace is live, contained, and its containment has an
+     `org` equal to the caller's `org`;
+  4. the caller's `prd` holds the containment's field and value with `read`.
+     `*` counts, because step 3 has already bound the namespace to the
+     caller's org.
+  A namespace dropped from the source stops being served, for a pinned read
+  too: liveness is checked at head.
+- **What is served.** The four relayed routes, from the source catalog's own
+  snapshots: the namespace (its name only: no containment and no
+  `namespace_id`, which is a counter of the shared source catalog), its
+  tables, one table, and the scan. The reader is bound to the one namespace
+  and reads the store itself, not the caller's grant view, which names a
+  catalog the source is not. A head read of the namespace is one lookup; only
+  a pinned read lists namespaces.
+- **Errors.** A refusal from the source is rewritten in the caller's
+  catalog's terms: a missing table is 404 `table '<ns>.<t>' in catalog
+  '<catalog>'`, a snapshot out of range is 422 and one below the expiry floor
+  is 410, each without the source's name, ids or times.
+- **Known leak.** `read_snapshot_id`, `begin_snapshot` and `data_file_id`
+  are the shared source catalog's counters, so a reader can infer its
+  aggregate commit rate. They stay because readers pin the snapshot (P3).
+- **Read-only.** Every other route naming the namespace is refused as in
+  §6.5c: 403 `read_only_catalog` for a write, 501
+  `mount_operation_unavailable` for a read that is not relayed. A body that
+  names the namespace under a catalog this server does not hold fails on that
+  catalog; nothing reaches the source.
+- **Not built.** A pattern rule (`team_<id>`), the stream tables with an
+  org and team row filter, the remote head snapshot fields of the Client's
+  catalog snapshot (P3), and removing `hog_mount`.
 
 ### 6.6 Client-supplied authority fields must die
 

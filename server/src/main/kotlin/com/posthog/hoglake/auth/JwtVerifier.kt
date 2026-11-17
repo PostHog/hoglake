@@ -323,6 +323,15 @@ class JwtVerifier(
      * `profile_not_enabled`, never read as a plain metadata token.
      */
     private val sessionProfile: Boolean = false,
+    /**
+     * A Host that serves namespaces (docs/auth-tenancy.md §6.5d) receives a
+     * relayed customer token, whose `rtg` names a backend of the customer's
+     * deployment that this server does not list. With this set, a scoped
+     * token's unknown `rtg.be` is ignored (no routing) instead of refused.
+     * A malformed `rtg`, a known backend of another kind, and every other
+     * token kind are refused as before.
+     */
+    private val ignoreUnknownScopedRouting: Boolean = false,
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
@@ -657,6 +666,7 @@ class JwtVerifier(
             } else {
                 null
             }
+        if (ignoreUnknownScopedRouting && id !in backends && claims.get("ten")?.asText() == "scoped") return null
         if (backends[id] != backend) throw JwtViolation(JwtViolation.UNKNOWN_BACKEND, "rtg backend is not configured")
         return Routing(catalog, backend, id, tenant)
     }
