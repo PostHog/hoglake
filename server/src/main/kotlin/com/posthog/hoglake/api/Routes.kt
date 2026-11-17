@@ -191,8 +191,8 @@ fun Application.installApiRoutes(
                         is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
                         is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
                         // Unreachable: this path names no namespace.
-                        is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
-                        is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.namespace)
+                        is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+                        is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
                     }
                 }
                 delete {
@@ -232,8 +232,8 @@ fun Application.installApiRoutes(
                                 )
                             is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
                             // Unreachable: this path names no namespace.
-                            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
-                            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.namespace)
+                            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+                            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
                             is CatalogBinding.Local -> {
                                 val catalogs = binding.store
                                 // A scoped caller sees only the contained

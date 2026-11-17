@@ -34,7 +34,7 @@ class OperatorTeamNamespaces(catalogs: Collection<String>) {
     fun isOperatorOnly(
         catalog: String,
         name: String,
-    ): Boolean = catalog in listed && TEAM_NAME.matches(name)
+    ): Boolean = catalog in listed && TeamNamespaces.hasShape(name)
 
     /** 403 `forbidden` for a non-operator creating an operator-only name; [operator] false is such a caller. */
     fun refuse(
@@ -49,7 +49,5 @@ class OperatorTeamNamespaces(catalogs: Collection<String>) {
 
     companion object {
         val NONE = OperatorTeamNamespaces(emptyList())
-
-        private val TEAM_NAME = Regex("^team_[0-9]+$", RegexOption.IGNORE_CASE)
     }
 }

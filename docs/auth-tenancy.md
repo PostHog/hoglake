@@ -769,6 +769,10 @@ hoglake reserves no name itself.
   identifiers to lowercase and lets the mount shadow any case variant of
   `posthog`, so an exact match would let a direct client create a namespace
   Trino hides.
+- **The team family.** A `namespace_family` entry in the hosts file (§6.5c)
+  reserves every `team_<digits>` name, matched on the shape alone: any ASCII
+  case and any leading zeros, so `TEAM_5` and `team_007` are refused with
+  `team_5`. `team_x` and `teams` are not.
 - **The error.** 422 `validation`, "namespace name '<name>' is reserved on this
   server", as `POST /v1/catalogs` refuses a mount-shaped catalog name.
 - **Boot.** Each entry must match the namespace identifier pattern, else the
@@ -1224,7 +1228,7 @@ are unchanged and still describe the mount.
   `catalog` entry: it is not a general switch.
   Entries of the `events` and `catalog` types behave as before, with the
   profile on or off and with `http` or `https`, and one file may hold all
-  three.
+  of the types.
 - **A local name (alias).** The server that holds the catalog chooses the
   name it shows. A `namespace` entry may set `"remote_name"`, the schema's
   name on the Host (a namespace name; default: `name`):
@@ -1244,10 +1248,42 @@ are unchanged and still describe the mount.
   namespace field must be `shared` and is shown as `analytics` (see "What is
   relayed"); and the boot check below. `shared` is not reserved here, so a
   local namespace of that name stays an ordinary one. `remote_name` is refused
-  on an `events` or `catalog` entry. Two `namespace` entries whose Host names
+  on every other match type, a `namespace_family` entry included. Two `namespace` entries whose Host names
   are equal are refused at boot, whether they name one Host or two, comparing
   names exactly as the claim does: a `remote_schemas` key names exactly one
   configured schema on a server, so one claim never opens two.
+- **The team family.** A fourth matcher,
+  `{"type": "namespace_family", "family": "team"}`, serves every team schema
+  (`team_<id>`, the canonical form: `team_` and a decimal id that fits a
+  `Long`, with no leading zero, lowercase) from its host, exactly as a
+  `namespace` entry serves its name: the same boot checks, `https` unless
+  `allow_insecure_http`, the session profile on, read-only, the same four
+  relayed routes. `team` is the only family; any other value is a boot error.
+  A `namespace` entry whose name is `team_<digits>`, in any case and with any
+  leading zeros, is a boot error beside it, because one name would then have
+  two hosts, and so is a second family entry.
+  The family reserves every `team_<digits>` name locally, in any case and with
+  any leading zeros (`team_5`, `TEAM_5`, `team_007`), the way a `namespace`
+  entry reserves its name: creating one is refused, a local one is never
+  listed, read or written, and every route that names one (path, body, id,
+  query parameter, upload prefix) answers as it does for a remote schema.
+  Only the canonical name is relayed, and only to a caller that holds it; the
+  other spellings answer 404 to everyone. A name such as `team_x` or `teams`
+  is an ordinary local namespace. Metrics carry the label `team_*` for the
+  family, never a team id.
+  The team family has no alias: its local name and its Host name are the same
+  `team_<id>`, so `remote_name` is refused on a `namespace_family` entry.
+- **The team family entry.** A token reaches a team schema through the
+  `team` entry of `remote_schemas`
+  ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)):
+  `{"team": ["read"]}`, read only. The caller holds `team_<id>` when it has
+  the entry, `<id>` is canonical, and its `prd` has `team_id` with the value
+  `<id>` at any scope, or `*`. The predicate field is fixed to `team_id`. A
+  per-name entry for another schema (such as `analytics`) works as before,
+  and a per-name `team_<id>` entry still names that schema without the `prd`
+  check, but team schemas are meant to use the family entry. The Host's org
+  mark (§6.5d) bounds a `*`: the Client relays any `team_<digits>` for such a
+  token, and the Host serves only those of the token's org.
 - **The name always means the remote schema.** On a server that configures
   `analytics`:
   - creating a namespace of that name is refused (§6.2c), without listing it
@@ -1263,7 +1299,8 @@ are unchanged and still describe the mount.
   allows it. The caller is `scoped`, its `cat` allows `read` on the catalog,
   and its `remote_schemas` claim names the schema, by its name on the Host
   ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)): an
-  issuer never needs to know a local name. The claim is part of the
+  issuer never needs to know a local name. For a team schema its `team`
+  family entry and `prd` hold it. The claim is part of the
   session profile, whose `cat` names one catalog, so a token reads a remote
   schema only in that catalog. Anyone else (a tenant, with or without the
   claim; an operator; a scoped token without the claim; no caller) gets 404
@@ -1347,6 +1384,11 @@ are unchanged and still describe the mount.
   namespaces, without one that has a remote schema's name, then one entry for
   each remote schema the token allows: `{"name": "<schema>", "remote": true}`,
   under its local name (the claim is checked by the Host's name).
+  For the team family, a caller that holds it gets one entry for each explicit
+  id in its `prd.team_id`, sorted numerically (`team_9` before `team_42`). A
+  `*` lists no team: it grants every team, and the listing names none. What a
+  `*` caller should see in the listing is open in the spec. The schemas are
+  still readable by name.
   The entry has no `namespace_id`, because the namespace has no id on this
   server. The listing is built from configuration and the token. No Host is
   asked, so a Host outage does not fail it.
@@ -1369,33 +1411,36 @@ are unchanged and still describe the mount.
 
 ### 6.5d Served namespaces on the Host
 
-A Host reads the namespaces it is configured to serve for a Client's relayed
-requests (§6.5c). The path's catalog is the customer's own, which this server
-does not hold; the data is a namespace of a source catalog in this server's
-PostgreSQL, such as the imports.
+A Host reads the team namespaces it is configured to serve for a Client's
+relayed requests (§6.5c). The path's catalog is the customer's own, which this
+server does not hold; the data is a namespace of a source catalog in this
+server's PostgreSQL, such as the imports. One pattern covers every team, so no
+per-team entry is needed.
 
 ```json
-{"namespaces": [{"name": "team_9400", "source_catalog": "imports-dev"}]}
+{"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id"}]}
 ```
 
 - **Configuration.** `HOGLAKE_SERVED_NAMESPACES_FILE` (empty, the default, is
-  off): an object with exactly a `namespaces` array, each entry exactly a
-  `name` (a namespace name) and a `source_catalog` (a catalog name). Unknown
-  keys and duplicate names are refused. The namespace in the source catalog
-  has the same name as the served one. Boot refuses it under auth `off`,
-  without `HOGLAKE_AUTH_SESSION_PROFILE=on`, without
+  off): an object with exactly a `families` array, each entry exactly a
+  `family` (only `team`), a `source_catalog` (a catalog name) and a
+  `predicate_field`, which must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. At
+  most one entry per family. Unknown keys are refused, and so is the former
+  `namespaces` list, with a message that names this shape. Boot refuses it
+  under auth `off`, without `HOGLAKE_AUTH_SESSION_PROFILE=on`, without
   `HOGLAKE_AUTH_PREDICATE_FIELDS`, with `HOGLAKE_MOUNT_HOSTS_FILE` (a server is
-  a Host or a Client), and unless PostgreSQL is the default backend.
-- **Resolution.** A request that names a configured name exactly (a case
-  variant is not served and is handled as any other namespace) under a
-  catalog this server does not hold resolves to the served namespace, before
-  a remote schema or the token's `rtg`. A mount's reserved name
-  (`<org>-events`) is never a served catalog. A catalog this server holds
-  keeps its own path: an operator reading `<source_catalog>.<name>` directly
-  is unchanged. Only a `scoped` caller enters the served rule. A tenant, an
-  operator and no caller fall through to normal handling, so the answer is
-  the one for any catalog this server does not hold, the same for a
-  configured and an unconfigured name.
+  a Host or a Client), and unless PostgreSQL is the default backend. The
+  namespace in the source catalog has the same name as the served one.
+- **Resolution.** A request whose path names a canonical `team_<id>` (§6.5c:
+  no leading zero, lowercase, fits a `Long`; any other name is not a team
+  schema and is handled as any other namespace) under a catalog this server
+  does not hold resolves to the served namespace, before a remote schema or
+  the token's `rtg`. A mount's reserved name (`<org>-events`) is never a
+  served catalog. A catalog this server holds keeps its own path: an operator
+  reading `<source_catalog>.<name>` directly is unchanged. Only a `scoped`
+  caller enters the served rule. A tenant, an operator and no caller fall
+  through to normal handling, so the answer is the one for any catalog this
+  server does not hold, the same for every name.
 - **`rtg` is ignored.** A relayed customer token carries an `rtg.be` naming
   the customer's own Hoglite backend, which this server does not list. On a
   server that serves namespaces, a scoped token whose `rtg.be` is unknown
@@ -1412,13 +1457,17 @@ PostgreSQL, such as the imports.
   (`at=served_namespace`), and nothing of the source is read for a caller
   that fails an earlier step:
   1. the token's `cat` names the path's catalog (§6.5);
-  2. the caller is `scoped`, its `cat` allows `read` on that catalog, and its
-     `remote_schemas` names the namespace;
-  3. the stored namespace is live, contained, and its containment has an
-     `org` equal to the caller's `org`;
-  4. the caller's `prd` holds the containment's field and value with `read`.
-     `*` counts, because step 3 has already bound the namespace to the
-     caller's org.
+  2. the caller is `scoped`, its `cat` allows `read` on that catalog, and it
+     holds the schema `team_<id>` (§6.5c): the `team` family entry in
+     `remote_schemas` with `team_id = <id>` in its `prd` (or `*`), or a
+     per-name entry naming it;
+  3. the namespace of that name in the source catalog is live, contained with
+     `field` equal to the served `predicate_field` and `value` equal to
+     `<id>`, and its containment has an `org` equal to the caller's `org`;
+     an unmarked namespace, one marked without an org, and one marked for a
+     different value than its name says are never served;
+  4. the caller's `prd` holds that field and `<id>` with `read`. `*` counts,
+     because step 3 has already bound the namespace to the caller's org.
   A namespace dropped from the source stops being served, for a pinned read
   too: liveness is checked at head.
 - **Auth mode.** Boot accepts `warn` (dev runs it) and logs a WARN. Under
@@ -1445,7 +1494,7 @@ PostgreSQL, such as the imports.
   `mount_operation_unavailable` for a read that is not relayed. A body that
   names the namespace under a catalog this server does not hold fails on that
   catalog; nothing reaches the source.
-- **Not built.** A pattern rule (`team_<id>`), the stream tables with an
+- **Not built.** The stream tables with an
   org and team row filter, the remote head snapshot fields of the Client's
   catalog snapshot (P3), and removing `hog_mount`.
 

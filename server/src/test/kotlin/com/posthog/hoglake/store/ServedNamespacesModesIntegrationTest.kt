@@ -63,7 +63,10 @@ class ServedNamespacesModesIntegrationTest {
         val served =
             Files.createTempFile("hoglake-served-modes-ns-", ".json").also {
                 it.toFile().deleteOnExit()
-                Files.writeString(it, """{"namespaces":[{"name":"team_42","source_catalog":"imports"}]}""")
+                Files.writeString(
+                    it,
+                    """{"families":[{"family":"team","source_catalog":"imports","predicate_field":"team_id"}]}""",
+                )
             }
         val cfg =
             Config(port = 0, hydratorIntervalMs = 0).copy(
@@ -92,7 +95,7 @@ class ServedNamespacesModesIntegrationTest {
                 catalogs = """{"cust":["read"]}""",
                 iat = System.currentTimeMillis() / 1000 - 5,
                 extra =
-                    TestTokens.sessionProfile("cust", """{"team_42":["read"]}""") +
+                    TestTokens.sessionProfile("cust", """{"team":["read"]}""") +
                         (rtg?.let { ""","rtg":$it""" } ?: ""),
             ).replace("\"org\":\"11111111-1111-1111-1111-111111111111\"", "\"org\":\"$orgA\"")
         return TestTokens.mint(pair, claims)
@@ -102,7 +105,7 @@ class ServedNamespacesModesIntegrationTest {
         TestTokens.mint(
             pair,
             TestTokens.tenantClaims(org = orgA, catalogs = mapOf("cust" to listOf("admin"))).dropLast(1) +
-                TestTokens.sessionProfile("cust", """{"team_42":["read"]}""") + "}",
+                TestTokens.sessionProfile("cust", """{"team":["read"]}""") + "}",
         )
 
     private fun get(

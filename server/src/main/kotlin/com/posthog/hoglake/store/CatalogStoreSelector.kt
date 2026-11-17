@@ -9,6 +9,7 @@ import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.refuseIgnoredRouting
 import com.posthog.hoglake.auth.remoteSchemasAmong
+import com.posthog.hoglake.auth.remoteTeamSchemas
 import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
 import com.posthog.hoglake.auth.requireServedNamespaceEntitlement
@@ -40,6 +41,7 @@ import com.posthog.hoglake.service.PartitionStatsBackend
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementBackend
 import com.posthog.hoglake.service.TableCreationBackend
+import com.posthog.hoglake.service.TeamNamespaces
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
 import io.ktor.server.application.ApplicationCall
@@ -66,10 +68,10 @@ class CatalogStoreSelector(
     private val objectStore: () -> ObjectStore = { error("compaction object store is not configured") },
     /** The server owns this store. Request-scoped cleanup backends only borrow it. */
     private val removalStore: () -> RemovalStore = { error("cleanup object store is not configured") },
-    /** Host mode: the namespaces served to relayed readers, by name (docs/auth-tenancy.md §6.5d). Empty is none. */
-    servedNamespaces: List<ServedNamespace> = emptyList(),
+    /** Host mode: the families of namespaces served to relayed readers (docs/auth-tenancy.md §6.5d). Empty is none. */
+    servedFamilies: List<ServedFamily> = emptyList(),
 ) : CatalogRegistry {
-    private val served = servedNamespaces.associateBy { it.name }
+    private val servedTeams = servedFamilies.singleOrNull { it.family == TeamNamespaces.FAMILY }
 
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
@@ -105,8 +107,8 @@ class CatalogStoreSelector(
             is CatalogBinding.Local -> binding.store
             is CatalogBinding.Mount -> throw mountRefusal(call, binding.mount.name)
             is CatalogBinding.Remote -> throw mountRefusal(call, binding.name)
-            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
-            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.namespace)
+            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
         }
 
     /**
@@ -153,24 +155,26 @@ class CatalogStoreSelector(
     }
 
     /**
-     * The binding for a path that names a configured served namespace, in a
-     * catalog this server does not hold: an operator reading the source
-     * catalog itself keeps the normal local path. The name is matched
-     * exactly; a case variant is not served. The caller rule refuses in every
-     * auth mode ([requireServedNamespaceEntitlement]), and the source
-     * namespace is read once, for a caller that passes its token checks.
+     * The binding for a path that names a canonical `team_<id>` of a served
+     * family, in a catalog this server does not hold: an operator reading the
+     * source catalog itself keeps the normal local path. Only the canonical
+     * name is served; a case variant or a padded id is not. The caller rule
+     * refuses in every auth mode ([requireServedNamespaceEntitlement]), and
+     * the source namespace is read once, for a caller that passes its token
+     * checks.
      */
     private fun servedBinding(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.Served? {
-        if (served.isEmpty() || MountNames.isReserved(catalog)) return null
+        val family = servedTeams ?: return null
+        if (MountNames.isReserved(catalog)) return null
         // Only a scoped caller enters the served rule. Anyone else is handled as for any
         // catalog this server does not hold, so no refusal can say whether a name is served.
         if (call.hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return null
         val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
         val namespace = match?.namespace?.takeIf { match.catalog == catalog } ?: return null
-        val config = served[namespace] ?: return null
+        val id = TeamNamespaces.id(namespace) ?: return null
         val store = defaultPostgres() ?: return null
         try {
             store.getCatalog(catalog)
@@ -178,13 +182,14 @@ class CatalogStoreSelector(
         } catch (_: HoglakeException.NotFound) {
             // Not a catalog here: the served namespace is the only reading this path has.
         }
-        call.requireServedNamespaceEntitlement(catalog, namespace) {
-            store.liveContainment(config.sourceCatalog, namespace)
+        call.requireServedNamespaceEntitlement(catalog, namespace, family, id) {
+            store.liveContainment(family.sourceCatalog, namespace)
         }
         return CatalogBinding.Served(
             catalog,
             namespace,
-            ServedNamespaceReader(store, config.sourceCatalog, namespace, catalog),
+            ServedNamespaceReader(store, family.sourceCatalog, namespace, catalog),
+            family.label,
         )
     }
 
@@ -269,9 +274,10 @@ class CatalogStoreSelector(
         store: CatalogStore,
     ): CatalogBinding.RemoteSchema? {
         val (schema, namespace) = namedSchema(call, catalog) ?: return null
-        call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace, schema.remoteName)
+        val name = schema.match.schemaFor(namespace)
+        call.requireRemoteSchemaEntitlement(catalog, name, namespace, schema.remoteNameFor(name), schema.name)
         store.getCatalog(catalog)
-        return CatalogBinding.RemoteSchema(catalog, schema.name, schema.host)
+        return CatalogBinding.RemoteSchema(catalog, name, schema.host, schema.name)
     }
 
     /** Whether this server configures any remote schema. */
@@ -286,8 +292,15 @@ class CatalogStoreSelector(
         catalog: String,
     ): List<String> {
         call.requireCatalogEntitlement(catalog)
-        val schemas = mountHosts.remoteSchemas().associate { it.name to it.remoteName }
-        return call.hoglakeAuth.callerOrNull.remoteSchemasAmong(catalog, schemas)
+        val caller = call.hoglakeAuth.callerOrNull
+        val schemas = mountHosts.remoteSchemas()
+        val named =
+            schemas
+                .filter { it.match is MountMatch.Namespace }
+                .associate { it.name to it.remoteNameFor(it.name) }
+        val hasTeamFamily = schemas.any { it.match is MountMatch.NamespaceFamily }
+        val teams = if (hasTeamFamily) caller.remoteTeamSchemas() else emptyList()
+        return caller.remoteSchemasAmong(catalog, named) + teams
     }
 
     /**
@@ -309,7 +322,8 @@ class CatalogStoreSelector(
         for (namespace in namespaces) {
             val schema = schemas.firstOrNull { it.match.covers(namespace) } ?: continue
             if (resolve(call, catalog) !is CatalogBinding.Local) return
-            call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace, schema.remoteName)
+            val name = schema.match.schemaFor(namespace)
+            call.requireRemoteSchemaEntitlement(catalog, name, namespace, schema.remoteNameFor(name), schema.name)
             throw remoteSchemaRefusal(call, schema.name)
         }
     }

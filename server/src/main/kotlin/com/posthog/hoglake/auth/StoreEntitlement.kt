@@ -3,6 +3,8 @@ package com.posthog.hoglake.auth
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.service.TeamNamespaces
+import com.posthog.hoglake.store.ServedFamily
 import io.ktor.server.application.ApplicationCall
 
 /**
@@ -96,17 +98,27 @@ private fun storeRefusal(
 /**
  * A remote schema (docs/auth-tenancy.md §6.5c) is handed out by the same
  * rule: only to a caller whose token allows it. That is a scoped caller
- * whose `cat` allows `read` on [catalog] and whose `remote_schemas` names
- * [schema], by the schema's name on its host (a local alias never reaches
- * the claim). Deny by default: false for every other caller and for none. A
- * token that places the catalog on hoglite is not refused for it, as a
+ * whose `cat` allows `read` on [catalog] and who holds [schema], by its name
+ * on its host (a local alias never reaches the claim): by name in
+ * `remote_schemas`, or as a team schema (`team_<id>`, [TeamNamespaces.id])
+ * through the `team` family entry, which also needs the caller's `prd` to
+ * hold that id. Deny by default: false for every other caller and for none.
+ * A token that places the catalog on hoglite is not refused for it, as a
  * mount's reader is: the catalog is the caller's own.
  */
 internal fun Caller?.readsRemoteSchema(
     catalog: String,
     schema: String,
 ): Boolean =
-    this != null && kind == Caller.Kind.SCOPED && catalogClaimAllows(catalog, Scope.READ) && schema in remoteSchemas
+    this != null && kind == Caller.Kind.SCOPED && catalogClaimAllows(catalog, Scope.READ) &&
+        (schema in remoteSchemas || holdsTeamSchema(schema))
+
+/** The family entry's rule for [schema]: a canonical `team_<id>` whose id the caller's `prd` holds with `read`. */
+private fun Caller.holdsTeamSchema(schema: String): Boolean {
+    if (TeamNamespaces.FAMILY !in remoteSchemaFamilies) return false
+    val id = TeamNamespaces.id(schema) ?: return false
+    return holdsPredicate(TeamNamespaces.PREDICATE_FIELD, id, Scope.READ)
+}
 
 /**
  * The local names a namespace listing of [catalog] shows this caller, among
@@ -117,6 +129,19 @@ internal fun Caller?.remoteSchemasAmong(
     catalog: String,
     schemas: Map<String, String>,
 ): List<String> = schemas.filterValues { readsRemoteSchema(catalog, it) }.keys.sorted()
+
+/**
+ * The team schemas a namespace listing shows a caller holding the `team`
+ * family: one for each id its `prd.team_id` names, in numeric order. The
+ * listing route has already required `read` on the catalog, and the verifier
+ * admits only canonical ids, so each name is one the caller holds. A `*`
+ * grant names no ids, so it lists none; its schemas are still readable.
+ */
+internal fun Caller?.remoteTeamSchemas(): List<String> {
+    if (this == null || TeamNamespaces.FAMILY !in remoteSchemaFamilies) return emptyList()
+    val grant = predicates[TeamNamespaces.PREDICATE_FIELD] as? PredicateGrant.Values ?: return emptyList()
+    return grant.values.keys.sorted().map(TeamNamespaces::name)
+}
 
 /**
  * `CatalogStoreSelector` asks here before it hands out the binding of the
@@ -132,32 +157,36 @@ internal fun Caller?.remoteSchemasAmong(
  * to let a request through to: the catalog's own namespace of that name is
  * never served, and the Host verifies the token itself. The refusal is
  * counted and audited as the store's is, once per request, and against
- * [schema] on the mount series: a configured name, never request input.
+ * [counted] on the mount series: a configured name or family label, never
+ * request input.
  */
 internal fun ApplicationCall.requireRemoteSchemaEntitlement(
     catalog: String,
     schema: String,
     namespace: String,
     remoteName: String,
+    counted: String = schema,
 ) {
     requireCatalogEntitlement(catalog)
     if (namespace == schema && hoglakeAuth.callerOrNull.readsRemoteSchema(catalog, remoteName)) return
-    refuseMissingNamespace(catalog, schema, namespace, "remote_schema")
+    refuseMissingNamespace(catalog, counted, namespace, "remote_schema")
 }
 
 /**
  * `CatalogStoreSelector` asks here before it hands out the binding of the
- * served namespace [namespace] (docs/auth-tenancy.md §6.5d) of the caller's
- * own [catalog], which this server does not hold. In order, each failure the
- * 404 of a missing namespace, in every auth mode: the token names [catalog]
- * ([requireCatalogEntitlement]); the caller [readsRemoteSchema]; the stored
- * namespace ([containment], read only for a caller that got this far) is
- * org-marked for the caller's org; and the caller's `prd` holds the mark's
- * field and value with `read`.
+ * served team namespace [namespace] (team [id], docs/auth-tenancy.md §6.5d)
+ * of the caller's own [catalog], which this server does not hold. In order,
+ * each failure the 404 of a missing namespace, in every auth mode: the token
+ * names [catalog] ([requireCatalogEntitlement]); the caller [readsRemoteSchema];
+ * the stored namespace ([containment], read only for a caller that got this
+ * far) is marked `family.predicateField = id` for the caller's own org; and
+ * the caller's `prd` holds that field and id with `read`.
  */
 internal fun ApplicationCall.requireServedNamespaceEntitlement(
     catalog: String,
     namespace: String,
+    family: ServedFamily,
+    id: Long,
     containment: () -> NamespaceContainment?,
 ) {
     requireCatalogEntitlement(catalog)
@@ -167,12 +196,13 @@ internal fun ApplicationCall.requireServedNamespaceEntitlement(
         // `*` is a grant over every value, and is safe here only because the org
         // comparison has already bound this namespace to the caller's own org.
         if (caller != null && mark?.org != null && mark.org == caller.orgId &&
-            caller.holdsPredicate(mark.field, mark.value, Scope.READ)
+            mark.field == family.predicateField && mark.value == id &&
+            caller.holdsPredicate(family.predicateField, id, Scope.READ)
         ) {
             return
         }
     }
-    refuseMissingNamespace(catalog, namespace, namespace, "served_namespace")
+    refuseMissingNamespace(catalog, family.label, namespace, "served_namespace")
 }
 
 private fun ApplicationCall.refuseMissingNamespace(

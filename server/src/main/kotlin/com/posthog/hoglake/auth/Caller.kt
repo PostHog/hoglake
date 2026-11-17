@@ -59,6 +59,12 @@ data class Caller(
      * other token. The profile's credentials are never carried here.
      */
     val remoteSchemas: Set<String> = emptySet(),
+    /**
+     * The `remote_schemas` family entries of the same token (only `team`
+     * exists): each stands for every schema of that family the caller's
+     * `prd` holds, with `read`. Empty on every other token.
+     */
+    val remoteSchemaFamilies: Set<String> = emptySet(),
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */

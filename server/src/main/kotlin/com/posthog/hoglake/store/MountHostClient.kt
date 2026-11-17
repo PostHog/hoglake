@@ -237,10 +237,13 @@ class MountHostClient(
         field: String?,
         vararg tail: String,
     ) {
-        check((host.match as? MountMatch.Namespace)?.name == schema.schema) { "not this host's remote schema" }
+        check((host.match as? MountMatch.RemoteSchemaMatch)?.relays(schema.schema) == true) {
+            "not this host's remote schema"
+        }
         if (!CATALOG.matches(schema.catalog)) throw HoglakeException.NotFound("catalog '${schema.catalog}'")
+        // Only a namespace entry has an alias; a family relay always has the same name on both sides.
         val remote = host.remoteName ?: schema.schema
-        val subject = Subject(setOf(schema.schema), "namespace '${schema.schema}' in catalog '${schema.catalog}'")
+        val subject = Subject(setOf(schema.label), "namespace '${schema.schema}' in catalog '${schema.catalog}'")
         val path = path(schema.catalog, listOf("namespaces", remote) + tail)
         if (field == null || remote == schema.schema) return relay(call, subject, path)
         NamespaceFieldRewrite(field, remote, schema.schema) { invalid(subject.labels, it) }
@@ -261,7 +264,7 @@ class MountHostClient(
     /** The subject for mount [names]: each must have the reserved shape, and this host must serve mounts. */
     private fun mountSubject(names: Set<String>): Subject {
         check(names.isNotEmpty() && names.all(MountNames::isReserved)) { "not a mount name" }
-        check(host.match !is MountMatch.Namespace) { "a remote schema's host serves no mount" }
+        check(host.match !is MountMatch.RemoteSchemaMatch) { "a remote schema's host serves no mount" }
         return Subject(names, "catalog '${names.first()}'")
     }
 

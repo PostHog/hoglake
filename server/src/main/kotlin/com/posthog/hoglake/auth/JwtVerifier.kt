@@ -500,6 +500,7 @@ class JwtVerifier(
                     delegates = delegates,
                     routing = routing,
                     remoteSchemas = profile?.remoteSchemas ?: emptySet(),
+                    remoteSchemaFamilies = profile?.remoteSchemaFamilies ?: emptySet(),
                 )
             }
 
@@ -747,6 +748,7 @@ class JwtVerifier(
             routing = routing,
             routingIgnored = routingIgnored,
             remoteSchemas = profile?.remoteSchemas ?: emptySet(),
+            remoteSchemaFamilies = profile?.remoteSchemaFamilies ?: emptySet(),
         )
     }
 

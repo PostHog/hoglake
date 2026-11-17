@@ -7,27 +7,37 @@ import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.service.TeamNamespaces
 import java.time.Instant
 
 /**
- * One namespace this server serves to relayed readers (docs/auth-tenancy.md
- * §6.5d), as `HOGLAKE_SERVED_NAMESPACES_FILE` states it: requests naming
- * [name] under a catalog this server does not hold are answered from the
- * namespace of the same name in [sourceCatalog].
+ * One family of namespaces this server serves to relayed readers
+ * (docs/auth-tenancy.md §6.5d), as `HOGLAKE_SERVED_NAMESPACES_FILE` states
+ * it: a request for a canonical `team_<id>` ([TeamNamespaces.id]) under a
+ * catalog this server does not hold is answered from the namespace of the
+ * same name in [sourceCatalog], when that namespace is marked
+ * `[predicateField] = <id>` for the caller's org.
  */
-data class ServedNamespace(
-    val name: String,
+data class ServedFamily(
+    val family: String,
     val sourceCatalog: String,
+    val predicateField: String,
 ) {
     init {
-        require(Regex(Identifiers.PATTERN).matches(name)) {
-            "a served namespace is named by a namespace name (${Identifiers.PATTERN}), got '$name'"
+        require(family == TeamNamespaces.FAMILY) {
+            "the only served family is '${TeamNamespaces.FAMILY}', got '$family'"
         }
         require(Regex(Identifiers.CATALOG_NAME_PATTERN).matches(sourceCatalog)) {
-            "a served namespace's source_catalog is a catalog name (${Identifiers.CATALOG_NAME_PATTERN}), " +
+            "a served family's source_catalog is a catalog name (${Identifiers.CATALOG_NAME_PATTERN}), " +
                 "got '$sourceCatalog'"
         }
+        require(Regex(Identifiers.PATTERN).matches(predicateField)) {
+            "a served family's predicate_field is a field name (${Identifiers.PATTERN}), got '$predicateField'"
+        }
     }
+
+    /** What a refusal is counted against: the family, never a team id. */
+    val label: String get() = TeamNamespaces.LABEL
 }
 
 /**

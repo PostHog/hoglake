@@ -35,8 +35,9 @@ import java.nio.file.Files
 /**
  * Served namespaces on the Host end to end (docs/auth-tenancy.md §6.5d): the
  * real application over PostgreSQL, with the source catalog `imports` holding
- * namespaces marked for org A and a served-namespaces file naming some of
- * them. The callers' catalog, `cust`, does not exist on this server.
+ * team namespaces marked for org A (and a few that are marked wrongly) and a
+ * served-namespaces file naming the `team` family. The callers' catalog,
+ * `cust`, does not exist on this server.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -70,16 +71,29 @@ class ServedNamespacesIntegrationTest {
         catalogs.createCatalog(source, "s3://bucket/$source")
         for (name in listOf(
             "team_42",
+            "team_43",
+            "team_44",
+            "team_45",
+            "team_46",
             "team_50",
             "team_51",
-            "team_60",
+            "team_007",
+            "TEAM_7",
             "Team_42",
         )) catalogs.createNamespace(source, name)
         catalogs.setNamespaceContainment(source, "team_42", NamespaceContainment("team_id", 42, orgA))
-        // team_50 is not contained, team_51 is contained without an org, team_60 is marked but not configured.
+        catalogs.setNamespaceContainment(source, "team_43", NamespaceContainment("team_id", 43, orgA))
+        // Marked for a team other than the one its name says, and for another field than the served one.
+        catalogs.setNamespaceContainment(source, "team_44", NamespaceContainment("team_id", 99, orgA))
+        catalogs.setNamespaceContainment(source, "team_45", NamespaceContainment("project_id", 45, orgA))
+        // Another org's team.
+        catalogs.setNamespaceContainment(source, "team_46", NamespaceContainment("team_id", 46, orgB))
+        // team_50 is not contained, team_51 is contained without an org.
         catalogs.setNamespaceContainment(source, "team_51", NamespaceContainment("team_id", 51))
-        catalogs.setNamespaceContainment(source, "team_60", NamespaceContainment("team_id", 60, orgA))
-        for (name in listOf("team_42", "team_50", "team_51", "team_60")) {
+        // Names that are not the canonical form of a team's, each marked with the id its digits spell.
+        catalogs.setNamespaceContainment(source, "team_007", NamespaceContainment("team_id", 7, orgA))
+        catalogs.setNamespaceContainment(source, "TEAM_7", NamespaceContainment("team_id", 8, orgA))
+        for (name in listOf("team_42", "team_43", "team_44", "team_45", "team_46", "team_50", "team_51")) {
             catalogs.createTable(source, name, "events", listOf(ColumnDef("v", ColType.LONG)))
         }
         commits.commit(
@@ -96,10 +110,7 @@ class ServedNamespacesIntegrationTest {
                 it.toFile().deleteOnExit()
                 Files.writeString(
                     it,
-                    """{"namespaces":[""" +
-                        listOf("team_42", "team_50", "team_51", "team_70").joinToString(",") { n ->
-                            """{"name":"$n","source_catalog":"$source"}"""
-                        } + "]}",
+                    """{"families":[{"family":"team","source_catalog":"$source","predicate_field":"team_id"}]}""",
                 )
             }
         val cfg =
@@ -141,7 +152,7 @@ class ServedNamespacesIntegrationTest {
     private fun scoped(
         org: String = orgA,
         prd: String = """{"team_id":{"42":"read"}}""",
-        schemas: String? = """{"team_42":["read"]}""",
+        schemas: String? = """{"team":["read"]}""",
         catalog: String = cust,
         scope: String = "read",
         rtg: String? = null,
@@ -161,7 +172,7 @@ class ServedNamespacesIntegrationTest {
         TestTokens.mint(
             pair,
             TestTokens.tenantClaims(org = orgA, catalogs = mapOf(cust to listOf("admin"))).dropLast(1) +
-                TestTokens.sessionProfile(cust, """{"team_42":["read"]}""") + "}",
+                TestTokens.sessionProfile(cust, """{"team":["read"]}""") + "}",
         )
 
     private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
@@ -268,9 +279,9 @@ class ServedNamespacesIntegrationTest {
         val rtg = """{"b":"hoglite","be":"$hogliteId","t":"opaque_1"}"""
         val held = "held"
         catalogs.createCatalog(held, "s3://bucket/$held")
-        catalogs.createNamespace(held, "team_77")
+        catalogs.createNamespace(held, "data_77")
         // Contained for the token's team with no org mark: without the guard this is a plain local namespace it may write.
-        catalogs.setNamespaceContainment(held, "team_77", NamespaceContainment("team_id", 42))
+        catalogs.setNamespaceContainment(held, "data_77", NamespaceContainment("team_id", 42))
         val writePrd = """{"team_id":{"42":"write"}}"""
         val heldBefore = catalogs.getCatalog(held).headSnapshotId
         val create = """{"name":"made","columns":[{"name":"v","type":"long"}]}"""
@@ -285,8 +296,8 @@ class ServedNamespacesIntegrationTest {
             val base = "/v1/catalogs/$name"
             for (path in listOf(
                 "$base/namespaces",
-                "$base/namespaces/team_77",
-                "$base/namespaces/team_77/tables",
+                "$base/namespaces/data_77",
+                "$base/namespaces/data_77/tables",
             )) {
                 val response = send("GET", path, token)
                 assertThat(response.statusCode()).describedAs("%s: %s", path, response.body()).isEqualTo(404)
@@ -294,7 +305,7 @@ class ServedNamespacesIntegrationTest {
                 assertThat(code(response)).describedAs(path).isEqualTo("not_found")
                 assertThat(response.body()).describedAs(path).contains("catalog '$name' not found")
             }
-            val made = send("POST", "$base/namespaces/team_77/tables", token, create)
+            val made = send("POST", "$base/namespaces/data_77/tables", token, create)
             assertThat(made.statusCode()).describedAs("%s: %s", name, made.body()).isEqualTo(404)
             assertThat(made.body()).describedAs(name).contains("catalog '$name' not found")
             val listing = send("GET", "/v1/catalogs", token)
@@ -303,7 +314,7 @@ class ServedNamespacesIntegrationTest {
         }
         // A write to the catalog the Host holds did not land.
         assertThat(catalogs.getCatalog(held).headSnapshotId).isEqualTo(heldBefore)
-        assertThat(catalogs.listTables(held, "team_77")).isEmpty()
+        assertThat(catalogs.listTables(held, "data_77")).isEmpty()
         // A route outside the namespace gate is refused and recorded as a refusal, not a bare ok.
         val capture = ListAppender<ILoggingEvent>().apply { start() }
         val audit = org.slf4j.LoggerFactory.getLogger(Audit.LOGGER_NAME) as Logger
@@ -331,6 +342,9 @@ class ServedNamespacesIntegrationTest {
                 "prd without the value" to scoped(prd = """{"team_id":{"43":"read"}}"""),
                 "no remote_schemas claim" to scoped(schemas = null),
                 "remote_schemas naming another namespace" to scoped(schemas = """{"team_43":["read"]}"""),
+                "remote_schemas naming another family" to scoped(schemas = """{"analytics":["read"]}"""),
+                "a family entry with the team in another org's prd only" to
+                    scoped(org = orgB, prd = """{"team_id":{"42":"read"}}"""),
             )
         for ((what, token) in refused) {
             for (path in relayed) {
@@ -356,7 +370,7 @@ class ServedNamespacesIntegrationTest {
 
     @Test
     fun `a refused scoped caller gets the same words for a configured and an unconfigured name`() {
-        val refused = scoped(org = orgB, schemas = """{"team_42":["read"],"team_99":["read"]}""")
+        val refused = scoped(org = orgB, prd = """{"team_id":{"42":"read","99":"read"}}""")
         for (suffix in listOf("", "/tables", "/tables/events", "/tables/events/scan")) {
             val configured = send("GET", "$ns$suffix", refused)
             val other = send("GET", "${ns.replace("team_42", "team_99")}$suffix", refused)
@@ -428,7 +442,7 @@ class ServedNamespacesIntegrationTest {
         catalogs.createTable(catalogName, "team_70", "events", listOf(ColumnDef("v", ColType.LONG)))
         val live = head()
         val path = "/v1/catalogs/$cust/namespaces/team_70/tables"
-        val token = scoped(prd = """{"team_id":{"70":"read"}}""", schemas = """{"team_70":["read"]}""")
+        val token = scoped(prd = """{"team_id":{"70":"read"}}""")
         assertThat(send("GET", path, token).statusCode()).isEqualTo(200)
         catalogs.dropTable(catalogName, "team_70", "events", author = "test", message = "test")
         catalogs.dropNamespace(catalogName, "team_70", author = "test", message = "test")
@@ -452,8 +466,7 @@ class ServedNamespacesIntegrationTest {
         // Not contained at all, and contained without an org: the same refusal as a missing namespace.
         for (name in listOf("team_50", "team_51")) {
             val path = "/v1/catalogs/$cust/namespaces/$name"
-            val token =
-                scoped(prd = """{"team_id":{"*":"read"}}""", schemas = """{"$name":["read"]}""")
+            val token = scoped(prd = """{"team_id":{"*":"read"}}""")
             for (relay in listOf(path, "$path/tables", "$path/tables/events", "$path/tables/events/scan")) {
                 assertMissingNamespace(send("GET", relay, token), "$name: $relay", path)
             }
@@ -461,14 +474,98 @@ class ServedNamespacesIntegrationTest {
     }
 
     @Test
-    fun `a case variant and an unconfigured name are not served`() {
-        // `Team_42` exists in the source but is no served name; `team_60` is org-marked but not configured.
-        for (name in listOf("Team_42", "team_60", "team_99")) {
-            val token = scoped(prd = """{"team_id":{"*":"read"}}""", schemas = """{"$name":["read"]}""")
-            val response = send("GET", "/v1/catalogs/$cust/namespaces/$name/tables", token)
-            assertThat(response.statusCode()).describedAs(name).isEqualTo(404)
-            assertThat(response.body()).describedAs(name).doesNotContain("events", "a.parquet", orgA)
+    fun `a name that is not the canonical form of a team's is not served, whatever the token holds`() {
+        // The source marks team_007 and TEAM_7 for org A, and the tokens hold team 7 and 8 by `*` and by value:
+        // only a canonical `team_<id>` could be served.
+        val tokens =
+            listOf(
+                scoped(prd = """{"team_id":{"*":"read"}}"""),
+                scoped(prd = """{"team_id":{"7":"read","8":"read"}}"""),
+            )
+        for (name in listOf("team_007", "TEAM_7", "Team_42", "team_x", "teams", "team_", "team_99999999999999999999")) {
+            val named = scoped(prd = """{"team_id":{"*":"read"}}""", schemas = """{"team":["read"],"$name":["read"]}""")
+            for (token in tokens + named) {
+                for (relay in listOf("", "/tables", "/tables/events", "/tables/events/scan")) {
+                    val response = send("GET", "/v1/catalogs/$cust/namespaces/$name$relay", token)
+                    assertThat(
+                        response.statusCode(),
+                    ).describedAs("%s%s: %s", name, relay, response.body()).isEqualTo(404)
+                    assertThat(response.body()).describedAs(name).doesNotContain("a.parquet", orgA)
+                }
+            }
         }
+    }
+
+    @Test
+    fun `two teams of one org are each served to a token that holds them`() {
+        val both = scoped(prd = """{"team_id":{"42":"read","43":"write"}}""")
+        for (team in listOf("team_42", "team_43")) {
+            val base = "/v1/catalogs/$cust/namespaces/$team"
+            for (path in listOf(base, "$base/tables", "$base/tables/events", "$base/tables/events/scan")) {
+                val response = send("GET", path, both)
+                assertThat(response.statusCode()).describedAs("%s: %s", path, response.body()).isEqualTo(200)
+            }
+        }
+        // The one it does not hold is a missing namespace, though the family entry is there.
+        val onlyOne = scoped(prd = """{"team_id":{"43":"read"}}""")
+        for (path in relayed) assertMissingNamespace(send("GET", path, onlyOne), "team_42 with only 43: $path")
+        assertThat(send("GET", "/v1/catalogs/$cust/namespaces/team_43", onlyOne).statusCode()).isEqualTo(200)
+    }
+
+    @Test
+    fun `a wildcard token is served any team of its org and gets a missing namespace for another org's`() {
+        val star = scoped(prd = """{"team_id":{"*":"read"}}""")
+        for (team in listOf("team_42", "team_43")) {
+            assertThat(send("GET", "/v1/catalogs/$cust/namespaces/$team/tables", star).statusCode()).describedAs(team)
+                .isEqualTo(200)
+        }
+        // team_46 is marked for org B: org A's `*` is bounded by the mark's org, and org B's reaches it.
+        val other = "/v1/catalogs/$cust/namespaces/team_46"
+        for (relay in listOf("", "/tables", "/tables/events", "/tables/events/scan")) {
+            assertMissingNamespace(send("GET", other + relay, star), "org A wildcard: team_46$relay", other)
+        }
+        val starB = scoped(org = orgB, prd = """{"team_id":{"*":"read"}}""")
+        assertThat(send("GET", "$other/tables", starB).statusCode()).isEqualTo(200)
+        assertMissingNamespace(send("GET", "$ns/tables", starB), "org B wildcard: team_42")
+    }
+
+    @Test
+    fun `a namespace marked for another value or another field than the served ones is not served`() {
+        // team_44 is marked team_id = 99 and team_45 project_id = 45; the tokens hold what the name and the mark say.
+        val cases =
+            mapOf(
+                "team_44" to
+                    listOf(
+                        scoped(prd = """{"team_id":{"44":"read"}}"""),
+                        scoped(prd = """{"team_id":{"99":"read"}}""", schemas = """{"team_44":["read"]}"""),
+                        scoped(prd = """{"team_id":{"*":"read"}}"""),
+                    ),
+                "team_45" to
+                    listOf(
+                        scoped(prd = """{"team_id":{"45":"read"}}"""),
+                        scoped(prd = """{"team_id":{"*":"read"}}"""),
+                    ),
+            )
+        for ((name, tokens) in cases) {
+            val path = "/v1/catalogs/$cust/namespaces/$name"
+            for (token in tokens) {
+                for (relay in listOf(path, "$path/tables", "$path/tables/events", "$path/tables/events/scan")) {
+                    assertMissingNamespace(send("GET", relay, token), "$name: $relay", path)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a per-name remote_schemas entry still serves its team`() {
+        val byName = scoped(schemas = """{"team_42":["read"]}""")
+        for (path in relayed) assertThat(send("GET", path, byName).statusCode()).describedAs(path).isEqualTo(200)
+        // The per-name entry names another team than the one asked for.
+        val other = scoped(schemas = """{"team_43":["read"]}""")
+        for (path in relayed) assertMissingNamespace(send("GET", path, other), "per-name team_43: $path")
+        // And a per-name entry still needs the `prd` to hold the team.
+        val noPrd = scoped(prd = """{"team_id":{"43":"read"}}""", schemas = """{"team_42":["read"]}""")
+        for (path in relayed) assertMissingNamespace(send("GET", path, noPrd), "per-name without prd: $path")
     }
 
     @Test

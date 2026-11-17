@@ -962,8 +962,9 @@ object Metrics {
      * `catalog` is only a name the registry holds (`<orgID>-events`) or, on a
      * mount Client, one a verified token's `cat` names, so a client cannot
      * add series. A mount's team ids are its read scope and are never labels.
-     * For a remote schema `catalog` holds the schema's configured name,
-     * never the catalog or org of the request.
+     * For a remote schema `catalog` holds the schema's configured name, or
+     * the family's label (`team_*`) for a family entry, never the catalog,
+     * org or team id of the request.
      */
     fun mountRefused(
         catalog: String,
