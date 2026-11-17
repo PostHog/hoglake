@@ -373,7 +373,11 @@ paths:
         The namespaces live at head, or at `snapshot`/`at_timestamp`.
         A pinned listing includes a namespace dropped after the pin and
         excludes one created after it, so it agrees with the pinned
-        table reads.
+        table reads. On a server that configures remote schemas, each
+        one the caller's token may read follows the catalog's own
+        namespaces as `{name, remote: true}`, whatever the pin, and a
+        namespace of the catalog that has a remote schema's name is
+        left out.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/snapshot" }
@@ -4102,14 +4106,30 @@ components:
 
     Namespace:
       type: object
-      required: [name, namespace_id]
+      required: [name]
       properties:
         name: { type: string }
-        namespace_id: { type: integer, format: int64, description: Stable identity; not reused after namespace deletion. }
+        namespace_id:
+          type: integer
+          format: int64
+          description: >
+            Stable identity; not reused after namespace deletion. Present
+            on every namespace this server holds. Absent exactly when
+            `remote` is true: a remote schema has no id on this server.
         containment:
           description: Present when the namespace is contained (PUT …/containment).
           allOf:
             - { $ref: "#/components/schemas/NamespaceContainment" }
+        remote:
+          type: boolean
+          description: >
+            Present, and true, only for a remote schema: a read-only
+            namespace that another hoglake deployment serves inside this
+            catalog. Its tables are read through the same namespace,
+            table and scan routes; every write to it answers 403
+            `read_only_catalog`, and every other read 501
+            `mount_operation_unavailable`. A listing entry for a remote
+            schema carries `name` and `remote` only.
 
     NamespaceContainment:
       type: object

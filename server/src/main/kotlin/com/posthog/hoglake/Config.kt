@@ -94,20 +94,37 @@ data class Config(
      * serves:
      * {"hosts": [{"id": UUID, "match": {"type": "events"}, "kind": "hoglake",
      * "url": HTTP_URL, "auth": "forward"}]}.
-     * `match` is {"type": "events"} (every mount name, `<orgID>-events`) or
-     * {"type": "catalog", "name": NAME} (one mount name). `kind` is what the
-     * host speaks (only `hoglake`), `auth` how this server authenticates to
-     * it (only `forward`: the caller's bearer token, unchanged). Optional
-     * keys: timeout_ms, max_response_bytes, max_concurrent. Entries contain
+     * `match` is {"type": "events"} (every mount name, `<orgID>-events`),
+     * {"type": "catalog", "name": NAME} (one mount name) or
+     * {"type": "namespace", "name": NAME} (a remote schema: the namespace
+     * NAME of every catalog this server holds itself, read-only, relayed to
+     * the host; NAME is then reserved as [reservedNamespaceNames] are).
+     * `kind` is what the host speaks (only `hoglake`), `auth` how this
+     * server authenticates to it (only `forward`: the caller's bearer
+     * token, unchanged). Optional
+     * keys: timeout_ms, max_response_bytes, max_concurrent, and on a
+     * namespace entry allow_insecure_http (a boolean, default false). A
+     * namespace entry's URL must be https unless that key is true: the token
+     * relayed for a remote schema can carry storage credentials, and http
+     * sends it without transport encryption. The key is refused on the
+     * other match types, whose URLs may be http as before. A namespace
+     * entry may also set remote_name, the schema's name on the host (default
+     * NAME): NAME is what this server shows and reserves, while the relayed
+     * path and the token's `remote_schemas` use remote_name. Refused on the other
+     * match types; no two namespace entries, on any hosts, may have one
+     * name on their hosts. Entries contain
      * endpoints, never credentials; each id must be unique and canonical,
      * each URL a bare http(s) origin, and no name may match two entries.
      *
      * Empty (the default), or an empty list: no proxy, today's behaviour.
      * With hosts, a request for a matched name is checked here as a mount
-     * reader's and then sent to that host and nowhere else. Refused at boot
+     * reader's (a remote schema's needs the token's `remote_schemas` claim)
+     * and then sent to that host and nowhere else. Refused at boot
      * with [mountAllowlist] (a server is a Host or a Client), under
      * `HOGLAKE_AUTH_MODE=off`, or without [authPredicateFields] (a mount
-     * serves only verified scoped tokens).
+     * serves only verified scoped tokens). A `namespace` entry is also
+     * refused unless [authSessionProfile] is `on`: only a token carrying
+     * the session profile can name a remote schema.
      */
     val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
@@ -1483,11 +1500,16 @@ data class Config(
     /** The pinned source [field id][mountSourceFieldId], or null when unset. */
     val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
 
-    /** [reservedNamespaceNames], checked at boot: each must be a valid namespace name. */
-    val reservedNamespaces: ReservedNamespaces = ReservedNamespaces(reservedNamespaceNames)
-
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
+
+    /**
+     * [reservedNamespaceNames], checked at boot: each must be a valid
+     * namespace name. Every remote schema [mountHosts] configures is
+     * reserved with them: its name always means the remote schema.
+     */
+    val reservedNamespaces: ReservedNamespaces =
+        ReservedNamespaces(reservedNamespaceNames + mountHosts.mapNotNull { (it.match as? MountMatch.Namespace)?.name })
 
     /** The storage credential provider kinds `HOGLAKE_STORAGE_PROVIDER` names. */
     enum class StorageProviderKind(val wire: String) {
@@ -1597,6 +1619,11 @@ data class Config(
             require(authPredicateFields.split(',').any { it.isNotBlank() }) {
                 "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS (the hosts' own): a mount serves " +
                     "only scoped tokens, and none verifies without them"
+            }
+            // Off, no token can carry `remote_schemas`: the name would be reserved and never readable.
+            require(authSessionProfileEnabled || mountHosts.none { it.match is MountMatch.Namespace }) {
+                "a namespace entry in HOGLAKE_MOUNT_HOSTS_FILE (a remote schema) requires " +
+                    "HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying the session profile can read one"
             }
         }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
@@ -2208,8 +2235,12 @@ private fun readMountHosts(file: String): List<MountHost> {
     val hosts = mutableListOf<MountHost>()
     for (entry in entries) {
         require(entry.isObject) { "mount host entry must be an object" }
-        val keys = setOf("id", "match", "kind", "url", "auth", "timeout_ms", "max_response_bytes", "max_concurrent")
+        val keys =
+            setOf("id", "match", "kind", "url", "auth", "timeout_ms", "max_response_bytes", "max_concurrent") +
+                setOf("allow_insecure_http", "remote_name")
         require(entry.properties().all { it.key in keys }) { "mount host entry has unknown fields" }
+        val insecure = entry.get("allow_insecure_http")
+        require(insecure == null || insecure.isBoolean) { "mount host allow_insecure_http must be true or false" }
 
         fun text(
             node: com.fasterxml.jackson.databind.JsonNode,
@@ -2251,8 +2282,21 @@ private fun readMountHosts(file: String): List<MountHost> {
                     }
                     MountMatch.Catalog(text(matcher, "name"))
                 }
-                else -> throw IllegalArgumentException("mount host match type must be events or catalog, got '$type'")
+                "namespace" -> {
+                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "name")) {
+                        "a namespace match takes exactly a name"
+                    }
+                    MountMatch.Namespace(text(matcher, "name"))
+                }
+                else ->
+                    throw IllegalArgumentException(
+                        "mount host match type must be events, catalog or namespace, got '$type'",
+                    )
             }
+        // Not a general switch: the key itself is refused where it would mean nothing.
+        require(insecure == null || match is MountMatch.Namespace) {
+            "allow_insecure_http is only for a mount host that matches a namespace"
+        }
         val kindText = text(entry, "kind")
         val kind =
             requireNotNull(MountHost.Kind.entries.firstOrNull { it.wire == kindText }) {
@@ -2285,6 +2329,9 @@ private fun readMountHosts(file: String): List<MountHost> {
                 timeoutMs = timeout,
                 maxResponseBytes = positive("max_response_bytes", MountHost.DEFAULT_MAX_RESPONSE_BYTES),
                 maxConcurrent = concurrent.toInt(),
+                allowInsecureHttp = insecure?.asBoolean() == true,
+                // Grammar and match type are checked by MountHost itself.
+                remoteName = if (entry.has("remote_name")) text(entry, "remote_name") else null,
             )
     }
     MountHost.requireDisjoint(hosts)

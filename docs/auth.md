@@ -182,7 +182,9 @@ standing cloud identity. This profile is how such a token is spelled; hoglake
 owns it the way it owns the rest of the contract, so an issuer that mints it
 conforms to this section and to `server/src/test/resources/oauth/session-profile-vectors.json`
 (generated here, like the contract vectors; verified with the profile on).
-The verifier's half is built; routing requests to remote schemas is not.
+The verifier's half is built, and so is the Client side of remote schemas
+([auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client)),
+which serves a schema the token names only to a `scoped` token.
 
 What the server does with such a token is deliberately small. It verifies the
 profile's shape, records the read-only remote schemas the token authorizes,
@@ -202,7 +204,7 @@ it must carry all of the following, or it is refused (`invalid_token`):
 | `version` | exactly `1`; an unknown version is refused, never parsed as the one the server knows |
 | `purpose` | exactly `user-session`; this profile is for a caller's own work, so an `operator` token may not carry it |
 | `primary_catalog` | the one catalog the session is about; it must be the single key of the `cat` object as written — a second `cat` entry refuses the token even when a plain tenant token would have dropped its unknown scope words, and the `scope` spelling alone does not carry the profile. A routed token (`rtg`) routes only this catalog |
-| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction and parsed strictly: any other word, a non-string entry, a non-array value or an empty list refuses the token; nothing is dropped |
+| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction and parsed strictly: any other word, a non-string entry, a non-array value or an empty list refuses the token; nothing is dropped. Each key is the name the serving deployment publishes; a deployment that shows the schema under another name maps that name to the published one before it checks the claim |
 | `aws` | the credential bundle: non-empty strings `access_key_id`, `secret_access_key`, `session_token`, `region`, and integer `expires_at`. The token may not outlive its credentials: `exp ≤ aws.expires_at` |
 | `sid`, `generation`, `session_deadline`, `grants` | optional, for the engine that refreshes the session: a non-empty string, a positive integer, integer seconds with `aws.expires_at ≤ session_deadline`, and an array. The server checks their types and the ordering, nothing more |
 

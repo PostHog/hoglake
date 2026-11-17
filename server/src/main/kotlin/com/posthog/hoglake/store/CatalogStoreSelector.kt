@@ -2,9 +2,13 @@ package com.posthog.hoglake.store
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.auth.AuthPolicy
 import com.posthog.hoglake.auth.Routing
+import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.requireCatalogEntitlement
+import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -36,6 +40,8 @@ import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.util.AttributeKey
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -67,14 +73,22 @@ class CatalogStoreSelector(
      * The binding resolved for this request's `{catalog}`, cached so the
      * namespace gate and the handler resolve a mount once (plan row 1.3h:
      * "cache the binding per request"). A request names one catalog, so a
-     * single entry suffices; only a successful resolution is cached.
+     * single entry suffices; only a successful resolution is cached. It
+     * holds what was handed out and, for a local store, the store behind
+     * the view ([Handed]).
      */
-    private val boundCatalog = AttributeKey<Pair<String, CatalogBinding>>("HoglakeCatalogBinding")
+    private val boundCatalog = AttributeKey<Pair<String, Handed>>("HoglakeCatalogBinding")
 
     /**
+     * Under auth this hands out the caller's view of the store ([asView]),
+     * never a [HogliteCatalogStore] itself: `forCatalog(...) as?
+     * HogliteCatalogStore` is null there and quietly takes the PostgreSQL
+     * path. Choose a backend from the store itself, as [handOut] does.
+     *
      * Return one request-scoped hoglite store, or the process's PostgreSQL
      * singleton. Every catalog route calls this before any service or body
-     * work, so a mount is refused here on every route it has no reader for.
+     * work, so a mount is refused here on every route it has no reader for,
+     * and so is a remote schema the route's path names.
      */
     fun forCatalog(
         call: ApplicationCall,
@@ -84,30 +98,36 @@ class CatalogStoreSelector(
             is CatalogBinding.Local -> binding.store
             is CatalogBinding.Mount -> throw mountRefusal(call, binding.mount.name)
             is CatalogBinding.Remote -> throw mountRefusal(call, binding.name)
+            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
         }
 
     /**
      * A mount name resolves first (to the Host's mount on a Client, else to
-     * this instance's own), then verified placement, then the default backend.
+     * this instance's own), then verified placement, then the default
+     * backend. In a catalog this server holds, a remote schema the request's
+     * path names then takes the store's place, so the store is never asked
+     * about that namespace.
      * Whatever [catalog] a handler passes, it resolves only when the caller's
-     * token allows that name (auth/StoreEntitlement.kt).
+     * token allows that name, and a remote schema only when the token allows
+     * that too (auth/StoreEntitlement.kt).
      */
     override fun resolve(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding {
-        call.attributes.getOrNull(boundCatalog)?.let { (name, binding) -> if (name == catalog) return binding }
+        call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
         // Before any binding: a name resolves only when the caller's token allows it.
         call.requireCatalogEntitlement(catalog)
         val binding =
             remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
                 val routing = call.hoglakeAuth.callerOrNull?.routing
-                CatalogBinding.Local(
-                    if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
-                )
+                val routed = routing != null && routing.catalog == catalog
+                val store = if (routed) routed(call, checkNotNull(routing)) else fallback(catalog)
+                pathSchema(call, catalog, store) ?: CatalogBinding.Local(store)
             }
-        call.attributes.put(boundCatalog, catalog to binding)
-        return binding
+        val handed = asView(call, catalog, binding)
+        call.attributes.put(boundCatalog, catalog to handed)
+        return handed.binding
     }
 
     /**
@@ -142,6 +162,115 @@ class CatalogStoreSelector(
         return CatalogBinding.Remote(catalog, host)
     }
 
+    /**
+     * The remote schema this request's path names in [catalog], through
+     * [resolve]; null, and nothing resolved, for every other request. A
+     * route that relays before it parses anything asks this, so the token
+     * is checked here for [catalog] as it is in [remote].
+     */
+    fun remoteSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.RemoteSchema? {
+        call.requireCatalogEntitlement(catalog)
+        return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
+    }
+
+    /** The configured remote schema the path's `{namespace}` is, or is a case variant of; the namespace as named. */
+    private fun namedSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): Pair<RemoteSchemaHost, String>? {
+        val schemas = mountHosts.remoteSchemas()
+        if (schemas.isEmpty()) return null
+        // The route table splits the path exactly as the router does, and
+        // is what mountRefusal reads the route's class from.
+        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+        val namespace = match?.namespace?.takeIf { match.catalog == catalog } ?: return null
+        return schemas.firstOrNull { it.match.covers(namespace) }?.let { it to namespace }
+    }
+
+    /**
+     * The binding for a path that names a remote schema, reached only once
+     * the token is known to allow [catalog], [catalog] is not a mount, and
+     * a backend of this server ([store]) is the one that would serve it.
+     * This is the one place the binding is handed out, and it is only when
+     * the token allows the schema too: before the namespace gate lets a
+     * scoped caller on and before any handler, so nothing is sent to the
+     * Host for anyone else.
+     *
+     * A remote schema is a namespace of a catalog this server holds, so
+     * the catalog must exist in [store]: one read, made only for a caller
+     * the token check has passed, once per request (the binding is cached).
+     * A catalog nobody holds is the store's own 404, and nothing is sent.
+     */
+    private fun pathSchema(
+        call: ApplicationCall,
+        catalog: String,
+        store: CatalogStore,
+    ): CatalogBinding.RemoteSchema? {
+        val (schema, namespace) = namedSchema(call, catalog) ?: return null
+        call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace, schema.remoteName)
+        store.getCatalog(catalog)
+        return CatalogBinding.RemoteSchema(catalog, schema.name, schema.host)
+    }
+
+    /** Whether this server configures any remote schema. */
+    val hasRemoteSchemas: Boolean get() = mountHosts.remoteSchemas().isNotEmpty()
+
+    /** Whether [namespace] is a configured remote schema's name or a case variant: never a local namespace here. */
+    fun isRemoteSchema(namespace: String): Boolean = mountHosts.remoteSchemas().any { it.match.covers(namespace) }
+
+    /** The remote schemas a namespace listing of the local [catalog] shows this caller: those its token allows. */
+    fun visibleRemoteSchemas(
+        call: ApplicationCall,
+        catalog: String,
+    ): List<String> {
+        call.requireCatalogEntitlement(catalog)
+        val schemas = mountHosts.remoteSchemas().associate { it.name to it.remoteName }
+        return call.hoglakeAuth.callerOrNull.remoteSchemasAmong(catalog, schemas)
+    }
+
+    /**
+     * Refuse a request on the local [catalog] that names a remote schema in
+     * its body or query ([namespaces]): a commit's targets, a table
+     * creation's namespace, a `namespace` parameter. The answer is the one
+     * a path naming it gets: 404 unless the caller's token allows the
+     * schema, then 403 for a write and 501 for a read. A no-op when none of
+     * [namespaces] is a remote schema, and on a server that configures none.
+     */
+    fun refuseRemoteSchemas(
+        call: ApplicationCall,
+        catalog: String,
+        namespaces: Collection<String>,
+    ) {
+        call.requireCatalogEntitlement(catalog)
+        val schemas = mountHosts.remoteSchemas()
+        if (schemas.isEmpty()) return
+        for (namespace in namespaces) {
+            val schema = schemas.firstOrNull { it.match.covers(namespace) } ?: continue
+            if (resolve(call, catalog) !is CatalogBinding.Local) return
+            call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace, schema.remoteName)
+            throw remoteSchemaRefusal(call, schema.name)
+        }
+    }
+
+    /**
+     * The live tables of the local [catalog] that sit in a namespace a
+     * remote schema hides, by UUID, each with that namespace's name: what a
+     * route that addresses a table by UUID alone checks before it serves.
+     * Empty, and nothing read, on a server that configures no remote schema.
+     */
+    fun hiddenTables(
+        store: CatalogStore,
+        catalog: String,
+    ): Map<UUID, String> {
+        if (!hasRemoteSchemas) return emptyMap()
+        return store.listNamespaces(catalog).map { it.name }.filter(::isRemoteSchema)
+            .flatMap { namespace -> store.listTables(catalog, namespace).map { it.tableUuid to namespace } }
+            .toMap()
+    }
+
     /** A mount reads this process's PostgreSQL, so it exists only where PostgreSQL is the default. */
     private fun mount(
         call: ApplicationCall,
@@ -163,7 +292,7 @@ class CatalogStoreSelector(
         val mounts = mountVisibility(caller)
         return if (routing != null) {
             Listing(
-                routed(call, routing),
+                listed(call, routed(call, routing)),
                 setOf(routing.catalog),
                 usePostgresTotals = routing.backend == BackendKind.POSTGRES,
                 mounts = mounts,
@@ -172,7 +301,7 @@ class CatalogStoreSelector(
             // A mount reader on a Client with no default backend has no local
             // catalogs to list, only the Host's mounts.
             val store = if (mounts.any { mountHosts.resolve(caller, it) != null }) defaultPostgres() else fallback("")
-            Listing(store, caller?.visibleCatalogs(), usePostgresTotals = true, mounts = mounts)
+            Listing(listed(call, store), caller?.visibleCatalogs(), usePostgresTotals = true, mounts = mounts)
         }
     }
 
@@ -238,7 +367,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> UploadBackend,
-    ): UploadBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.uploads ?: postgres()
+    ): UploadBackend = handOut(call, catalog, postgres, ::BoundUploads) { it.uploads }
 
     fun tableCreations(
         call: ApplicationCall,
@@ -250,7 +379,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> TableCreationBackend,
-    ): TableCreationBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.tableCreations ?: postgres()
+    ): TableCreationBackend = handOut(call, catalog, postgres, ::BoundTableCreations) { it.tableCreations }
 
     fun alters(
         call: ApplicationCall,
@@ -262,7 +391,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> AlterBackend,
-    ): AlterBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.alters ?: postgres()
+    ): AlterBackend = handOut(call, catalog, postgres, ::BoundAlters) { it.alters }
 
     fun views(
         call: ApplicationCall,
@@ -274,7 +403,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> ViewBackend,
-    ): ViewBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.views ?: postgres()
+    ): ViewBackend = handOut(call, catalog, postgres, ::BoundViews) { it.views }
 
     fun partitionStats(
         call: ApplicationCall,
@@ -286,7 +415,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> PartitionStatsBackend,
-    ): PartitionStatsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres()
+    ): PartitionStatsBackend = handOut(call, catalog, postgres, ::BoundPartitionStats) { it.partitions }
 
     fun partitionListing(
         call: ApplicationCall,
@@ -298,7 +427,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> PartitionListingBackend,
-    ): PartitionListingBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres()
+    ): PartitionListingBackend = handOut(call, catalog, postgres, ::BoundPartitionListing) { it.partitions }
 
     fun partitionLookup(
         call: ApplicationCall,
@@ -310,7 +439,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> PartitionLookupBackend,
-    ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres()
+    ): PartitionLookupBackend = handOut(call, catalog, postgres, ::BoundPartitionLookup) { it.partitionLookup }
 
     /** Resolve options through the same request-scoped store as catalog operations. */
     fun options(
@@ -323,7 +452,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> OptionsBackend,
-    ): OptionsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.options ?: postgres()
+    ): OptionsBackend = handOut(call, catalog, postgres, ::BoundOptions) { it.options }
 
     fun expiry(
         call: ApplicationCall,
@@ -335,7 +464,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> ExpiryBackend,
-    ): ExpiryBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.expiry ?: postgres()
+    ): ExpiryBackend = handOut(call, catalog, postgres, ::BoundExpiry) { it.expiry }
 
     fun cleanup(
         call: ApplicationCall,
@@ -348,9 +477,9 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> CleanupBackend,
     ): CleanupBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+        handOut(call, catalog, postgres, ::BoundCleanup) {
             HogliteCleanup(checkNotNull(cfg), it, removalStore())
-        } ?: postgres()
+        }
 
     fun compaction(
         call: ApplicationCall,
@@ -363,15 +492,17 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> CompactionBackend,
     ): CompactionBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+        handOut(call, catalog, postgres, ::BoundCompaction) {
             HogliteCompaction(
-                it, objectStore(), hogliteCompactionConfig(),
+                it,
+                objectStore(),
+                hogliteCompactionConfig(),
                 cursors =
                     compactionCursors.computeIfAbsent(checkNotNull(call.hoglakeAuth.callerOrNull?.routing).backendId) {
                         HogliteCompactionCursors()
                     },
             )
-        } ?: postgres()
+        }
 
     fun retirement(
         call: ApplicationCall,
@@ -383,7 +514,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> RetirementBackend,
-    ): RetirementBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.retirement ?: postgres()
+    ): RetirementBackend = handOut(call, catalog, postgres, ::BoundRetirement) { it.retirement }
 
     fun hydratorMaintenance(
         call: ApplicationCall,
@@ -396,7 +527,7 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
     ): HydratorMaintenanceBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.hydratorMaintenance ?: postgres()
+        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) { it.hydratorMaintenance }
 
     fun maintenanceStatus(
         call: ApplicationCall,
@@ -409,7 +540,7 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> MaintenanceStatusBackend,
     ): MaintenanceStatusBackend =
-        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+        handOut(call, catalog, postgres, ::BoundMaintenanceStatus) {
             val config = checkNotNull(cfg)
             HogliteMaintenanceStatus(
                 it,
@@ -420,7 +551,7 @@ class CatalogStoreSelector(
                 config.retirementIntervalMs,
                 config.compactionTargetBytes,
             )
-        } ?: postgres()
+        }
 
     /** Fleet reads require a configured PostgreSQL backend, not a tenant placement. */
     fun requirePostgresInstance() {
@@ -434,10 +565,87 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ) {
-        if (forCatalog(call, catalog) is HogliteCatalogStore) {
-            throw HoglakeException.NotSupported("this operation is not supported on a hoglite backend")
-        }
+        if (local(call, catalog).store is HogliteCatalogStore) throw notOnHoglite()
     }
+
+    private fun notOnHoglite() = HoglakeException.NotSupported("this operation is not supported on a hoglite backend")
+
+    /**
+     * The namespace table creation [operationId] of [catalog] was prepared
+     * for, read from the backend itself: the input of the handler's own check
+     * (api/TableCreationRoutes.kt), which decides before the handler asks the
+     * caller's view. The view then finds it kept for the request.
+     */
+    fun creationNamespace(
+        call: ApplicationCall,
+        catalog: String,
+        operationId: UUID,
+        postgres: () -> TableCreationBackend,
+    ): String {
+        val local = local(call, catalog)
+        val backend = (local.store as? HogliteCatalogStore)?.tableCreations ?: postgres()
+        return backend.status(catalog, operationId).definition.namespace.also { local.grant?.found(operationId, it) }
+    }
+
+    /**
+     * What [resolve] handed out for a catalog on this request ([binding]),
+     * and for a local store the store itself and the grant its views ask
+     * (auth/StoreGrant.kt).
+     */
+    private class Handed(
+        val binding: CatalogBinding,
+        val store: CatalogStore? = null,
+        val grant: StoreGrant? = null,
+    )
+
+    /**
+     * A local store leaves this class only as the caller's view of it
+     * (BoundCatalogStore.kt), which holds every operation to this catalog
+     * and to what the caller's token allows in it. With no caller resolved
+     * (auth `off`) there is no grant, and the store itself is handed out.
+     */
+    private fun asView(
+        call: ApplicationCall,
+        catalog: String,
+        binding: CatalogBinding,
+    ): Handed {
+        if (binding !is CatalogBinding.Local) return Handed(binding)
+        val grant = StoreGrant.of(call, catalog, binding.store) ?: return Handed(binding, binding.store)
+        return Handed(CatalogBinding.Local(BoundCatalogStore(grant, binding.store)), binding.store, grant)
+    }
+
+    /** What [forCatalog] handed out, after every refusal it makes: for this class's backend choice. */
+    private fun local(
+        call: ApplicationCall,
+        catalog: String,
+    ): Handed {
+        forCatalog(call, catalog)
+        // forCatalog resolved [catalog] last, so the request's one entry is its.
+        return call.attributes[boundCatalog].second
+    }
+
+    /**
+     * The sub-backend of [catalog] for this request: the hoglite store's
+     * own ([hoglite]) or the PostgreSQL service, chosen from the store
+     * itself and handed out as the caller's view of it ([view]).
+     */
+    private fun <T : Any> handOut(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> T,
+        view: (StoreGrant, T) -> T,
+        hoglite: (HogliteCatalogStore) -> T,
+    ): T {
+        val local = local(call, catalog)
+        val backend = (local.store as? HogliteCatalogStore)?.let(hoglite) ?: postgres()
+        return local.grant?.let { view(it, backend) } ?: backend
+    }
+
+    /** The catalog listing's store, as a view bound to no catalog: it lists the token's catalogs and nothing else. */
+    private fun listed(
+        call: ApplicationCall,
+        store: CatalogStore?,
+    ): CatalogStore? = store?.let { StoreGrant.of(call, null, it)?.let { grant -> BoundCatalogStore(grant, it) } ?: it }
 
     /** Readiness also checks every configured hoglite backend, including clients not yet used by a request. */
     fun reachable(): Boolean = cfg?.hogliteBackends?.keys?.all { client(it).reachable() } ?: true

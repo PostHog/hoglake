@@ -28,7 +28,7 @@ val jdbiVersion = "3.55.0"
 val flywayVersion = "13.12.1"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.57.10"
+val awsSdkVersion = "2.57.12"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -42,8 +42,8 @@ dependencies {
     implementation("io.ktor:ktor-serialization-jackson:$ktorVersion")
     implementation("io.ktor:ktor-server-status-pages:$ktorVersion")
     implementation("io.ktor:ktor-server-call-logging:$ktorVersion")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.22.4")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.22.4")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.23.0")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.23.0")
 
     // Persistence
     implementation("org.postgresql:postgresql:42.7.14")
@@ -103,7 +103,7 @@ dependencies {
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.6")
-    implementation("io.github.oshai:kotlin-logging-jvm:8.0.4")
+    implementation("io.github.oshai:kotlin-logging-jvm:8.0.6")
     implementation("net.logstash.logback:logstash-logback-encoder:8.1")
     implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")
     implementation("io.micrometer:micrometer-registry-prometheus:1.17.2")
@@ -303,6 +303,7 @@ val fuzzSoakTargets =
         "CommitReceiptFuzzTest",
         "VariantShreddingFuzzTest",
         "JwtAudienceFuzzTest",
+        "NamespaceFieldRewriteFuzzTest",
     )
 
 val fuzzSweepTargets =

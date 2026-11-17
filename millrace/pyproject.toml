@@ -16,14 +16,14 @@ dependencies = [
     # layer unpacks two-tuples and raises "too many values to unpack"
     # for every sorted flush (verified by bisecting 21.0.0–25.0.0 in
     # scratch venvs; the failure mode is every sorted flush refusing).
-    "pyarrow>=26.0.0",
+    "pyarrow>=26.0.1",
     # Pinned to the 0.17.x line: the binding-parity suite
     # (tests/test_slatedb_parity.py) pins THIS version's observed
     # semantics — lazy FENCED on a contested open, GC-beside-a-writer
     # safety, "compactor disabled stalls L0 at l0_max_ssts",
     # submit_compaction's enqueue-only shape, the emitted metric names.
     # A minor bump is a deliberate re-verification, not a refresh.
-    "slatedb==0.17.*",
+    "slatedb==0.18.*",
     "confluent-kafka>=2.16.0",
     "prometheus-client>=0.20",
     "httpx>=0.27",
@@ -48,7 +48,11 @@ dev = [
     # Pinned for the same reason: mutant generation changes between
     # releases. Scoped to the pure core (keyspace, planner); run on
     # changes to those files (docs/kafka-ingestion-plan.md, Phase 1).
-    "mutmut==3.8.0",
+    # 3.8.1 is the first release whose stats collector reads
+    # `item.nodeid`; 3.8.0 read the private `item._nodeid`, which pytest
+    # 9.2 removed, so `mutmut run` died in "Running stats" on every
+    # mutant (boxed/mutmut#615, fixed by #616).
+    "mutmut==3.8.1",
 ]
 
 [tool.uv.sources]

@@ -1,12 +1,16 @@
 package com.posthog.hoglake.store
 
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.ReservedNamespaces
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.URI
 import java.util.UUID
 
 /**
- * Which catalog names one mount host serves. A name matches at most one
- * configured host ([MountHost.requireDisjoint], checked at boot).
+ * Which names one mount host serves: catalog names ([Events], [Catalog]) or
+ * one namespace name in every local catalog ([Namespace]). A name matches at
+ * most one configured host ([MountHost.requireDisjoint], checked at boot).
  */
 sealed interface MountMatch {
     fun matches(catalog: String): Boolean
@@ -37,6 +41,33 @@ sealed interface MountMatch {
 
         override fun matches(catalog: String): Boolean = catalog == name
     }
+
+    /**
+     * A remote schema: the namespace [name] of every catalog this server
+     * holds itself is served by the host. Wire:
+     * `{"type": "namespace", "name": "..."}`.
+     *
+     * It matches no catalog name: the catalog stays local and only requests
+     * for this namespace go to the host ([MountHostResolver.remoteSchemas]).
+     * [covers] folds ASCII case as the reserved-name check does
+     * ([ReservedNamespaces]), so no case variant of the name is a local
+     * namespace; only the exact [name] is relayed. [name] is the local
+     * name; the host may know the schema by another ([MountHost.remoteName]).
+     */
+    data class Namespace(
+        val name: String,
+    ) : MountMatch {
+        init {
+            require(Regex(Identifiers.PATTERN).matches(name)) {
+                "a mount host matches a namespace by a namespace name (${Identifiers.PATTERN}), got '$name'"
+            }
+        }
+
+        override fun matches(catalog: String): Boolean = false
+
+        /** Whether [namespace] is this remote schema's name or a case variant of it. */
+        fun covers(namespace: String): Boolean = ReservedNamespaces.fold(namespace) == ReservedNamespaces.fold(name)
+    }
 }
 
 /**
@@ -64,6 +95,22 @@ data class MountHost(
     val maxResponseBytes: Long = DEFAULT_MAX_RESPONSE_BYTES,
     /** The cap over this host's proxied requests in flight. */
     val maxConcurrent: Int = DEFAULT_MAX_CONCURRENT,
+    /**
+     * `allow_insecure_http`, for a [MountMatch.Namespace] entry only: this
+     * remote schema's host may be an `http` origin. Without it such an
+     * entry must be `https`: the token relayed for a remote schema can
+     * carry storage credentials (the session profile), and `http` sends
+     * it without transport encryption.
+     */
+    val allowInsecureHttp: Boolean = false,
+    /**
+     * `remote_name`, for a [MountMatch.Namespace] entry only: the schema's
+     * name on the host, when it is not the local name (an alias). The
+     * relayed path and the token check use it; the reserved name, the
+     * hidden local namespace and every answer to the caller use the local
+     * name. Null: the same name on both sides.
+     */
+    val remoteName: String? = null,
 ) {
     /** What the host speaks. Each kind needs its own reader; only a hoglake's exists. */
     enum class Kind(val wire: String) {
@@ -88,6 +135,19 @@ data class MountHost(
     init {
         require(origin.scheme in setOf("http", "https") && !origin.host.isNullOrEmpty()) {
             "a mount host must be an http(s) origin"
+        }
+        require(!allowInsecureHttp || match is MountMatch.Namespace) {
+            "allow_insecure_http is only for a mount host that matches a namespace"
+        }
+        require(match !is MountMatch.Namespace || origin.scheme == "https" || allowInsecureHttp) {
+            "a mount host that matches a namespace must be an https origin: the token it is sent can carry " +
+                "storage credentials. Set \"allow_insecure_http\": true on the entry to send it over http"
+        }
+        require(remoteName == null || match is MountMatch.Namespace) {
+            "remote_name is only for a mount host that matches a namespace"
+        }
+        require(remoteName == null || Regex(Identifiers.PATTERN).matches(remoteName)) {
+            "a mount host's remote_name must be a namespace name (${Identifiers.PATTERN}), got '$remoteName'"
         }
         require(timeoutMs >= 1) { "timeout_ms must be >= 1, got $timeoutMs" }
         require(maxResponseBytes >= 1) { "max_response_bytes must be >= 1, got $maxResponseBytes" }
@@ -128,19 +188,31 @@ data class MountHost(
         }
 
         /**
-         * No id may name two of [hosts], and no catalog name may match two:
-         * which host answers must never depend on their order.
+         * No id may name two of [hosts], and no catalog or namespace name
+         * may match two: which host answers must never depend on their order.
+         * Nor may two namespace entries have one name on their hosts, on one
+         * host or two: a `remote_schemas` claim names a schema by that name
+         * alone, exactly, so one key would open both.
          */
         fun requireDisjoint(hosts: List<MountHost>) {
             require(hosts.map { it.id }.toSet().size == hosts.size) { "duplicate mount host id" }
             for ((i, a) in hosts.withIndex()) {
                 for (b in hosts.drop(i + 1)) {
                     require(!overlap(a.match, b.match)) {
-                        "two mount hosts match the same catalog name (${describe(a.match)} and ${describe(b.match)})"
+                        val what = if (a.match is MountMatch.Namespace) "namespace" else "catalog"
+                        "two mount hosts match the same $what name (${describe(a.match)} and ${describe(b.match)})"
+                    }
+                    require(a.remoteSchema == null || a.remoteSchema != b.remoteSchema) {
+                        "two mount hosts relay to the same schema name '${a.remoteSchema}' on their hosts " +
+                            "(${describe(a.match)} and ${describe(b.match)})"
                     }
                 }
             }
         }
+
+        /** A namespace entry's schema name on its host; null for a mount entry. */
+        private val MountHost.remoteSchema: String?
+            get() = (match as? MountMatch.Namespace)?.let { remoteName ?: it.name }
 
         private fun overlap(
             a: MountMatch,
@@ -149,12 +221,15 @@ data class MountHost(
             when (a) {
                 is MountMatch.Events -> b is MountMatch.Events || (b is MountMatch.Catalog && a.matches(b.name))
                 is MountMatch.Catalog -> b.matches(a.name)
+                // A namespace name and a catalog name never meet.
+                is MountMatch.Namespace -> b is MountMatch.Namespace && a.covers(b.name)
             }
 
         private fun describe(match: MountMatch): String =
             when (match) {
                 is MountMatch.Events -> "events"
                 is MountMatch.Catalog -> "catalog '${match.name}'"
+                is MountMatch.Namespace -> "namespace '${match.name}'"
             }
     }
 }
@@ -177,21 +252,54 @@ fun interface MountHostResolver {
         catalog: String,
     ): MountHostClient?
 
+    /**
+     * The remote schemas this server configures: empty unless a host matches
+     * a namespace ([MountMatch.Namespace]). Static configuration, the same
+     * for every caller and catalog; who may read one is the token's to say
+     * (auth/StoreEntitlement.kt).
+     */
+    fun remoteSchemas(): List<RemoteSchemaHost> = emptyList()
+
     companion object {
         /** No hosts: every name is local, which is a server that is not a mount Client. */
         val NONE = MountHostResolver { _, _ -> null }
     }
 }
 
+/** One configured remote schema: its [match] and the reader of the host that serves it. */
+class RemoteSchemaHost(
+    val match: MountMatch.Namespace,
+    val host: MountHostClient,
+) {
+    /** The schema's local name: the one name a request may use, and its label in metrics. */
+    val name: String get() = match.name
+
+    /** The schema's name on the host: what is relayed and what the token's `remote_schemas` names. */
+    val remoteName: String get() = host.host.remoteName ?: match.name
+}
+
 /** The resolver over static server configuration: each configured host, by id and by the names it matches. */
 class StaticMountHosts(
     hosts: List<MountHost>,
 ) : MountHostResolver, AutoCloseable {
+    private val log = KotlinLogging.logger {}
     private val readers: List<MountHostClient>
+    private val schemas: List<RemoteSchemaHost>
 
     init {
         MountHost.requireDisjoint(hosts)
+        // Once, where the configuration is taken up: an entry that opted in is named by its id.
+        hosts.filter { it.allowInsecureHttp && it.origin.scheme == "http" }.forEach {
+            log.warn {
+                "mount host ${it.id} is a remote schema's host over http (allow_insecure_http): the caller's " +
+                    "token, which can carry storage credentials, is sent to it without transport encryption"
+            }
+        }
         readers = hosts.map(::MountHostClient)
+        schemas =
+            readers.mapNotNull { reader ->
+                (reader.host.match as? MountMatch.Namespace)?.let { RemoteSchemaHost(it, reader) }
+            }
     }
 
     /** The reader for the configured host [id], or null: an id outside the configuration names nothing. */
@@ -201,6 +309,8 @@ class StaticMountHosts(
         caller: Caller?,
         catalog: String,
     ): MountHostClient? = readers.firstOrNull { it.host.match.matches(catalog) }
+
+    override fun remoteSchemas(): List<RemoteSchemaHost> = schemas
 
     override fun close() = readers.forEach { it.close() }
 }

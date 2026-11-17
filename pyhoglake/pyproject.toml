@@ -29,7 +29,7 @@ dependencies = [
     # pyarrow matrix runs the variant suites on this one. (Below that, 21
     # is the floor of the parquet UUID annotation hoglake's uuid wire form
     # requires: 18-20 write a bare FIXED_LEN_BYTE_ARRAY(16).)
-    "pyarrow>=26.0.0",
+    "pyarrow>=26.0.1",
     "thrift>=0.22.0,<1",
 ]
 
@@ -63,7 +63,7 @@ fast-upload = ["boto3>=1.43.119"]
 # installs nothing rather than build the sdist (Rust needed), and the
 # Python codec runs. Free-threaded CPython and glibc below 2.28, which no
 # marker tells apart, still get the sdist.
-variant-codec = ["""pyhoglake-variant-codec==0.1.0; \
+variant-codec = ["""pyhoglake-variant-codec==0.1.1; \
     platform_python_implementation == 'CPython' and (\
     (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) \
     or (sys_platform == 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'arm64')) \

@@ -72,8 +72,36 @@ object FuzzSeedGenerator {
         seedCommitReceiptTarget(root)
         seedVariantShreddingTarget(root)
         seedJwtAudienceTarget(root)
+        seedNamespaceFieldRewriteTarget(root)
 
         println("fuzz seed corpus written under $root")
+    }
+
+    /**
+     * NamespaceFieldRewriteFuzzTest's layout: a mode byte (0 a generated
+     * answer, 1 arbitrary bytes) and a chunk-size seed, then the generator's
+     * tape or the answer itself.
+     */
+    private fun seedNamespaceFieldRewriteTarget(root: Path) {
+        val out = dir(root, "NamespaceFieldRewriteFuzzTest", "rewriteChangesOnlyTheTopLevelField")
+        val u = "\\" + "u00"
+        val answers =
+            mapOf(
+                "answer_namespace" to """{"name":"shared","remote":true}""",
+                "answer_numbers" to
+                    """{"n":[1e10,-0.0,-0,1.10,1E-7,12345678901234567890],"name":"shared","o":{"name":"shared"}}""",
+                "answer_escaped" to """ { "s" : "${u}e9\/" , "n${u}61me" : "sh${u}61red" } """,
+                "refused_duplicate" to """{"name":"shared","name":"shared"}""",
+                "refused_trailing_comma" to """{"name":"shared","a":1,}""",
+                "refused_trailing_value" to """{"name":"shared"} {}""",
+                "refused_other_name" to """{"name":"other"}""",
+            )
+        for ((i, entry) in answers.entries.withIndex()) {
+            write(out, entry.key, byteArrayOf(1, i.toByte()) + entry.value.toByteArray())
+        }
+        for (fill in listOf(1, 7, 0x55, 0xff)) {
+            write(out, "generated_$fill", byteArrayOf(0, fill.toByte()) + ByteArray(96) { (fill * (it + 1)).toByte() })
+        }
     }
 
     private fun seedJwtAudienceTarget(root: Path) {

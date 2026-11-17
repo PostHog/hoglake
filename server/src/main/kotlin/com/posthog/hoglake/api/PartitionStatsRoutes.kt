@@ -35,12 +35,17 @@ fun Application.installPartitionStatsRoutes(
     routing {
         get("/v1/catalogs/{catalog}/stats/partitions") {
             val stats = selector?.partitionStats(call, call.catalog(), stats) ?: stats()
+            val namespace = call.request.queryParameters["namespace"]
+            // A remote schema's name is never a local namespace: asking for
+            // it is refused, and the catalog-wide report leaves it out. The
+            // rows go after the backend's query, so a page can be shorter
+            // than the limit and the report's counts still include them.
+            selector?.refuseRemoteSchemas(call, call.catalog(), listOfNotNull(namespace))
+            val table = call.request.queryParameters["table"]
+            val report = stats.partitionStats(call.catalog(), namespace, table, call.statsLimit())
             call.respond(
-                stats.partitionStats(
-                    call.catalog(),
-                    call.request.queryParameters["namespace"],
-                    call.request.queryParameters["table"],
-                    call.statsLimit(),
+                report.copy(
+                    partitions = report.partitions.filterNot { selector?.isRemoteSchema(it.namespace) == true },
                 ).toDto(),
             )
         }
