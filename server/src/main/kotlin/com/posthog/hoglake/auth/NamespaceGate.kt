@@ -81,7 +81,11 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         // 1.3h: "calls resolve and skips containment for an export"). A
         // mount Client's remote binding is the same case one hop early:
         // the Client holds no namespaces, and the Host scopes the read.
+        // A remote schema is the same case for one namespace of a local
+        // catalog: resolve has checked the token allows it, which is the
+        // whole of this server's check, and no containment exists to read.
         isExport = { call, catalog -> selector.resolve(call, catalog) !is CatalogBinding.Local },
+        refuseRemoteSchemas = selector::refuseRemoteSchemas.takeIf { selector.hasRemoteSchemas },
     )
 }
 
@@ -89,6 +93,7 @@ private fun Application.installCallNamespaceGate(
     dataPath: (ApplicationCall, String) -> String?,
     containment: (ApplicationCall, String, String) -> NamespaceContainment?,
     isExport: (ApplicationCall, String) -> Boolean = { _, _ -> false },
+    refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
 ) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
@@ -98,7 +103,7 @@ private fun Application.installCallNamespaceGate(
         NamespaceGatePhase,
     )
     attributes.put(NamespaceGateKey, Unit)
-    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath))
+    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath, refuseRemoteSchemas))
     intercept(NamespaceGatePhase) {
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull
@@ -126,10 +131,12 @@ private fun Application.installCallNamespaceGate(
                     is HoglakeException.ReadOnlyCatalog, is HoglakeException.MountOperationUnavailable ->
                         Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
                     // A mount placed on hoglite, or a catalog no backend holds.
-                    is HoglakeException.NotSupported, is HoglakeException.NotFound -> {
-                        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
-                        countRefusal(service, service.clientClass(call), caller, match, failure, enforced = true)
-                    }
+                    // One a remote schema refused was counted where it was decided (StoreEntitlement.kt).
+                    is HoglakeException.NotSupported, is HoglakeException.NotFound ->
+                        if (!call.attributes.contains(RefusalCountedKey)) {
+                            val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+                            countRefusal(service, service.clientClass(call), caller, match, failure, enforced = true)
+                        }
                     else -> Unit
                 }
                 throw failure

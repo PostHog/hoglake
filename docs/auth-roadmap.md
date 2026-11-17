@@ -129,7 +129,10 @@ mounts — so this list keeps only what hoglake owns and what has no other home.
       PostHog/hogtower `docs/jwt-aws-session-design.md` — [#622](https://github.com/PostHog/hoglake/pull/622)
 - [ ] **hoglake** Remote Schemas: a read-only namespace in one catalog served
       by forwarding the caller's verified token to another hoglake deployment
-      (`docs/remote_schema.md` D3/D4; this is what the mount feature becomes)
+      (`docs/remote_schema.md` D3/D4; this is what the mount feature becomes).
+      The Client side (the server that holds the catalog) is built,
+      [auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client);
+      the Host side is not
 - [ ] **hogtower** Signing-key rotation (`rotate-key`)
 - [ ] **charts** `HOGLAKE_STORAGE_PROVIDER=broker` and its settings on
       PostHog's hoglake deployments — hogtower side live in dev

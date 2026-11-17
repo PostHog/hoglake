@@ -93,6 +93,20 @@ sealed interface CatalogBinding {
         val name: String,
         val host: MountHostClient,
     ) : CatalogBinding
+
+    /**
+     * A remote schema (docs/auth-tenancy.md §6.5c): the request's path names
+     * the namespace [schema] of the local catalog [catalog], and [host]
+     * serves that namespace. Built only once the caller's token is known to
+     * allow it (auth/StoreEntitlement.kt). The catalog's own store is never
+     * consulted for this namespace: a route with no relay refuses
+     * ([remoteSchemaRefusal]).
+     */
+    data class RemoteSchema(
+        val catalog: String,
+        val schema: String,
+        val host: MountHostClient,
+    ) : CatalogBinding
 }
 
 /** #291's `CatalogRegistry.resolve`: a mount name resolves before any backend lookup. */
@@ -188,6 +202,27 @@ internal fun mountRefusal(
         )
     } else {
         refused(mount, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a mount is read-only"))
+    }
+
+/**
+ * The refusal for a request that names the remote schema [schema] on a route
+ * that is not relayed, with [mountRefusal]'s codes: a write is never allowed
+ * on a remote schema (403), and a read with no relay is unavailable (501).
+ * Only for a caller the token check has passed (auth/StoreEntitlement.kt);
+ * build it only to throw it.
+ */
+internal fun remoteSchemaRefusal(
+    call: ApplicationCall,
+    schema: String,
+): HoglakeException =
+    if (AuthPolicy.match(call.request.httpMethod, call.request.path())?.requirement == Requirement.READ) {
+        refused(
+            schema,
+            "mount_operation_unavailable",
+            HoglakeException.MountOperationUnavailable("this operation is not available on a remote schema"),
+        )
+    } else {
+        refused(schema, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a remote schema is read-only"))
     }
 
 /**

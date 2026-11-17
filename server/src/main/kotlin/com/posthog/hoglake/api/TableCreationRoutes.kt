@@ -3,7 +3,9 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.guardsRemoteSchemas
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.refuseRemoteSchemas
 import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.ReplacementTarget
@@ -193,11 +195,18 @@ private fun ApplicationCall.creationOperation(): UUID =
  * One in a namespace the caller may not use answers the same 404, so neither
  * its existence nor its namespace shows. [namespace] reads it from the backend
  * itself, so this decides before the handler's view of the backend does.
+ *
+ * On a server that configures remote schemas the creation is looked up for
+ * every caller: one prepared for a namespace before its name became a remote
+ * schema must not be read, published or aborted afterwards. The request
+ * named an operation and no namespace, so a caller the schema is not for
+ * gets the 404 of an operation that does not exist, in the backends' words.
  */
 private fun ApplicationCall.requireScopedCreation(namespace: () -> String) {
-    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return
+    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED && !guardsRemoteSchemas) return
     val namespaces = listOf(namespace())
     try {
+        refuseRemoteSchemas(creationCatalog(), namespaces)
         requireScopedNamespaces(creationCatalog(), namespaces)
     } catch (_: HoglakeException.NotFound) {
         throw HoglakeException.NotFound("table creation operation '${creationOperation()}'")

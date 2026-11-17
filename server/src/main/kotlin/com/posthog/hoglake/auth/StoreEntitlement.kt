@@ -1,6 +1,7 @@
 package com.posthog.hoglake.auth
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import io.ktor.server.application.ApplicationCall
 
 /**
@@ -63,4 +64,60 @@ private fun storeRefusal(
     val required = match?.requirement?.scopeOrNull() ?: return null
     if (caller.kind.isOperator() || caller.catalogClaimAllows(catalog, required)) return null
     return insufficientScope(catalog, required, match)
+}
+
+/**
+ * A remote schema (docs/auth-tenancy.md §6.5c) is handed out by the same
+ * rule: only to a caller whose token allows it. That is a scoped caller
+ * whose `cat` allows `read` on [catalog] and whose `remote_schemas` names
+ * [schema]. Deny by default: false for every other caller and for none. A
+ * token that places the catalog on hoglite is not refused for it, as a
+ * mount's reader is: the catalog is the caller's own.
+ */
+internal fun Caller?.readsRemoteSchema(
+    catalog: String,
+    schema: String,
+): Boolean =
+    this != null && kind == Caller.Kind.SCOPED && catalogClaimAllows(catalog, Scope.READ) && schema in remoteSchemas
+
+/** The names among [schemas] a namespace listing of [catalog] shows this caller: those it [readsRemoteSchema]. */
+internal fun Caller?.remoteSchemasAmong(
+    catalog: String,
+    schemas: Collection<String>,
+): List<String> = schemas.filter { readsRemoteSchema(catalog, it) }.sorted()
+
+/**
+ * `CatalogStoreSelector` asks here before it hands out the binding of the
+ * remote schema [schema] to a request that named [namespace]. The catalog
+ * comes first ([requireCatalogEntitlement]), so a caller refused for
+ * [catalog] gets that answer and the schema is never looked at. Then a
+ * caller that does not [readsRemoteSchema] gets the 404 of a missing
+ * namespace, and so does a request for a case variant of the name: the
+ * variant is no local namespace and is not the remote schema either.
+ *
+ * Unlike the store's check this refuses in every mode. Nothing is behind it
+ * to let a request through to: the catalog's own namespace of that name is
+ * never served, and the Host verifies the token itself. The refusal is
+ * counted and audited as the store's is, once per request, and against
+ * [schema] on the mount series: a configured name, never request input.
+ */
+internal fun ApplicationCall.requireRemoteSchemaEntitlement(
+    catalog: String,
+    schema: String,
+    namespace: String,
+) {
+    requireCatalogEntitlement(catalog)
+    val auth = hoglakeAuth
+    val caller = auth.callerOrNull
+    if (namespace == schema && caller.readsRemoteSchema(catalog, schema)) return
+    // The gate's and the body check's wording for a missing namespace, to the letter.
+    val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+    Metrics.mountRefused(schema, "not_found")
+    if (auth !is AuthState.Off && !attributes.contains(RefusalCountedKey)) {
+        attributes.put(RefusalCountedKey, Unit)
+        val service = application.attributes[AuthServiceKey]
+        val match = attributes.getOrNull(RouteMatchKey)
+        countRefusal(service, service.clientClass(this), caller, match, refusal, true, catalog, at = "remote_schema")
+    }
+    throw refusal
 }
