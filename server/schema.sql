@@ -117,7 +117,8 @@ CREATE TABLE hog_namespace (
     contained_field text,
     contained_value bigint,
     -- V37: the org mark. Moves the prefix to
-    -- `<data_path>/org_id=<org>/<field>=<value>/`; permanent once set.
+    -- `<data_path>/org_id=<org>/<field>=<value>/`; replaceable only while the
+    -- namespace has never held a table.
     contained_org text,
     PRIMARY KEY (catalog_id, namespace_id),
     CONSTRAINT hog_namespace_containment_shape CHECK (
@@ -127,7 +128,7 @@ CREATE TABLE hog_namespace (
     ),
     CONSTRAINT hog_namespace_containment_org_shape CHECK (
         contained_org IS NULL
-        OR (contained_field IS NOT NULL AND contained_org ~ '^[a-z0-9][a-z0-9-]{0,63}$')
+        OR (contained_field IS NOT NULL AND contained_org ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
     )
 );
 CREATE UNIQUE INDEX hog_namespace_live_name

@@ -182,6 +182,8 @@ class NamespaceContainmentIntegrationTest {
         // A name another namespace once had: a read at an old snapshot
         // resolves the name to that one, so it can never be contained.
         catalogs.createNamespace(cat, "team_6")
+        catalogs.createTable(cat, "team_6", "gone", columns)
+        catalogs.dropTable(cat, "team_6", "gone", author = "test", message = "test")
         catalogs.dropNamespace(cat, "team_6", author = "test", message = "test")
         catalogs.createNamespace(cat, "team_6")
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_6", NamespaceContainment("team_id", 6)) }
@@ -372,7 +374,18 @@ class NamespaceContainmentIntegrationTest {
         val cat = "contain-org-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://bucket/$cat")
         catalogs.createNamespace(cat, "team_9400")
-        for (bad in listOf("UPPER", "-a", "a_b", "a".repeat(65), "", "a/b")) {
+        for (bad in listOf(
+            "UPPER",
+            "-a",
+            "a_b",
+            "a".repeat(65),
+            "",
+            "a/b",
+            "team-slug",
+            org.uppercase(),
+            org.replace("-", ""),
+            "$org-0",
+        )) {
             assertThatThrownBy {
                 catalogs.setNamespaceContainment(
                     cat,
@@ -396,6 +409,11 @@ class NamespaceContainmentIntegrationTest {
                 h.execute("UPDATE hog_namespace SET contained_org = 'x' WHERE contained_field IS NULL")
             }
         }.hasMessageContaining("hog_namespace_containment_org_shape")
+        assertThatThrownBy {
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("UPDATE hog_namespace SET contained_org = 'team-slug' WHERE contained_field IS NOT NULL")
+            }
+        }.hasMessageContaining("hog_namespace_containment_org_shape")
     }
 
     @Test
@@ -404,7 +422,7 @@ class NamespaceContainmentIntegrationTest {
         append(cat, "team_9400", hive(cat, "t/a.parquet"))
         refused { append(cat, "team_9400", "s3://bucket/$cat/imports/data/team_9400/t/b.parquet") }
         refused { append(cat, "team_9400", hive(cat, "t/c.parquet", "org_id=$org/team_id=9401")) }
-        refused { append(cat, "team_9400", hive(cat, "t/d.parquet", "org_id=other/team_id=9400")) }
+        refused { append(cat, "team_9400", hive(cat, "t/d.parquet", "org_id=$otherOrg/team_id=9400")) }
         refused { append(cat, "team_9400", hive(cat, "t/e.parquet", "org_id%3D$org/team_id=9400")) }
         refused { append(cat, "team_9400", "s3://bucket/$cat/imports/x.parquet") }
         // One bad file refuses the whole commit.
@@ -427,7 +445,7 @@ class NamespaceContainmentIntegrationTest {
             refused { append(cat, "team_42", hive(cat, "t/x.parquet", head)) }
         }
         // Another org's, another value's, or another field's directory is not this namespace's.
-        append(cat, "main", hive(cat, "t/a.parquet", "org_id=other/team_id=9400"))
+        append(cat, "main", hive(cat, "t/a.parquet", "org_id=$otherOrg/team_id=9400"))
         append(cat, "main", hive(cat, "t/b.parquet", "org_id=$org/team_id=9401"))
         append(cat, "main", hive(cat, "t/c.parquet", "org_id=$org/project_id=9400"))
         append(cat, "main", hive(cat, "t/d.parquet", "org_id=$org/team_id=09400"))
@@ -468,7 +486,7 @@ class NamespaceContainmentIntegrationTest {
         append(
             cat,
             "main",
-            hive(cat, "t/a.parquet", "org_id=other/team_id=9500"),
+            hive(cat, "t/a.parquet", "org_id=$otherOrg/team_id=9500"),
             hive(cat, "t/b.parquet", "org_id=$org/team_id=9501"),
             "s3://bucket/$cat/imports/data/team_9500/t/c.parquet",
         )
@@ -488,7 +506,7 @@ class NamespaceContainmentIntegrationTest {
             catalogs.setNamespaceContainment(
                 cat,
                 "team_9501",
-                NamespaceContainment("team_id", 9501, "elsewhere"),
+                NamespaceContainment("team_id", 9501, otherOrg),
             ).containment,
         ).isNotNull()
         // A live claim under the prefix blocks too.
@@ -505,13 +523,15 @@ class NamespaceContainmentIntegrationTest {
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
     }
 
+    private val otherOrg = "02b2f6ef-2bd6-0000-f64f-e3a0b88efbf5"
+
     @Test
-    fun `the org mark is permanent`() {
+    fun `an org mark is permanent once the namespace has held a table`() {
         val cat = orgFixture()
-        // Identical: the existing no-op.
+        // Identical: the existing no-op, even with a table.
         assertThat(catalogs.setNamespaceContainment(cat, "team_9400", team9400).containment).isEqualTo(team9400)
         for (other in listOf(
-            NamespaceContainment("team_id", 9400, "other"),
+            NamespaceContainment("team_id", 9400, otherOrg),
             NamespaceContainment("team_id", 9400),
             NamespaceContainment("team_id", 9401, org),
         )) {
@@ -519,15 +539,127 @@ class NamespaceContainmentIntegrationTest {
                 .describedAs(other.toString()).isInstanceOf(HoglakeException.CommitConflict::class.java)
                 .hasMessageContaining("permanent")
         }
-        // Even once empty, clearing is refused; dropping the namespace is the way out.
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_9400", null) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java).hasMessageContaining("permanent")
+        // Dropping the table does not undo it: the namespace has held one.
         catalogs.dropTable(cat, "team_9400", "t", author = "test", message = "test")
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_9400", null) }
-            .isInstanceOf(HoglakeException.CommitConflict::class.java).hasMessageContaining("drop the empty namespace")
+            .isInstanceOf(HoglakeException.CommitConflict::class.java).hasMessageContaining("permanent")
+        assertThatThrownBy {
+            catalogs.setNamespaceContainment(cat, "team_9400", NamespaceContainment("team_id", 9400, otherOrg))
+        }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
         assertThat(catalogs.getNamespace(cat, "team_9400").containment).isEqualTo(team9400)
-        catalogs.dropNamespace(cat, "team_9400", author = "test", message = "test")
-        // A non-org mark is as before: cleared, not permanent.
+        // A non-org mark is as before: cleared once empty.
         catalogs.dropTable(cat, "team_42", "t", author = "test", message = "test")
         catalogs.setNamespaceContainment(cat, "team_42", null)
+    }
+
+    @Test
+    fun `an org mark on a namespace that never held a table can be changed or cleared`() {
+        val cat = "contain-org-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://bucket/$cat/imports")
+        catalogs.createNamespace(cat, "team_9400")
+        catalogs.setNamespaceContainment(cat, "team_9400", team9400)
+        val moved = NamespaceContainment("team_id", 9400, otherOrg)
+        assertThat(catalogs.setNamespaceContainment(cat, "team_9400", moved).containment).isEqualTo(moved)
+        assertThat(
+            catalogs.setNamespaceContainment(cat, "team_9400", NamespaceContainment("team_id", 9401, org)).containment,
+        )
+            .isEqualTo(NamespaceContainment("team_id", 9401, org))
+        assertThat(catalogs.setNamespaceContainment(cat, "team_9400", null).containment).isNull()
+        assertThat(catalogs.setNamespaceContainment(cat, "team_9400", team9400).containment).isEqualTo(team9400)
+        // The new prefix is still scanned for foreign files.
+        catalogs.createNamespace(cat, "main")
+        catalogs.createTable(cat, "main", "t", columns)
+        append(cat, "main", hive(cat, "t/x.parquet", "org_id=$otherOrg/team_id=9400"))
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_9400", moved) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(catalogs.getNamespace(cat, "team_9400").containment).isEqualTo(team9400)
+    }
+
+    @Test
+    fun `a view or a table landing between the scan and the lock keeps an org mark from being replaced`() {
+        val cat = "contain-org-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://bucket/$cat/imports")
+        catalogs.createNamespace(cat, "team_9400")
+        catalogs.setNamespaceContainment(cat, "team_9400", team9400)
+        val moved = NamespaceContainment("team_id", 9400, otherOrg)
+        val marking =
+            markWhileLockHeld(cat, { catalogs.setNamespaceContainment(cat, "team_9400", moved) }) { h, catalogId ->
+                // Held a view after the unlocked pass found the namespace empty.
+                db.jdbi.useHandleUnchecked { other ->
+                    other.execute(
+                        "INSERT INTO hog_view (catalog_id, view_id, namespace_id, name, sql, begin_snapshot) " +
+                            "SELECT catalog_id, 900001, namespace_id, 'v', 'select 1', 1 FROM hog_namespace " +
+                            "WHERE catalog_id = ? AND name = 'team_9400'",
+                        catalogId,
+                    )
+                }
+            }
+        assertThatThrownBy { marking.get(10, TimeUnit.SECONDS) }
+            .hasCauseInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("has held a table or view")
+        assertThat(catalogs.getNamespace(cat, "team_9400").containment).isEqualTo(team9400)
+    }
+
+    @Test
+    fun `a claim or an undrained removal under the current org prefix keeps the mark from being replaced or cleared`() {
+        val cat = "contain-org-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://bucket/$cat/imports")
+        for (kind in listOf("claim", "removal")) {
+            val value = if (kind == "claim") 9910L else 9911L
+            val ns = "team_$value"
+            val mark = NamespaceContainment("team_id", value, org)
+            catalogs.createNamespace(cat, ns)
+            catalogs.setNamespaceContainment(cat, ns, mark)
+            val prefix = hive(cat, "t", "org_id=$org/team_id=$value")
+            if (kind == "claim") {
+                uploads.claim(cat, UUID.randomUUID(), UUID.randomUUID(), prefix, "data")
+            } else {
+                db.jdbi.useHandleUnchecked { h ->
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                        SELECT catalog_id, :p, 'data', 'snapshot_expiry' FROM hog_catalog WHERE name = :cat
+                        """,
+                    ).bind("p", "$prefix/old.parquet").bind("cat", cat).execute()
+                }
+            }
+            for (change in listOf<NamespaceContainment?>(NamespaceContainment("team_id", value, otherOrg), null)) {
+                assertThatThrownBy { catalogs.setNamespaceContainment(cat, ns, change) }
+                    .describedAs("$kind, $change")
+                    .isInstanceOf(HoglakeException.CommitConflict::class.java)
+                    .hasMessageContaining("registered or claimed under its prefix")
+            }
+            assertThat(catalogs.getNamespace(cat, ns).containment).isEqualTo(mark)
+        }
+    }
+
+    @Test
+    fun `a dropped org-marked namespace that never held a table leaves its name markable`() {
+        val cat = "contain-org-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://bucket/$cat/imports")
+        catalogs.createNamespace(cat, "team_9400")
+        catalogs.setNamespaceContainment(cat, "team_9400", team9400)
+        catalogs.dropNamespace(cat, "team_9400", author = "test", message = "test", mayDropContained = true)
+        catalogs.createNamespace(cat, "team_9400")
+        assertThat(catalogs.setNamespaceContainment(cat, "team_9400", team9400).containment).isEqualTo(team9400)
+    }
+
+    @Test
+    fun `a dropped namespace that held a table keeps its name from being marked`() {
+        val cat = "contain-org-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://bucket/$cat/imports")
+        catalogs.createNamespace(cat, "team_9400")
+        catalogs.setNamespaceContainment(cat, "team_9400", team9400)
+        catalogs.createTable(cat, "team_9400", "t", columns)
+        catalogs.dropTable(cat, "team_9400", "t", author = "test", message = "test")
+        catalogs.dropNamespace(cat, "team_9400", author = "test", message = "test", mayDropContained = true)
+        catalogs.createNamespace(cat, "team_9400")
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_9400", team9400) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("belonged to another")
     }
 
     @Test

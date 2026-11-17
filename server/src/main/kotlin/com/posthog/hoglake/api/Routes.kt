@@ -249,7 +249,13 @@ fun Application.installApiRoutes(
                                             (
                                                 scoped == null ||
                                                     ns.containment?.let {
-                                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
+                                                        scoped.mayUseContained(
+                                                            catalog,
+                                                            it.field,
+                                                            it.value,
+                                                            it.org,
+                                                            Scope.READ,
+                                                        )
                                                     } == true
                                             )
                                     }.map { it.toDto() } +

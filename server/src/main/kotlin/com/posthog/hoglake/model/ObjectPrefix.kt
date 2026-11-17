@@ -280,7 +280,7 @@ object ObjectPrefix {
  * validation, so only what follows it can vary.)
  */
 object Containment {
-    private val ORG_SEGMENT = Regex("^org_id=([a-z0-9][a-z0-9-]{0,63})$")
+    private val ORG_SEGMENT = Regex("^org_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
     private val VALUE_SEGMENT = Regex("^([a-z][a-z0-9_]{0,62})=([1-9][0-9]{0,18})$")
 
     /** A path's first two segments read as `org_id=<org>/<field>=<value>/`. */

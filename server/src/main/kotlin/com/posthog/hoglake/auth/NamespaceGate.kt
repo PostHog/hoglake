@@ -151,7 +151,7 @@ private fun Application.installCallNamespaceGate(
                 throw failure
             }
         if (caller != null && held != null &&
-            caller.mayUseContained(pending.catalog, held.field, held.value, pending.required)
+            caller.mayUseContained(pending.catalog, held.field, held.value, held.org, pending.required)
         ) {
             Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
             return@intercept

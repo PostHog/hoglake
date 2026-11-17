@@ -708,7 +708,7 @@ is any lowercase identifier, the value a positive id, and the convention that
 - **Operators only.** Marking and clearing are operator routes; a tenant
   token cannot drop a contained namespace (403). Clearing requires the
   namespace to be empty.
-- **Org mark.** The body may also carry `"org": "<org>"` (`^[a-z0-9][a-z0-9-]{0,63}$`;
+- **Org mark.** The body may also carry `"org": "<org>"` (a canonical lowercase UUID, `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`;
   capability `org-marked-containment-v1`, Postgres catalogs only, 422 on
   hoglite). It moves the namespace's prefix to
   `<data_path>/org_id=<org>/<field>=<value>/`: its tables register files only
@@ -720,9 +720,16 @@ is any lowercase identifier, the value a positive id, and the convention that
   percent-decoded per segment; the commit finds the owner by
   `(field, value)` and compares its org, so the same value under another org
   is not foreign. Marking scans for foreign files under the hive prefix as
-  it does under `data/<n>/`. The org mark is permanent: re-marking with
-  anything but the identical containment, and clearing, are `commit_conflict`;
-  drop the empty namespace instead. A table with the object-prefix layout in
+  it does under `data/<n>/`. A scoped caller uses an org-marked
+  namespace only when its token's `org` claim equals the mark (a team belongs
+  to one org); on any other org every route answers as for a missing
+  namespace (404), and the namespace is absent from its listings. Tenant and
+  operator callers are unaffected. The mark can be replaced or cleared only
+  while the namespace has never held a table or view (at any snapshot, dropped
+  ones included) and no file is registered under its prefix; after that
+  re-marking with anything but the identical containment, and clearing, are
+  `commit_conflict`. A name whose earlier, dropped namespaces never held a
+  table or view can be marked again. A table with the object-prefix layout in
   an org-marked namespace is unsupported (compaction keeps its path, the
   commit refuses it).
 - **Nothing changes until something is marked.** A catalog with no contained

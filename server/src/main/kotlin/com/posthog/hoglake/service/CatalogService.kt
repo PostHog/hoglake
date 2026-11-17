@@ -68,7 +68,7 @@ class CatalogService(private val jdbi: Jdbi) {
         /** The prefix scan's bound when marking a namespace contained; see setNamespaceContainment. */
         const val CONTAINMENT_SCAN_TIMEOUT_MS = 10_000L
         private val CONTAINMENT_FIELD = Regex("^[a-z][a-z0-9_]{0,62}$")
-        private val CONTAINMENT_ORG = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
+        private val CONTAINMENT_ORG = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
         /**
          * Ceiling on a catalog's `data_path`.
@@ -488,7 +488,11 @@ class CatalogService(private val jdbi: Jdbi) {
                     // tables is told so rather than that its own files sit
                     // under its prefix. Repeated under the lock below.
                     var scanned: String? = null
-                    if (containment != null && ns.containment == null) {
+                    val current = ns.containment
+                    if (current?.org != null && current != containment) {
+                        requireOrgMarkReplaceable(h, cat, namespace, ns, current, null)
+                    }
+                    if (containment != null && current != containment && (current == null || current.org != null)) {
                         requireNeverHeld(h, cat.catalogId, ns)
                         foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, containment, null)?.let {
                             throw prefixTaken(namespace, it)
@@ -501,22 +505,15 @@ class CatalogService(private val jdbi: Jdbi) {
                 Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 val ns = requireNamespace(h, cat, namespace)
                 if (ns.containment == containment) return@inTransactionUnchecked ns
-                // The org mark outlives every file registered under its prefix
-                // and every reader token minted against it, so neither a
-                // different mark nor none replaces it.
-                if (ns.containment?.org != null) {
-                    throw HoglakeException.CommitConflict(
-                        if (containment == null) {
-                            "namespace '$namespace' carries an org mark, which is permanent; " +
-                                "drop the empty namespace instead"
-                        } else {
-                            "namespace '$namespace' carries an org mark, which is permanent; " +
-                                "it cannot be marked differently"
-                        },
-                    )
+                // An org mark outlives every file registered under its prefix
+                // and every reader token minted against it, so it is replaced
+                // or cleared only while nothing can depend on it.
+                val current = ns.containment
+                if (current?.org != null) {
+                    requireOrgMarkReplaceable(h, cat, namespace, ns, current, scannedFrom)
                 }
                 if (containment != null) {
-                    if (ns.containment != null) {
+                    if (current != null && current.org == null) {
                         throw HoglakeException.CommitConflict(
                             "namespace '$namespace' is already contained for " +
                                 "${ns.containment.field} = ${ns.containment.value}; clear it first",
@@ -659,19 +656,54 @@ class CatalogService(private val jdbi: Jdbi) {
             "(?:$c|%${hex[0]}$second)"
         }
 
+    /** Has [ns] ever held a table or view, at any snapshot, dropped ones included? */
+    private fun everHeld(
+        h: org.jdbi.v3.core.Handle,
+        catalogId: Long,
+        ns: NamespaceInfo,
+    ): Boolean =
+        h.createQuery(
+            """
+            SELECT EXISTS (SELECT 1 FROM hog_table_version WHERE catalog_id = :c AND namespace_id = :n)
+                OR EXISTS (SELECT 1 FROM hog_view WHERE catalog_id = :c AND namespace_id = :n)
+            """,
+        ).bind("c", catalogId).bind("n", ns.namespaceId).mapTo(Boolean::class.java).one()
+
+    /**
+     * An org mark may be replaced or cleared only while nothing depends on it:
+     * the namespace has never held a table or view and no file, upload claim
+     * or undrained removal sits under its prefix. [from] is the watermark of
+     * the pass under the commit lock, null for the unlocked full scan.
+     */
+    private fun requireOrgMarkReplaceable(
+        h: org.jdbi.v3.core.Handle,
+        cat: CatalogInfo,
+        namespace: String,
+        ns: NamespaceInfo,
+        current: NamespaceContainment,
+        from: ScanWatermark?,
+    ) {
+        if (everHeld(h, cat.catalogId, ns)) {
+            throw HoglakeException.CommitConflict(
+                "namespace '$namespace' carries an org mark and has held a table or view; " +
+                    "the mark is permanent once anything can depend on it",
+            )
+        }
+        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, current, from)?.let {
+            throw HoglakeException.CommitConflict(
+                "namespace '$namespace' carries an org mark and '$it' is registered or claimed under its " +
+                    "prefix; the mark is permanent once anything can depend on it",
+            )
+        }
+    }
+
     /** Refuse a namespace that has ever held a table or view, or whose name another namespace has had. */
     private fun requireNeverHeld(
         h: org.jdbi.v3.core.Handle,
         catalogId: Long,
         ns: NamespaceInfo,
     ) {
-        val held =
-            h.createQuery(
-                """
-                SELECT EXISTS (SELECT 1 FROM hog_table_version WHERE catalog_id = :c AND namespace_id = :n)
-                    OR EXISTS (SELECT 1 FROM hog_view WHERE catalog_id = :c AND namespace_id = :n)
-                """,
-            ).bind("c", catalogId).bind("n", ns.namespaceId).mapTo(Boolean::class.java).one()
+        val held = everHeld(h, catalogId, ns)
         if (held) {
             throw HoglakeException.NamespaceNotEmpty(
                 "namespace '${ns.name}' has held a table or view; only a namespace that never has can be " +
@@ -685,12 +717,19 @@ class CatalogService(private val jdbi: Jdbi) {
         // namespace's, every resolution of it at any snapshot is this
         // namespace or nothing, and authorizing the live one authorizes them
         // all. A later namespace reusing the name (after this one is dropped)
-        // is refused here in turn.
+        // is refused here in turn. A dropped namespace of that name that never
+        // held a table or view serves nothing at any snapshot, so it does not
+        // count.
         val reused =
             h.createQuery(
                 """
-                SELECT EXISTS (SELECT 1 FROM hog_namespace
-                                WHERE catalog_id = :c AND name = :name AND namespace_id <> :n)
+                SELECT EXISTS (
+                    SELECT 1 FROM hog_namespace o
+                     WHERE o.catalog_id = :c AND o.name = :name AND o.namespace_id <> :n
+                       AND (EXISTS (SELECT 1 FROM hog_table_version t
+                                     WHERE t.catalog_id = :c AND t.namespace_id = o.namespace_id)
+                            OR EXISTS (SELECT 1 FROM hog_view v
+                                        WHERE v.catalog_id = :c AND v.namespace_id = o.namespace_id)))
                 """,
             ).bind("c", catalogId).bind("name", ns.name).bind("n", ns.namespaceId)
                 .mapTo(Boolean::class.java).one()

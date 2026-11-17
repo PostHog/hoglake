@@ -93,8 +93,12 @@ internal val PendingBodyKey = AttributeKey<AuthDecision.ByBody>("HoglakePendingB
  * The check runs without the commit lock. What it reads cannot change under a
  * scoped writer: hoglake clears a namespace's containment only when it holds
  * no table or view, drops a contained namespace only for an operator, and
- * never contains a name another namespace has had. So a namespace that passed
- * stays the caller's until an operator acts.
+ * never contains a name another namespace has held a table or view under. So a namespace that passed
+ * stays the caller's until an operator acts. Re-marking an org-marked namespace
+ * (allowed while it has never held a table or view) has the same unlocked-gate
+ * window as clearing a plain mark: a request that passed the gate can still
+ * see the namespace re-marked before it commits, and a commit is then held to
+ * the new mark.
  */
 internal fun ApplicationCall.requireScopedNamespaces(
     catalog: String,
@@ -117,7 +121,7 @@ internal fun ApplicationCall.requireScopedNamespaces(
     for (namespace in namespaces.distinct()) {
         refuseRemoteSchemas(catalog, listOf(namespace))
         val held = lookups.containment(this, catalog, namespace)
-        if (held == null || !caller.mayUseContained(catalog, held.field, held.value, pending.required)) {
+        if (held == null || !caller.mayUseContained(catalog, held.field, held.value, held.org, pending.required)) {
             val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
             countRefusal(service, service.clientClass(this), caller, match, refusal, enforced = true)
             throw refusal

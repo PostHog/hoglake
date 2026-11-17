@@ -109,7 +109,7 @@ internal class StoreGrant private constructor(
     ): List<T> {
         val caller = scoped ?: return items
         return items.filter { item ->
-            containment(item)?.let { caller.mayUseContained(name, it.field, it.value, Scope.READ) } == true
+            containment(item)?.let { caller.mayUseContained(name, it.field, it.value, it.org, Scope.READ) } == true
         }
     }
 
@@ -125,7 +125,7 @@ internal class StoreGrant private constructor(
     ): NamespaceContainment? {
         open(name)
         val caller = scoped ?: return store.liveContainment(name, namespace)
-        return held(name, namespace)?.takeIf { caller.mayUseContained(name, it.field, it.value, Scope.READ) }
+        return held(name, namespace)?.takeIf { caller.mayUseContained(name, it.field, it.value, it.org, Scope.READ) }
     }
 
     /**
@@ -141,7 +141,7 @@ internal class StoreGrant private constructor(
         open(name)
         val found = store.liveContainedFor(name, field, value) ?: return null
         val caller = scoped ?: return found
-        return found.takeIf { caller.mayUseContained(name, field, value, Scope.READ) }
+        return found.takeIf { caller.mayUseContained(name, field, value, found.second.org, Scope.READ) }
     }
 
     /** The catalog's data_path, as an operation that read it found it: kept for [claim]. */
@@ -224,7 +224,7 @@ internal class StoreGrant private constructor(
         open(name)
         val caller = scoped ?: return
         val held = held(name, namespace)
-        if (held == null || !caller.mayUseContained(name, held.field, held.value, scope)) {
+        if (held == null || !caller.mayUseContained(name, held.field, held.value, held.org, scope)) {
             val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$name'")
             val missing = creation?.let { HoglakeException.NotFound("table creation operation '$it'") }
             refuse(refusal, name, missing ?: refusal)

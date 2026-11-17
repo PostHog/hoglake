@@ -48,6 +48,7 @@ class ScopedWritesIntegrationTest {
     private val dataPath = "s3://bucket/$cat"
     private val columns = listOf(ColumnDef("v", ColType.LONG))
     private val org = "01a1e5de-1ac5-0000-e53e-d2f9a77deae4"
+    private val otherOrg = "02b2f6ef-2bd6-0000-f64f-e3a0b88efbf5"
     private val driven = mutableSetOf<Pair<String, String>>()
     private var serial = 0
 
@@ -79,11 +80,14 @@ class ScopedWritesIntegrationTest {
         Files.deleteIfExists(keyFile)
     }
 
-    private fun scoped(prd: String = """{"team_id":{"42":"write","7":"read"}}"""): String {
+    private fun scoped(
+        prd: String = """{"team_id":{"42":"write","7":"read"}}""",
+        tokenOrg: String = org,
+    ): String {
         val iat = System.currentTimeMillis() / 1000 - 5
         return TestTokens.mint(
             pair,
-            TestTokens.scopedClaims(prd = prd, catalogs = """{"$cat":["write"]}""", iat = iat),
+            TestTokens.scopedClaims(prd = prd, catalogs = """{"$cat":["write"]}""", iat = iat, org = tokenOrg),
         )
     }
 
@@ -386,7 +390,7 @@ class ScopedWritesIntegrationTest {
             }
             for (refused in listOf(
                 "$dataPath/data/team_9400/t",
-                "$dataPath/org_id=other/team_id=9400/t",
+                "$dataPath/org_id=$otherOrg/team_id=9400/t",
                 "$dataPath/org_id=$org/team_id=9401/t",
                 "$dataPath/org_id%3D$org/team_id=9400/t",
                 "$dataPath/org_id=$org/team%5Fid=9400/t",
@@ -406,6 +410,56 @@ class ScopedWritesIntegrationTest {
     }
 
     @Test
+    fun `a scoped token whose org differs from the namespace's org mark gets the missing-namespace answer`() {
+        withServer(AuthMode.ENFORCE) { port ->
+            val prd = """{"team_id":{"9400":"write"}}"""
+            val right = scoped(prd)
+            val wrong = scoped(prd, tokenOrg = otherOrg)
+            val create = """{"namespace":"team_9400","name":"${fresh(
+                "mismatch",
+            )}","columns":[{"name":"v","type":"long"}]}"""
+
+            // The matching org reaches the namespace.
+            ok(call(port, right, "GET", "/namespaces/team_9400"), "matching org get")
+            ok(call(port, right, "GET", "/namespaces/team_9400/tables"), "matching org list")
+            ok(call(port, right, "GET", "/namespaces/team_9400/tables/t"), "matching org load")
+            ok(call(port, right, "PUT", "/table-creations/${UUID.randomUUID()}", create), "matching org create")
+
+            // A token holding the team under another org does not: the answer is a missing namespace's.
+            val absent = call(port, wrong, "GET", "/namespaces/team_9400_absent")
+            assertThat(absent.statusCode()).isEqualTo(404)
+            val get = call(port, wrong, "GET", "/namespaces/team_9400")
+            assertMissing(get, "mismatched org get")
+            assertThat(get.body().replace("team_9400", "X")).isEqualTo(absent.body().replace("team_9400_absent", "X"))
+            assertMissing(call(port, wrong, "GET", "/namespaces/team_9400/tables"), "mismatched org list")
+            assertMissing(call(port, wrong, "GET", "/namespaces/team_9400/tables/t"), "mismatched org load")
+            assertMissing(
+                call(port, wrong, "PUT", "/table-creations/${UUID.randomUUID()}", create),
+                "mismatched org create",
+            )
+            assertMissing(call(port, wrong, "DELETE", "/namespaces/team_9400/tables/t"), "mismatched org drop")
+            // An upload claim under the mark's prefix resolves through the value lookup: same answer.
+            val owner = UUID.randomUUID()
+            val claimBody = """{"owner":"$owner","prefix":"$dataPath/org_id=$org/team_id=9400/t","file_kind":"data"}"""
+            ok(
+                call(port, right, "PUT", "/uploads/${UUID.randomUUID()}", claimBody, "/uploads/{upload}"),
+                "matching org claim",
+            )
+            val denied = call(port, wrong, "PUT", "/uploads/${UUID.randomUUID()}", claimBody, "/uploads/{upload}")
+            // A claim is refused 403, not 404, when no namespace of the caller's owns the prefix; the
+            // answer is the one a prefix nobody owns gets.
+            val nobody = claimBody.replace("team_id=9400", "team_id=9499")
+            val unowned = call(port, right, "PUT", "/uploads/${UUID.randomUUID()}", nobody, "/uploads/{upload}")
+            assertThat(denied.statusCode()).describedAs(denied.body()).isEqualTo(403)
+            assertThat(denied.body()).isEqualTo(unowned.body())
+            val names = json.readTree(call(port, wrong, "GET", "/namespaces").body()).toString()
+            assertThat(names).doesNotContain("team_9400")
+            val rightNames = json.readTree(call(port, right, "GET", "/namespaces").body()).toString()
+            assertThat(rightNames).contains("team_9400")
+        }
+    }
+
+    @Test
     fun `the containment route carries the org mark through the API`() {
         catalogs.createNamespace(cat, "team_9700")
         withServer(AuthMode.ENFORCE) { port ->
@@ -421,11 +475,14 @@ class ScopedWritesIntegrationTest {
             assertThat(json.readTree(marked.body()).path("containment").path("org").asText()).isEqualTo(org)
             assertThat(containment().path("org").asText()).isEqualTo(org)
             assertThat(containment().path("value").asLong()).isEqualTo(9700)
-            // Identical is a no-op; anything else, and clearing, is the permanent mark's 409.
+            // Identical is a no-op; the namespace has never held a table, so its mark can change or clear.
             assertThat(put("""{"field":"team_id","value":9700,"org":"$org"}""").statusCode()).isEqualTo(200)
-            assertThat(put("""{"field":"team_id","value":9700,"org":"other"}""").statusCode()).isEqualTo(409)
-            assertThat(put("""{"field":"team_id","value":9700}""").statusCode()).isEqualTo(409)
-            assertThat(call(port, operator, "DELETE", path).statusCode()).isEqualTo(409)
+            assertThat(put("""{"field":"team_id","value":9700,"org":"other"}""").statusCode()).isEqualTo(422)
+            val other = "02b2f6ef-2bd6-0000-f64f-e3a0b88efbf5"
+            assertThat(put("""{"field":"team_id","value":9700,"org":"$other"}""").statusCode()).isEqualTo(200)
+            assertThat(containment().path("org").asText()).isEqualTo(other)
+            assertThat(call(port, operator, "DELETE", path).statusCode()).isEqualTo(200)
+            assertThat(put("""{"field":"team_id","value":9700,"org":"$org"}""").statusCode()).isEqualTo(200)
             assertThat(containment().path("org").asText()).isEqualTo(org)
             catalogs.createNamespace(cat, "team_9701")
             assertThat(

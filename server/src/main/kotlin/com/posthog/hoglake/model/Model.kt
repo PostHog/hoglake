@@ -794,7 +794,8 @@ data class NamespaceInfo(
  * for `field` is given; operator-managed.
  *
  * [org] is the optional org mark: it moves the prefix to
- * `<data_path>/org_id=<org>/<field>=<value>/` and is permanent once set.
+ * `<data_path>/org_id=<org>/<field>=<value>/`. It can be replaced or cleared only
+ * while the namespace has never held a table or view and no file sits under its prefix.
  */
 data class NamespaceContainment(
     val field: String,

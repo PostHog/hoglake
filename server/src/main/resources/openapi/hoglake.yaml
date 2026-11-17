@@ -499,9 +499,12 @@ paths:
         creation's `write_path`, a scoped upload claim and a compaction
         output are held to, and no other table registers files under it,
         compared raw and percent-decoded per segment. Marking scans for
-        foreign files under that prefix. The org mark is permanent: marking
-        an org-marked namespace with anything but the identical containment
-        is 409, and so is clearing it; drop the empty namespace instead.
+        foreign files under that prefix. The org must be a canonical lowercase
+        UUID. An org-marked namespace can be re-marked or cleared only while
+        it has never held a table or view (at any snapshot) and no file is
+        registered under its prefix; otherwise 409. A scoped token may use an
+        org-marked namespace only when its `org` claim equals the mark; any
+        other org gets the answer a missing namespace gets.
         The prefix check reads the catalog's file rows under a time bound;
         503 `containment_unverified` when it cannot finish, and the
         namespace is left unmarked.
@@ -533,7 +536,8 @@ paths:
       description: >
         Requires the namespace to hold no live table or view (409 otherwise).
         Clearing an uncontained namespace is a no-op. A namespace with an org
-        mark cannot be cleared (409): drop the empty namespace instead.
+        mark is cleared only while it has never held a table or view (409
+        otherwise).
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -4154,11 +4158,13 @@ components:
         value: { type: integer, format: int64, minimum: 1, description: The value this namespace holds. }
         org:
           type: string
-          pattern: "^[a-z0-9][a-z0-9-]{0,63}$"
+          pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
           description: >
             The org mark, omitted when the namespace has none. Set, it makes the
             namespace's prefix `<data_path>/org_id=<org>/<field>=<value>/`
-            and is permanent. Capability `org-marked-containment-v1`.
+            and may be replaced or cleared only while the namespace has never held a
+            table or view. A canonical lowercase UUID. Capability
+            `org-marked-containment-v1`.
 
     TableCreation:
       type: object
