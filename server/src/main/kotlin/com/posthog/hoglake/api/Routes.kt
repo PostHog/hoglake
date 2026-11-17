@@ -135,6 +135,14 @@ fun Application.installApiRoutes(
                 // token reads the whole fleet's catalog roster off the first
                 // request it makes. Under HOGLAKE_AUTH_MODE=off the caller is
                 // null and the filter is "everything", i.e. today's behaviour.
+                //
+                // An anonymous caller reaches this handler only under `warn`,
+                // whose point is to let a refusal through while counting it.
+                // The plugin counted this request's missing token already, so
+                // it lists everything as `off` does, and the store's own
+                // refusal of "*" (auth/StoreGrant.kt) adds no second count.
+                // Only the totals are withheld: the fleet's sizes are not an
+                // unauthenticated caller's, as /v1/info above decides too.
                 val listing = selector.forListing(call)
                 val catalogs = listing.store
                 // The sampler reads PostgreSQL only. Catalog names are not unique across backends.
@@ -142,19 +150,25 @@ fun Application.installApiRoutes(
                 val visible =
                     when (val auth = call.hoglakeAuth) {
                         is AuthState.Off -> null
-                        // Only reachable in `warn`, which lets a refusal through.
-                        is AuthState.Anonymous -> emptySet()
+                        is AuthState.Anonymous -> null
                         is AuthState.Authenticated -> listing.catalogs
                     }
-                // Totals are catalog-wide, so a scoped caller gets none.
-                val scoped = (call.hoglakeAuth as? AuthState.Authenticated)?.caller?.kind == Caller.Kind.SCOPED
+                // Totals are catalog-wide, so a scoped caller gets none; nor
+                // does an anonymous one, as above.
+                val withoutTotals =
+                    when (val auth = call.hoglakeAuth) {
+                        is AuthState.Off -> false
+                        is AuthState.Anonymous -> true
+                        is AuthState.Authenticated -> auth.caller.kind == Caller.Kind.SCOPED
+                    }
                 // A catalog a mount shadows answers as the mount on every
                 // route, so it is not listed. The caller's own mounts follow,
                 // unsorted: re-sorting could reorder the backend's listing.
                 val listed = catalogs?.listCatalogs(visible).orEmpty()
                 val mounts = selector.mountsAmong(call, listed.map { it.name } + listing.mounts)
                 val local =
-                    listed.filterNot { it.name in mounts }.map { it.toDto(if (scoped) null else totals[it.name]) }
+                    listed.filterNot { it.name in mounts }
+                        .map { it.toDto(if (withoutTotals) null else totals[it.name]) }
                 val shown = listing.mounts.filter { it in mounts }
                 // A mount Client asks each host once, with the caller's
                 // token, and shows the entries the host returns for these
