@@ -242,6 +242,49 @@ object SessionProfileVectors {
                     ),
             ),
             ContractVectors.Spec(
+                "session_scoped_team_family",
+                "A scoped token holding the team family: remote_schemas.team is [\"read\"] and stands for every " +
+                    "team_<id> the prd holds. Accepted; the caller's family set is {team}, never a schema named " +
+                    "team.",
+                "client",
+                scopedInput(),
+                111,
+                ContractVectors.accept("scoped"),
+                mutation = "$added; remote_schemas is {\"team\": [\"read\"]}",
+                body = profileBody(scopedBody, remote = remoteSchemas("team" to listOf("read"))),
+            ),
+            ContractVectors.Spec(
+                "session_team_family_with_named_schemas",
+                "The team family entry beside per-name entries, one of them a team schema named outright: " +
+                    "accepted; each per-name entry stays a named schema.",
+                "client",
+                scopedInput(),
+                112,
+                ContractVectors.accept("scoped"),
+                mutation = "$added; remote_schemas is {\"shared\", \"team\", \"team_42\"}, each [\"read\"]",
+                body =
+                    profileBody(
+                        scopedBody,
+                        remote =
+                            remoteSchemas(
+                                "shared" to listOf("read"),
+                                "team" to listOf("read"),
+                                "team_42" to listOf("read"),
+                            ),
+                    ),
+            ),
+            ContractVectors.Spec(
+                "session_team_family_write",
+                "The team family entry granted write: remote schemas are read-only by construction, so it is " +
+                    "refused.",
+                "client",
+                scopedInput(),
+                113,
+                ContractVectors.refuse(JwtViolation.MALFORMED),
+                mutation = "$added; remote_schemas.team is [\"read\", \"write\"]",
+                body = profileBody(scopedBody, remote = remoteSchemas("team" to listOf("read", "write"))),
+            ),
+            ContractVectors.Spec(
                 "session_bundle_without_marker",
                 "A credential object without the profile marker: a token nobody declared the meaning of, refused.",
                 "client",

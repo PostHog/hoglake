@@ -390,20 +390,30 @@ class AuthPolicyTest {
         )
         val values = PredicateGrant.Values(mapOf(42L to Scope.WRITE, 7L to Scope.READ))
         val rw = caller(setOf(Scope.WRITE), values)
-        assertThat(rw.mayUseContained("lake", "team_id", 42, Scope.WRITE)).isTrue()
-        assertThat(rw.mayUseContained("lake", "team_id", 7, Scope.READ)).isTrue()
-        assertThat(rw.mayUseContained("lake", "team_id", 7, Scope.WRITE)).isFalse()
-        assertThat(rw.mayUseContained("lake", "team_id", 9, Scope.READ)).isFalse()
-        assertThat(rw.mayUseContained("lake", "org_id", 42, Scope.READ)).isFalse()
-        assertThat(rw.mayUseContained("other", "team_id", 42, Scope.READ)).isFalse()
+        assertThat(rw.mayUseContained("lake", "team_id", 42, null, Scope.WRITE)).isTrue()
+        assertThat(rw.mayUseContained("lake", "team_id", 7, null, Scope.READ)).isTrue()
+        assertThat(rw.mayUseContained("lake", "team_id", 7, null, Scope.WRITE)).isFalse()
+        assertThat(rw.mayUseContained("lake", "team_id", 9, null, Scope.READ)).isFalse()
+        assertThat(rw.mayUseContained("lake", "org_id", 42, null, Scope.READ)).isFalse()
+        assertThat(rw.mayUseContained("other", "team_id", 42, null, Scope.READ)).isFalse()
         val readOnlyCatalog = caller(setOf(Scope.READ), values)
-        assertThat(readOnlyCatalog.mayUseContained("lake", "team_id", 42, Scope.WRITE)).isFalse()
-        assertThat(readOnlyCatalog.mayUseContained("lake", "team_id", 42, Scope.READ)).isTrue()
+        assertThat(readOnlyCatalog.mayUseContained("lake", "team_id", 42, null, Scope.WRITE)).isFalse()
+        assertThat(readOnlyCatalog.mayUseContained("lake", "team_id", 42, null, Scope.READ)).isTrue()
         val all = caller(setOf(Scope.WRITE), PredicateGrant.All(Scope.READ))
-        assertThat(all.mayUseContained("lake", "team_id", 123, Scope.READ)).isTrue()
-        assertThat(all.mayUseContained("lake", "team_id", 123, Scope.WRITE)).isFalse()
+        assertThat(all.mayUseContained("lake", "team_id", 123, null, Scope.READ)).isTrue()
+        assertThat(all.mayUseContained("lake", "team_id", 123, null, Scope.WRITE)).isFalse()
+        // An org mark must equal the token's org; an unmarked namespace is not compared.
+        assertThat(rw.mayUseContained("lake", "team_id", 42, "org-1", Scope.WRITE)).isTrue()
+        assertThat(rw.mayUseContained("lake", "team_id", 42, "org-2", Scope.WRITE)).isFalse()
+        assertThat(rw.mayUseContained("lake", "team_id", 7, "org-2", Scope.READ)).isFalse()
+        assertThat(rw.copy(orgId = null).mayUseContained("lake", "team_id", 42, "org-1", Scope.READ)).isFalse()
         // Never for another kind: a tenant's authority is `holds`.
-        assertThat(rw.copy(kind = Caller.Kind.TENANT).mayUseContained("lake", "team_id", 42, Scope.READ)).isFalse()
+        assertThat(
+            rw.copy(kind = Caller.Kind.TENANT).mayUseContained("lake", "team_id", 42, null, Scope.READ),
+        ).isFalse()
+        assertThat(
+            rw.copy(kind = Caller.Kind.TENANT).mayUseContained("lake", "team_id", 42, "org-1", Scope.READ),
+        ).isFalse()
     }
 
     // ---- fixtures -------------------------------------------------------

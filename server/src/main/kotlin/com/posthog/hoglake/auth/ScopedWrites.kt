@@ -17,6 +17,9 @@ import io.ktor.util.AttributeKey
 internal class ScopedLookups(
     val containment: (call: ApplicationCall, catalog: String, namespace: String) -> NamespaceContainment?,
     val dataPath: (call: ApplicationCall, catalog: String) -> String?,
+    /** The namespace contained for `field = value` and its containment, for an org-marked claim's prefix. */
+    val containedFor: (call: ApplicationCall, catalog: String, field: String, value: Long) ->
+    Pair<String, NamespaceContainment>? = { _, _, _, _ -> null },
     /**
      * Refuses a request that names a remote schema among the namespaces, for
      * every caller kind (`CatalogStoreSelector.refuseRemoteSchemas`); null on
@@ -90,8 +93,12 @@ internal val PendingBodyKey = AttributeKey<AuthDecision.ByBody>("HoglakePendingB
  * The check runs without the commit lock. What it reads cannot change under a
  * scoped writer: hoglake clears a namespace's containment only when it holds
  * no table or view, drops a contained namespace only for an operator, and
- * never contains a name another namespace has had. So a namespace that passed
- * stays the caller's until an operator acts.
+ * never contains a name another namespace has held a table or view under. So a namespace that passed
+ * stays the caller's until an operator acts. Re-marking an org-marked namespace
+ * (allowed while it has never held a table or view) has the same unlocked-gate
+ * window as clearing a plain mark: a request that passed the gate can still
+ * see the namespace re-marked before it commits, and a commit is then held to
+ * the new mark.
  */
 internal fun ApplicationCall.requireScopedNamespaces(
     catalog: String,
@@ -114,7 +121,7 @@ internal fun ApplicationCall.requireScopedNamespaces(
     for (namespace in namespaces.distinct()) {
         refuseRemoteSchemas(catalog, listOf(namespace))
         val held = lookups.containment(this, catalog, namespace)
-        if (held == null || !caller.mayUseContained(catalog, held.field, held.value, pending.required)) {
+        if (held == null || !caller.mayUseContained(catalog, held.field, held.value, held.org, pending.required)) {
             val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
             countRefusal(service, service.clientClass(this), caller, match, refusal, enforced = true)
             throw refusal
@@ -122,6 +129,31 @@ internal fun ApplicationCall.requireScopedNamespaces(
     }
     Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(this))
 }
+
+/**
+ * The namespace whose prefix a scoped caller's claim at [path] spells
+ * literally, or null when it spells none: `<data_path>/data/<namespace>/`
+ * for a namespace without an org mark, `org_id=<org>/<field>=<value>/` for
+ * the namespace [owner] finds for that pair when its org mark is `<org>`.
+ * An org-marked namespace's `data/<namespace>/` is not its prefix.
+ */
+internal fun scopedClaimNamespace(
+    dataPath: String,
+    path: String,
+    containment: (namespace: String) -> NamespaceContainment?,
+    owner: (field: String, value: Long) -> Pair<String, NamespaceContainment>?,
+): String? {
+    Containment.rawSegment(dataPath, path)?.let { namespace ->
+        return namespace.takeIf { containment(it)?.org == null }
+    }
+    val head = Containment.literalHiveHead(dataPath, path) ?: return null
+    val (namespace, held) = owner(head.field, head.value) ?: return null
+    return namespace.takeIf { held.org == head.org }
+}
+
+internal fun scopedClaimRefusal(dataPath: String): String =
+    "a scoped credential's upload must be claimed under ${dataPath.trimEnd('/')}/data/<namespace>/, " +
+        "or under its namespace's org prefix"
 
 /**
  * The namespace a scoped caller's upload claim under [prefix] is for, checked
@@ -152,14 +184,18 @@ internal fun ApplicationCall.requireScopedUploadPrefix(
         return
     }
     val dataPath = found ?: throw HoglakeException.NotFound("catalog '$catalog'")
-    val namespace = Containment.rawSegment(dataPath, path)
+    val lookups = application.attributes.getOrNull(ScopedLookupsKey)
+    val namespace =
+        scopedClaimNamespace(
+            dataPath,
+            path,
+            containment = { lookups?.containment?.invoke(this, catalog, it) },
+            owner = { field, value -> lookups?.containedFor?.invoke(this, catalog, field, value) },
+        )
     if (namespace == null) {
         val service = application.attributes[AuthServiceKey]
         val match = AuthPolicy.match(request.httpMethod, request.path())
-        val refusal =
-            HoglakeException.Forbidden(
-                "a scoped credential's upload must be claimed under ${dataPath.trimEnd('/')}/data/<namespace>/",
-            )
+        val refusal = HoglakeException.Forbidden(scopedClaimRefusal(dataPath))
         countRefusal(service, service.clientClass(this), caller, match, refusal, enforced = true)
         throw refusal
     }

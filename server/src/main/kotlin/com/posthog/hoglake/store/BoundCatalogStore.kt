@@ -79,9 +79,10 @@ internal class BoundCatalogStore(
         name: String,
         author: String?,
         message: String?,
+        containment: NamespaceContainment?,
     ): NamespaceInfo {
         grant.closed(catalog)
-        return inner.createNamespace(catalog, name, author, message)
+        return inner.createNamespace(catalog, name, author, message, containment)
     }
 
     override fun listNamespaces(
@@ -128,6 +129,12 @@ internal class BoundCatalogStore(
         catalog: String,
         namespace: String,
     ): NamespaceContainment? = grant.containment(catalog, namespace)
+
+    override fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? = grant.containedFor(catalog, field, value)
 
     // ---- tables ----------------------------------------------------------
 

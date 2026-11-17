@@ -2,6 +2,7 @@ package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.api.toDto
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
@@ -555,6 +556,29 @@ class HogliteCatalogStoreTest {
         )
         assertThat(tx[2]).contains("contained_field IS NOT NULL")
         assertThat(tx[7]).contains("contained_field = ? AND contained_value = ?")
+    }
+
+    @Test
+    fun `an org mark is refused before any write, and the catalog does not advertise it`() {
+        seedNamespaces()
+
+        assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42.copy(org = "acme"), "op") })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("needs the Postgres backend")
+        assertThat(writes()).isEmpty()
+        assertThat(store.getCatalog("wh").toDto().capabilities)
+            .contains("object-prefix-layout-v1")
+            .doesNotContain("org-marked-containment-v1")
+    }
+
+    @Test
+    fun `creating a namespace with a containment mark is refused before any write`() {
+        seedNamespaces()
+
+        assertThat(catchThrowable { store.createNamespace("wh", "team_43", "op", null, team42) })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("needs the Postgres backend")
+        assertThat(writes()).isEmpty()
     }
 
     @Test

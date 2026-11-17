@@ -6,6 +6,8 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.ColumnStats
+import com.posthog.hoglake.model.Containment
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.service.UploadClaim
 import com.posthog.hoglake.service.UploadService
@@ -295,17 +297,26 @@ internal object CommitTail {
                AND end_snapshot IS NULL
                AND NOT EXISTS (SELECT 1 FROM receipt)
         ),
-        -- V33: which of the named namespaces are contained. One probe of
-        -- hog_namespace_live_name per distinct name (a commit names its
-        -- target namespaces and the `data/<segment>/` of its paths, so
-        -- usually one or two), read under the commit lock that marking
-        -- also takes.
+        -- V33/V37: which of the named namespaces are contained, and which
+        -- namespace holds each (field, value) the paths' hive heads spell.
+        -- One probe of hog_namespace_live_name per distinct name (a commit
+        -- names its target namespaces and the `data/<segment>/` of its
+        -- paths, so usually one or two) and one of
+        -- hog_namespace_live_containment per distinct (field, value), read
+        -- under the commit lock that marking also takes.
         contained AS (
-            SELECT n.name
+            SELECT n.name, n.contained_field AS field, n.contained_value AS value, n.contained_org AS org
               FROM hog_namespace n
              WHERE n.catalog_id = :catalogId AND NOT n.dropped
                AND n.name = ANY(CAST(:containmentNames AS text[]))
                AND n.contained_field IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM receipt)
+            UNION
+            SELECT n.name, n.contained_field AS field, n.contained_value AS value, n.contained_org AS org
+              FROM unnest(CAST(:hiveFields AS text[]), CAST(:hiveValues AS bigint[])) AS h(field, value)
+              JOIN hog_namespace n
+                ON n.catalog_id = :catalogId AND n.contained_field = h.field AND n.contained_value = h.value
+             WHERE NOT n.dropped
                AND NOT EXISTS (SELECT 1 FROM receipt)
         )
         SELECT h.last_snapshot_id, h.schema_version, h.earliest_snapshot_id, h.earliest_snapshot_time,
@@ -320,7 +331,7 @@ internal object CommitTail {
                (SELECT json_agg(q.path) FROM queued q) AS queued,
                (SELECT json_agg(t) FROM targets t) AS targets,
                (SELECT json_agg(d) FROM live_dvs d) AS live_dvs,
-               (SELECT json_agg(c.name) FROM contained c) AS contained
+               (SELECT json_agg(c) FROM contained c) AS contained
           FROM head h
           LEFT JOIN receipt rc ON true
         """
@@ -533,7 +544,13 @@ internal object CommitTail {
          * path names (see [com.posthog.hoglake.model.Containment.segments]).
          */
         val containmentNames: List<String> = emptyList(),
+        /** The `(field, value)` of every hive head the paths spell, as parallel lists (see [Containment.hiveHeads]). */
+        val hiveFields: List<String> = emptyList(),
+        val hiveValues: List<Long> = emptyList(),
     )
+
+    /** One contained namespace the probe found. */
+    data class ContainedRow(val name: String, val field: String, val value: Long, val org: String?)
 
     /** hog_catalog's head-of-line state. */
     data class Head(
@@ -611,8 +628,11 @@ internal object CommitTail {
         val queued: List<String>,
         val targets: Map<Long, Target>,
         val liveDvs: Map<Long, LiveDv>,
-        /** Which of [ReadInputs.containmentNames] are live contained namespaces. */
-        val contained: Set<String> = emptySet(),
+        /**
+         * The live contained namespaces among [ReadInputs.containmentNames],
+         * and those holding a [ReadInputs.hiveFields] pair.
+         */
+        val contained: Map<String, NamespaceContainment> = emptyMap(),
     )
 
     /**
@@ -635,6 +655,8 @@ internal object CommitTail {
             .bindArray("paths", String::class.java, inputs.paths)
             .bindArray("targetIds", LONG, inputs.targetIds)
             .bindArray("containmentNames", String::class.java, inputs.containmentNames.distinct())
+            .bindArray("hiveFields", String::class.java, inputs.hiveFields)
+            .bindArray("hiveValues", LONG, inputs.hiveValues)
 
     fun read(
         h: Handle,
@@ -685,7 +707,9 @@ internal object CommitTail {
                                 }
                             }
                         },
-                    contained = section<String>(rs.getString("contained")).toSet(),
+                    contained =
+                        section<ContainedRow>(rs.getString("contained"))
+                            .associate { it.name to NamespaceContainment(it.field, it.value, it.org) },
                 )
             }
             .findOne()

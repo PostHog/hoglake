@@ -323,6 +323,15 @@ class JwtVerifier(
      * `profile_not_enabled`, never read as a plain metadata token.
      */
     private val sessionProfile: Boolean = false,
+    /**
+     * A Host that serves namespaces (docs/auth-tenancy.md §6.5d) receives a
+     * relayed customer token, whose `rtg` names a backend of the customer's
+     * deployment that this server does not list. With this set, a scoped
+     * token's unknown `rtg.be` is ignored (no routing) instead of refused.
+     * A malformed `rtg`, a known backend of another kind, and every other
+     * token kind are refused as before.
+     */
+    private val ignoreUnknownScopedRouting: Boolean = false,
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
@@ -444,6 +453,8 @@ class JwtVerifier(
         val kindText = if (claims.has("ten")) Jwt.text(claims, "ten") else null
         val clientName = Jwt.textOrNull(claims, "cli")
         val routing = routing(claims)
+        // routing() is null with an `rtg` present only when it was ignored as unknown.
+        val routingIgnored = routing == null && claims.has("rtg")
 
         // The profile is checked for EVERY kind, operator included, so an
         // operator token carrying credentials is refused rather than ignored.
@@ -461,7 +472,7 @@ class JwtVerifier(
                     routing = routing,
                 )
 
-            "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing)
+            "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing, routingIgnored)
 
             "tenant", null -> {
                 // A token that carries a predicate but no `ten` is a scoped
@@ -489,6 +500,7 @@ class JwtVerifier(
                     delegates = delegates,
                     routing = routing,
                     remoteSchemas = profile?.remoteSchemas ?: emptySet(),
+                    remoteSchemaFamilies = profile?.remoteSchemaFamilies ?: emptySet(),
                 )
             }
 
@@ -657,6 +669,7 @@ class JwtVerifier(
             } else {
                 null
             }
+        if (ignoreUnknownScopedRouting && id !in backends && claims.get("ten")?.asText() == "scoped") return null
         if (backends[id] != backend) throw JwtViolation(JwtViolation.UNKNOWN_BACKEND, "rtg backend is not configured")
         return Routing(catalog, backend, id, tenant)
     }
@@ -687,6 +700,7 @@ class JwtVerifier(
         tokenId: String,
         clientName: String?,
         routing: Routing?,
+        routingIgnored: Boolean,
     ): Caller {
         if (predicateFields.isEmpty()) {
             throw JwtViolation(JwtViolation.INVALID_PREDICATE, "this instance accepts no scoped tokens")
@@ -732,7 +746,9 @@ class JwtVerifier(
             predicates = predicates(claims.get("prd")),
             user = user,
             routing = routing,
+            routingIgnored = routingIgnored,
             remoteSchemas = profile?.remoteSchemas ?: emptySet(),
+            remoteSchemaFamilies = profile?.remoteSchemaFamilies ?: emptySet(),
         )
     }
 

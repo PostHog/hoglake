@@ -85,6 +85,8 @@ data class ApiErrorDto(
 
 // ---- catalogs ------------------------------------------------------------
 
+private const val ORG_MARKED_CONTAINMENT = "org-marked-containment-v1"
+
 data class CatalogDto(
     val name: String,
     val dataPath: String,
@@ -110,6 +112,7 @@ data class CatalogDto(
             "object-prefix-layout-v1",
             "mutable-variant-shredding-v1",
             "atomic-partition-replacement-v1",
+            ORG_MARKED_CONTAINMENT,
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -165,6 +168,8 @@ fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
         headSnapshotId = headSnapshotId,
         schemaVersion = schemaVersion,
         earliestSnapshotTime = earliestSnapshotTime,
+        capabilities =
+            CatalogDto("", "", 0, 0).capabilities.filter { orgMarkedContainment || it != ORG_MARKED_CONTAINMENT },
         tableCount = totals?.tableCount,
         liveRows = totals?.liveRows,
         liveSizeBytes = totals?.liveBytes,
@@ -211,10 +216,10 @@ data class NamespaceDto(
     val remote: Boolean? = null,
 )
 
-data class NamespaceContainmentDto(val field: String, val value: Long)
+data class NamespaceContainmentDto(val field: String, val value: Long, val org: String? = null)
 
 fun NamespaceInfo.toDto() =
-    NamespaceDto(name, namespaceId, containment?.let { NamespaceContainmentDto(it.field, it.value) })
+    NamespaceDto(name, namespaceId, containment?.let { NamespaceContainmentDto(it.field, it.value, it.org) })
 
 data class CreateNamespaceRequestDto(
     val name: String,
@@ -222,6 +227,8 @@ data class CreateNamespaceRequestDto(
     val author: String? = null,
     @JsonDeserialize(using = OperationTextDeserializer::class)
     val message: String? = null,
+    /** Operator-only: the namespace is created already marked, as `PUT .../containment` marks one. */
+    val containment: NamespaceContainmentDto? = null,
 )
 
 // ---- tables --------------------------------------------------------------

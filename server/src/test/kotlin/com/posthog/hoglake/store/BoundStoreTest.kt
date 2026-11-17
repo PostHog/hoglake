@@ -39,6 +39,7 @@ import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.entry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.security.interfaces.ECPublicKey
@@ -60,14 +61,18 @@ import kotlin.reflect.full.declaredMemberFunctions
 class BoundStoreTest {
     private val pair = TestTokens.keyPair()
 
+    private val markOrg = BoundStoreCalls.MARK_ORG
+    private val otherOrg = "02b2f6ef-2bd6-0000-f64f-e3a0b88efbf5"
+
     /** `mine` and `shared` are the default scoped token's (team 42 for write, team 7 for read); `plain` is uncontained. */
     private val contained =
         mapOf(
             "mine" to NamespaceContainment("team_id", 42),
             "shared" to NamespaceContainment("team_id", 7),
             "theirs" to NamespaceContainment("team_id", 99),
+            "orged" to NamespaceContainment("team_id", 9400, markOrg),
         )
-    private val everyNamespace = listOf("mine", "shared", "theirs", "plain")
+    private val everyNamespace = listOf("mine", "shared", "theirs", "orged", "plain")
 
     /** READ in the route table, and open to a scoped caller by `cat` alone (AuthPolicy.SCOPED_ROUTES). */
     private val namespaces = "/v1/catalogs/alpha/namespaces"
@@ -98,7 +103,8 @@ class BoundStoreTest {
     private fun scoped(
         catalogs: String = """{"alpha":["write"]}""",
         prd: String = """{"team_id":{"42":"write","7":"read"}}""",
-    ) = TestTokens.mint(pair, TestTokens.scopedClaims(prd = prd, catalogs = catalogs))
+        org: String = otherOrg,
+    ) = TestTokens.mint(pair, TestTokens.scopedClaims(prd = prd, catalogs = catalogs, org = org))
 
     private fun callers() = listOf("tenant" to tenant(), "operator" to operator(), "scoped" to scoped())
 
@@ -166,7 +172,7 @@ class BoundStoreTest {
             assertThat(type.declaredMemberFunctions.map { it.name }).describedAs(type.simpleName)
                 .containsExactlyInAnyOrderElementsOf(byName.keys)
         }
-        assertThat(ops).hasSize(54)
+        assertThat(ops).hasSize(55)
         // Every sub-backend interface the selector hands out per catalog is one of them.
         val handedOut =
             CatalogStoreSelector::class.java.methods
@@ -392,7 +398,13 @@ class BoundStoreTest {
     ): List<String> {
         val wrong = mutableListOf<String>()
         // What a check may read on the way to a refusal: never the operation itself.
-        val lookups = setOf("CatalogStore.liveContainment", "CatalogStore.getCatalog", "TableCreationBackend.status")
+        val lookups =
+            setOf(
+                "CatalogStore.liveContainment",
+                "CatalogStore.liveContainedFor",
+                "CatalogStore.getCatalog",
+                "TableCreationBackend.status",
+            )
         for (namespace in everyNamespace) {
             val stores = RecordingStores(contained)
             request(mode, token, stores) { views ->
@@ -441,6 +453,7 @@ class BoundStoreTest {
     @Test
     fun `read and write come from the token, the lower of its catalog scope and its predicate`() {
         val everyTeam = """{"team_id":{"*":"write"}}"""
+        // `orged` carries an org mark these tokens' org does not match, so it is never theirs.
         val contained = setOf("mine", "shared", "theirs")
         // `cat` read: the predicate's write on team 42 is not a write.
         val catRead = scoped(catalogs = """{"alpha":["read"]}""")
@@ -452,6 +465,35 @@ class BoundStoreTest {
         // Every value for read under a `cat` write: nothing is a write.
         val everyTeamRead = scoped(prd = """{"team_id":{"*":"read"}}""")
         assertThat(scopedSweep(AuthMode.ENFORCE, everyTeamRead, readable = contained, writable = emptySet())).isEmpty()
+    }
+
+    @Test
+    fun `an org-marked namespace is the caller's only when the token's org is the mark, at every grant site`() {
+        // MUTATION: pass null for the org at any StoreGrant site and the wrong-org token is served.
+        val prd = """{"team_id":{"9400":"write"}}"""
+        for (mode in listOf(AuthMode.ENFORCE, AuthMode.LOCAL, AuthMode.WARN)) {
+            val right = scoped(prd = prd, org = markOrg)
+            assertThat(scopedSweep(mode, right, readable = setOf("orged"), writable = setOf("orged"))).isEmpty()
+            val wrong = scoped(prd = prd, org = otherOrg)
+            assertThat(scopedSweep(mode, wrong, readable = emptySet(), writable = emptySet())).isEmpty()
+        }
+        val answers = mutableMapOf<String, Any?>()
+        for ((label, token) in listOf("right" to scoped(prd = prd, org = markOrg), "wrong" to scoped(prd = prd))) {
+            request(AuthMode.ENFORCE, token) { views ->
+                val store = views.view<CatalogStore>()
+                answers["$label listed"] = store.listNamespaces("alpha").map { it.name }
+                answers["$label held"] = store.liveContainment("alpha", "orged")
+                answers["$label byValue"] = store.liveContainedFor("alpha", "team_id", 9400)
+            }
+        }
+        assertThat(answers).containsExactly(
+            entry("right listed", listOf("orged")),
+            entry("right held", contained["orged"]),
+            entry("right byValue", "orged" to contained.getValue("orged")),
+            entry("wrong listed", emptyList<String>()),
+            entry("wrong held", null),
+            entry("wrong byValue", null),
+        )
     }
 
     @Test
@@ -471,6 +513,7 @@ class BoundStoreTest {
                 "mine" to contained["mine"],
                 "shared" to contained["shared"],
                 "theirs" to null,
+                "orged" to null,
                 "plain" to null,
                 "gone" to null,
             ),
@@ -528,6 +571,22 @@ class BoundStoreTest {
     }
 
     @Test
+    fun `the lookup by value answers a scoped caller only for a value it may read`() {
+        val found = mutableMapOf<Long, Pair<String, NamespaceContainment>?>()
+        request(AuthMode.ENFORCE, scoped(), RecordingStores(contained)) { views ->
+            val store = views.view<CatalogStore>()
+            // MUTATION: drop the read filter in StoreGrant.containedFor and team 99 is answered.
+            for (value in listOf(42L, 7L, 99L, 5L)) found[value] = store.liveContainedFor("alpha", "team_id", value)
+        }
+        assertThat(found).containsExactly(
+            entry(42L, "mine" to contained.getValue("mine")),
+            entry(7L, "shared" to contained.getValue("shared")),
+            entry(99L, null),
+            entry(5L, null),
+        )
+    }
+
+    @Test
     fun `an upload claim is held to the namespace its prefix spells`() {
         val stores = RecordingStores(contained)
         val refusals = mutableListOf<Throwable?>()
@@ -547,7 +606,9 @@ class BoundStoreTest {
             uploads.renew("alpha", id)
             uploads.abandon("alpha", id, listOf("$DATA_PATH/data/theirs/x"))
         }
-        val under = "a scoped credential's upload must be claimed under $DATA_PATH/data/<namespace>/"
+        val under =
+            "a scoped credential's upload must be claimed under $DATA_PATH/data/<namespace>/, " +
+                "or under its namespace's org prefix"
         assertThat(refusals.map { it?.message }).containsExactly("namespace 'theirs' in catalog 'alpha'", under, under)
         assertThat(refusals.map { it!!::class })
             .containsExactly(
