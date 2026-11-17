@@ -23,6 +23,13 @@ IDS = {
 }
 
 
+# Fixture COPYs that take both a target and a query value bind by NAME.
+# Positional `?` numbering is not stable across DuckDB versions for a
+# COPY: 1.5 bound the TO target first, 2.0's parser numbers placeholders
+# in source order, and either way round one version hands the target an
+# integer ("Unsupported parameter type for filename").
+
+
 def raw_file(tmp_path, name="raw.parquet", count=10000):
     path = tmp_path / name
     with duckdb.connect() as c:
@@ -33,8 +40,8 @@ def raw_file(tmp_path, name="raw.parquet", count=10000):
             CASE WHEN i%7=0 THEN NULL ELSE md5(i::VARCHAR) END AS event,
             lpad(to_hex(i),32,'0')::UUID uuid,
             json_object('counter',i,'nested',{'flag':true,'null':NULL},'text','雪😀') properties
-            FROM range(?) t(i)) TO ? (FORMAT PARQUET, ROW_GROUP_SIZE 2048)""",
-            [str(path), count],
+            FROM range($count) t(i)) TO $path (FORMAT PARQUET, ROW_GROUP_SIZE 2048)""",
+            {"path": str(path), "count": count},
         )
     return path
 
@@ -137,8 +144,8 @@ def test_json_null_policy_and_blob_uuid(tmp_path):
         write(path, tmp_path / "out", 1, (0,))
     with duckdb.connect() as c:
         c.execute(
-            "COPY (SELECT 1::BIGINT team_id, TIMESTAMP '2026-01-01' AS timestamp, 'e' AS event, ?::BLOB uuid, NULL::JSON properties) TO ? (FORMAT PARQUET)",
-            [str(path), uuid.UUID(int=42).bytes],
+            "COPY (SELECT 1::BIGINT team_id, TIMESTAMP '2026-01-01' AS timestamp, 'e' AS event, $uuid::BLOB uuid, NULL::JSON properties) TO $path (FORMAT PARQUET)",
+            {"path": str(path), "uuid": uuid.UUID(int=42).bytes},
         )
     # The source's SQL NULL must not become a non-null VARIANT null group.
     assert pq.read_table(path, columns=["properties"]).to_pylist() == [
@@ -149,8 +156,8 @@ def test_json_null_policy_and_blob_uuid(tmp_path):
     assert list((tmp_path / "out").iterdir()) == []
     with duckdb.connect() as c:
         c.execute(
-            "COPY (SELECT 1::BIGINT team_id, TIMESTAMP '2026-01-01' AS timestamp, 'e' AS event, ?::BLOB uuid, '{\"a\":null}'::JSON properties) TO ? (FORMAT PARQUET)",
-            [str(path), uuid.UUID(int=42).bytes],
+            "COPY (SELECT 1::BIGINT team_id, TIMESTAMP '2026-01-01' AS timestamp, 'e' AS event, $uuid::BLOB uuid, '{\"a\":null}'::JSON properties) TO $path (FORMAT PARQUET)",
+            {"path": str(path), "uuid": uuid.UUID(int=42).bytes},
         )
     files = write(path, tmp_path / "out", 1, (0,))
     with duckdb.connect() as c:
