@@ -142,13 +142,18 @@ def script_bootstrap(
     ``table=False`` registers no table read (resolve is expected to fail
     before it)."""
     httpx_mock.add_response(method="GET", url=CATALOG_URL, json=catalog_wire())
+    names = namespaces if namespaces is not None else [NAMESPACE]
     httpx_mock.add_response(
-        method="GET",
-        url=NAMESPACES_URL,
-        json=[
-            {"name": n} for n in (namespaces if namespaces is not None else [NAMESPACE])
-        ],
+        method="GET", url=NAMESPACES_URL, json=[{"name": n} for n in names]
     )
+    if NAMESPACE not in names:
+        # a name the listing omits is asked of the namespace itself
+        httpx_mock.add_response(
+            method="GET",
+            url=f"{NAMESPACES_URL}/{NAMESPACE}",
+            status_code=404,
+            json={"error": "not_found"},
+        )
     if table is not False:
         httpx_mock.add_response(
             method="GET",

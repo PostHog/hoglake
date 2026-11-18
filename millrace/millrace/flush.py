@@ -1385,8 +1385,8 @@ def read_destination(client: HoglakeClient, cfg: Config) -> tuple[Catalog, Table
     :class:`FlushStartupError`."""
     try:
         catalog = client.catalog(cfg.catalog)
-        # Existence-check the namespace (the API has no per-namespace
-        # GET; the listing is the check).
+        # Existence-check the namespace: the listing, then
+        # GET /namespaces/{name} for a name the listing leaves out.
         catalog.namespace(cfg.namespace)
         info = read_table_identity(client, cfg.catalog, cfg.namespace, cfg.table)
     except FlushStartupError:
