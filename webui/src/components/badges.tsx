@@ -14,3 +14,17 @@ export function ChangeBadge({ change }: { change: SnapshotChange }) {
     </span>
   );
 }
+
+/** A remote schema or table: read-only, served by another Hoglake. */
+export function RemoteBadge() {
+  return (
+    <span className="badge remote" title="Read-only: served by another Hoglake">
+      remote
+    </span>
+  );
+}
+
+/** The one line a remote schema's pages carry under their heading. */
+export function RemoteLine() {
+  return <p className="subtle">Read-only: this schema is served by another Hoglake.</p>;
+}

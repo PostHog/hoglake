@@ -6,6 +6,7 @@ import type { PartitionStats } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
+import { useSchemaKind } from "../lib/remote";
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
@@ -75,6 +76,11 @@ export function PartitionsPage() {
   const [tableDraft, setTableDraft] = useState(table);
   // null = the server's order (score desc, ties by small-file bytes desc).
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
+  // A namespace filter can name a remote schema, whose host serves no
+  // partition statistics: it is classified first (src/lib/remote.ts).
+  const kind = useSchemaKind(catalog, namespace || undefined);
+  const remoteFilter = namespace !== "" && kind.remote;
+  const filterFailed = namespace !== "" && !kind.local && !kind.remote && kind.error !== null;
 
   const query = useQuery({
     queryKey: ["partition-stats", catalog, namespace, table],
@@ -84,7 +90,7 @@ export function PartitionsPage() {
         table: table || undefined,
         limit: LIMIT,
       }),
-    enabled: Boolean(catalog),
+    enabled: Boolean(catalog) && (namespace === "" || kind.local),
     refetchInterval: 60_000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
@@ -144,12 +150,16 @@ export function PartitionsPage() {
         </div>
       </form>
       {query.isError && <ErrorBox error={query.error} />}
+      {filterFailed && <ErrorBox error={kind.error} />}
+      {remoteFilter && (
+        <p className="empty">Compaction debt: not available for a remote schema.</p>
+      )}
       {query.data && (
         <p className="subtle">
           {query.data.sampled_at ? `Sampled ${formatTime(query.data.sampled_at)}` : "Partition summary warming up — no completed sample yet."}
         </p>
       )}
-      {!query.isError && (
+      {!query.isError && !remoteFilter && !filterFailed && (
         <>
           {query.data?.truncated && (
             <p className="truncated-banner" role="status">
