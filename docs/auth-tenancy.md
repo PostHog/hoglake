@@ -1545,10 +1545,9 @@ same `team_<id>` then shows the published stream tables beside the imports:
   object-prefix field. It is never the token's other values, so a token
   holding teams 42 and 43 sees only team 42's rows in `team_42`. The token's
   grant must still hold that id, and a file is returned only when its
-  statistics prove the value and it is not quarantined (`ReadScope`). The
-  spec's `org_id = <token org>` predicate waits for an `org_id` in the
-  layout. When it lands, it is a second condition in the same seam, not a
-  replacement for the mark.
+  statistics prove the value and it is not quarantined (`ReadScope`). There
+  is no `org_id` predicate: the stream layout carries only `team_id`
+  (PostHog/hogtower#244), so the mark is the whole team-to-org proof.
 - **Totals and properties.** The listing's counts are the team's own files.
   The table response never carries totals, `totals=true` included, because
   whole-table counts are every team's. It never carries the table's
@@ -1579,9 +1578,9 @@ same `team_<id>` then shows the published stream tables beside the imports:
   block is turned on, audit every `team_<digits>` mark against Hogtower's
   team-to-org records. A mark written while the server ran `off` or `warn`
   stays after a later switch to `enforce`.
-- **Not built.** The `org_id` predicate and removing `hog_mount`. The
-  per-schema remote head snapshot field of the old P3 will not be built: the
-  per-table pin replaces it, which is `read_snapshot_id` with `remote: true`.
+- **Not built.** Removing `hog_mount`. The per-schema remote head snapshot
+  field of the old P3 will not be built: the per-table pin replaces it,
+  which is `read_snapshot_id` with `remote: true`.
 
 ### 6.6 Client-supplied authority fields must die
 
