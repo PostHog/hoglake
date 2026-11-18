@@ -425,6 +425,15 @@ data class TableDto(
      * DDL made instead of racing a separate head read.
      */
     val snapshotId: Long? = null,
+    /**
+     * Present, and true, only on a table of a namespace this server serves
+     * to relayed readers (docs/auth-tenancy.md §6.5d): a remote schema's
+     * table. Its [readSnapshotId] is then a snapshot of the catalog that
+     * holds the table, which a reader pins for that table and sends back.
+     * Set by the served get-table route alone, so every other table answer,
+     * create receipt and alter receipt is the body it was.
+     */
+    val remote: Boolean? = null,
 )
 
 fun TableInfo.toDto() =
