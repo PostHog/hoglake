@@ -45,6 +45,17 @@ public:
 	//! Travel for an optional AT (VERSION/TIMESTAMP) clause; nullptr =
 	//! the transaction's pinned travel.
 	HoglakeTravel TravelFor(optional_ptr<BoundAtClause> at_clause);
+	//! The first get-table of a table in a REMOTE schema (DESIGN.md
+	//! "Remote schemas"): head, or the AT / attach timestamp, never this
+	//! catalog's snapshot id. A version (AT (VERSION) or a SNAPSHOT_VERSION
+	//! attach) names this catalog's history: refused before any request.
+	HoglakeTravel RemoteFirstTravel(const string &ns, optional_ptr<BoundAtClause> at_clause);
+	//! The travel an entry fetched at `fetched` reads at from then on:
+	//! `fetched` in a local schema; in a remote one, the table's own
+	//! read_snapshot_id. A table answered as remote in a local schema
+	//! fails (the read carried this catalog's snapshot).
+	static HoglakeTravel EntryTravel(const string &ns, bool remote, const HoglakeTableInfo &table,
+	                                 const HoglakeTravel &fetched);
 
 	//! Buffer a table append (files already uploaded to object storage);
 	//! shipped as ONE CommitRequest at COMMIT (multi-statement,
@@ -86,7 +97,9 @@ public:
 	void Rollback();
 
 	// -- catalog entry cache ----------------------------------------------
-	optional_ptr<HoglakeSchemaEntry> GetSchema(const string &name);
+	//! A name the listing does not hold is asked of the server once per
+	//! transaction (`probe`), and the answer says whether it is remote.
+	optional_ptr<HoglakeSchemaEntry> GetSchema(const string &name, bool probe = true);
 	void ScanSchemas(const std::function<void(HoglakeSchemaEntry &)> &callback);
 	//! Register a schema entry created inside this transaction (eager DDL).
 	HoglakeSchemaEntry &AddSchema(unique_ptr<HoglakeSchemaEntry> schema);
@@ -107,6 +120,9 @@ private:
 	//! CI-colliding namespace groups: lookups throw ambiguity; listings
 	//! skip them (same policy as tables)
 	case_insensitive_map_t<vector<string>> ambiguous_schemas;
+	//! get-namespace answers for names the listing does not hold (null =
+	//! 404); kept out of `schemas`, so ScanSchemas lists only the listing
+	case_insensitive_map_t<unique_ptr<HoglakeSchemaEntry>> probed_schemas;
 	//! buffered appends, one entry per (namespace, table)
 	vector<HoglakeTableAppend> buffered_appends;
 	optional_idx append_read_snapshot;

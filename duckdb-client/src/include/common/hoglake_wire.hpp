@@ -89,6 +89,21 @@ struct HoglakeTableInfo {
 	//! distinguishes "came with a fresh DDL pin" from a plain read.
 	bool has_snapshot_id = false;
 	int64_t snapshot_id = -1;
+	//! The snapshot the read was resolved at, in the catalog that HOLDS
+	//! the table. For a table of a remote schema it is the table's own pin
+	//! (DESIGN.md "Remote schemas"); local entries ignore it.
+	bool has_read_snapshot_id = false;
+	int64_t read_snapshot_id = -1;
+	//! the answer says "remote": true (absent = false)
+	bool remote = false;
+};
+
+//! Namespace (wire): a listing entry or a get-namespace answer.
+struct HoglakeNamespaceInfo {
+	string name;
+	//! "remote": true: another Hoglake serves it, read-only, with its own
+	//! snapshots (DESIGN.md "Remote schemas")
+	bool remote = false;
 };
 
 struct HoglakeTableSummary {

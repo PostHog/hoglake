@@ -7,7 +7,9 @@
 #include "duckdb/common/multi_file/multi_file_data.hpp"
 #include "storage/hoglake_multi_file_reader.hpp"
 #include "storage/hoglake_scan.hpp"
+#include "storage/hoglake_schema_entry.hpp"
 #include "storage/hoglake_transaction.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -19,7 +21,16 @@ HoglakeTableEntry::HoglakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schem
                                      HoglakeTableInfo table_info_p, HoglakeTravel read_travel_p,
                                      bool writes_refused_p)
     : TableCatalogEntry(catalog, schema, info), table_info(std::move(table_info_p)),
-      read_travel(std::move(read_travel_p)), writes_refused(writes_refused_p) {
+      read_travel(std::move(read_travel_p)), writes_refused(writes_refused_p),
+      remote(schema.Cast<HoglakeSchemaEntry>().IsRemote()) {
+}
+
+void HoglakeTableEntry::RequireLocal(const char *what) const {
+	if (remote) {
+		throw BinderException("hoglake: cannot %s table \"%s.%s\": schema \"%s\" is a remote schema, served read-only "
+		                      "by another Hoglake",
+		                      what, schema.name.GetIdentifierName(), table_info.name, schema.name.GetIdentifierName());
+	}
 }
 
 unique_ptr<BaseStatistics> HoglakeTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
