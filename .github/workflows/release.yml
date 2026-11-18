@@ -1,0 +1,625 @@
+name: "Release"
+
+# PostHog's SDK release flow (modelled on posthog-python's release.yml):
+# Sampo changesets on main, a Slack-notified approval gate, then a bot
+# commit that bumps versions and changelogs, and the tags that publish.
+#
+#   .sampo/changesets/*.md on main  ->  (Slack "approval needed", optional)
+#     -> environment "Release" approved by a maintainer
+#     -> `sampo release` + ci/release_versions.py sync, committed to main
+#        by the releaser GitHub App (a signed commit, no PR)
+#     -> tags: vX.Y.Z (+ the GitHub release from CHANGELOG.md),
+#              pyhoglake-variant-codec-vX.Y.Z when the codec moved,
+#              pyhoglake-vX.Y.Z once that codec is on PyPI.
+#
+# The tags are pushed with the App token so the existing publish
+# workflows fire on them: publish-pyhoglake-variant-codec.yml and
+# publish-pyhoglake.yml build, test and upload to PyPI exactly as for a
+# hand-pushed tag, and refuse a tag whose version is not the pyproject's.
+# The release commit is an ordinary main push for every other workflow,
+# so the server and webui images of the released commit are built and
+# deployed by server.yml / webui.yml / ecr-release.yml as before (no
+# `[skip ci]`: the image must carry the released version).
+#
+# The approval gate is the GitHub environment alone. Slack is an optional
+# layer on top: every Slack job and step runs only when the repository
+# variable RELEASE_SLACK_ENABLED is "true" (default: unset, off), so a
+# missing Slack variable or secret never fails a release. Turning it on
+# means setting that variable plus SLACK_ALERTS_MANAGED_WAREHOUSE_CHANNEL_ID
+# (#alerts-managed-warehouse), GROUP_MANAGED_WAREHOUSE_SLACK_GROUP_ID and
+# the SLACK_MANAGED_WAREHOUSE_BOT_TOKEN secret; release-failure-notification.yml
+# reads the same switch.
+#
+# Names other workflows and scripts read: the job names "Bump versions and
+# commit to main", "Tag and release", "Tag pyhoglake", "Notify Slack - Released" and
+# "Notify Slack - Rejected" (release-failure-notification.yml), and the
+# artifact "release-slack-thread-<attempt>".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".sampo/changesets/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time: two releasable merges in a row must not race on
+# main. The second run finds no changesets and stops.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check-changesets:
+    name: Check for changesets
+    # The dry run below is the only job on a non-main dispatch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has-changesets: ${{ steps.check.outputs.has-changesets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check for changesets
+        id: check
+        run: |
+          changeset_count=$(find .sampo/changesets -name '*.md' 2>/dev/null | wc -l)
+          if [ "$changeset_count" -gt 0 ]; then
+            echo "has-changesets=true" >> "$GITHUB_OUTPUT"
+            echo "Found $changeset_count changeset(s), ready to release"
+          else
+            echo "has-changesets=false" >> "$GITHUB_OUTPUT"
+            echo "No changesets to release"
+          fi
+
+  notify-approval-needed:
+    name: Notify Slack - Approval Needed
+    needs: check-changesets
+    if: needs.check-changesets.outputs.has-changesets == 'true' && vars.RELEASE_SLACK_ENABLED == 'true'
+    uses: posthog/.github/.github/workflows/notify-approval-needed.yml@5ba5d24966f2c416ca792654638e4ce6f19f545b
+    with:
+      slack_channel_id: ${{ vars.SLACK_ALERTS_MANAGED_WAREHOUSE_CHANNEL_ID }}
+      slack_user_group_id: ${{ vars.GROUP_MANAGED_WAREHOUSE_SLACK_GROUP_ID }}
+      # The "View Diff" button compares main to the newest vX.Y.Z tag, not
+      # to the newest tag of any kind (pyhoglake-v* and the codec's share
+      # the repository).
+      checkout_repository: false
+      tag_pattern: "v[0-9]*"
+      tag_sort: version
+    secrets:
+      slack_bot_token: ${{ secrets.SLACK_MANAGED_WAREHOUSE_BOT_TOKEN }}
+      posthog_project_api_key: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
+
+  preserve-slack-thread:
+    name: Preserve Slack thread
+    needs: notify-approval-needed
+    if: vars.RELEASE_SLACK_ENABLED == 'true' && needs.notify-approval-needed.outputs.slack_ts != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions: {}
+    steps:
+      - name: Save approval thread timestamp
+        env:
+          THREAD_TS: ${{ needs.notify-approval-needed.outputs.slack_ts }}
+        run: printf '%s' "$THREAD_TS" > thread-ts.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-slack-thread-${{ github.run_attempt }}
+          path: thread-ts.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  # The single approval-gated job (environment "Release"). It bumps and
+  # commits; it does NOT tag or publish, so a rerun of the jobs after it
+  # never asks for approval again.
+  version-bump:
+    name: Bump versions and commit to main
+    needs: [check-changesets, notify-approval-needed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # `!cancelled()` so the job runs when the Slack notification was skipped
+    # (Slack off) or failed, while still reading its slack_ts output.
+    if: ${{ !cancelled() && needs.check-changesets.outputs.has-changesets == 'true' }}
+    # THE GATE. The App's secrets live in this environment (required
+    # reviewers, deployment branch main only) and in `release-tags` below
+    # (main only, no reviewers), never as repository secrets, so no branch
+    # workflow can mint a token that commits to main or tags.
+    environment: "Release" # a maintainer approves here (Slack, when on, told them above)
+    permissions:
+      contents: read
+    outputs:
+      commit-hash: ${{ steps.commit-release.outputs.commit-hash }}
+      train-version: ${{ steps.versions.outputs.train-version }}
+      train-release: ${{ steps.versions.outputs.train-release }}
+      codec-version: ${{ steps.versions.outputs.codec-version }}
+      codec-release: ${{ steps.versions.outputs.codec-release }}
+    steps:
+      - name: Notify Slack - Approved
+        if: vars.RELEASE_SLACK_ENABLED == 'true' && needs.notify-approval-needed.outputs.slack_ts != ''
+        continue-on-error: true
+        uses: posthog/.github/.github/actions/slack-thread-reply@cb0979b67dcd585828b61ac45927eef4da8f6287 # main
+        with:
+          slack_bot_token: ${{ secrets.SLACK_MANAGED_WAREHOUSE_BOT_TOKEN }}
+          slack_channel_id: ${{ vars.SLACK_ALERTS_MANAGED_WAREHOUSE_CHANNEL_ID }}
+          thread_ts: ${{ needs.notify-approval-needed.outputs.slack_ts }}
+          message: "✅ Release approved! Version bump in progress..."
+          emoji_reaction: "white_check_mark"
+
+      - name: Get GitHub App token
+        id: releaser
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.GH_APP_HOGLAKE_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GH_APP_HOGLAKE_RELEASER_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0 # Sampo's changelog links need the history
+          token: ${{ steps.releaser.outputs.token }}
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.91.1
+          components: cargo
+
+      - name: Cache Sampo CLI
+        id: cache-sampo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/sampo
+          key: sampo-${{ env.SAMPO_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+        env:
+          SAMPO_VERSION: "0.24.1"
+
+      - name: Install Sampo CLI
+        if: steps.cache-sampo.outputs.cache-hit != 'true'
+        run: cargo install sampo --version 0.24.1 --locked
+
+      - name: Record the versions before the bump
+        id: before
+        run: |
+          echo "train=$(uv version --short)" >> "$GITHUB_OUTPUT"
+          echo "codec=$(uv version --short --directory pyhoglake-variant-codec)" >> "$GITHUB_OUTPUT"
+
+      # Consumes .sampo/changesets/*.md: bumps the root pyproject (hoglake,
+      # the release train) and/or the codec's, writes their CHANGELOG.md
+      # entries, and runs `uv lock`.
+      - name: Prepare release with Sampo
+        env:
+          GITHUB_TOKEN: ${{ steps.releaser.outputs.token }}
+        run: sampo release
+
+      # The nine other version strings follow the train, the codec pin
+      # follows the codec, and uv.lock is refreshed again for them.
+      - name: Sync the follower version strings
+        run: python3 ci/release_versions.py sync
+
+      # What this run releases (ci/release_tags.py plan): the train when
+      # its version moved; the codec when its version moved OR has no tag
+      # yet (a hand bump, or an earlier run that died before tagging), since
+      # pyhoglake installs the pinned codec from PyPI. Fails when nothing is
+      # to be released, or when a tag a moved version needs already exists;
+      # the tags of packages that did not move are not consulted.
+      - name: Record the released versions
+        id: versions
+        env:
+          TRAIN_BEFORE: ${{ steps.before.outputs.train }}
+          CODEC_BEFORE: ${{ steps.before.outputs.codec }}
+        run: |
+          git fetch --tags --force
+          python3 ci/release_tags.py plan --train-before "$TRAIN_BEFORE" --codec-before "$CODEC_BEFORE" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Release commit message
+        id: message
+        env:
+          TRAIN: ${{ steps.versions.outputs.train-version }}
+          TRAIN_RELEASE: ${{ steps.versions.outputs.train-release }}
+          CODEC: ${{ steps.versions.outputs.codec-version }}
+          CODEC_RELEASE: ${{ steps.versions.outputs.codec-release }}
+        run: |
+          text="release:"
+          [ "$TRAIN_RELEASE" = true ] && text="$text hoglake v$TRAIN"
+          [ "$TRAIN_RELEASE" = true ] && [ "$CODEC_RELEASE" = true ] && text="$text,"
+          [ "$CODEC_RELEASE" = true ] && text="$text pyhoglake-variant-codec v$CODEC"
+          echo "text=$text" >> "$GITHUB_OUTPUT"
+
+      # Commits through the GitHub API, so the commit is signed by the App
+      # and admitted by the signed-commits ruleset.
+      - name: Commit release changes
+        id: commit-release
+        uses: planetscale/ghcommit-action@a6b150b81dca5dd027baa898604418eec9e11465 # v0.2.22
+        with:
+          commit_message: ${{ steps.message.outputs.text }}
+          repo: ${{ github.repository }}
+          branch: main
+        env:
+          GITHUB_TOKEN: ${{ steps.releaser.outputs.token }}
+
+      - name: Send failure event to PostHog
+        if: ${{ failure() }}
+        continue-on-error: true
+        uses: PostHog/posthog-github-action@9a6a19d360820ab4d95ecc4a5a7564062c895f84 # v1.3.0
+        with:
+          posthog-token: "${{ secrets.POSTHOG_PROJECT_API_KEY }}"
+          event: "posthog-sdk-github-release-workflow-failure"
+          properties: >-
+            {
+              "commitSha": "${{ github.sha }}",
+              "jobStatus": "${{ job.status }}",
+              "ref": "${{ github.ref }}",
+              "repository": "${{ github.repository }}",
+              "sdk": "hoglake",
+              "jobName": "version-bump",
+              "packageName": "hoglake",
+              "packageVersion": "${{ steps.versions.outputs.train-version || 'unknown' }}",
+              "actionUrl": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "alertText": ":rotating_light: Failed to prepare release hoglake@${{ steps.versions.outputs.train-version }} :rotating_light:",
+              "alertContext": "The version bump/changelog step failed before anything was tagged."
+            }
+
+  # Tags the release commit and creates the vX.Y.Z GitHub release. The
+  # `release-tags` environment (main only, NO reviewers) holds the App's
+  # secrets, so a re-run never asks for approval again. The order matters:
+  # pyhoglake's extra pins the exact codec release and publish-pyhoglake.yml
+  # installs that pin from PyPI, so when the codec is released its tag goes
+  # first, and pyhoglake's tag (the next job) waits for PyPI.
+  #
+  # Every step is idempotent, so a failed run is fixed by re-running the
+  # failed jobs: a tag that already points at the release commit is kept,
+  # one pointing elsewhere fails the step, an existing GitHub release is
+  # kept. RECOVERY after a FULL re-run (or a new run) once version-bump has
+  # committed: the changesets are consumed, so check-changesets finds none
+  # and the run stops; tag the release commit by hand instead (the commands
+  # are these steps': `git tag -a v$V -m "hoglake $V" <sha> && git push
+  # origin v$V`, the codec tag, then once the codec is on PyPI
+  # `pyhoglake-v$V`), and `gh release create v$V --target <sha>
+  # --notes-file` with the newest CHANGELOG.md section.
+  tag-and-release:
+    name: Tag and release
+    needs: [version-bump, notify-approval-needed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ !cancelled() && needs.version-bump.outputs.commit-hash != '' }}
+    environment: release-tags
+    permissions:
+      contents: write # the GitHub release
+    env:
+      COMMIT_HASH: ${{ needs.version-bump.outputs.commit-hash }}
+      TRAIN: ${{ needs.version-bump.outputs.train-version }}
+      TRAIN_RELEASE: ${{ needs.version-bump.outputs.train-release }}
+      CODEC: ${{ needs.version-bump.outputs.codec-version }}
+      CODEC_RELEASE: ${{ needs.version-bump.outputs.codec-release }}
+    steps:
+      - name: Get GitHub App token
+        id: releaser
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.GH_APP_HOGLAKE_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GH_APP_HOGLAKE_RELEASER_PRIVATE_KEY }}
+
+      # The App token is the push credential: a tag pushed with the
+      # workflow's own GITHUB_TOKEN would not start the publish workflows.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version-bump.outputs.commit-hash }}
+          fetch-depth: 0
+          token: ${{ steps.releaser.outputs.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force
+
+      - name: Tag v${{ env.TRAIN }}
+        if: env.TRAIN_RELEASE == 'true'
+        run: |
+          # Assigned first: a failing $(...) as a case word does not trip -e.
+          state=$(python3 ci/release_tags.py tag-state --tag "v$TRAIN" --commit "$COMMIT_HASH")
+          case "$state" in
+            present) echo "v$TRAIN already points at $COMMIT_HASH" ;;
+            absent) git tag -a "v$TRAIN" -m "hoglake $TRAIN" "$COMMIT_HASH" && git push origin "v$TRAIN" ;;
+            *) echo "::error::unexpected tag-state: $state"; exit 1 ;;
+          esac
+
+      - name: Create the v${{ env.TRAIN }} GitHub release
+        if: env.TRAIN_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$TRAIN" >/dev/null 2>&1; then
+            echo "release v$TRAIN already exists"
+            exit 0
+          fi
+          # The newest CHANGELOG.md section (between the first two '## '
+          # headings) is the release body; a pointer if it is empty.
+          awk '
+            /^## / { if (found_version) exit; found_version=1; next }
+            found_version { lines[++n] = $0 }
+            END {
+              start = 1
+              while (start <= n && lines[start] ~ /^[[:space:]]*$/) start++
+              end = n
+              while (end >= start && lines[end] ~ /^[[:space:]]*$/) end--
+              for (i = start; i <= end; i++) print lines[i]
+            }
+          ' CHANGELOG.md > release-notes.md
+          if [ -z "$(tr -d '[:space:]' < release-notes.md)" ]; then
+            echo "See CHANGELOG.md for details." > release-notes.md
+          fi
+          if [ "$CODEC_RELEASE" = true ]; then
+            printf '\n\npyhoglake-variant-codec %s releases with it; see its [changelog](pyhoglake-variant-codec/CHANGELOG.md).\n' "$CODEC" >> release-notes.md
+          fi
+          gh release create "v$TRAIN" \
+            --target "$COMMIT_HASH" \
+            --title "hoglake $TRAIN" \
+            --verify-tag \
+            --notes-file release-notes.md
+
+      - name: Tag pyhoglake-variant-codec-v${{ env.CODEC }}
+        if: env.CODEC_RELEASE == 'true'
+        run: |
+          tag="pyhoglake-variant-codec-v$CODEC"
+          # Assigned first: a failing $(...) as a case word does not trip -e.
+          state=$(python3 ci/release_tags.py tag-state --tag "$tag" --commit "$COMMIT_HASH")
+          case "$state" in
+            present) echo "$tag already points at $COMMIT_HASH" ;;
+            absent) git tag -a "$tag" -m "pyhoglake-variant-codec $CODEC" "$COMMIT_HASH" && git push origin "$tag" ;;
+            *) echo "::error::unexpected tag-state: $state"; exit 1 ;;
+          esac
+
+      - name: Send failure event to PostHog
+        if: ${{ failure() }}
+        continue-on-error: true
+        uses: PostHog/posthog-github-action@9a6a19d360820ab4d95ecc4a5a7564062c895f84 # v1.3.0
+        with:
+          posthog-token: "${{ secrets.POSTHOG_PROJECT_API_KEY }}"
+          event: "posthog-sdk-github-release-workflow-failure"
+          properties: >-
+            {
+              "commitSha": "${{ github.sha }}",
+              "jobStatus": "${{ job.status }}",
+              "ref": "${{ github.ref }}",
+              "repository": "${{ github.repository }}",
+              "sdk": "hoglake",
+              "jobName": "tag-and-release",
+              "packageName": "hoglake",
+              "packageVersion": "${{ needs.version-bump.outputs.train-version || 'unknown' }}",
+              "actionUrl": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "alertText": ":rotating_light: Failed to tag release hoglake@${{ needs.version-bump.outputs.train-version }} :rotating_light:",
+              "alertContext": "The release commit is on main; a tag or the GitHub release was not made."
+            }
+
+  # pyhoglake's tag, in its own job: its publish installs the pinned codec
+  # from PyPI, so when the codec was released this waits (up to 90 minutes,
+  # the codec builds wheels on every platform first) BEFORE minting the App
+  # token, which lives an hour. Same environment, same idempotent tagging.
+  tag-pyhoglake:
+    name: Tag pyhoglake
+    needs: [version-bump, tag-and-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: ${{ !cancelled() && needs.tag-and-release.result == 'success' && needs.version-bump.outputs.train-release == 'true' }}
+    environment: release-tags
+    permissions:
+      contents: read
+    env:
+      COMMIT_HASH: ${{ needs.version-bump.outputs.commit-hash }}
+      TRAIN: ${{ needs.version-bump.outputs.train-version }}
+      CODEC: ${{ needs.version-bump.outputs.codec-version }}
+      CODEC_RELEASE: ${{ needs.version-bump.outputs.codec-release }}
+    steps:
+      - name: Wait for pyhoglake-variant-codec ${{ env.CODEC }} on PyPI
+        if: env.CODEC_RELEASE == 'true'
+        run: |
+          url="https://pypi.org/pypi/pyhoglake-variant-codec/$CODEC/json"
+          deadline=$((SECONDS + 90 * 60))
+          until curl -fsS -o /dev/null "$url"; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::pyhoglake-variant-codec $CODEC is not on PyPI after 90 minutes; check publish-pyhoglake-variant-codec.yml, then re-run this job"
+              exit 1
+            fi
+            echo "not on PyPI yet; retrying in 60s"
+            sleep 60
+          done
+          echo "pyhoglake-variant-codec $CODEC is on PyPI"
+
+      - name: Get GitHub App token
+        id: releaser
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.GH_APP_HOGLAKE_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GH_APP_HOGLAKE_RELEASER_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version-bump.outputs.commit-hash }}
+          fetch-depth: 0
+          token: ${{ steps.releaser.outputs.token }}
+
+      - name: Tag pyhoglake-v${{ env.TRAIN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force
+          # Assigned first: a failing $(...) as a case word does not trip -e.
+          state=$(python3 ci/release_tags.py tag-state --tag "pyhoglake-v$TRAIN" --commit "$COMMIT_HASH")
+          case "$state" in
+            present) echo "pyhoglake-v$TRAIN already points at $COMMIT_HASH" ;;
+            absent) git tag -a "pyhoglake-v$TRAIN" -m "pyhoglake $TRAIN" "$COMMIT_HASH" && git push origin "pyhoglake-v$TRAIN" ;;
+            *) echo "::error::unexpected tag-state: $state"; exit 1 ;;
+          esac
+
+      - name: Send failure event to PostHog
+        if: ${{ failure() }}
+        continue-on-error: true
+        uses: PostHog/posthog-github-action@9a6a19d360820ab4d95ecc4a5a7564062c895f84 # v1.3.0
+        with:
+          posthog-token: "${{ secrets.POSTHOG_PROJECT_API_KEY }}"
+          event: "posthog-sdk-github-release-workflow-failure"
+          properties: >-
+            {
+              "commitSha": "${{ github.sha }}",
+              "jobStatus": "${{ job.status }}",
+              "ref": "${{ github.ref }}",
+              "repository": "${{ github.repository }}",
+              "sdk": "hoglake",
+              "jobName": "tag-pyhoglake",
+              "packageName": "pyhoglake",
+              "packageVersion": "${{ needs.version-bump.outputs.train-version || 'unknown' }}",
+              "actionUrl": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "alertText": ":rotating_light: Failed to tag pyhoglake@${{ needs.version-bump.outputs.train-version }} :rotating_light:",
+              "alertContext": "vX.Y.Z is tagged; pyhoglake-vX.Y.Z was not (codec not on PyPI in time, or the push failed). Re-run this job."
+            }
+
+  # Side-effect-free rehearsal: ONLY on a manual dispatch from a non-main
+  # branch (this is how a change to the flow is tried). It applies the
+  # pending changesets with Sampo, syncs the follower strings, and checks
+  # the lockstep, without committing, tagging or publishing anything.
+  dry-run:
+    name: Dry run (version bump only)
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Its own group: a rehearsal must neither queue behind nor block a
+    # real release (the workflow-level group is `release`).
+    concurrency:
+      group: release-dry-run-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.91.1
+          components: cargo
+
+      - name: Cache Sampo CLI
+        id: cache-sampo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/sampo
+          key: sampo-${{ env.SAMPO_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+        env:
+          SAMPO_VERSION: "0.24.1"
+
+      - name: Install Sampo CLI
+        if: steps.cache-sampo.outputs.cache-hit != 'true'
+        run: cargo install sampo --version 0.24.1 --locked
+
+      - name: Apply version bumps with Sampo (no commit)
+        env:
+          # Sampo releases only from main; the branch under test stands in.
+          SAMPO_RELEASE_BRANCH: main
+        run: |
+          # Sampo exits 2 when there is nothing to do; that is a valid
+          # rehearsal of the bump machinery, not a failure.
+          status=0
+          sampo release --dry-run || status=$?
+          case "$status" in
+            0) sampo release ;;
+            2) echo "no changesets to apply; syncing the current versions" ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Sync and check the follower version strings
+        run: |
+          python3 ci/release_versions.py sync
+          git status --short
+          git diff --stat
+
+      - name: Plan the tags this release would make
+        env:
+          BASE_REF: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --tags --force
+          train_before=$(git show "origin/$BASE_REF:pyproject.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')
+          codec_before=$(git show "origin/$BASE_REF:pyhoglake-variant-codec/pyproject.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')
+          python3 ci/release_tags.py plan --train-before "$train_before" --codec-before "$codec_before" || echo "(nothing to release from this branch's changesets, or a tag clash: see above)"
+
+      - name: The spec's version is the server's
+        run: |
+          server=$(sed -n 's/^version = "\(.*\)"$/\1/p' server/build.gradle.kts)
+          spec=$(sed -n 's/^  version: *\(.*\)$/\1/p' server/src/main/resources/openapi/hoglake.yaml)
+          test "$server" = "$spec" || { echo "::error::server $server, spec $spec"; exit 1; }
+
+  notify-released:
+    name: Notify Slack - Released
+    needs: [notify-approval-needed, version-bump, tag-and-release, tag-pyhoglake]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ !cancelled() && vars.RELEASE_SLACK_ENABLED == 'true' && needs.tag-and-release.result == 'success' && (needs.tag-pyhoglake.result == 'success' || needs.tag-pyhoglake.result == 'skipped') && needs.notify-approval-needed.outputs.slack_ts != '' }}
+    steps:
+      - uses: posthog/.github/.github/actions/slack-thread-reply@cb0979b67dcd585828b61ac45927eef4da8f6287 # main
+        with:
+          slack_bot_token: ${{ secrets.SLACK_MANAGED_WAREHOUSE_BOT_TOKEN }}
+          slack_channel_id: ${{ vars.SLACK_ALERTS_MANAGED_WAREHOUSE_CHANNEL_ID }}
+          thread_ts: ${{ needs.notify-approval-needed.outputs.slack_ts }}
+          message: "🚀 hoglake v${{ needs.version-bump.outputs.train-version }} tagged; publish-pyhoglake.yml takes it from here."
+          emoji_reaction: "rocket"
+
+  notify-rejected:
+    name: Notify Slack - Rejected
+    needs: [version-bump, notify-approval-needed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ !cancelled() && vars.RELEASE_SLACK_ENABLED == 'true' && needs.version-bump.result == 'failure' && needs.notify-approval-needed.outputs.slack_ts != '' }}
+    permissions:
+      actions: read
+    steps:
+      - name: Check for rejection
+        id: check-rejection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RESPONSE=$(gh api /repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/approvals)
+          REJECTED=$(echo "$RESPONSE" | jq '[.[] | select(.state == "rejected")] | length')
+          if [ "$REJECTED" -gt 0 ]; then
+            echo "was_rejected=true" >> "$GITHUB_OUTPUT"
+            COMMENT=$(echo "$RESPONSE" | jq -r 'first(.[] | select(.state == "rejected") | .comment // empty)')
+            if [ -n "$COMMENT" ]; then
+              # Random delimiter: a rejection comment is reviewer-controlled text, and a
+              # literal delimiter line inside it would close the block early and let the
+              # rest be parsed as step outputs.
+              DELIMITER="EOF_$(openssl rand -hex 16)"
+              {
+                echo "message<<$DELIMITER"
+                echo "🚫 Release was rejected: $COMMENT"
+                echo "$DELIMITER"
+              } >> "$GITHUB_OUTPUT"
+            else
+              echo "message=🚫 Release was rejected." >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "was_rejected=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack - Rejected
+        if: steps.check-rejection.outputs.was_rejected == 'true'
+        uses: posthog/.github/.github/actions/slack-thread-reply@cb0979b67dcd585828b61ac45927eef4da8f6287 # main
+        with:
+          slack_bot_token: ${{ secrets.SLACK_MANAGED_WAREHOUSE_BOT_TOKEN }}
+          slack_channel_id: ${{ vars.SLACK_ALERTS_MANAGED_WAREHOUSE_CHANNEL_ID }}
+          thread_ts: ${{ needs.notify-approval-needed.outputs.slack_ts }}
+          message: "${{ steps.check-rejection.outputs.message }}"
+          emoji_reaction: "no_entry_sign"

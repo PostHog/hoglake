@@ -255,10 +255,10 @@ function Breadcrumbs() {
 const RELEASES_URL = "https://github.com/PostHog/hoglake/releases";
 
 function releaseNotesUrl(version: string | undefined): string {
-  // Only a plain X.Y.Z is a tagged release. main carries the NEXT
-  // version with a -dev suffix, and BuildInfo answers "unknown" when it
-  // cannot read its version; neither has a tag, so both land on the
-  // newest actual release instead.
+  // A plain X.Y.Z links to its tag. main carries the LAST released
+  // version (Sampo; AGENT.md § Versioning), so a main build links to
+  // that release's notes. BuildInfo answers "unknown" when it cannot
+  // read its version, and anything not X.Y.Z lands on the newest release.
   return version && /^\d+\.\d+\.\d+$/.test(version)
     ? `${RELEASES_URL}/tag/v${version}`
     : `${RELEASES_URL}/latest`;
