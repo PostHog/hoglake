@@ -43,10 +43,12 @@ Provision a dedicated namespace (for example, `costbench-<suffix>`) and an exist
 ServiceAccount usable by Hoglake, Trino and the driver. Its S3 identity must work
 inside all three images and permit reading, listing, writing and deleting objects
 under **your benchmark prefix**. IRSA or EKS Pod Identity can supply credentials;
-keep associations and IAM in your infrastructure repository. Trino's image is
-ARM64-only. The default Trino and Hoglake images are public and digest-pinned;
-PostgreSQL 18 is also pinned. You can override these
-three image digests, but disclose that version change in any comparison.
+Keep associations in your infrastructure repository. Keep IAM there too.
+The Truffle image only supports ARM64. The default Truffle image is public.
+The default Hoglake image is also public. The three image references use digests.
+A different digest can change benchmark results. Use the `trino_image` override
+with the recorded digest to reproduce an earlier run. Disclose image changes in
+comparisons.
 
 The namespace must support Kubernetes NetworkPolicy enforcement. Only fixture pods
 can connect to its services; there is no external ingress. Trino uses HTTPS and a
