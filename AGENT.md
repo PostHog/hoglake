@@ -387,6 +387,12 @@ stamp below is what tells two deploys apart; `pyhoglake` installed from
 a main checkout reports the last release, as every changesets-managed
 package does.
 
+A release does not gate deploys. Kargo's `gigahog-release` Warehouse
+makes Freight from every main build that passes CI (above), so a prod
+Stage can be promoted to any build that ran in dev. To ship a release
+to prod, promote the Freight whose image tag ends in the release
+commit's first six characters (the `sampo release` commit on main).
+
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
 CD job passes `HOGLAKE_BUILD_STAMP` (a UTC `date -u +%Y%m%dT%H%MZ`) as a
