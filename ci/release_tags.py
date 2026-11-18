@@ -33,7 +33,7 @@ from pathlib import Path
 
 CODEC = "pyhoglake-variant-codec"
 CODEC_ENTRY = re.compile(
-    r"^\s*(?:pypi/)?pyhoglake-variant-codec\s*:\s*(patch|minor|major)\b"
+    r"^\s*(?:pypi/)?pyhoglake-variant-codec\s*:\s*(patch|minor|major)(?:\s+\([^)]*\))?\s*$"
 )
 
 
@@ -113,15 +113,15 @@ def plan(root: Path, train_before: str, codec_before: str) -> dict[str, str]:
 
 
 def names_codec(changeset_text: str) -> bool:
-    """Whether a changeset's front matter bumps the codec."""
+    """Whether a changeset's front matter bumps the codec: an opening and a
+    closing `---`, and between them a codec entry whose bump is exactly
+    patch, minor or major (optionally followed by a `(Tag)`)."""
     lines = changeset_text.splitlines()
     if not lines or lines[0].strip() != "---":
         return False
-    for line in lines[1:]:
+    for i, line in enumerate(lines[1:], start=1):
         if line.strip() == "---":
-            return False
-        if CODEC_ENTRY.match(line):
-            return True
+            return any(CODEC_ENTRY.match(entry) for entry in lines[1:i])
     return False
 
 

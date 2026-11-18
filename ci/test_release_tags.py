@@ -214,6 +214,9 @@ class ReleaseTagsTest(unittest.TestCase):
                 False,
             ),  # another package
             ("---\npyhoglake-variant-codec: big\n---\n", False),
+            ("---\npyhoglake-variant-codec: patch\n", False),  # no closing ---
+            ("---\npyhoglake-variant-codec: patch-invalid\n---\n", False),
+            ("---\npyhoglake-variant-codec: patch (pyhoglake)\n---\n", True),
             ("", False),
         ):
             with self.subTest(text=text):

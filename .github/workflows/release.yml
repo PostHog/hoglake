@@ -46,10 +46,14 @@ permissions:
   contents: read
 
 # One release at a time: two releasable merges in a row must not race on
-# main. The second run finds no changesets and stops.
+# main. The second run finds no changesets and stops. A branch dry run
+# takes its own group, so it never queues behind a release that is waiting
+# for approval or for the codec on PyPI.
 concurrency:
-  group: release
-  cancel-in-progress: false
+  group: ${{ github.ref == 'refs/heads/main' && 'release' || format('release-dry-run-{0}', github.ref) }}
+  # A newer dry run of the same branch replaces an older one; a release is
+  # never cancelled.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check-changesets:
@@ -218,6 +222,9 @@ jobs:
           TRAIN_BEFORE: ${{ steps.before.outputs.train }}
           CODEC_BEFORE: ${{ steps.before.outputs.codec }}
         run: |
+          # pipefail: a refused plan must fail this step, not hide behind
+          # tee's status and let the bump commit with no tags to follow.
+          set -o pipefail
           git fetch --tags --force
           python3 ci/release_tags.py plan --train-before "$TRAIN_BEFORE" --codec-before "$CODEC_BEFORE" | tee -a "$GITHUB_OUTPUT"
 
@@ -493,11 +500,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Its own group: a rehearsal must neither queue behind nor block a
-    # real release (the workflow-level group is `release`).
-    concurrency:
-      group: release-dry-run-${{ github.ref }}
-      cancel-in-progress: true
+    # A dry run's workflow-level concurrency group is its own (top of this
+    # file), so a rehearsal neither queues behind nor blocks a real release.
     permissions:
       contents: read
     steps:
@@ -604,6 +608,9 @@ jobs:
               DELIMITER="EOF_$(openssl rand -hex 16)"
               {
                 echo "message<<$DELIMITER"
+                # slack-thread-reply puts the message inside a JSON string
+                # unescaped: escape quotes, backslashes and newlines here.
+                COMMENT=$(printf '%s' "$COMMENT" | jq -Rs . | sed -e 's/^"//' -e 's/"$//')
                 echo "🚫 Release was rejected: $COMMENT"
                 echo "$DELIMITER"
               } >> "$GITHUB_OUTPUT"
