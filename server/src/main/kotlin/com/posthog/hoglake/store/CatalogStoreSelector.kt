@@ -2,9 +2,14 @@ package com.posthog.hoglake.store
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.auth.AuthPolicy
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.Jwt
+import com.posthog.hoglake.auth.JwtViolation
 import com.posthog.hoglake.auth.Routing
+import com.posthog.hoglake.auth.Scope
+import com.posthog.hoglake.auth.SessionProfile
 import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.refuseIgnoredRouting
@@ -76,6 +81,52 @@ class CatalogStoreSelector(
     private val servedTeams = servedFamilies.singleOrNull { it.family == TeamNamespaces.FAMILY }
 
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
+
+    /** Select only the operator's exact tuple, without resolving a legacy store. */
+    internal fun scopedNamespaceBinding(
+        catalog: String,
+        namespace: String,
+    ): ScopedNamespaceBinding? =
+        cfg?.scopedNamespaceBinding?.takeIf { it.catalog == catalog && it.namespace == namespace }
+
+    /** Terminal typed read. No outcome can select another store or credential. */
+    internal fun readScopedNamespace(
+        call: ApplicationCall,
+        binding: ScopedNamespaceBinding,
+    ): NamespaceDto? {
+        val caller = call.hoglakeAuth.callerOrNull
+        val expected = Routing(binding.catalog, BackendKind.HOGLITE, binding.backendId, binding.tenant)
+        if (binding != cfg?.scopedNamespaceBinding || caller?.kind != Caller.Kind.SCOPED || caller.routingIgnored ||
+            caller.routing != expected || caller.catalogScopes.keys != setOf(binding.catalog) ||
+            !caller.catalogClaimAllows(binding.catalog, Scope.READ)
+        ) {
+            throw HoglakeException.NotFound("namespace")
+        }
+        val token = call.verifiedBackendToken ?: throw HoglakeException.NotFound("namespace")
+        if (token.length > 64 * 1024) throw HoglakeException.NotFound("namespace")
+        // Never forward a credential-bearing profile on the typed metadata path.
+        val claims =
+            try {
+                Jwt.parse(token).claims
+            } catch (_: JwtViolation) {
+                throw HoglakeException.NotFound("namespace")
+            }
+        if (SessionProfile.carried(claims) || claims.has("storage")) {
+            throw HoglakeException.NotFound("namespace")
+        }
+        val result =
+            client(binding.backendId).forRequest(token)
+                .readScopedNamespace(binding.tenant, binding.catalog, binding.namespace) ?: return null
+        val held = result.containment
+        val fields = checkNotNull(cfg).authPredicateFields.split(',').map { it.trim() }.toSet()
+        if (result.name != binding.namespace || result.namespaceId?.let { it > 0 } != true ||
+            result.remote != null || held == null || held.org != null || held.field !in fields || held.value <= 0
+        ) {
+            throw HoglakeException.BackendUnavailable("scoped namespace unavailable")
+        }
+        return result
+    }
+
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
     private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")

@@ -3,6 +3,7 @@ package com.posthog.hoglake
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.hoglite.HogliteBackend
@@ -14,6 +15,7 @@ import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.ScopedNamespaceBinding
 import com.posthog.hoglake.store.ServedFamily
 import com.posthog.hoglake.store.ServedStream
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -48,6 +50,11 @@ data class Config(
      * Entries contain endpoints, never credentials. Each id must be unique and canonical.
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
+    /**
+     * One exact local namespace binding for the typed scoped read.
+     * Empty disables it. The binding attests tenant-local isolation and owner support.
+     */
+    val scopedNamespaceFile: String = env("HOGLAKE_SCOPED_NAMESPACE_FILE", ""),
     /** PostgreSQL is the only default backend. `none` disables fallback and opens PostgreSQL only on a routed request. */
     val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
     /** Optional allowlist id for this process's PostgreSQL backend. */
@@ -1566,6 +1573,8 @@ data class Config(
             teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
         )
 
+    val scopedNamespaceBinding: ScopedNamespaceBinding? = ScopedNamespaceBinding.read(scopedNamespaceFile)
+
     /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
     val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
 
@@ -1602,6 +1611,30 @@ data class Config(
         }
 
     init {
+        scopedNamespaceBinding?.let { binding ->
+            require(AuthMode.parse("HOGLAKE_AUTH_MODE", authMode) == AuthMode.ENFORCE) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_MODE=enforce"
+            }
+            require(authJwksFile.isNotBlank() && authJwksUrl.isBlank()) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE requires file JWKS"
+            }
+            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS"
+            }
+            require(backendKinds[binding.backendId] == BackendKind.HOGLITE) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE requires a configured hoglite backend"
+            }
+            require(!MountNames.isReserved(binding.catalog)) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved mount"
+            }
+            require(!reservedNamespaces.isReserved(binding.namespace)) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved namespace"
+            }
+            // Remote and served routing can require SQL to establish local placement.
+            require(mountHosts.isEmpty() && servedFamilies.isEmpty()) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot coexist with mount hosts or served namespaces"
+            }
+        }
         val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
         when (effectiveStorageProvider) {
             StorageProviderKind.STATIC ->
