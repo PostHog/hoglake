@@ -1,0 +1,71 @@
+name: Changeset hygiene
+
+# Informational, never required: compares the Sampo packages a PR changes
+# with the packages its changesets name (ci/changeset_hygiene.py) and keeps
+# one sticky comment on the PR while they disagree. posthog-js's check of
+# the same name, from PostHog/.github, reads pnpm workspaces and
+# `.changeset/`, so it does not fit a Sampo repository; this is its
+# equivalent. The hard rule for the codec is ci-python.yml's codec-version.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: changeset-hygiene-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check changeset hygiene
+    # Fork and Dependabot PR tokens are read-only, so they cannot post the comment.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute hygiene report
+        id: hygiene
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: python3 ci/changeset_hygiene.py >> "$GITHUB_OUTPUT"
+
+      - name: Upsert or delete the sticky comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          COMMENT_BODY: ${{ steps.hygiene.outputs.body }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const marker = '<!-- changeset-hygiene -->';
+            const body = process.env.COMMENT_BODY || '';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.user.type === 'Bot' && c.body.includes(marker));
+            if (!body) {
+              if (existing) {
+                await github.rest.issues.deleteComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id });
+                console.log('Deleted stale changeset-hygiene comment');
+              }
+              return;
+            }
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+              console.log('Updated changeset-hygiene comment');
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+              console.log('Created changeset-hygiene comment');
+            }

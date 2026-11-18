@@ -111,8 +111,9 @@ jobs:
 
       # The client in the image must be the sibling tree's, built from
       # THIS commit — not a PyPI release that merely shares a name.
-      # main carries a .dev0 version PyPI has never seen, so a silent
-      # fallback to the registry shows up here as a version mismatch.
+      # main carries the last released version (Sampo flow), so the
+      # version alone would not tell; the direct_url origin check below is
+      # what catches a silent fallback to the registry.
       - name: Smoke - pyhoglake comes from this commit
         run: |
           want=$(grep -m1 '^version = ' pyhoglake/pyproject.toml | cut -d'"' -f2)

@@ -431,8 +431,8 @@ The image is tagged `latest` and by commit sha, and the publish job's summary
 prints the multi-arch manifest digest; pin the pod to a sha tag or a digest
 when a run has to be reproducible. It carries the `pyhoglake` from the same
 commit as the harness — the pair the repo tests — rather than the newest
-release on PyPI, which is a different client (main carries a `.dev0` version
-PyPI has never seen). `uv sync --no-sources` is the escape hatch if you ever
+release on PyPI, which is a different client (main carries the last released
+version plus whatever has merged since). `uv sync --no-sources` is the escape hatch if you ever
 need the published client instead; nothing in the image uses it.
 
 The bucket is the environment's own bucket; bench writes under a per-run

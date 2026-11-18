@@ -140,8 +140,13 @@ jobs:
     with:
       all-platforms: false
 
-  # A codec change ships under a version not yet released: a new one, or
-  # a .dev one (pyhoglake's extra pins exact codec releases).
+  # A codec change is released: pyhoglake's extra pins exact codec
+  # releases, so a change to what the wheel is built from must carry a
+  # changeset that bumps `pyhoglake-variant-codec` (release.yml then tags
+  # and publishes it). The version string itself stays the last release's
+  # until that run. A PR that bumps it by hand is accepted too: release.yml
+  # tags and publishes any codec version that has no tag yet, so a hand
+  # bump is released with the next run (without a changelog entry).
   codec-version:
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.codec-source == 'true'
@@ -152,16 +157,25 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2 # the PR's merge commit and the base, its first parent
-      - name: A codec change has a new or .dev version
+      - name: A codec change has a changeset for pyhoglake-variant-codec
         run: |
           version() { git show "$1:pyhoglake-variant-codec/pyproject.toml" | grep -m1 '^version = ' | cut -d'"' -f2; }
           new=$(version HEAD) old=$(version HEAD^1)
           [ -n "$new" ] && [ -n "$old" ] || { echo "::error::cannot read the codec's version"; exit 1; }
-          case "$new" in *.dev*) exit 0 ;; esac
-          if [ "$new" = "$old" ]; then
-            echo "::error::pyhoglake-variant-codec changed but is still $new: bump its version, or make it .dev"
-            exit 1
+          if [ "$new" != "$old" ]; then
+            echo "the codec's version moved by hand: $old -> $new"
+            exit 0
           fi
+          # The changesets this PR adds or edits; ci/release_tags.py reads
+          # their front matter for `pyhoglake-variant-codec: <bump>` (with or
+          # without the `pypi/` prefix) and exits 0 when one names it.
+          git diff --name-only --diff-filter=AM HEAD^1 HEAD -- '.sampo/changesets/*.md' > changesets.txt
+          # No -r: with no changeset at all the command must still run (and exit 1).
+          if [ -s changesets.txt ] && xargs -a changesets.txt python3 ci/release_tags.py codec-changeset; then
+            exit 0
+          fi
+          echo "::error::pyhoglake-variant-codec changed but no changeset in this PR names it: run \`sampo add -p pyhoglake-variant-codec\` (CONTRIBUTING.md § Adding a changeset)"
+          exit 1
 
   check:
     needs: changes

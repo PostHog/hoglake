@@ -183,7 +183,7 @@ path-scoped per component, posthog-monorepo style:
 | `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/truffle`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
 | `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | on a PR that changes the codec's source, `codec-version` (a new or `.dev` codec version). pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. millrace: uv sync, ruff, mypy, pytest, and the mutmut survivors gate. When `pyhoglake-variant-codec/**`, `uv.lock` or the codec's wheel workflow or scripts changed, `variant-codec-wheels.yml` too, for the manylinux wheels and the sdist. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
+| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | on a PR that changes the codec's source, `codec-version` (a changeset naming `pyhoglake-variant-codec`, or a hand-bumped version). pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. millrace: uv sync, ruff, mypy, pytest, and the mutmut survivors gate. When `pyhoglake-variant-codec/**`, `uv.lock` or the codec's wheel workflow or scripts changed, `variant-codec-wheels.yml` too, for the manylinux wheels and the sdist. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake as a uv workspace member from the root `uv.lock`, so the root manifest, the lock, pyhoglake and every member's `pyproject.toml` must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `millrace-image.yml` | `millrace/**` `pyhoglake/**` `pyhoglake-variant-codec/**` root `pyproject.toml` `uv.lock` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) for amd64 and, under QEMU, arm64, and smokes each — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's, and the Rust VARIANT codec (cross-built by zig in a `$BUILDPLATFORM` stage) is installed, off by default (`PYHOGLAKE_VARIANT_CODEC=python`), and with `native` encodes as the Python codec does. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
 | `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the gigahog CD entry point: it makes the images the Kargo Warehouse turns into Freight (CD paragraph below). A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
@@ -191,6 +191,9 @@ path-scoped per component, posthog-monorepo style:
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags (not `pyhoglake-variant-codec-v*`); PRs touching the workflow | `pyhoglake-checks.yml`, then the built wheel with its `variant-codec` extra in a clean env, the pinned codec from PyPI (`ci/variant_codec_smoke.py`), and the variant suites through it, so a pin not on PyPI fails every run; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `variant-codec-wheels.yml` | reusable: Python checks (manylinux only), codec publishing (every platform, on a tag or a manual run) | `pyhoglake-variant-codec`'s abi3 wheels (manylinux_2_28 and musllinux_1_2 x86_64/aarch64 through zig, macOS arm64/x86_64, Windows x86_64) and sdist, each installed into pyhoglake's locked env on its own platform (`ci/variant-codec-wheel.sh`: the parity smoke `ci/variant_codec_smoke.py`, then the variant suites except on Windows) and uploaded as an artifact |
 | `publish-pyhoglake-variant-codec.yml` | `pyhoglake-variant-codec-v*` tags; PRs touching the workflow | `variant-codec-wheels.yml`; tags also publish those exact files to PyPI (trusted publishing pinned to this file, `pypi` environment) and create a non-latest GitHub release. The tag's version must be the codec's |
+| `release.yml` | a main push that touches `.sampo/changesets/*.md`; `workflow_dispatch` (on a branch other than main: a dry run of the bump only) | the Sampo release flow of [Versioning](#versioning): the `Release` environment gate (plus a Slack approval request in `#alerts-managed-warehouse` when `vars.RELEASE_SLACK_ENABLED` is `true`), `sampo release` + `ci/release_versions.py sync` committed to main by the releaser App (its secrets live only in the `Release` and `release-tags` environments), then `tag-and-release` (the `vX.Y.Z` tag and GitHub release, the codec tag; `ci/release_tags.py` plans the tags and makes every step a safe re-run) and `tag-pyhoglake` (waits for the codec on PyPI, then the `pyhoglake-vX.Y.Z` tag). One run at a time (`concurrency: release`; the dry run has its own group). Not a check |
+| `release-failure-notification.yml` | `workflow_run` of Release on main, only with `vars.RELEASE_SLACK_ENABLED` `true` | replies in the approval's Slack thread when a Release job failed, timed out or was cancelled, when the tag job never ran, or when the released reply was skipped (`.github/scripts/release-failure-notification.cjs`). Survives a cancelled Release run because it is its own workflow |
+| `changeset-hygiene.yml` | PRs from this repository (not Dependabot) | `ci/changeset_hygiene.py`: one sticky comment while a PR changes a package's source without a changeset naming it, names a package that did not change, or has a changeset that does not parse; deleted when fixed. Informational, NOT a required check |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (900s per soak target, 60s per sweep target, by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
@@ -300,32 +303,95 @@ gate does not read them, so a GHCR failure does not block CD. Keep the
 
 ### Versioning
 
-Images deploy per-commit by SHA+digest (above); semver is release-only.
-Between releases, main carries the NEXT patch version with a dev
-suffix — `X.Y.Z-dev` in gradle/npm/the OpenAPI spec, `X.Y.Z.dev0`
-(PEP 440) in the Python trees — so an unreleased build never claims a
-released number. Cutting a release = one PR that strips the suffix
-(bumping minor/major if warranted) across all six version strings
-(server + trino build.gradle.kts, webui package.json, pyhoglake +
-hedgerow pyproject.toml, spec
-`info.version`) plus the matching entries in `webui/package-lock.json`
-and `uv.lock`, tag it (`vX.Y.Z`;
-`pyhoglake-vX.Y.Z` additionally publishes pyhoglake to PyPI), then a follow-up
-commit restores the next `-dev`. pyhoglake-variant-codec has its own
-version, released only when it changes: a PR that changes its source,
-Cargo files, pyproject or toolchain gives it a new or a `.dev` version
-(CI's `codec-version`; Dependabot's cargo PRs too), and a `pyhoglake-variant-codec-vX.Y.Z` tag publishes
-it. pyhoglake's `variant-codec` extra pins one exact codec release, and
-pyhoglake's publish fails while that pin is not on PyPI, so release the
-codec before the pyhoglake that pins it. The `:checkOpenapiVersion` gradle task
-(in CI) keeps the spec's `info.version` locked to the server version;
-each publish workflow refuses a tag that mismatches its
-pyproject. The Python packages' `__version__` attributes read the
-installed metadata, so they are not version strings to bump. A change
-that needs a line in the next release body and has no changelog in the
-tree gets a "Pending note for the X.Y.Z release body" paragraph here,
-removed by the release PR that states it (the 1.3.8 `Catalog.verify()`
-removal and the 1.4.0 VARIANT-shaped struct refusal were the first two).
+Images deploy per-commit by SHA+digest (above); semver is release-only,
+and releases are cut by [Sampo](https://github.com/bruits/sampo)
+changesets through `release.yml`, PostHog's SDK release flow
+(posthog-python's). Two packages release from this repository:
+
+- **`hoglake`**, the release train: server, trino harness, webui,
+  OpenAPI spec, pyhoglake and hedgerow share ONE version, carried by
+  ten strings (server + trino `build.gradle.kts`, the spec's
+  `info.version`, webui `package.json` plus two `package-lock.json`
+  entries, pyhoglake + hedgerow `pyproject.toml`, and their two
+  `uv.lock` entries). Sampo's manifest for it is the root
+  `pyproject.toml` (a virtual uv project, never built; the comment there
+  says why), its changelog the root `CHANGELOG.md`, its tags `vX.Y.Z`
+  and `pyhoglake-vX.Y.Z`.
+- **`pyhoglake-variant-codec`**, its own version, released only when the
+  codec changes; tag `pyhoglake-variant-codec-vX.Y.Z`.
+
+A PR that changes something a user of a release should hear about adds
+a changeset, `.sampo/changesets/<name>.md`, naming the package and the
+bump (CONTRIBUTING.md § Adding a changeset; `changeset-hygiene.yml`
+comments, non-blocking, when a PR changes a package's source without
+one). A PR that changes the codec's source MUST carry a codec changeset
+(ci-python's `codec-version`, a required leaf of `python-checks`). The
+version strings themselves are not edited by hand: between releases
+main carries the LAST RELEASED version, and the pending changesets are
+the delta.
+
+Merging a changeset to main starts `release.yml`: a maintainer approves
+the `Release` environment (the gate; with the repository variable
+`RELEASE_SLACK_ENABLED=true`, and only then, `notify-approval-needed`
+first asks in `#alerts-managed-warehouse`, replies there on approval,
+release and rejection, and `release-failure-notification.yml` reports
+failures; Slack is off by default and a missing Slack variable or secret
+never fails a release), and the releaser GitHub App
+(`GH_APP_HOGLAKE_RELEASER_*`) runs `sampo release`, which bumps the
+root pyproject and/or the codec's and writes the changelog entries,
+then `ci/release_versions.py sync`, which copies the train version into
+the other nine strings and the codec's version into pyhoglake's
+`variant-codec` pin and runs `uv lock`, and commits the result straight
+to main (a signed API commit, no PR, no `[skip ci]`: the released
+commit's images come off the normal CD path). `ci/release_tags.py plan`
+decides what that commit releases: the train when its version moved,
+the codec when its version moved OR has no tag yet (a hand bump, or a
+run that died before tagging, both of which would otherwise leave
+pyhoglake pinned to an unpublished codec), and it fails on a tag that
+already exists for a version being released, consulting only the tags
+of the packages that move. The `tag-and-release` job then tags `vX.Y.Z`
+and creates the GitHub release from the newest `CHANGELOG.md` section
+and tags `pyhoglake-variant-codec-vX.Y.Z`; `tag-pyhoglake` waits for
+that codec release on PyPI (up to 90 minutes) and only then mints its
+token and tags `pyhoglake-vX.Y.Z`; the two publish workflows fire on
+their tags as before and still refuse a tag whose version is not the
+pyproject's. The App's secrets live in two environments and nowhere
+else: `Release` (required reviewers, main only) for `version-bump`, the
+gate, and `release-tags` (main only, no reviewers) for the two tag
+jobs, so a branch workflow cannot mint a token and a re-run of the tag
+jobs never re-asks. Every tag step is idempotent (`release_tags.py
+tag-state`: a tag already at the release commit is kept, one elsewhere
+fails) and the GitHub release is skipped when it exists, so a failed
+run is fixed by re-running its failed jobs. A full re-run after the
+commit landed finds the changesets consumed and stops at
+`check-changesets`; recover by tagging the release commit by hand with
+the commands in `release.yml`'s comments. `release-failure-notification.yml`
+replies in the approval thread when any of that fails (Slack on). A
+codec-only release moves the pin on main without a
+pyhoglake release, so a codec changeset normally travels with a
+`hoglake: patch (pyhoglake)` changeset stating the new pin. The
+`:checkOpenapiVersion` gradle task (in CI) still locks the spec's
+`info.version` to the server version; `ci/release_versions.py check`
+verifies all ten strings and the pin, and its tests run a sync over a
+copy of the real files. The Python packages' `__version__` attributes
+read the installed metadata, so they are not version strings to bump.
+Release notes live in the changesets, so the former "Pending note for
+the X.Y.Z release body" paragraphs here are retired.
+
+The old rule "an unreleased build never claims a released number" (a
+`-dev` / `.dev0` suffix on main, restored by a PR after each release)
+is dropped with the dev suffix: Sampo rejects `.dev0` outright and
+would read `-dev` as a pre-release line, and the suffix bought little,
+since the version is constant between releases either way. The build
+stamp below is what tells two deploys apart; `pyhoglake` installed from
+a main checkout reports the last release, as every changesets-managed
+package does.
+
+A release does not gate deploys. Kargo's `gigahog-release` Warehouse
+makes Freight from every main build that passes CI (above), so a prod
+Stage can be promoted to any build that ran in dev. To ship a release
+to prod, promote the Freight whose image tag ends in the release
+commit's first six characters (the `sampo release` commit on main).
 
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
