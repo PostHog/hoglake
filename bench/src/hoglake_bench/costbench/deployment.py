@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 LABEL = {"app.kubernetes.io/part-of": "hoglake-costbench"}
 SELECTOR = "app.kubernetes.io/part-of=hoglake-costbench"
 WORKERS = 9
-TRINO_IMAGE = "ghcr.io/posthog/trino@sha256:1362d5a95e092fb13f7ff86cdeee03c0a6f72a3689c9ac85a675f6662b40343f"
+TRINO_IMAGE = "ghcr.io/posthog/truffle@sha256:089b2ff2c87260e7bcbcf77b24c2bfabd812127549b0cdc3f6c126e7d8fd80d4"
 HOGLAKE_IMAGE = "ghcr.io/posthog/hoglake-server@sha256:afc4f60de67a0e239bf97aca2cc9af34c349240cce059e7683a7b49f73af0588"
 POSTGRES_IMAGE = "postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
 
