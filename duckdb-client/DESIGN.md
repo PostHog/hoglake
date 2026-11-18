@@ -176,6 +176,28 @@ an append-producing statement on the same table requires COMMIT
 first. Tested in `hoglake_txn.test` (both corruption shapes refused,
 the legal orders verified).
 
+**Remote schemas.** A schema is remote exactly when the server says
+`"remote": true` for it: in its listing entry, or, for a name the listing
+does not hold (a `*` token lists no team schemas), in the
+`GET /namespaces/{ns}` answer the extension asks once per transaction.
+The name's shape never decides. This catalog's snapshot id means nothing
+on the remote side, so a remote table never uses the transaction pin. Its
+first get-table goes at head, or at the timestamp of an
+`AT (TIMESTAMP => ...)` clause or a `SNAPSHOT_TIME` attach, and the
+answer's `read_snapshot_id` becomes the entry's travel: every scan of the
+table in the transaction sends `snapshot=<that pin>`. A table read twice
+uses one pin, two remote tables may be pinned at different moments, and a
+new transaction takes new pins. `AT (VERSION => n)` and a
+`SNAPSHOT_VERSION` attach name this catalog's history, so a read under
+them is refused before any request, and under such an attach the
+listings show no tables of a remote schema. A remote answer without
+`read_snapshot_id` fails the read, and a table answered `"remote": true`
+in a schema classed local fails the query (that read carried this
+catalog's snapshot). Remote
+schemas are read-only: INSERT, DELETE, UPDATE, ALTER, CREATE TABLE/VIEW and
+DROP are refused before any request or upload, so a remote pin never
+reaches a commit. `SHOW SCHEMAS` still lists only the listing.
+
 ## Transactions and eager DDL
 
 Every hoglake DDL endpoint (create/drop/alter table, create namespace)

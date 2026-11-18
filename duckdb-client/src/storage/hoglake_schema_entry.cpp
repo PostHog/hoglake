@@ -31,8 +31,17 @@ namespace duckdb {
 //! shared catalog and breaks name-based readers fleet-wide.
 static constexpr const char *RESERVED_COLUMN_PREFIX = "_hog";
 
-HoglakeSchemaEntry::HoglakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, HoglakeTransaction &transaction)
-    : SchemaCatalogEntry(catalog, info) {
+HoglakeSchemaEntry::HoglakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, HoglakeTransaction &transaction,
+                                       bool remote_p)
+    : SchemaCatalogEntry(catalog, info), remote(remote_p) {
+}
+
+void HoglakeSchemaEntry::RequireLocal(const char *what) const {
+	if (remote) {
+		throw BinderException("hoglake: cannot %s in schema \"%s\": it is a remote schema, served read-only by "
+		                      "another Hoglake",
+		                      what, name.GetIdentifierName());
+	}
 }
 
 HoglakeTransaction &HoglakeSchemaEntry::Transaction(CatalogTransaction &transaction) {
@@ -161,13 +170,14 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableInternal(HoglakeTransa
 		return nullptr;
 	}
 	auto ns = name.GetIdentifierName();
-	auto travel = transaction.Travel();
+	auto travel = remote ? transaction.RemoteFirstTravel(ns, nullptr) : transaction.Travel();
 	try {
 		auto table_info = transaction.Api().TryGetTable(ns, resolved, travel);
 		if (!table_info) {
 			return nullptr;
 		}
-		return &CacheTableInternal(transaction, std::move(*table_info), travel, false);
+		auto read_travel = HoglakeTransaction::EntryTravel(ns, remote, *table_info, travel);
+		return &CacheTableInternal(transaction, std::move(*table_info), read_travel, false);
 	} catch (CatalogException &ex) {
 		unrepresentable_tables[resolved] = ErrorData(ex).RawMessage();
 		throw;
@@ -181,9 +191,15 @@ void HoglakeSchemaEntry::LoadAllTablesInternal(HoglakeTransaction &transaction) 
 	if (all_tables_loaded) {
 		return;
 	}
+	if (remote && transaction.GetCatalog().AttachSnapshotVersion().IsValid()) {
+		// a version attach cannot read a remote schema: a direct read is
+		// refused (RemoteFirstTravel), and listings, DuckDB's "did you
+		// mean" scan of every schema included, show none of its tables
+		return;
+	}
 	EnsureTableNamesInternal(transaction);
 	auto ns = name.GetIdentifierName();
-	auto travel = transaction.Travel();
+	auto travel = remote ? transaction.RemoteFirstTravel(ns, nullptr) : transaction.Travel();
 	for (auto &entry : table_names) {
 		if (entry.second.size() != 1) {
 			// CI-ambiguous pair: unaddressable from DuckDB (lookup
@@ -206,7 +222,8 @@ void HoglakeSchemaEntry::LoadAllTablesInternal(HoglakeTransaction &transaction) 
 				// listed at head but missing at the pinned travel
 				continue;
 			}
-			CacheTableInternal(transaction, std::move(*table_info), travel, false);
+			auto read_travel = HoglakeTransaction::EntryTravel(ns, remote, *table_info, travel);
+			CacheTableInternal(transaction, std::move(*table_info), read_travel, false);
 		} catch (CatalogException &ex) {
 			unrepresentable_tables[exact] = ErrorData(ex).RawMessage();
 			continue;
@@ -231,8 +248,11 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupEntry(CatalogTransaction tr
 	auto &hoglake_transaction = Transaction(transaction);
 	std::lock_guard<std::recursive_mutex> guard(entry_lock);
 	auto at_clause = lookup_info.GetAtClause();
+	// remote: a version (AT or attach) is refused here, before any request
+	auto remote_travel =
+	    remote ? hoglake_transaction.RemoteFirstTravel(name.GetIdentifierName(), at_clause) : HoglakeTravel();
 	if (at_clause) {
-		auto travel = hoglake_transaction.TravelFor(at_clause);
+		auto travel = remote ? remote_travel : hoglake_transaction.TravelFor(at_clause);
 		return LookupTableAtInternal(hoglake_transaction, lookup_info.GetEntryName(), travel);
 	}
 	return LookupTableInternal(hoglake_transaction, lookup_info.GetEntryName());
@@ -276,7 +296,10 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableAtInternal(HoglakeTran
 	for (auto idx : not_null) {
 		create_info.constraints.push_back(make_uniq<NotNullConstraint>(idx));
 	}
-	auto entry = make_uniq<HoglakeTableEntry>(catalog, *this, create_info, std::move(*table_info), travel, true);
+	// remote: cached under the timestamp's key, read at the table's own pin
+	auto read_travel = HoglakeTransaction::EntryTravel(ns, remote, *table_info, travel);
+	auto entry =
+	    make_uniq<HoglakeTableEntry>(catalog, *this, create_info, std::move(*table_info), read_travel, true);
 	auto &result = *entry;
 	travel_tables[key] = std::move(entry);
 	return &result;
@@ -356,6 +379,7 @@ static HoglakeTravel PostDDLTravel(HoglakeTransaction &transaction, const Hoglak
 
 optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateTable(CatalogTransaction transaction,
                                                            BoundCreateTableInfo &info) {
+	RequireLocal("CREATE TABLE");
 	auto &hoglake_transaction = Transaction(transaction);
 	auto &base_info = info.Base();
 	auto table_name = base_info.GetTableName().GetIdentifierName();
@@ -410,6 +434,7 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateTable(CatalogTransaction tr
 }
 
 void HoglakeSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+	RequireLocal("DROP");
 	if (info.cascade) {
 		throw NotImplementedException("DROP ... CASCADE is not supported for hoglake");
 	}
@@ -543,6 +568,7 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw NotImplementedException("hoglake: only ALTER TABLE is supported");
 	}
+	RequireLocal("ALTER TABLE");
 	auto &hoglake_transaction = Transaction(transaction);
 	auto &alter_table = info.Cast<AlterTableInfo>();
 	auto typed_name = alter_table.GetQualifiedName().Name().GetIdentifierName();
@@ -735,6 +761,7 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 //===--------------------------------------------------------------------===//
 
 optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
+	RequireLocal("CREATE VIEW");
 	throw NotImplementedException("CREATE VIEW is not supported for hoglake yet");
 }
 

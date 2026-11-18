@@ -1482,7 +1482,10 @@ per-team entry is needed.
   tables, one table, and the scan. The reader is bound to the one namespace
   and reads the store itself, not the caller's grant view, which names a
   catalog the source is not. A head read of the namespace is one lookup; only
-  a pinned read lists namespaces.
+  a pinned read lists namespaces. The table answer carries `remote: true`, as
+  the namespace answer does; the listing's entries and the scan do not. Its
+  `read_snapshot_id` is the snapshot of the catalog that holds the table,
+  which a reader pins per table and sends back as `snapshot`.
 - **Errors.** A refusal from the source is rewritten in the caller's
   catalog's terms: a missing table is 404 `table '<ns>.<t>' in catalog
   '<catalog>'`, a snapshot out of range is 422 and one below the expiry floor
@@ -1576,9 +1579,9 @@ same `team_<id>` then shows the published stream tables beside the imports:
   block is turned on, audit every `team_<digits>` mark against Hogtower's
   team-to-org records. A mark written while the server ran `off` or `warn`
   stays after a later switch to `enforce`.
-- **Not built.** The `org_id` predicate, `remote: true` on the table
-  response, the remote head snapshot fields of the Client's catalog snapshot
-  (P3), and removing `hog_mount`.
+- **Not built.** The `org_id` predicate and removing `hog_mount`. The
+  per-schema remote head snapshot field of the old P3 will not be built: the
+  per-table pin replaces it, which is `read_snapshot_id` with `remote: true`.
 
 ### 6.6 Client-supplied authority fields must die
 

@@ -240,11 +240,18 @@ class ServedNamespacesIntegrationTest {
 
         val table = send("GET", "$ns/tables/events", scoped())
         assertThat(table.statusCode()).describedAs(table.body()).isEqualTo(200)
-        assertThat(mapper.readTree(table.body())["name"].asText()).isEqualTo("events")
+        val served = mapper.readTree(table.body())
+        assertThat(served["name"].asText()).isEqualTo("events")
+        // A remote table, pinned in the source catalog. `cust` is held nowhere here, and the source head is far
+        // above a new catalog's, so the number can only be the source's.
+        assertThat(served["remote"].isBoolean && served["remote"].asBoolean()).describedAs(table.body()).isTrue()
+        assertThat(served["read_snapshot_id"].asLong()).isEqualTo(before).isGreaterThan(10)
 
         val scan = send("GET", "$ns/tables/events/scan", scoped())
         assertThat(scan.statusCode()).describedAs(scan.body()).isEqualTo(200)
         assertThat(scan.body()).contains(filePath)
+        // The flag is on the table answer alone: not on the listing's entries or the scan.
+        assertThat(tables.body() + scan.body()).doesNotContain("remote")
         assertThat(head()).isEqualTo(before)
     }
 

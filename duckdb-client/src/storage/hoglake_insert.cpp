@@ -217,6 +217,7 @@ static Value WrittenFieldIds(const vector<HoglakeColumn> &columns) {
 PhysicalOperator &HoglakeInsert::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                             HoglakeTableEntry &table, optional_ptr<PhysicalOperator> plan) {
 	auto &catalog = table.ParentCatalog().Cast<HoglakeCatalog>();
+	table.RequireLocal("INSERT into");
 	if (table.IsTravelPinned()) {
 		throw BinderException("hoglake: cannot INSERT into a table pinned with AT (VERSION/TIMESTAMP)");
 	}

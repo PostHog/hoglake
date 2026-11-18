@@ -1,7 +1,7 @@
 # Hoglake / Trino integration tests
 
 The native connector is maintained in
-[PostHog/trino](https://github.com/PostHog/trino/tree/master/plugin/trino-hoglake).
+[PostHog/truffle](https://github.com/PostHog/truffle/tree/master/plugin/trino-hoglake).
 It builds and ships with the engine, using the same SPI, Parquet reader, and S3
 filesystem versions. Connector unit tests and configuration documentation live
 there too.
@@ -12,28 +12,28 @@ the connector. The REST contract and server behavior remain owned by Hoglake.
 
 ## Run
 
-The fork publishes its server image (with `plugin/hoglake`) to the **public**
-`ghcr.io/posthog/trino` on every master push — no registry auth needed, but the
-image is arm64-only. Pick the newest ordered release tag
-(`r<position>-<sha6>`; they sort lexicographically):
+Truffle publishes the server image with `plugin/hoglake` to `ghcr.io/posthog/truffle`.
+The image is public. It only supports ARM64. Select the greatest release tag in
+lexicographic order (`r<position>-<sha6>`):
 
 ```bash
 cd server
 flox activate -- ./gradlew :trino:test \
-  -PhoglakeTrinoImage=ghcr.io/posthog/trino:$( \
-    curl -fsS -H "Authorization: Bearer $(curl -fsS 'https://ghcr.io/token?scope=repository:posthog/trino:pull' | jq -r .token)" \
-      'https://ghcr.io/v2/posthog/trino/tags/list?n=1000' \
+  -PhoglakeTrinoImage=ghcr.io/posthog/truffle:$( \
+    curl -fsS -H "Authorization: Bearer $(curl -fsS 'https://ghcr.io/token?scope=repository:posthog/truffle:pull' | jq -r .token)" \
+      'https://ghcr.io/v2/posthog/truffle/tags/list?n=1000' \
     | jq -r '.tags[]' | grep -E '^r[0-9]{12}-[0-9a-f]{6}$' | sort | tail -1)
 ```
 
-Alternatively set `HOGLAKE_TRINO_IMAGE`. Pin an immutable tag or digest for
-reproducible results. Docker must be running. The same setting is required when
-running the full Gradle test suite, since it includes these integration tests.
-`-PunitOnly` excludes the Docker integration harness.
+Alternatively, set `HOGLAKE_TRINO_IMAGE`. For reproducible results, pin an
+immutable tag or digest. Start Docker before running the tests.
+The full Gradle test suite includes this harness. It requires the same image
+setting. `-PunitOnly` excludes the harness.
 
-CI runs this harness as `server.yml`'s `trino-test` job (ARM runner, same
-newest-ordered-tag resolution, `HOGLAKE_TRINO_IMAGE` repo variable as the pin
-override). The job is deliberately not required and not in `deploy`'s `needs`.
+The `trino-test` job in `server.yml` uses the same default on an ARM runner.
+The `HOGLAKE_TRINO_IMAGE` repository variable overrides the default in CI.
+If the variable pins a legacy image, update it to a verified Truffle reference
+or remove it to use the default. The `deploy` job does not depend on this check.
 
 There is deliberately no default Trino image and no local plugin mount: the tests
 exercise the connector shipped in the selected engine image. The old Gradle
@@ -99,22 +99,19 @@ because hoglake never opens DV files: a vector whose cardinality disagrees
 with the scan's `delete_count`, and a vector whose blob names a different data
 file than the one it was paired with. The connector refuses more than these
 (missing, truncated, bad checksum, wrong format, positions past the row count);
-those are covered by the connector's own suite in PostHog/trino, not here.
+those are covered by the connector's own suite in PostHog/truffle, not here.
 The mismatch case is also the only assertion proving the metadata-count path
 decodes the bitmap rather than trusting `delete_count`.
 
 This puts a **floor under the fork image**: these assertions fail against any
-image built before PostHog/trino's "Apply deletion vectors to Hoglake reads"
+image built before PostHog/truffle's "Apply deletion vectors to Hoglake reads"
 (`d4d5fa2`, first published as `r000000046914-6e5fcd`), which refuses
 DV-bearing scans at split planning. There is no harness-side way to satisfy
 both behaviors.
 
-Note the floor currently has **zero margin**: `r000000046914-6e5fcd` is both
-the floor and the newest published tag, so exactly one image passes. Newest-tag
-resolution keeps normal runs above the floor only while the fork moves forward
-— a revert or a re-tag below the DV commit reds this job, and the fix then is
-to set `HOGLAKE_TRINO_IMAGE` to an image at or above `d4d5fa2` rather than to
-weaken these assertions. This is an assumption, not a guarantee.
+A later Truffle image can still regress deletion-vector support. If that occurs,
+use `HOGLAKE_TRINO_IMAGE` to pin an image with known support. Do not weaken the
+assertions.
 
 Message assertions here match no fork prose at all — no required phrase, no
 excluded one. An exclusion evaporates silently the moment upstream rewords the
