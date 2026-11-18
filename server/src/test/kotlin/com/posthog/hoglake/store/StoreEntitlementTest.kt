@@ -6,6 +6,7 @@ import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthService
 import com.posthog.hoglake.auth.JwtVerifier
+import com.posthog.hoglake.auth.ProvenTeam
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.auth.installAuth
@@ -40,6 +41,7 @@ import org.junit.jupiter.api.Test
 import java.lang.reflect.Proxy
 import java.security.interfaces.ECPublicKey
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.reflect.KVisibility
 
 /**
  * A store is handed out only for a catalog the caller's token allows
@@ -408,5 +410,14 @@ class StoreEntitlementTest {
         // MUTATION: drop the plugin's mark and each of these counts twice.
         assertThat(registry.outcomes()).isEqualTo(mapOf("warn/missing" to 1.0, "warn/not_entitled" to 2.0))
         assertThat(lines).hasSize(3).noneMatch { "at=store" in it }
+    }
+
+    @Test
+    fun `a proven team is made only by the org-bound seam`() {
+        // Its constructor and the seam that calls it are private; the rule is the only way in.
+        val proven = ProvenTeam::class
+        assertThat(proven.constructors.map { it.visibility }).containsOnly(KVisibility.PRIVATE)
+        assertThat(proven.nestedClasses.single { it.simpleName == "ImportNamespaceMark" }.visibility)
+            .isEqualTo(KVisibility.PRIVATE)
     }
 }

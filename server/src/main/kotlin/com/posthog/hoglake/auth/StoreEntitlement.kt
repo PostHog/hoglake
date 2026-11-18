@@ -4,6 +4,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.TeamNamespaces
+import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.ServedFamily
 import io.ktor.server.application.ApplicationCall
 
@@ -173,37 +174,106 @@ internal fun ApplicationCall.requireRemoteSchemaEntitlement(
 }
 
 /**
+ * A team proven to belong to the caller's org [org]: what a served
+ * `team_<id>`'s stream rows are read for. The constructor is private and its
+ * one caller is [ImportNamespaceMark], the org-bound seam, after its
+ * comparison. That seam is private too, and is reached only through
+ * [requireServedNamespaceEntitlement]'s rule ([admit]). The rule takes the
+ * caller from the request's verified auth state and reads the mark from the
+ * store itself. So no code can make a [ProvenTeam] from a caller or a mark it
+ * built, or outside the rule.
+ */
+class ProvenTeam private constructor(
+    val org: String,
+    val id: Long,
+) {
+    internal companion object {
+        /** The org bound in use: the one place that compares the org. */
+        private val orgBound: TeamOrgBound = ImportNamespaceMark
+
+        /**
+         * The caller rule for the served team namespace [namespace] (team
+         * [id]) of the caller's own [catalog]. In order, each failure the 404
+         * of a missing namespace, in every auth mode: the token names
+         * [catalog] ([requireCatalogEntitlement]); the caller
+         * [readsRemoteSchema]; the namespace of that name in the family's
+         * source catalog, read from [store] only for a caller that got this
+         * far, proves the team is the caller's org's ([orgBound]); and the
+         * caller's `prd` holds that field and id with `read`.
+         */
+        fun admit(
+            call: ApplicationCall,
+            catalog: String,
+            namespace: String,
+            family: ServedFamily,
+            id: Long,
+            store: CatalogStore,
+        ): ProvenTeam {
+            call.requireCatalogEntitlement(catalog)
+            val caller = call.hoglakeAuth.callerOrNull
+            if (caller != null && caller.readsRemoteSchema(catalog, namespace)) {
+                val mark = store.liveContainment(family.sourceCatalog, namespace)
+                val team = orgBound.prove(caller, family.predicateField, id, mark)
+                // `*` is a grant over every value, and is safe here only because the org
+                // bound has already proved this team is the caller's own org's.
+                if (team != null && caller.holdsPredicate(family.predicateField, id, Scope.READ)) return team
+            }
+            call.refuseMissingNamespace(catalog, family.label, namespace, "served_namespace")
+        }
+    }
+
+    /**
+     * The org bound today: the org mark Hogtower's provisioner writes on the
+     * team's stored import namespace (#640). It proves [id] when the mark has
+     * an org, that org is the caller's, and the mark is `predicateField = id`.
+     */
+    private object ImportNamespaceMark : TeamOrgBound {
+        override fun prove(
+            caller: Caller,
+            predicateField: String,
+            id: Long,
+            mark: NamespaceContainment?,
+        ): ProvenTeam? {
+            val org = mark?.org ?: return null
+            if (org != caller.orgId) return null
+            if (mark.field != predicateField || mark.value != id) return null
+            return ProvenTeam(org, id)
+        }
+    }
+}
+
+/**
+ * The one place that proves a team belongs to the caller's org, for a served
+ * `team_<id>` (docs/auth-tenancy.md §6.5d): null when it cannot. Today the
+ * proof is the org mark on the team's stored import namespace
+ * (`ProvenTeam.ImportNamespaceMark`, its one implementation). An `org_id`
+ * predicate on the stream tables, once their layout has one, is a second
+ * condition beside it, not a replacement. An implementation elsewhere cannot
+ * make a [ProvenTeam]: only the seam inside that class can.
+ */
+internal fun interface TeamOrgBound {
+    fun prove(
+        caller: Caller,
+        predicateField: String,
+        id: Long,
+        mark: NamespaceContainment?,
+    ): ProvenTeam?
+}
+
+/**
  * `CatalogStoreSelector` asks here before it hands out the binding of the
  * served team namespace [namespace] (team [id], docs/auth-tenancy.md §6.5d)
- * of the caller's own [catalog], which this server does not hold. In order,
- * each failure the 404 of a missing namespace, in every auth mode: the token
- * names [catalog] ([requireCatalogEntitlement]); the caller [readsRemoteSchema];
- * the stored namespace ([containment], read only for a caller that got this
- * far) is marked `family.predicateField = id` for the caller's own org; and
- * the caller's `prd` holds that field and id with `read`.
+ * of the caller's own [catalog], which this server does not hold. The rule
+ * is [ProvenTeam.admit]'s; it returns the team it proved, or refuses with the
+ * 404 of a missing namespace.
  */
 internal fun ApplicationCall.requireServedNamespaceEntitlement(
     catalog: String,
     namespace: String,
     family: ServedFamily,
     id: Long,
-    containment: () -> NamespaceContainment?,
-) {
-    requireCatalogEntitlement(catalog)
-    val caller = hoglakeAuth.callerOrNull
-    if (caller.readsRemoteSchema(catalog, namespace)) {
-        val mark = containment()
-        // `*` is a grant over every value, and is safe here only because the org
-        // comparison has already bound this namespace to the caller's own org.
-        if (caller != null && mark?.org != null && mark.org == caller.orgId &&
-            mark.field == family.predicateField && mark.value == id &&
-            caller.holdsPredicate(family.predicateField, id, Scope.READ)
-        ) {
-            return
-        }
-    }
-    refuseMissingNamespace(catalog, family.label, namespace, "served_namespace")
-}
+    store: CatalogStore,
+): ProvenTeam = ProvenTeam.admit(this, catalog, namespace, family, id, store)
 
 private fun ApplicationCall.refuseMissingNamespace(
     catalog: String,
