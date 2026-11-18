@@ -1195,10 +1195,10 @@ that holds the catalog is the Client. For readers this replaces the separate
 mount catalog of §6.5a and §6.5b.
 
 The Host serves the relayed paths for the namespaces it is configured to
-serve from a source catalog (§6.5d, the imports), not yet for the stream
-tables. The Host verifies the relayed token itself, so it must accept the
-session profile too. Nothing turns this on in any deployment. §6.5a and §6.5b
-are unchanged and still describe the mount.
+serve from a source catalog (§6.5d, the imports) and, when configured, the
+published stream tables beside them. The Host verifies the relayed token
+itself, so it must accept the session profile too. Nothing turns this on in
+any deployment. §6.5a and §6.5b are unchanged and still describe the mount.
 
 ```json
 {"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
@@ -1424,9 +1424,10 @@ per-team entry is needed.
 - **Configuration.** `HOGLAKE_SERVED_NAMESPACES_FILE` (empty, the default, is
   off): an object with exactly a `families` array, each entry exactly a
   `family` (only `team`), a `source_catalog` (a catalog name) and a
-  `predicate_field`, which must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. At
-  most one entry per family. Unknown keys are refused, and so is the former
-  `namespaces` list, with a message that names this shape. Boot refuses it
+  `predicate_field`, which must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`, and
+  optionally a `stream` block (below). At most one entry per family. Unknown
+  keys are refused, and so is the former `namespaces` list, with a message
+  that names this shape. Boot refuses it
   under auth `off`, without `HOGLAKE_AUTH_SESSION_PROFILE=on`, without
   `HOGLAKE_AUTH_PREDICATE_FIELDS`, with `HOGLAKE_MOUNT_HOSTS_FILE` (a server is
   a Host or a Client), and unless PostgreSQL is the default backend. The
@@ -1494,9 +1495,90 @@ per-team entry is needed.
   `mount_operation_unavailable` for a read that is not relayed. A body that
   names the namespace under a catalog this server does not hold fails on that
   catalog; nothing reaches the source.
-- **Not built.** The stream tables with an
-  org and team row filter, the remote head snapshot fields of the Client's
-  catalog snapshot (P3), and removing `hog_mount`.
+
+**The stream half.** The family entry may also carry a `stream` block. The
+same `team_<id>` then shows the published stream tables beside the imports:
+
+```json
+{"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id",
+  "stream": {"catalog": "millrace-dev", "namespace": "ingest", "tables": ["events"]}}]}
+```
+
+- **Configuration.** `stream` has exactly `catalog` (a catalog name),
+  `namespace` (a namespace name without a team's shape) and `tables` (a
+  non-empty array of table names that differ in more than ASCII case). Boot
+  refuses anything else. Without `stream`, nothing below applies and the
+  server answers as before. The stream catalog is not checked at boot: if it
+  is missing, the listing, table and scan routes answer 500, and the body
+  names nothing.
+- **Which tables.** Only the listed names, and only those that are live
+  tables of that namespace in that catalog. A table is found by
+  (catalog, namespace, name), so a table of another namespace is never
+  reached. It must also have an object-prefix field equal to the top-level
+  column `predicate_field` at the read snapshot. Any other listed name is
+  left out of the listing, and its table and scan routes answer 404. A table
+  whose layout and specs disagree is left out of the listing and counted on
+  `hoglake_served_stream_unscopable_tables_total{family="team_*"}`. Its scan
+  answers 500. The tables keep their real names; the table response's
+  `namespace` is `team_<id>`.
+- **The org bound.** The caller rule above is unchanged, and the stream half
+  has no rule of its own. The team is bound to the caller's org by the org
+  mark on its stored import namespace, the same comparison step 3 makes. That
+  comparison is made in one place (`TeamOrgBound` in
+  `auth/StoreEntitlement.kt`). Only that comparison can create the
+  `ProvenTeam` that a stream read needs. So a team's events are served only
+  after Hogtower's provisioner has created and marked its namespace. A team
+  with no import namespace gets the 404, events included. A wrong mark now
+  exposes that team's events, not only its imports.
+- **A mark is not fixed until the namespace holds a table.** A team that
+  only has events keeps an empty import namespace, and an operator can change
+  its mark until that namespace holds a table. Under `off` and `warn`, a
+  caller with no token counts as an operator for this, so it can change the
+  mark too. The mark is read at head, so
+  after a change the new org reads every retained snapshot of the team's
+  events, not only the new ones. Keeping those marks right is the
+  provisioner's duty.
+- **The row filter.** The only value is the one team id, on the table's
+  object-prefix field. It is never the token's other values, so a token
+  holding teams 42 and 43 sees only team 42's rows in `team_42`. The token's
+  grant must still hold that id, and a file is returned only when its
+  statistics prove the value and it is not quarantined (`ReadScope`). The
+  spec's `org_id = <token org>` predicate waits for an `org_id` in the
+  layout. When it lands, it is a second condition in the same seam, not a
+  replacement for the mark.
+- **Totals and properties.** The listing's counts are the team's own files.
+  The table response never carries totals, `totals=true` included, because
+  whole-table counts are every team's. It never carries the table's
+  `properties` either: on a shared table they are PostHog's own metadata,
+  and no reader needs them.
+- **Name collision.** The stream table wins. An import whose name is a listed
+  name, in any ASCII case, is not listed. A case variant of a listed name
+  answers 404 on the table and scan routes.
+- **Snapshots.** A table and its scan resolve `snapshot` and `at_timestamp`
+  in the catalog that holds the table: for a stream table, `snapshot` is a
+  stream catalog id, and `read_snapshot_id` is that catalog's. The table
+  route resolves its snapshot once, so the definition it returns is the
+  table it checked. On the
+  listing, `at_timestamp` applies to both catalogs. `snapshot` is the import
+  catalog's, and the stream tables are then listed at their catalog's head.
+  Out of range is 422 and below the expiry floor is 410, worded as for the
+  imports.
+- **Limits.** A stream scan keeps the mount's shared cap
+  (`HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT`), file budget and deadline. The
+  listing takes one permit of the cap. The series are labelled `team_*`.
+- **The listing fails with the stream side.** With `stream` set, the listing
+  of `team_<id>` fails whenever its stream half does, imports included: 500
+  when the stream catalog is missing, 410 when `at_timestamp` is before the
+  stream catalog's earliest retained snapshot, and 503 `mount_scan_busy` when
+  the shared cap is full. One org's scans can fill the cap, so size it
+  before the stream half is turned on.
+- **Rollout.** In an environment that serves customers, before a stream
+  block is turned on, audit every `team_<digits>` mark against Hogtower's
+  team-to-org records. A mark written while the server ran `off` or `warn`
+  stays after a later switch to `enforce`.
+- **Not built.** The `org_id` predicate, `remote: true` on the table
+  response, the remote head snapshot fields of the Client's catalog snapshot
+  (P3), and removing `hog_mount`.
 
 ### 6.6 Client-supplied authority fields must die
 

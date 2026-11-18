@@ -70,6 +70,8 @@ class CatalogStoreSelector(
     private val removalStore: () -> RemovalStore = { error("cleanup object store is not configured") },
     /** Host mode: the families of namespaces served to relayed readers (docs/auth-tenancy.md §6.5d). Empty is none. */
     servedFamilies: List<ServedFamily> = emptyList(),
+    /** The reads of a served family's stream half ([ServedFamily.stream]), asked only once the caller rule passed. */
+    private val streamRead: () -> MountReadService? = { null },
 ) : CatalogRegistry {
     private val servedTeams = servedFamilies.singleOrNull { it.family == TeamNamespaces.FAMILY }
 
@@ -161,7 +163,8 @@ class CatalogStoreSelector(
      * name is served; a case variant or a padded id is not. The caller rule
      * refuses in every auth mode ([requireServedNamespaceEntitlement]), and
      * the source namespace is read once, for a caller that passes its token
-     * checks.
+     * checks. The stream half, when the family has one, is built only from
+     * the team the rule returned, after it returned.
      */
     private fun servedBinding(
         call: ApplicationCall,
@@ -182,13 +185,23 @@ class CatalogStoreSelector(
         } catch (_: HoglakeException.NotFound) {
             // Not a catalog here: the served namespace is the only reading this path has.
         }
-        call.requireServedNamespaceEntitlement(catalog, namespace, family, id) {
-            store.liveContainment(family.sourceCatalog, namespace)
-        }
+        // The rule reads the namespace's mark from the store itself, only for a caller that passes its token checks.
+        val team = call.requireServedNamespaceEntitlement(catalog, namespace, family, id, store)
+        val stream =
+            family.stream?.let {
+                StreamHalf(
+                    checkNotNull(streamRead()) { "a served family has a stream, but no stream reader is wired" },
+                    it,
+                    team,
+                    family.predicateField,
+                    call.hoglakeAuth.callerOrNull?.predicates?.get(family.predicateField),
+                    family.label,
+                )
+            }
         return CatalogBinding.Served(
             catalog,
             namespace,
-            ServedNamespaceReader(store, family.sourceCatalog, namespace, catalog),
+            ServedNamespaceReader(store, family.sourceCatalog, namespace, catalog, stream),
             family.label,
         )
     }

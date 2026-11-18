@@ -1,6 +1,7 @@
 package com.posthog.hoglake
 
 import com.fasterxml.jackson.core.JsonParser
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
@@ -14,6 +15,7 @@ import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.ServedFamily
+import com.posthog.hoglake.store.ServedStream
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.URI
 import java.nio.file.Files
@@ -150,7 +152,14 @@ data class Config(
      * the source catalog, read-only, when that namespace is marked
      * `predicate_field = <id>` for the caller's org and a scoped
      * session-profile caller of that org holds the team. `predicate_field`
-     * must be one of [authPredicateFields]. Unknown keys, a second entry for
+     * must be one of [authPredicateFields]. An entry may also carry
+     * `"stream": {"catalog": "<catalog>", "namespace": "<namespace>",
+     * "tables": ["events", ...]}`: the same `team_<id>` then also shows those
+     * published tables of that namespace, shared by every team, with the
+     * rows of team `<id>` only; a published name hides an import of that name
+     * in any ASCII case. The namespace may not have a team's shape, and the
+     * tables must be non-empty, valid and distinct in ASCII case. Without
+     * `stream` only the imports are served. Unknown keys, a second entry for
      * a family, and the former `namespaces` list are refused. Empty (the
      * default): nothing is served. Refused at boot under
      * `HOGLAKE_AUTH_MODE=off`, without [authSessionProfile] `on` or
@@ -2335,20 +2344,36 @@ private fun readServedFamilies(file: String): List<ServedFamily> {
     val entries = root.get("families")
     require(entries.isArray) { "families must be an array" }
     val result = mutableListOf<ServedFamily>()
+    val keys = setOf("family", "source_catalog", "predicate_field")
+
+    fun keysOf(node: JsonNode): Set<String>? = if (node.isObject) node.properties().map { it.key }.toSet() else null
     for (entry in entries) {
-        require(
-            entry.isObject && entry.properties().map { it.key }.toSet() ==
-                setOf("family", "source_catalog", "predicate_field"),
-        ) {
-            "a served family entry is an object with exactly a family, a source_catalog and a predicate_field"
+        require(keysOf(entry).let { it == keys || it == keys + "stream" }) {
+            "a served family entry is an object with exactly a family, a source_catalog and a predicate_field, " +
+                "and optionally a stream"
         }
 
-        fun text(key: String): String {
-            val value = entry.get(key)
+        fun text(
+            node: JsonNode,
+            key: String,
+        ): String {
+            val value = node.get(key)
             require(value != null && value.isTextual) { "a served family requires a string $key" }
             return value.asText()
         }
-        val served = ServedFamily(text("family"), text("source_catalog"), text("predicate_field"))
+        val stream =
+            entry.get("stream")?.let { node ->
+                require(keysOf(node) == setOf("catalog", "namespace", "tables")) {
+                    "a served family's stream is an object with exactly a catalog, a namespace and a tables array"
+                }
+                val tables = node.get("tables")
+                require(tables.isArray && tables.all { it.isTextual }) {
+                    "a served stream's tables is an array of strings"
+                }
+                ServedStream(text(node, "catalog"), text(node, "namespace"), tables.map { it.asText() })
+            }
+        val served =
+            ServedFamily(text(entry, "family"), text(entry, "source_catalog"), text(entry, "predicate_field"), stream)
         require(result.none { it.family == served.family }) { "duplicate served family '${served.family}'" }
         result += served
     }
