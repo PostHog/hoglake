@@ -2,10 +2,8 @@
 # uv workspace member whose static metadata locks without a build.
 [project]
 name = "pyhoglake-variant-codec"
-# Its own version, released only when the codec changes: Sampo bumps it
-# from a `pyhoglake-variant-codec: patch|minor|major` changeset, which
-# ci-python.yml's codec-version requires of a PR that changes the codec's
-# source. pyhoglake's extra pins one release of it. Not edited by hand.
+# Its own version, released only when the codec changes (ci-python.yml
+# holds a change to a new or a .dev version); pyhoglake's extra pins one.
 version = "0.1.1"
 description = "pyhoglake's VARIANT value codec (private to pyhoglake)"
 readme = "README.md"
