@@ -1,6 +1,7 @@
 package com.posthog.hoglake
 
 import com.posthog.hoglake.store.ServedFamily
+import com.posthog.hoglake.store.ServedStream
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -101,6 +102,65 @@ class ServedNamespacesConfigTest {
             config(valid, predicateFields = "org_id")
         }
         assertThat(config(valid, predicateFields = "org_id, team_id").servedFamilies).hasSize(1)
+    }
+
+    private fun withStream(stream: String): String {
+        val entry = """{"family":"team","source_catalog":"imports-dev","predicate_field":"team_id","stream":$stream}"""
+        return """{"families":[$entry]}"""
+    }
+
+    @Test
+    fun `a stream block parses, and an entry without one has none`() {
+        val parsed =
+            config(withStream("""{"catalog":"millrace-dev","namespace":"ingest","tables":["events","persons"]}"""))
+        assertThat(parsed.servedFamilies.single().stream)
+            .isEqualTo(ServedStream("millrace-dev", "ingest", listOf("events", "persons")))
+        assertThat(config().servedFamilies.single().stream).isNull()
+    }
+
+    @Test
+    fun `a stream block is parsed strictly, and its names are checked at boot`() {
+        val good = """"catalog":"millrace-dev","namespace":"ingest","tables":["events"]"""
+        for (bad in listOf(
+            // An unknown key in the block, beside it, or a key missing.
+            withStream("""{$good,"extra":1}"""),
+            """{"families":[{"family":"team","source_catalog":"x","predicate_field":"team_id","streams":{$good}}]}""",
+            withStream("""{"catalog":"millrace-dev","namespace":"ingest"}"""),
+            withStream("""{"namespace":"ingest","tables":["events"]}"""),
+            withStream("""[]"""),
+            withStream("""null"""),
+            // The tables: empty, not an array, a non-string, an invalid name, two names one fold apart.
+            withStream("""{"catalog":"millrace-dev","namespace":"ingest","tables":[]}"""),
+            withStream("""{"catalog":"millrace-dev","namespace":"ingest","tables":"events"}"""),
+            withStream("""{"catalog":"millrace-dev","namespace":"ingest","tables":[1]}"""),
+            withStream("""{"catalog":"millrace-dev","namespace":"ingest","tables":["a b"]}"""),
+            withStream("""{"catalog":"millrace-dev","namespace":"ingest","tables":["events","EVENTS"]}"""),
+            // The namespace: a team's shape in any case, or invalid. The catalog: invalid, or not a string.
+            withStream("""{"catalog":"millrace-dev","namespace":"team_5","tables":["events"]}"""),
+            withStream("""{"catalog":"millrace-dev","namespace":"TEAM_007","tables":["events"]}"""),
+            withStream("""{"catalog":"millrace-dev","namespace":"a b","tables":["events"]}"""),
+            withStream("""{"catalog":"Millrace","namespace":"ingest","tables":["events"]}"""),
+            withStream("""{"catalog":1,"namespace":"ingest","tables":["events"]}"""),
+        )) {
+            assertThatThrownBy { config(bad) }.describedAs(bad).isInstanceOf(IllegalArgumentException::class.java)
+        }
+        refused("must differ in more than ASCII case") {
+            config(withStream("""{"catalog":"c","namespace":"ingest","tables":["events","Events"]}"""))
+        }
+        refused("that is not a team's") {
+            config(withStream("""{"catalog":"c","namespace":"team_1","tables":["e"]}"""))
+        }
+    }
+
+    @Test
+    fun `a stream publishes its exact names and reserves them in any ASCII case`() {
+        val stream = ServedStream("millrace-dev", "ingest", listOf("events", "persons"))
+        assertThat(stream.publishes("events")).isTrue()
+        assertThat(stream.publishes("EVENTS")).isFalse()
+        assertThat(stream.publishes("events_raw")).isFalse()
+        val reserved = listOf("events", "EVENTS", "Events", "PERSONS")
+        assertThat(reserved).allMatch { stream.reserves(it) }
+        assertThat(listOf("events_raw", "event", "pageviews")).noneMatch { stream.reserves(it) }
     }
 
     @Test

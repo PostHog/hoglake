@@ -158,6 +158,7 @@ class App private constructor(
             objectStore = { objectStore },
             removalStore = { removalStore },
             servedFamilies = cfg.servedFamilies,
+            streamRead = { mountReadService },
         )
     }
 
