@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.model.HoglakeException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.ConnectException
@@ -203,6 +204,21 @@ class HogliteClient(
         )
 
     // ---- public API -------------------------------------------------------
+
+    /**
+     * Read one namespace through the typed metadata protocol.
+     * The caller supplies verified request authority and a trusted local placement.
+     * This operation does not use SQL, routing pins, retries, or circuit breakers.
+     */
+    internal fun readScopedNamespace(
+        tenant: String,
+        catalog: String,
+        namespace: String,
+    ): NamespaceDto? {
+        val token = bearerToken
+        if (shared == null || token == null) throw HogliteScopedNamespaceRead.unavailable()
+        return HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, readTimeoutMs)
+    }
 
     /**
      * Run [statements] as one hoglite transaction on [tenant], exactly

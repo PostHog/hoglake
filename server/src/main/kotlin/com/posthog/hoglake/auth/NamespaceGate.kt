@@ -1,18 +1,28 @@
 package com.posthog.hoglake.auth
 
 import com.posthog.hoglake.api.BlockingDispatchPhase
+import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStoreSelector
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
+import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
+import io.ktor.server.request.receiveChannel
+import io.ktor.server.request.uri
+import io.ktor.server.response.respond
 import io.ktor.util.AttributeKey
+import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Present on the application once [installNamespaceGate] ran; the plugin defers only then. */
 internal val NamespaceGateKey = AttributeKey<Unit>("HoglakeNamespaceGate")
@@ -89,6 +99,34 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         // whole of this server's check, and no containment exists to read.
         isExport = { call, catalog -> selector.resolve(call, catalog) !is CatalogBinding.Local },
         refuseRemoteSchemas = selector::refuseRemoteSchemas.takeIf { selector.hasRemoteSchemas },
+        scopedNamespace = { call, pending ->
+            if (call.request.httpMethod != HttpMethod.Get) {
+                null
+            } else {
+                val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+                selector.scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeIf {
+                    match?.pattern == "/v1/catalogs/{catalog}/namespaces/{namespace}"
+                }?.let { binding ->
+                    ScopedNamespaceRead {
+                        val expected = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}"
+                        val lengths = call.request.headers.getAll(HttpHeaders.ContentLength)
+                        if (call.request.uri != expected || (lengths != null && lengths != listOf("0")) ||
+                            call.request.headers.getAll(HttpHeaders.TransferEncoding) != null
+                        ) {
+                            throw BadRequestException("invalid scoped namespace request")
+                        }
+                        // Bound end-of-stream detection, including HTTP/2 without a length.
+                        // Parent cancellation still propagates through withTimeoutOrNull.
+                        val empty =
+                            withTimeoutOrNull(5_000) {
+                                call.request.receiveChannel().readAvailable(ByteArray(1), 0, 1) == -1
+                            }
+                        if (empty != true) throw BadRequestException("invalid scoped namespace request")
+                        runInterruptible { selector.readScopedNamespace(call, binding) }
+                    }
+                }
+            }
+        },
     )
 }
 
@@ -103,6 +141,7 @@ private fun Application.installCallNamespaceGate(
     ) -> Pair<String, NamespaceContainment>? = { _, _, _, _ -> null },
     isExport: (ApplicationCall, String) -> Boolean = { _, _ -> false },
     refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
+    scopedNamespace: (ApplicationCall, AuthDecision.ByNamespace) -> ScopedNamespaceRead? = { _, _ -> null },
 ) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
@@ -117,6 +156,47 @@ private fun Application.installCallNamespaceGate(
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull
         val service = call.application.attributes[AuthServiceKey]
+        // This selection precedes isExport: resolve can issue legacy SQL.
+        // A selected read always finishes here, including every refusal.
+        val selected = scopedNamespace(call, pending)
+        if (selected != null) {
+            val result =
+                try {
+                    selected.read()
+                } catch (failure: HoglakeException.NotFound) {
+                    countRefusal(
+                        service,
+                        service.clientClass(call),
+                        caller,
+                        AuthPolicy.match(call.request.httpMethod, call.request.path()),
+                        failure,
+                        enforced = true,
+                    )
+                    call.respondRefusal(failure)
+                    finish()
+                    return@intercept
+                }
+            val mark = result?.containment
+            if (result != null && mark != null && caller != null &&
+                caller.mayUseContained(pending.catalog, mark.field, mark.value, null, pending.required)
+            ) {
+                Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
+                call.respond(result)
+            } else {
+                val refusal = HoglakeException.NotFound("namespace")
+                countRefusal(
+                    service,
+                    service.clientClass(call),
+                    caller,
+                    AuthPolicy.match(call.request.httpMethod, call.request.path()),
+                    refusal,
+                    enforced = true,
+                )
+                call.respondRefusal(refusal)
+            }
+            finish()
+            return@intercept
+        }
         val held =
             try {
                 if (isExport(call, pending.catalog)) {
@@ -166,3 +246,5 @@ private fun Application.installCallNamespaceGate(
 }
 
 internal val NamespaceGatePhase = io.ktor.util.pipeline.PipelinePhase("HoglakeNamespaceGate")
+
+private class ScopedNamespaceRead(val read: suspend () -> NamespaceDto?)
