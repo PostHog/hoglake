@@ -1460,6 +1460,7 @@ class CompactionService(
                     ?.takeIf { it.def.type in ObjectPrefix.ALLOWED_TYPES }
                     ?.let { ObjectPrefixLayout(it.fieldId, it.def.name, it.def.type) },
             prefixKeyIndex = prefixKeyIndex.orEmpty(),
+            containment = ns.containment,
         )
     }
 

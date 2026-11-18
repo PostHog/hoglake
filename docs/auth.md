@@ -44,6 +44,17 @@ one issuer among possible issuers.
 | `enforce` | deny by default; a route without a verified, sufficient token gets 401 or 403 | production |
 | `local` | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer) | a standalone install that wants real authentication and no extra service |
 
+Under `warn` a request with no token (or one that does not verify) is counted
+once, as `missing` or `invalid`, and then served as under `off`: `GET
+/v1/catalogs` lists every catalog of the default PostgreSQL backend, so the
+web UI keeps working through the burn-in. It lists no hoglite catalogs and no
+mounts (an anonymous caller has no routing claim and no mount visibility), and
+on a deployment whose default backend is not PostgreSQL it answers 404, as it
+did before. The per-catalog totals (`table_count`, `live_rows`,
+`live_size_bytes`, `oldest_snapshot_time`) are omitted for the anonymous
+caller, as `/v1/info` omits the instance totals. A verified token gets its own
+catalogs as it would under `enforce`, with their totals unless it is scoped.
+
 Some features refuse `off` because they rely on the token: the public listener
 (`HOGLAKE_PUBLIC_PORT`), hoglite backends and mounts.
 
@@ -125,7 +136,7 @@ The core, which every issuer must emit:
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes, by decision | token id, for correlating an audit line with a token. Required because the audit log and the access log name tokens by it; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
-| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log only; hoglake does not authorize on it. Required by the verifier today; making it optional is tracked |
+| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
 | `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
 
 Authorization is per catalog. The scope vocabulary is ordered,
@@ -153,7 +164,7 @@ deployment needs them; hoglake applies them without knowing what they mean:
 | `dlg` | the caller may set `author` on a commit to a name other than its own `sub` |
 | `prd` | on a `scoped` token: `{"<field>": {"<value>": "read" \| "write", …}}`, or `{"<field>": {"*": …}}`. The field must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. hoglake filters metadata by `field ∈ values` and refuses commits whose files are attributed to a value the token may not write. This is how a multi-tenant issuer narrows one catalog to one tenant; PostHog's field is `team_id` |
 | `usr` | on a `scoped` token: an opaque end-user name for access logs, never used for authorization |
-| `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend` |
+| `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend`. Exception: on a Host with served namespaces, a scoped token's `rtg` naming an unknown backend is ignored; such a token can read only served namespaces and gets 404 for everything else |
 
 ### Backends that verify the token themselves
 
@@ -204,7 +215,7 @@ it must carry all of the following, or it is refused (`invalid_token`):
 | `version` | exactly `1`; an unknown version is refused, never parsed as the one the server knows |
 | `purpose` | exactly `user-session`; this profile is for a caller's own work, so an `operator` token may not carry it |
 | `primary_catalog` | the one catalog the session is about; it must be the single key of the `cat` object as written — a second `cat` entry refuses the token even when a plain tenant token would have dropped its unknown scope words, and the `scope` spelling alone does not carry the profile. A routed token (`rtg`) routes only this catalog |
-| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction and parsed strictly: any other word, a non-string entry, a non-array value or an empty list refuses the token; nothing is dropped. Each key is the name the serving deployment publishes; a deployment that shows the schema under another name maps that name to the published one before it checks the claim |
+| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction and parsed strictly: any other word, a non-string entry, a non-array value or an empty list refuses the token; nothing is dropped. The key `team` is the **team family entry**, not a schema named `team`: `{"team": ["read"]}` grants every schema `team_<id>` (`team_` and the decimal id, no leading zeros) whose id the token's `prd.team_id` holds, at any scope, or every team with `*`. The family grants read only, counts toward the 16, and may sit beside per-name entries. Team schemas are meant to be granted by this entry; a per-name `team_<id>` entry still works and names that one schema without a `prd` check on the Client; a deployment that shows a schema under another name maps that name to the published one before it checks the claim (a team schema has no alias) |
 | `aws` | the credential bundle: non-empty strings `access_key_id`, `secret_access_key`, `session_token`, `region`, and integer `expires_at`. The token may not outlive its credentials: `exp ≤ aws.expires_at` |
 | `sid`, `generation`, `session_deadline`, `grants` | optional, for the engine that refreshes the session: a non-empty string, a positive integer, integer seconds with `aws.expires_at ≤ session_deadline`, and an array. The server checks their types and the ordering, nothing more |
 

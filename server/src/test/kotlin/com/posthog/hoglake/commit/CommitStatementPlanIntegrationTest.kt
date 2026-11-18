@@ -641,6 +641,9 @@ class CommitStatementPlanIntegrationTest {
                 paths = (1..PATHS).map { "s3://bucket/plan/data/team_10/${UUID.randomUUID()}.parquet" },
                 targetIds = emptyList(),
                 containmentNames = names,
+                // V37: a path whose hive head names team_id = 20 finds its namespace by value.
+                hiveFields = listOf("team_id"),
+                hiveValues = listOf(20L),
             )
         val plan = explainAnalyze(CommitTail.READ_SQL) { q -> CommitTail.bindRead(q, inputs) }
         val generic = explainGeneric(CommitTail.READ_SQL)
@@ -652,7 +655,7 @@ class CommitStatementPlanIntegrationTest {
                 .containsPattern("Index (Only )?Scan (using|on) hog_namespace_live_(name|containment)")
         }
         val read = db.jdbi.withHandleUnchecked { h -> CommitTail.read(h, inputs) }
-        assertThat(read.contained).containsExactly("team_10")
+        assertThat(read.contained.keys).containsExactlyInAnyOrder("team_10", "team_20")
     }
 
     @Test

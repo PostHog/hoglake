@@ -195,6 +195,47 @@ class SessionProfileTest {
         assertThat(verifier(true).verify(profiled(extra = """$aws,"primary_catalog":"lake"""")).remoteSchemas).isEmpty()
     }
 
+    private fun withRemote(schemas: String) =
+        profiled(
+            extra = """$aws,"primary_catalog":"lake","remote_schemas":$schemas""",
+        )
+
+    @Test
+    fun `the team key is the family entry, kept apart from the named schemas`() {
+        val family = verifier(true).verify(withRemote("""{"team":["read"]}"""))
+        assertThat(family.remoteSchemaFamilies).containsExactly("team")
+        assertThat(family.remoteSchemas).isEmpty()
+        // Beside per-name entries, including a team schema named outright: all of them stay.
+        val both = verifier(true).verify(withRemote("""{"shared":["read"],"team":["read"],"team_42":["read"]}"""))
+        assertThat(both.remoteSchemaFamilies).containsExactly("team")
+        assertThat(both.remoteSchemas).containsExactlyInAnyOrder("shared", "team_42")
+        // Without the entry no family is held, whatever else the token names.
+        val none = verifier(true).verify(withRemote("""{"team_42":["read"],"teams":["read"],"Team":["read"]}"""))
+        assertThat(none.remoteSchemaFamilies).isEmpty()
+        assertThat(none.remoteSchemas).containsExactlyInAnyOrder("team_42", "teams", "Team")
+    }
+
+    @Test
+    fun `the family entry is read-only like every remote schema`() {
+        for (bad in listOf("""["read","write"]""", """["write"]""", "[]", """"read"""", """["read",42]""", "null")) {
+            refusedWith(withRemote("""{"team":$bad}"""), on = true, reason = JwtViolation.MALFORMED)
+        }
+        refusedWith(withRemote("""{"shared":["read"],"team":["admin"]}"""), on = true, reason = JwtViolation.MALFORMED)
+    }
+
+    @Test
+    fun `the cap on remote schema entries counts the family entry`() {
+        val fifteen = (1..15).joinToString(",") { """"s$it":["read"]""" }
+        val ok = verifier(true).verify(withRemote("""{$fifteen,"team":["read"]}"""))
+        assertThat(ok.remoteSchemas).hasSize(15)
+        assertThat(ok.remoteSchemaFamilies).containsExactly("team")
+        refusedWith(
+            withRemote("""{$fifteen,"s16":["read"],"team":["read"]}"""),
+            on = true,
+            reason = JwtViolation.MALFORMED,
+        )
+    }
+
     @Test
     fun `the token may not outlive its credentials`() {
         // exp 1700001201 > aws.expires_at 1700001200

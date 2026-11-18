@@ -1,6 +1,5 @@
 package com.posthog.hoglake.auth
 
-import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.store.CatalogStore
@@ -110,7 +109,7 @@ internal class StoreGrant private constructor(
     ): List<T> {
         val caller = scoped ?: return items
         return items.filter { item ->
-            containment(item)?.let { caller.mayUseContained(name, it.field, it.value, Scope.READ) } == true
+            containment(item)?.let { caller.mayUseContained(name, it.field, it.value, it.org, Scope.READ) } == true
         }
     }
 
@@ -126,7 +125,23 @@ internal class StoreGrant private constructor(
     ): NamespaceContainment? {
         open(name)
         val caller = scoped ?: return store.liveContainment(name, namespace)
-        return held(name, namespace)?.takeIf { caller.mayUseContained(name, it.field, it.value, Scope.READ) }
+        return held(name, namespace)?.takeIf { caller.mayUseContained(name, it.field, it.value, it.org, Scope.READ) }
+    }
+
+    /**
+     * The namespace contained for `field = value` and its containment. For a
+     * scoped caller, null unless the token may read that value, as
+     * [containment] answers for a name.
+     */
+    fun containedFor(
+        name: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? {
+        open(name)
+        val found = store.liveContainedFor(name, field, value) ?: return null
+        val caller = scoped ?: return found
+        return found.takeIf { caller.mayUseContained(name, field, value, found.second.org, Scope.READ) }
     }
 
     /** The catalog's data_path, as an operation that read it found it: kept for [claim]. */
@@ -146,10 +161,15 @@ internal class StoreGrant private constructor(
         open(name)
         if (scoped == null) return
         val path = dataPath ?: store.getCatalog(name).dataPath.also { dataPath = it }
-        val namespace = Containment.rawSegment(path, prefix.trimEnd('/') + "/trino-upload/x")
+        val namespace =
+            scopedClaimNamespace(
+                path,
+                prefix.trimEnd('/') + "/trino-upload/x",
+                containment = { held(name, it) },
+                owner = { field, value -> store.liveContainedFor(name, field, value) },
+            )
         if (namespace == null) {
-            val under = "${path.trimEnd('/')}/data/<namespace>/"
-            refuse(HoglakeException.Forbidden("a scoped credential's upload must be claimed under $under"), name)
+            refuse(HoglakeException.Forbidden(scopedClaimRefusal(path)), name)
         } else {
             mustHold(name, namespace, Scope.WRITE)
         }
@@ -204,7 +224,7 @@ internal class StoreGrant private constructor(
         open(name)
         val caller = scoped ?: return
         val held = held(name, namespace)
-        if (held == null || !caller.mayUseContained(name, held.field, held.value, scope)) {
+        if (held == null || !caller.mayUseContained(name, held.field, held.value, held.org, scope)) {
             val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$name'")
             val missing = creation?.let { HoglakeException.NotFound("table creation operation '$it'") }
             refuse(refusal, name, missing ?: refusal)

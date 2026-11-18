@@ -453,6 +453,17 @@ object Metrics {
     fun mountIntegrityError() = increment("hoglake_mount_integrity_errors_total", 1.0)
 
     /**
+     * hoglake_served_stream_unscopable_tables_total{family} — published
+     * stream tables left out of a served `team_<id>`'s table listing
+     * (docs/auth-tenancy.md §6.5d) because their layout and specs disagree,
+     * one count per table per listing. Each is also on [mountIntegrityError].
+     * `family` is the served family's label (`team_*`): never a team id, an
+     * org or a table name.
+     */
+    fun servedStreamUnscopable(family: String) =
+        increment("hoglake_served_stream_unscopable_tables_total", 1.0, "family", family)
+
+    /**
      * hoglake_hydrator_claim_timeouts_total{catalog} — sweeps in which
      * this catalog's claim exceeded the hydrator's claim timeout and
      * was skipped (#269: the catalog lost its share of that sweep; no
@@ -962,8 +973,9 @@ object Metrics {
      * `catalog` is only a name the registry holds (`<orgID>-events`) or, on a
      * mount Client, one a verified token's `cat` names, so a client cannot
      * add series. A mount's team ids are its read scope and are never labels.
-     * For a remote schema `catalog` holds the schema's configured name,
-     * never the catalog or org of the request.
+     * For a remote schema `catalog` holds the schema's configured name, or
+     * the family's label (`team_*`) for a family entry, never the catalog,
+     * org or team id of the request.
      */
     fun mountRefused(
         catalog: String,

@@ -157,6 +157,8 @@ class App private constructor(
             mountHosts.value ?: MountHostResolver.NONE,
             objectStore = { objectStore },
             removalStore = { removalStore },
+            servedFamilies = cfg.servedFamilies,
+            streamRead = { mountReadService },
         )
     }
 
@@ -615,6 +617,7 @@ class App private constructor(
             // built only when a mount actually resolves (PG is the default then).
             mountRead = { mountReadService },
             reservedNamespaces = cfg.reservedNamespaces,
+            operatorTeamNamespaces = cfg.operatorTeamNamespaces,
         )
         app.installTableCreationRoutes(
             { tableCreationService },

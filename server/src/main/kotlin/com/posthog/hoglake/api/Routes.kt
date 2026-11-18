@@ -16,6 +16,7 @@ import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.store.CatalogBinding
@@ -24,6 +25,7 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.MountReadService
 import com.posthog.hoglake.store.remoteSchemaRefusal
+import com.posthog.hoglake.store.servedNamespaceRefusal
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Parameters
 import io.ktor.server.application.Application
@@ -76,6 +78,8 @@ fun Application.installApiRoutes(
     mountRead: () -> MountReadService? = { null },
     /** Names `POST .../namespaces` refuses for every caller (HOGLAKE_RESERVED_NAMESPACES). */
     reservedNamespaces: ReservedNamespaces = ReservedNamespaces.NONE,
+    /** Names only an operator creates in the listed catalogs (HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS). */
+    operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces.NONE,
 ) {
     // The handlers keep the receiver names `catalogs.` and `commits.`.
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
@@ -131,6 +135,14 @@ fun Application.installApiRoutes(
                 // token reads the whole fleet's catalog roster off the first
                 // request it makes. Under HOGLAKE_AUTH_MODE=off the caller is
                 // null and the filter is "everything", i.e. today's behaviour.
+                //
+                // An anonymous caller reaches this handler only under `warn`,
+                // whose point is to let a refusal through while counting it.
+                // The plugin counted this request's missing token already, so
+                // it lists everything as `off` does, and the store's own
+                // refusal of "*" (auth/StoreGrant.kt) adds no second count.
+                // Only the totals are withheld: the fleet's sizes are not an
+                // unauthenticated caller's, as /v1/info above decides too.
                 val listing = selector.forListing(call)
                 val catalogs = listing.store
                 // The sampler reads PostgreSQL only. Catalog names are not unique across backends.
@@ -138,19 +150,25 @@ fun Application.installApiRoutes(
                 val visible =
                     when (val auth = call.hoglakeAuth) {
                         is AuthState.Off -> null
-                        // Only reachable in `warn`, which lets a refusal through.
-                        is AuthState.Anonymous -> emptySet()
+                        is AuthState.Anonymous -> null
                         is AuthState.Authenticated -> listing.catalogs
                     }
-                // Totals are catalog-wide, so a scoped caller gets none.
-                val scoped = (call.hoglakeAuth as? AuthState.Authenticated)?.caller?.kind == Caller.Kind.SCOPED
+                // Totals are catalog-wide, so a scoped caller gets none; nor
+                // does an anonymous one, as above.
+                val withoutTotals =
+                    when (val auth = call.hoglakeAuth) {
+                        is AuthState.Off -> false
+                        is AuthState.Anonymous -> true
+                        is AuthState.Authenticated -> auth.caller.kind == Caller.Kind.SCOPED
+                    }
                 // A catalog a mount shadows answers as the mount on every
                 // route, so it is not listed. The caller's own mounts follow,
                 // unsorted: re-sorting could reorder the backend's listing.
                 val listed = catalogs?.listCatalogs(visible).orEmpty()
                 val mounts = selector.mountsAmong(call, listed.map { it.name } + listing.mounts)
                 val local =
-                    listed.filterNot { it.name in mounts }.map { it.toDto(if (scoped) null else totals[it.name]) }
+                    listed.filterNot { it.name in mounts }
+                        .map { it.toDto(if (withoutTotals) null else totals[it.name]) }
                 val shown = listing.mounts.filter { it in mounts }
                 // A mount Client asks each host once, with the caller's
                 // token, and shows the entries the host returns for these
@@ -187,7 +205,8 @@ fun Application.installApiRoutes(
                         is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
                         is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
                         // Unreachable: this path names no namespace.
-                        is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+                        is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+                        is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
                     }
                 }
                 delete {
@@ -227,7 +246,8 @@ fun Application.installApiRoutes(
                                 )
                             is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
                             // Unreachable: this path names no namespace.
-                            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
+                            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+                            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
                             is CatalogBinding.Local -> {
                                 val catalogs = binding.store
                                 // A scoped caller sees only the contained
@@ -249,7 +269,13 @@ fun Application.installApiRoutes(
                                             (
                                                 scoped == null ||
                                                     ns.containment?.let {
-                                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
+                                                        scoped.mayUseContained(
+                                                            catalog,
+                                                            it.field,
+                                                            it.value,
+                                                            it.org,
+                                                            Scope.READ,
+                                                        )
                                                     } == true
                                             )
                                     }.map { it.toDto() } +
@@ -265,6 +291,16 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         // Before the store: the only path that creates a namespace, on every backend.
                         reservedNamespaces.refuse(req.name)
+                        // Auth off has no callers to tell apart: it is the operator, as for a drop.
+                        val operator = call.hoglakeAuth.callerOrNull?.kind?.isOperator() ?: true
+                        operatorTeamNamespaces.refuse(call.catalog(), req.name, operator)
+                        // The mark is the operator's alone (PUT .../containment is OPERATOR in AuthPolicy), and
+                        // this route is WRITE, so the body decides.
+                        if (req.containment != null && !operator) {
+                            throw com.posthog.hoglake.model.HoglakeException.Forbidden(
+                                "only an operator may create a namespace with a containment mark",
+                            )
+                        }
                         call.respond(
                             HttpStatusCode.Created,
                             catalogs.createNamespace(
@@ -272,6 +308,7 @@ fun Application.installApiRoutes(
                                 req.name,
                                 call.actorOrRefuse(req.author),
                                 req.message,
+                                req.containment?.let { NamespaceContainment(it.field, it.value, it.org) },
                             ).toDto(),
                         )
                     }
@@ -287,6 +324,18 @@ fun Application.installApiRoutes(
                                 )
                             is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
+                            is CatalogBinding.Served ->
+                                call.respond(
+                                    // No id: it is a counter of the shared source catalog.
+                                    NamespaceDto(
+                                        remote = true,
+                                        name =
+                                            binding.reader.namespace(
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).name,
+                                    ),
+                                )
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -314,7 +363,7 @@ fun Application.installApiRoutes(
                             catalogs.setNamespaceContainment(
                                 call.catalog(),
                                 call.namespace(),
-                                NamespaceContainment(req.field, req.value),
+                                NamespaceContainment(req.field, req.value, req.org),
                                 call.actorOrRefuse(null),
                             ).toDto(),
                         )
@@ -346,6 +395,13 @@ fun Application.installApiRoutes(
                                     )
                                 is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
                                 is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
+                                is CatalogBinding.Served ->
+                                    call.respond(
+                                        binding.reader.tables(
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
                                 is CatalogBinding.Local ->
                                     call.respond(
                                         binding.store.listTables(
@@ -390,6 +446,14 @@ fun Application.installApiRoutes(
                                         binding.host.table(call, binding.name, call.namespace(), call.table())
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
+                                    is CatalogBinding.Served ->
+                                        call.respond(
+                                            binding.reader.table(
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).toDto(),
+                                        )
                                     is CatalogBinding.Local ->
                                         call.respond(
                                             binding.store.getTable(
@@ -860,6 +924,14 @@ fun Application.installScanRoutes(
                         binding.store.planScan(
                             call.catalog(),
                             call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                    is CatalogBinding.Served ->
+                        binding.reader.scan(
                             call.table(),
                             call.longQuery("snapshot"),
                             call.instantQuery("at_timestamp"),

@@ -3,6 +3,7 @@ package com.posthog.hoglake.auth
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.TeamNamespaces
 
 /**
  * The session profile: a token that carries storage credentials for the
@@ -28,15 +29,21 @@ internal object SessionProfile {
     const val VERSION = 1L
     const val PURPOSE = "user-session"
 
-    /** The most remote schemas one token may name. */
+    /** The most `remote_schemas` entries one token may carry, the `team` family entry included. */
     const val MAX_REMOTE_SCHEMAS = 16
 
     private val CREDENTIAL_FIELDS = listOf("access_key_id", "secret_access_key", "session_token", "region")
     private val SCHEMA_NAME = Regex(Identifiers.PATTERN)
 
-    /** What a verified profile contributes to the caller: the read-only remote schemas it may use. */
+    /**
+     * What a verified profile contributes to the caller: the read-only remote
+     * schemas it names, and the families it holds. The key `team` is the
+     * family entry (every `team_<id>` the token's `prd` holds), never a schema
+     * named `team`, so it is in [remoteSchemaFamilies] and not in [remoteSchemas].
+     */
     class Grant(
         val remoteSchemas: Set<String>,
+        val remoteSchemaFamilies: Set<String> = emptySet(),
     )
 
     /** Does [claims] carry any of the profile's claims? Any one of them selects this parser. */
@@ -118,6 +125,7 @@ internal object SessionProfile {
         // Remote schemas are read-only by construction: any other word, or
         // an empty list, refuses the token rather than being dropped.
         val remote = LinkedHashSet<String>()
+        val families = LinkedHashSet<String>()
         claims.get("remote_schemas")?.let { node ->
             if (!node.isObject) malformed("claim 'remote_schemas' is not an object")
             if (node.size() > MAX_REMOTE_SCHEMAS) {
@@ -136,7 +144,7 @@ internal object SessionProfile {
                         malformed("remote_schemas['$name'] may grant only [\"read\"]")
                     }
                 }
-                remote.add(name)
+                if (name == TeamNamespaces.FAMILY) families.add(name) else remote.add(name)
             }
         }
 
@@ -170,6 +178,6 @@ internal object SessionProfile {
         claims.get("grants")?.let { if (!it.isArray) malformed("claim 'grants' must be an array") }
 
         Metrics.authSessionProfile("accepted")
-        return Grant(remote)
+        return Grant(remote, families)
     }
 }
