@@ -244,12 +244,12 @@ class ProvenTeam private constructor(
 
 /**
  * The one place that proves a team belongs to the caller's org, for a served
- * `team_<id>` (docs/auth-tenancy.md §6.5d): null when it cannot. Today the
- * proof is the org mark on the team's stored import namespace
- * (`ProvenTeam.ImportNamespaceMark`, its one implementation). An `org_id`
- * predicate on the stream tables, once their layout has one, is a second
- * condition beside it, not a replacement. An implementation elsewhere cannot
- * make a [ProvenTeam]: only the seam inside that class can.
+ * `team_<id>` (docs/auth-tenancy.md §6.5d): null when it cannot. The proof
+ * is the org mark on the team's stored import namespace
+ * (`ProvenTeam.ImportNamespaceMark`, its one implementation). The stream
+ * layout has no `org_id` (PostHog/hogtower#244), so there is no second
+ * condition. An implementation elsewhere cannot make a [ProvenTeam]: only
+ * the seam inside that class can.
  */
 internal fun interface TeamOrgBound {
     fun prove(
