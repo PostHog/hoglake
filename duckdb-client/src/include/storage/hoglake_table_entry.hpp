@@ -35,6 +35,13 @@ public:
 	bool IsTravelPinned() const {
 		return writes_refused;
 	}
+	//! a table of a remote schema: read at its own pin, never written
+	//! (DESIGN.md "Remote schemas")
+	bool IsRemote() const {
+		return remote;
+	}
+	//! Throw before any upload when `what` would write a remote table.
+	void RequireLocal(const char *what) const;
 
 public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
@@ -49,6 +56,7 @@ private:
 	HoglakeTableInfo table_info;
 	HoglakeTravel read_travel;
 	bool writes_refused = false;
+	bool remote = false;
 };
 
 } // namespace duckdb

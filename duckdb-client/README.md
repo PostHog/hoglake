@@ -143,6 +143,14 @@ cd "$PYHOGLAKE_DIR" && DUCKEXT_AUTH_MODE=enforce HOGLAKE_URL=... DUCKEXT_S3_ENDP
 ES256 tokens from the contract file's published test key and runs its own
 client-credentials token endpoint.
 
+The remote-schema cases (DESIGN.md "Remote schemas") need no server and
+no S3: a stdlib stub plays the catalog's server and records every request
+line. `run-live-tests.sh` runs them last; on their own:
+
+```bash
+python3 test/fixtures/verify_remote_pin.py
+```
+
 The harness also runs append guard regressions through an HTTP proxy.
 They cover DDL between file preparation and commit, table recreation,
 eager DDL, multi-table atomicity, and retries that preserve the request.

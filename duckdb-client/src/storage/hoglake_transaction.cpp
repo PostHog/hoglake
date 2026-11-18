@@ -88,6 +88,44 @@ HoglakeTravel HoglakeTransaction::TravelFor(optional_ptr<BoundAtClause> at_claus
 	throw BinderException("hoglake: unsupported AT unit \"%s\" (VERSION or TIMESTAMP)", unit);
 }
 
+HoglakeTravel HoglakeTransaction::RemoteFirstTravel(const string &ns, optional_ptr<BoundAtClause> at_clause) {
+	// an AT clause overrides the attach pin, as in TravelFor
+	bool version = at_clause ? StringUtil::CIEquals(at_clause->Unit().GetIdentifierName(), "version")
+	                         : hoglake_catalog.AttachSnapshotVersion().IsValid();
+	if (version) {
+		throw BinderException("hoglake: schema \"%s\" is remote (served by another Hoglake), so it cannot be read at a "
+		                      "snapshot version (AT (VERSION) or ATTACH ... SNAPSHOT_VERSION): the version is this "
+		                      "catalog's, which means nothing on the remote side. Read it at head or with a timestamp",
+		                      ns);
+	}
+	if (at_clause) {
+		return TravelFor(at_clause);
+	}
+	HoglakeTravel travel;
+	// empty = head; otherwise the same instant GetSnapshotInternal resolves
+	travel.at_timestamp = hoglake_catalog.AttachSnapshotTime();
+	return travel;
+}
+
+HoglakeTravel HoglakeTransaction::EntryTravel(const string &ns, bool remote, const HoglakeTableInfo &table,
+                                              const HoglakeTravel &fetched) {
+	if (!remote) {
+		if (table.remote) {
+			throw TransactionException("hoglake: table \"%s.%s\" was answered as remote, but schema \"%s\" is not "
+			                           "listed as remote: the read carried this catalog's snapshot, which means "
+			                           "nothing to the remote side",
+			                           ns, table.name, ns);
+		}
+		return fetched;
+	}
+	if (!table.has_read_snapshot_id) {
+		throw InvalidInputException("hoglake: table \"%s.%s\" of remote schema \"%s\" came without "
+		                            "read_snapshot_id, the snapshot to pin it at",
+		                            ns, table.name, ns);
+	}
+	return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(table.read_snapshot_id));
+}
+
 //===--------------------------------------------------------------------===//
 // Write buffers
 //===--------------------------------------------------------------------===//
@@ -376,6 +414,14 @@ void HoglakeTransaction::Rollback() {
 // Schema cache
 //===--------------------------------------------------------------------===//
 
+static unique_ptr<HoglakeSchemaEntry> NewSchemaEntry(HoglakeCatalog &catalog, HoglakeTransaction &transaction,
+                                                     const string &ns, bool remote) {
+	CreateSchemaInfo schema_info;
+	schema_info.SetQualifiedName(QualifiedName(schema_info.GetQualifiedName().Catalog(), Identifier(ns),
+	                                           schema_info.GetQualifiedName().Name()));
+	return make_uniq<HoglakeSchemaEntry>(catalog, schema_info, transaction, remote);
+}
+
 void HoglakeTransaction::LoadSchemas() {
 	if (schemas_loaded) {
 		return;
@@ -383,13 +429,15 @@ void HoglakeTransaction::LoadSchemas() {
 	// NOTE (wire): /namespaces is head-only — the listing itself is not
 	// versioned by the pinned snapshot. Tables ARE fetched at the pinned
 	// snapshot. Documented as a server finding in DESIGN.md.
-	auto names = Api().ListNamespaces();
+	auto listed = Api().ListNamespaces();
 	// group CI-equal names first: a case-colliding namespace pair is
 	// unaddressable from DuckDB and must error as ambiguous (same
 	// policy as tables), never silently bind first-listed-wins
 	case_insensitive_map_t<vector<string>> grouped;
-	for (auto &ns : names) {
-		grouped[ns].push_back(ns);
+	case_insensitive_map_t<bool> remote;
+	for (auto &ns : listed) {
+		grouped[ns.name].push_back(ns.name);
+		remote[ns.name] = ns.remote;
 	}
 	for (auto &group : grouped) {
 		auto &exact_names = group.second;
@@ -401,16 +449,12 @@ void HoglakeTransaction::LoadSchemas() {
 		if (schemas.find(ns) != schemas.end()) {
 			continue;
 		}
-		CreateSchemaInfo schema_info;
-		schema_info.SetQualifiedName(QualifiedName(schema_info.GetQualifiedName().Catalog(), Identifier(ns),
-		                                           schema_info.GetQualifiedName().Name()));
-		auto entry = make_uniq<HoglakeSchemaEntry>(hoglake_catalog, schema_info, *this);
-		schemas.emplace(ns, std::move(entry));
+		schemas.emplace(ns, NewSchemaEntry(hoglake_catalog, *this, ns, remote[ns]));
 	}
 	schemas_loaded = true;
 }
 
-optional_ptr<HoglakeSchemaEntry> HoglakeTransaction::GetSchema(const string &name) {
+optional_ptr<HoglakeSchemaEntry> HoglakeTransaction::GetSchema(const string &name, bool probe) {
 	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
 	if (!schemas_loaded) {
 		LoadSchemas();
@@ -426,7 +470,21 @@ optional_ptr<HoglakeSchemaEntry> HoglakeTransaction::GetSchema(const string &nam
 	if (entry != schemas.end()) {
 		return entry->second.get();
 	}
-	return nullptr;
+	// not listed (a `*` caller lists no team schemas): ask once, and let
+	// the answer, never the name, say whether the schema is remote
+	auto probed = probed_schemas.find(name);
+	if (probed == probed_schemas.end()) {
+		if (!probe) {
+			return nullptr;
+		}
+		unique_ptr<HoglakeSchemaEntry> schema;
+		auto info = Api().TryGetNamespace(name);
+		if (info) {
+			schema = NewSchemaEntry(hoglake_catalog, *this, name, info->remote);
+		}
+		probed = probed_schemas.emplace(name, std::move(schema)).first;
+	}
+	return probed->second.get();
 }
 
 void HoglakeTransaction::ScanSchemas(const std::function<void(HoglakeSchemaEntry &)> &callback) {

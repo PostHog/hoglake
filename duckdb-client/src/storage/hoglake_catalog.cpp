@@ -62,7 +62,8 @@ optional_ptr<CatalogEntry> HoglakeCatalog::CreateSchema(CatalogTransaction trans
 	auto schema_name = info.SchemaName().GetIdentifierName();
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT ||
 	    info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT) {
-		auto existing = hoglake_transaction.GetSchema(schema_name);
+		// no get-namespace probe: CREATE SCHEMA keeps its request lines
+		auto existing = hoglake_transaction.GetSchema(schema_name, false);
 		if (existing) {
 			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 				return existing.get();
@@ -200,6 +201,7 @@ PhysicalOperator &HoglakeCatalog::PlanUpdate(ClientContext &context, PhysicalPla
 		}
 	}
 	auto &table = op.table.Cast<HoglakeTableEntry>();
+	table.RequireLocal("UPDATE");
 
 	// embedded delete sink over the delete chunk the update operator
 	// builds: [rowid, filename, file_index, file_row_number]

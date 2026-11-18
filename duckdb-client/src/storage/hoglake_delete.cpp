@@ -257,6 +257,7 @@ SourceResultType HoglakeDelete::GetDataInternal(ExecutionContext &context, DataC
 PhysicalOperator &HoglakeDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                             HoglakeTableEntry &table, PhysicalOperator &child_plan,
                                             vector<idx_t> row_id_indexes, bool wire_child) {
+	table.RequireLocal("DELETE from");
 	if (table.IsTravelPinned()) {
 		throw BinderException("hoglake: cannot DELETE from a table pinned with AT (VERSION/TIMESTAMP)");
 	}
