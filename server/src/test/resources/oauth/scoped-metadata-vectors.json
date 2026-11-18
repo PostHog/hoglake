@@ -1,0 +1,145 @@
+{
+  "description": [
+    "M3-A issuer-neutral containment checks from a verified caller.",
+    "Resolve token_fixture.resource relative to the test resources directory.",
+    "Use the named vector's exact token with its source issuer, JWKS, and verify_at.",
+    "The test supplies synthetic namespace containment, not persisted backend state.",
+    "The placement precondition establishes tenant-local isolation for these fixtures only.",
+    "An unmarked organization does not establish tenant-local isolation by itself.",
+    "The expected boolean describes Caller.mayUseContained, not an HTTP result.",
+    "These cases do not assert backend acceptance of scoped tokens.",
+    "Future endpoint tests must cover stored catalog identity, owner forwarding, and cold refusal."
+  ],
+  "token_fixture": {
+    "resource": "oauth/contract-vectors.json",
+    "vector": "scoped_routed"
+  },
+  "verification": {
+    "audience": "hoglake",
+    "predicate_fields": [
+      "team_id"
+    ]
+  },
+  "placement_precondition": {
+    "tenant_local_isolation_established": true,
+    "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+    "backend": "hoglite",
+    "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+    "tenant": "t_3fa8c1d9e2_1"
+  },
+  "expected_caller": {
+    "kind": "scoped",
+    "subject": "hlc_00112233445566778899aabb",
+    "actor": "hlc_00112233445566778899aabb",
+    "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+    "user": "0190a1b2-c3d4-7e5f-8a9b-000000000042",
+    "token_id": "00000000-0000-4000-8000-000000000007",
+    "client_name": "laptop",
+    "delegates": false
+  },
+  "cases": [
+    {
+      "name": "matching_grant",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "reports",
+      "containment": {
+        "field": "team_id",
+        "value": 42,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "scope": "read",
+      "expected_may_use_contained": true
+    },
+    {
+      "name": "matching_read_only_value",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "archive",
+      "containment": {
+        "field": "team_id",
+        "value": 7,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "scope": "read",
+      "expected_may_use_contained": true
+    },
+    {
+      "name": "different_field",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "reports",
+      "containment": {
+        "field": "project_id",
+        "value": 42,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "scope": "read",
+      "expected_may_use_contained": false
+    },
+    {
+      "name": "field_case_mismatch",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "reports",
+      "containment": {
+        "field": "TEAM_ID",
+        "value": 42,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "scope": "read",
+      "expected_may_use_contained": false
+    },
+    {
+      "name": "different_value_despite_namespace_name",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "team_42",
+      "containment": {
+        "field": "team_id",
+        "value": 43,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "scope": "read",
+      "expected_may_use_contained": false
+    },
+    {
+      "name": "different_catalog",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c",
+      "namespace": "reports",
+      "containment": {
+        "field": "team_id",
+        "value": 42,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "scope": "read",
+      "expected_may_use_contained": false
+    },
+    {
+      "name": "marked_organization_mismatch",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "reports",
+      "containment": {
+        "field": "team_id",
+        "value": 42,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c"
+      },
+      "scope": "read",
+      "expected_may_use_contained": false
+    },
+    {
+      "name": "unmarked_organization_with_tenant_local_isolation",
+      "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+      "namespace": "reports",
+      "containment": {
+        "field": "team_id",
+        "value": 42,
+        "org": null
+      },
+      "scope": "read",
+      "expected_may_use_contained": true
+    }
+  ],
+  "deferred": [
+    "Wildcard access to an uncontained namespace needs an endpoint containment gate.",
+    "Placement mismatch needs the backend operation that binds the target to verified routing.",
+    "Stored identity and namespace incarnation need a consistent backend read.",
+    "Owner forwarding needs independent verification of the exact JWT at the receiving owner.",
+    "Cold refusal needs proof that the operation does not acquire or create a tenant."
+  ]
+}
