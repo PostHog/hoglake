@@ -1008,7 +1008,12 @@ class ServedStreamIntegrationTest {
         val importsAt = importsHead()
         assertThat(importsAt).describedAs("the fixture needs two different heads").isGreaterThan(head)
         withHost { port, _ ->
-            assertThat(json(get(port, "$ns/tables/events", scoped()))["read_snapshot_id"].asLong()).isEqualTo(head)
+            // Two remote tables of one team_42, each pinned in the catalog that holds it.
+            for ((table, pin) in listOf("events" to head, "pageviews" to importsAt)) {
+                val served = json(get(port, "$ns/tables/$table", scoped()))
+                assertThat(served["remote"].isBoolean && served["remote"].asBoolean()).describedAs(table).isTrue()
+                assertThat(served["read_snapshot_id"].asLong()).describedAs(table).isEqualTo(pin)
+            }
             assertThat(json(get(port, "$ns/tables/events?snapshot=$head", scoped()))["read_snapshot_id"].asLong())
                 .isEqualTo(head)
             assertThat(ids(json(get(port, "$ns/tables/events/scan?snapshot=$head", scoped())))).containsExactly(1L, 2L)

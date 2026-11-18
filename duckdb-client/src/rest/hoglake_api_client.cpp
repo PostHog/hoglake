@@ -261,6 +261,19 @@ HoglakeTableInfo ParseTableInfo(yyjson_val *obj) {
 		info.has_snapshot_id = true;
 		info.snapshot_id = GetBoundedInt(obj, "snapshot_id", 0, 9223372036854775807LL);
 	}
+	auto read_snap = yyjson_obj_get(obj, "read_snapshot_id");
+	if (read_snap && !yyjson_is_null(read_snap)) {
+		info.has_read_snapshot_id = true;
+		info.read_snapshot_id = GetBoundedInt(obj, "read_snapshot_id", 0, 9223372036854775807LL);
+	}
+	info.remote = GetBool(obj, "remote");
+	return info;
+}
+
+HoglakeNamespaceInfo ParseNamespaceInfo(yyjson_val *obj) {
+	HoglakeNamespaceInfo info;
+	info.name = GetString(obj, "name");
+	info.remote = GetBool(obj, "remote");
 	return info;
 }
 
@@ -654,20 +667,32 @@ HoglakeCatalogInfo HoglakeApiClient::CreateCatalog(const string &data_path) {
 // Namespaces
 //===--------------------------------------------------------------------===//
 
-vector<string> HoglakeApiClient::ListNamespaces() {
+vector<HoglakeNamespaceInfo> HoglakeApiClient::ListNamespaces() {
 	auto response = Request("GET", CatalogPath("/namespaces"), string());
 	if (response.status != 200) {
 		ThrowFor(response, "list namespaces");
 	}
 	JsonDoc doc(response.body);
 	auto root = ParseArrayResponse(doc, "list namespaces");
-	vector<string> result;
+	vector<HoglakeNamespaceInfo> result;
 	size_t idx, max;
 	yyjson_val *ns;
 	yyjson_arr_foreach(root, idx, max, ns) {
-		result.push_back(GetString(ns, "name"));
+		result.push_back(ParseNamespaceInfo(ns));
 	}
 	return result;
+}
+
+unique_ptr<HoglakeNamespaceInfo> HoglakeApiClient::TryGetNamespace(const string &ns) {
+	auto response = Request("GET", CatalogPath("/namespaces/" + EncodeSegment(ns)), string());
+	if (response.status == 404) {
+		return nullptr;
+	}
+	if (response.status != 200) {
+		ThrowFor(response, "GET namespace \"" + ns + "\"");
+	}
+	JsonDoc doc(response.body);
+	return make_uniq<HoglakeNamespaceInfo>(ParseNamespaceInfo(ParseObjectResponse(doc, "GET namespace")));
 }
 
 void HoglakeApiClient::CreateNamespace(const string &name) {

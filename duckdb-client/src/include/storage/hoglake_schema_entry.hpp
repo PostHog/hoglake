@@ -31,7 +31,17 @@ class HoglakeTransaction;
 
 class HoglakeSchemaEntry : public SchemaCatalogEntry {
 public:
-	HoglakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, HoglakeTransaction &transaction);
+	HoglakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, HoglakeTransaction &transaction,
+	                   bool remote = false);
+
+	//! the server said "remote": true (listing or get-namespace): every
+	//! table pins its own snapshot and the schema is read-only
+	//! (DESIGN.md "Remote schemas")
+	bool IsRemote() const {
+		return remote;
+	}
+	//! Throw before any request when `what` would write a remote schema.
+	void RequireLocal(const char *what) const;
 
 public:
 	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override;
@@ -75,6 +85,7 @@ private:
 	                                 const HoglakeTravel &read_travel, bool writes_refused);
 
 private:
+	bool remote;
 	//! guards every member below (recursive: DDL paths re-enter lookup)
 	std::recursive_mutex entry_lock;
 	//! loaded table entries (exact server name -> entry)

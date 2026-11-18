@@ -176,11 +176,23 @@ static unique_ptr<GlobalTableFunctionState> TableInfoInit(ClientContext &context
 	auto &catalog = bind_data.catalog;
 	auto &transaction = HoglakeTransaction::Get(context, catalog);
 	auto result = make_uniq<HoglakeTableInfoState>();
-	for (auto &ns : catalog.Api().ListNamespaces()) {
+	for (auto &listed : catalog.Api().ListNamespaces()) {
+		auto &ns = listed.name;
+		if (listed.remote && catalog.AttachSnapshotVersion().IsValid()) {
+			// a version attach cannot read a remote schema (DESIGN.md
+			// "Remote schemas"), as in the schema scan
+			continue;
+		}
 		for (auto &summary : catalog.Api().ListTables(ns)) {
 			unique_ptr<HoglakeTableInfo> table;
 			try {
-				table = catalog.Api().TryGetTable(ns, summary.name, transaction.Travel());
+				// a remote schema: head or the attach timestamp, never this
+				// catalog's pin
+				auto travel = listed.remote ? transaction.RemoteFirstTravel(ns, nullptr) : transaction.Travel();
+				table = catalog.Api().TryGetTable(ns, summary.name, travel);
+				if (table) {
+					HoglakeTransaction::EntryTravel(ns, listed.remote, *table, travel);
+				}
 			} catch (CatalogException &) {
 				// unrepresentable wire metadata (e.g. out-of-range
 				// decimal params): skip the table, never break the

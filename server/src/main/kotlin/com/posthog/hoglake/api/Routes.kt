@@ -446,13 +446,15 @@ fun Application.installApiRoutes(
                                         binding.host.table(call, binding.name, call.namespace(), call.table())
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
+                                    // The one table answer that says remote: its
+                                    // read_snapshot_id is the holding catalog's.
                                     is CatalogBinding.Served ->
                                         call.respond(
                                             binding.reader.table(
                                                 call.table(),
                                                 call.longQuery("snapshot"),
                                                 call.instantQuery("at_timestamp"),
-                                            ).toDto(),
+                                            ).toDto().copy(remote = true),
                                         )
                                     is CatalogBinding.Local ->
                                         call.respond(
