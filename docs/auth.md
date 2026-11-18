@@ -174,13 +174,44 @@ on its own. hoglake forwards the current request's verified JWT to that
 backend unchanged and nothing else: no credential of hoglake's own, and no
 caller credential shared across requests. The backend verifies it offline
 against the same JWKS, requires its own audience to be present, and binds the
-request to the backend and tenant the `rtg` claim names. It refuses `scoped`
-tokens and any `prd` constraint, because raw SQL cannot preserve them.
+request to the backend and tenant the `rtg` claim names.
+The raw SQL routes refuse `scoped` tokens and any `prd` constraint.
+Raw SQL cannot preserve that authority.
 Ordinary reads and writes never provision a tenant or bootstrap a schema
 there; only a catalog-bound `operator` request provisions or deletes. An
 issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
+
+#### Typed scoped namespace read
+
+This operation is disabled by default.
+An operator can configure one exact local namespace binding.
+The binding names the catalog, backend ID, routed tenant, and namespace.
+It confirms tenant isolation and support at every eligible owner.
+It requires enforced authentication with mounted public JWKS.
+It cannot coexist with Remote Schema or served namespace configuration.
+
+The caller uses `GET /v1/catalogs/{catalog}/namespaces/{namespace}`.
+The request has no body or query parameters.
+The server sends the original verified bearer to the configured backend.
+The backend operation is `GET /v1/t/{tenant}/metadata/v1/catalogs/{catalog}/namespaces/{namespace}`.
+The backend verifies that bearer independently.
+These routes do not accept embedded storage credentials.
+
+The existing owner reads the catalog identity and live namespace in one read view.
+It requires catalog READ authority and permission for the stored containment field and value.
+The namespace name grants no authority.
+A successful JSON response contains `namespace_id`, `name`, and `containment`.
+The `containment` object contains `field` and `value`.
+An absent or unauthorized namespace returns `404` with `{"code":"not_found"}` on the backend route.
+
+The backend request target and response each have a 4 KiB limit.
+The compact JWT has a 64 KiB limit.
+The server uses at most 5 seconds for the backend call and response validation.
+A backend may forward once to a configured live owner.
+An unsupported backend response does not trigger an SQL fallback.
+This operation never acquires a tenant or initializes a schema.
 
 ### Session profile with embedded storage credentials
 
