@@ -188,7 +188,8 @@ class CatalogStoreSelector(
                 val routing = call.hoglakeAuth.callerOrNull?.routing
                 val routed = routing != null && routing.catalog == catalog
                 val store = if (routed) routed(call, checkNotNull(routing)) else fallback(catalog)
-                pathSchema(call, catalog, store) ?: CatalogBinding.Local(store)
+                val hogliteVerified = routed && checkNotNull(routing).backend == BackendKind.HOGLITE
+                pathSchema(call, catalog, store, hogliteVerified) ?: CatalogBinding.Local(store)
             }
         val handed = asView(call, catalog, binding)
         call.attributes.put(boundCatalog, catalog to handed)
@@ -328,19 +329,24 @@ class CatalogStoreSelector(
      * Host for anyone else.
      *
      * A remote schema is a namespace of a catalog this server holds, so
-     * the catalog must exist in [store]: one read, made only for a caller
-     * the token check has passed, once per request (the binding is cached).
-     * A catalog nobody holds is the store's own 404, and nothing is sent.
+     * the catalog must exist. The store proves it with one read, made only
+     * for a caller the token check has passed, once per request (the binding
+     * is cached); for a Hoglite placement ([hogliteVerified]) the verified
+     * `rtg` proves it instead, because Hoglite refuses the caller's scoped
+     * token on that read. A catalog nobody holds on PostgreSQL is still the
+     * store's own 404. The entitlement check runs first, so nothing is sent
+     * to the Host for a caller the token check refuses.
      */
     private fun pathSchema(
         call: ApplicationCall,
         catalog: String,
         store: CatalogStore,
+        hogliteVerified: Boolean,
     ): CatalogBinding.RemoteSchema? {
         val (schema, namespace) = namedSchema(call, catalog) ?: return null
         val name = schema.match.schemaFor(namespace)
         call.requireRemoteSchemaEntitlement(catalog, name, namespace, schema.remoteNameFor(name), schema.name)
-        store.getCatalog(catalog)
+        if (!hogliteVerified) store.getCatalog(catalog)
         return CatalogBinding.RemoteSchema(catalog, name, schema.host, schema.name)
     }
 
