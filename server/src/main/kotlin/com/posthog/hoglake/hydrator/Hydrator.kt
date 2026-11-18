@@ -81,9 +81,10 @@ import java.time.Instant
  * Failure taxonomy: TRANSIENT object-store failures (throttle/5xx,
  * connection, timeout — anything but a definitive 404/NoSuchKey) leave
  * the file 'pending' for the next sweep. The log line and
- * `hoglake_hydrator_transient_errors_total` are emitted only after the
- * sweep commits, so a rolled-back sweep does not count the retry twice
- * (#488). STRUCTURAL failures (object missing, unparseable footer,
+ * `hoglake_hydrator_transient_errors_total` are emitted immediately: they
+ * record an object-store event that happened whether or not the sweep
+ * commits, so a rolled-back sweep still shows the throttle storm (#488).
+ * STRUCTURAL failures (object missing, unparseable footer,
  * registration mismatch, over-cap) mark it 'failed'. 'failed' is
  * terminal to the sweep but operator-recoverable: [rehydrateFailed]
  * (POST /maintenance/rehydrate) flips failed rows back to pending.
