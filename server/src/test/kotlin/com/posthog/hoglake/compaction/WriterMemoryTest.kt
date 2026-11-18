@@ -22,6 +22,7 @@ import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Random
+import java.util.concurrent.TimeUnit
 
 class WriterMemoryTest {
     @TempDir
@@ -397,6 +398,37 @@ class WriterMemoryTest {
 
     @Test
     fun `large legal values rewrite with room and refuse cleanly without writer room`() {
+        // The merge keeps three 24 MiB values live across readers, keys, and writer buffers.
+        // Run this fixture outside the shared 512 MiB worker.
+        val log = tmp.resolve("large-values.log")
+        val process =
+            ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx2g",
+                "-XX:+UseG1GC",
+                "-ea",
+                "-cp",
+                System.getProperty("java.class.path"),
+                WriterMemoryTest::class.java.name,
+                tmp.toString(),
+            ).redirectErrorStream(true).redirectOutput(log.toFile()).start()
+        val finished =
+            try {
+                process.waitFor(180, TimeUnit.SECONDS)
+            } finally {
+                if (process.isAlive) {
+                    process.destroyForcibly()
+                    check(process.waitFor(30, TimeUnit.SECONDS)) { "The large-value probe does not stop." }
+                }
+            }
+        val text = Files.readString(log)
+        assertThat(finished).describedAs(text).isTrue()
+        assertThat(process.exitValue()).describedAs(text).isZero()
+        assertThat(text).doesNotContain("OutOfMemoryError")
+        assertThat(text).contains("WRITER_MEMORY_OK")
+    }
+
+    private fun verifyLargeValues() {
         val source = tmp.resolve("source.parquet")
         ExampleParquetWriter.builder(LocalOutputFile(source))
             .withType(schema)
@@ -458,5 +490,13 @@ class WriterMemoryTest {
             assertThat(records).isEqualTo(3)
         }
         Files.list(spills).use { assertThat(it.toList()).isEmpty() }
+    }
+
+    companion object {
+        @JvmStatic
+        fun main(args: Array<String>) {
+            WriterMemoryTest().apply { tmp = Path.of(args.single()) }.verifyLargeValues()
+            println("WRITER_MEMORY_OK")
+        }
     }
 }
