@@ -1,0 +1,53 @@
+# Sampo configuration (https://github.com/bruits/sampo/blob/main/crates/sampo/README.md).
+#
+# Two packages release from this repository:
+#
+#   hoglake                  the release train: server, trino harness, webui,
+#                            OpenAPI spec, pyhoglake and hedgerow, one version,
+#                            tagged vX.Y.Z (+ pyhoglake-vX.Y.Z for PyPI). Its
+#                            manifest is the root pyproject.toml; its changelog
+#                            is the root CHANGELOG.md.
+#   pyhoglake-variant-codec  pyhoglake's Rust codec, its own version, tagged
+#                            pyhoglake-variant-codec-vX.Y.Z.
+#
+# Sampo writes those two manifests and refreshes uv.lock. The nine other
+# train strings (gradle x2, the spec, webui package.json and the lock's two
+# records, the pyhoglake and hedgerow pyproject) and the codec pin in pyhoglake's
+# `variant-codec` extra follow through ci/release_versions.py, which
+# release.yml runs after `sampo release`. pyhoglake and hedgerow are
+# therefore IGNORED here even though they are uv workspace members: they
+# never carry their own version or changelog, and ignoring them keeps the
+# exact codec pin out of Sampo's constraint check (Sampo treats a PEP 440
+# `==` pin as a violated range, which is fatal inside a fixed group).
+version = 1
+
+[git]
+default_branch = "main"
+# Tags are made by release.yml, not `sampo publish`; the formats there are
+# vX.Y.Z, pyhoglake-vX.Y.Z and pyhoglake-variant-codec-vX.Y.Z.
+
+[github]
+repository = "PostHog/hoglake"
+
+[changesets]
+# Optional section headings for the hoglake changelog, written as
+# `hoglake: minor (Server)`. Without one the entry lands under the bump
+# level ("Minor changes").
+tags = ["Server", "webui", "pyhoglake", "hedgerow", "millrace", "Operators", "Dependencies", "CI"]
+
+[changelog]
+# show_commit_hash = true (default)
+# show_acknowledgments = true (default)
+# Nothing bumps a package here through a dependency, so this only matters
+# if that changes: one heading per run of dependency-only releases.
+automatic_entries = "collapse"
+
+[packages]
+ignore = [
+  # Followers of the train version (see the header).
+  "pypi/pyhoglake",
+  "pypi/hedgerow",
+  # Deployed by image, never versioned or published.
+  "pypi/millrace",
+  "pypi/hoglake-bench",
+]

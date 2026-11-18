@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "hedgerow",
+    "hoglake",
     "hoglake-bench",
     "millrace",
     "pyhoglake",
@@ -332,7 +333,7 @@ wheels = [
 
 [[package]]
 name = "hedgerow"
-version = "1.4.13.dev0"
+version = "1.4.12"
 source = { editable = "hedgerow" }
 dependencies = [
     { name = "duckdb" },
@@ -371,6 +372,11 @@ dev = [
     { name = "pytest-httpx", specifier = ">=0.30" },
     { name = "ruff", specifier = ">=0.17.3" },
 ]
+
+[[package]]
+name = "hoglake"
+version = "1.4.12"
+source = { virtual = "." }
 
 [[package]]
 name = "hoglake-bench"
@@ -1118,7 +1124,7 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.4.13.dev0"
+version = "1.4.12"
 source = { editable = "pyhoglake" }
 dependencies = [
     { name = "httpx" },

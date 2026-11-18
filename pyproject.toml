@@ -22,3 +22,18 @@
 # (pyhoglake's `variant-codec` group) needs Rust.
 [tool.uv.workspace]
 members = ["pyhoglake", "hedgerow", "bench", "millrace", "pyhoglake-variant-codec"]
+
+# The [project] table below does NOT make the root a package: with no
+# [build-system] uv treats it as a virtual project (locked as
+# `source = { virtual = "." }`, never built or installed), so the sync
+# behaviour above is unchanged. It exists so that Sampo (.sampo/config.toml)
+# has a manifest for `hoglake`, the release train: the one version of the
+# server, trino harness, webui, OpenAPI spec, pyhoglake and hedgerow.
+# `sampo release` bumps THIS version and writes CHANGELOG.md beside it;
+# ci/release_versions.py then copies it into the other nine strings. Edit
+# it only through a changeset (CONTRIBUTING.md § Adding a changeset).
+[project]
+name = "hoglake"
+version = "1.4.12"
+requires-python = ">=3.12"
+classifiers = ["Private :: Do Not Upload"]
