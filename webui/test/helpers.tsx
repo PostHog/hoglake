@@ -35,6 +35,11 @@ export function mockFetch(handler: FetchHandler) {
     if (url === "/healthz") return new Response("ok", { status: 200 });
     // Topbar instance badge; unnamed by default so page tests are unaffected.
     if (url === "/v1/info") return jsonResponse({});
+    // get-namespace, which classifies a namespace before its pages read
+    // it: local unless the handler answers otherwise.
+    const ns = /^\/v1\/catalogs\/[^/?]+\/namespaces\/([^/?]+)$/.exec(url);
+    if (ns && (init?.method ?? "GET") === "GET")
+      return jsonResponse({ name: decodeURIComponent(ns[1]) });
     throw new Error(`Unhandled fetch: ${init?.method ?? "GET"} ${url}`);
   });
   vi.stubGlobal("fetch", fn);

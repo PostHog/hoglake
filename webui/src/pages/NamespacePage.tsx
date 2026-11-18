@@ -7,8 +7,10 @@ import { ClampedText } from "../components/ClampedText";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
 import { SnapshotId } from "../components/SnapshotId";
+import { RemoteBadge, RemoteLine } from "../components/badges";
 import { formatBytes, formatCount } from "../lib/format";
 import { columnNameError, identifierError } from "../lib/names";
+import { useSchemaKind } from "../lib/remote";
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
@@ -213,6 +215,7 @@ export function NamespacePage() {
     queryFn: () => listTables(catalog!, namespace!),
     enabled,
   });
+  const kind = useSchemaKind(catalog, namespace);
   // null = the server's order (name).
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const onSort = (key: SortKey) => setSort((prev) => nextSort(prev, key));
@@ -223,7 +226,10 @@ export function NamespacePage() {
     <section>
       <h2>
         {namespace} <span className="subtle">namespace</span>
+        {kind.remote && <> <RemoteBadge /></>}
       </h2>
+      {kind.remote && <RemoteLine />}
+      {kind.error && !kind.remote && !isError && <ErrorBox error={kind.error} />}
       {isError ? (
         <ErrorBox error={error} />
       ) : (
@@ -307,6 +313,10 @@ export function NamespacePage() {
                   <td className="num mono">
                     {t.earliest_snapshot_id === undefined ? (
                       "—"
+                    ) : !kind.local ? (
+                      // A remote schema's ids belong to the catalog that
+                      // holds the table: never looked up in this one.
+                      t.earliest_snapshot_id
                     ) : (
                       <SnapshotId
                         catalog={catalog}
@@ -330,7 +340,7 @@ export function NamespacePage() {
           )}
         </table>
       )}
-      <CreateTableForm catalog={catalog} namespace={namespace} />
+      {kind.local && <CreateTableForm catalog={catalog} namespace={namespace} />}
     </section>
   );
 }
