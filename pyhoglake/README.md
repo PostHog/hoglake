@@ -108,6 +108,14 @@ writes from another process, pass `catalog.refresh().head_snapshot_id`.
 Calling `info()` or passing `snapshot=None` does not clear the DDL snapshot.
 A new handle from `ns.table(name)` has no DDL snapshot and reads the current head.
 
+A remote schema (`ns.remote`, from the server's `remote: true`) is served by
+another Hoglake and is read-only: every write raises before any upload or
+request. Each of its tables is pinned to the `read_snapshot_id` it loaded
+with, a snapshot of its own catalog, and `info()`, `files()` and `scan_plan()`
+read at that pin; a new `ns.table(name)` takes a new pin. `at_timestamp`
+travels, resolved in the table's own catalog. `snapshot=` and `changes()`
+take ids of this catalog and raise `ValueError`.
+
 More surface:
 
 ```python

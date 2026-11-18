@@ -16,7 +16,7 @@ import uuid as _uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final, Literal, Self
+from typing import Any, Final, Literal, NoReturn, Self
 from urllib.parse import quote
 
 import httpx
@@ -42,6 +42,7 @@ from .errors import (
     HoglakeError,
     IdlessFilesPresentError,
     IncarnationChangedError,
+    MalformedResponseError,
     NotFoundError,
     ObjectPrefixViolationError,
     OffsetRegressionError,
@@ -701,6 +702,20 @@ def _ts_param(value: datetime | str | None) -> str | None:
     return value
 
 
+def _remote_snapshot_refused(where: str) -> ValueError:
+    return ValueError(
+        f"snapshot refused for {where}: in a remote schema a snapshot id of "
+        "this catalog means nothing; pass at_timestamp to travel in time"
+    )
+
+
+def _refuse_remote_write(where: str, what: str) -> NoReturn:
+    """The one guard every write entry of a remote schema calls, before any
+    upload or request: the server would refuse it (403), but only after
+    the upload."""
+    raise HoglakeError(f"{what} on {where} refused: a remote schema is read-only")
+
+
 def _travel_params(
     snapshot: int | None, at_timestamp: datetime | str | None
 ) -> dict[str, Any]:
@@ -998,16 +1013,27 @@ class Catalog:
             self._path("/namespaces"),
             json={"name": name, **_operation_metadata(author, message)},
         )
-        return Namespace(self, name)
+        return Namespace(self, name, remote=False)
 
     def namespace(self, name: str) -> Namespace:
-        # No per-namespace GET in the API; existence-check via the listing.
-        if name not in self.list_namespaces():
+        """The namespace ``name``, classed local or remote by the server.
+
+        The listing is checked first; its entry says ``remote: true`` for a
+        remote schema. A name it does not list (a ``*`` caller lists no
+        team schemas but may open one) is asked of the namespace itself,
+        with no snapshot. Raises :class:`NotFoundError` when neither has it.
+        """
+        for entry in self._client._request("GET", self._path("/namespaces")):
+            if entry["name"] == name:
+                return Namespace(self, name, remote=entry.get("remote") is True)
+        try:
+            body = self._client._request("GET", self._path(f"/namespaces/{_seg(name)}"))
+        except NotFoundError:
             raise NotFoundError(
                 f"namespace {name!r} not found in catalog {self.name!r}",
                 status_code=404,
-            )
-        return Namespace(self, name)
+            ) from None
+        return Namespace(self, name, remote=body.get("remote") is True)
 
     def list_namespaces(
         self,
@@ -1191,6 +1217,8 @@ class Catalog:
         ``Namespace.table()``, which reads anyway. Pass it whenever you
         can; see ``Table.invalidate``.
         """
+        if table is not None:
+            table._refuse_if_remote("commit_prepared")
         if not payload.get("idempotency_key"):
             raise ValueError("prepared commits require an idempotency_key")
         _uuid.UUID(payload["idempotency_key"])
@@ -1327,9 +1355,33 @@ class Catalog:
 
 
 class Namespace:
-    def __init__(self, catalog: Catalog, name: str) -> None:
+    def __init__(
+        self, catalog: Catalog, name: str, *, remote: bool | None = None
+    ) -> None:
         self._catalog = catalog
         self.name = name
+        # None = not known yet; see `remote`.
+        self._remote = remote
+
+    @property
+    def remote(self) -> bool:
+        """True for a remote schema: one that another Hoglake serves
+        through this catalog's server. It is read-only, and each of its
+        tables reads at its own snapshot (:attr:`Table.remote`).
+
+        The server says so, with ``remote: true`` in the listing entry or
+        in the namespace's own answer; the name is never read for it.
+        :meth:`Catalog.namespace` knows it. A ``Namespace`` built directly
+        asks the server once, here, and keeps the answer.
+        """
+        if self._remote is None:
+            body = self._catalog._client._request("GET", self._path())
+            self._remote = body.get("remote") is True
+        return self._remote
+
+    def _refuse_if_remote(self, what: str) -> None:
+        if self._remote:
+            _refuse_remote_write(f"namespace {self.name!r}", what)
 
     def _path(self, suffix: str = "") -> str:
         return self._catalog._path(f"/namespaces/{_seg(self.name)}{suffix}")
@@ -1341,9 +1393,17 @@ class Namespace:
         self, *, author: str, message: str, expected_namespace_id: int | None = None
     ) -> CommitResult:
         """Drop an empty namespace, guarded by its identity. Do not retry an unknown outcome."""
+        self._refuse_if_remote("drop")
         params: dict[str, Any] = _operation_metadata(author, message, required=True)
         if expected_namespace_id is None:
             namespace = self._catalog._client._request("GET", self._path())
+            if namespace.get("remote") is True:
+                _refuse_remote_write(f"namespace {self.name!r}", "drop")
+            if namespace.get("namespace_id") is None:
+                raise MalformedResponseError(
+                    f"namespace {self.name!r}: the server's answer has no "
+                    "namespace_id; pass expected_namespace_id"
+                )
             expected_namespace_id = namespace["namespace_id"]
         params["expected_namespace_id"] = expected_namespace_id
         body = self._catalog._client._request(
@@ -1390,6 +1450,7 @@ class Namespace:
         empty spec. A writer that keys state by the spec (millrace)
         must require the capability instead (``catalog.info.capabilities``).
         """
+        self._refuse_if_remote("create_table")
         _check_reserved_columns(schema)
         columns = schema_to_column_defs(schema)
         field_ids = column_def_field_ids(columns)
@@ -1482,8 +1543,11 @@ class Namespace:
 
         Every field of every row answers for that one snapshot. A pinned
         listing includes a table dropped after the pin and resolves this
-        namespace at the pin too.
+        namespace at the pin too. A remote schema refuses ``snapshot``,
+        an id of this catalog, and takes ``at_timestamp``.
         """
+        if snapshot is not None and self._remote:
+            raise _remote_snapshot_refused(f"namespace {self.name!r}")
         body = self._catalog._client._request(
             "GET",
             self._path("/tables"),
@@ -1502,6 +1566,7 @@ class Namespace:
         author: str | None = None,
         message: str | None = None,
     ) -> View:
+        self._refuse_if_remote("create_view")
         body = self._catalog._client._request(
             "POST",
             self._path("/views"),
@@ -1561,6 +1626,25 @@ class Table:
     def __init__(self, namespace: Namespace, info: TableInfo) -> None:
         self._namespace = namespace
         self._info = info
+        # The class comes from the namespace when the server has said it
+        # (Catalog.namespace), else from the table answer's own flag; a
+        # remote schema's tables are all remote (D11).
+        if namespace._remote is False and info.remote is True:
+            raise MalformedResponseError(
+                f"table {namespace.name}.{info.name} answered as remote in "
+                "a namespace the server classed as local"
+            )
+        self._remote = namespace._remote is True or info.remote is True
+        # A remote table's one pin: its own catalog's snapshot at load.
+        self._pin: int | None = None
+        if self._remote:
+            if info.read_snapshot_id is None:
+                raise MalformedResponseError(
+                    f"table {namespace.name}.{info.name} is remote and its "
+                    "answer has no read_snapshot_id to pin"
+                )
+            self._pin = info.read_snapshot_id
+            namespace._remote = True
         # The freshest snapshot this client's own DDL made (create/alter),
         # kept SEPARATELY from _info: a later info() refresh replaces _info
         # from a read response that carries no snapshot_id, and must not
@@ -1604,6 +1688,26 @@ class Table:
         return self._ddl_snapshot_id
 
     @property
+    def remote(self) -> bool:
+        """True when this table is in a remote schema (:attr:`Namespace.remote`).
+
+        A remote table is pinned to the ``read_snapshot_id`` it was loaded
+        with, a snapshot of its own catalog: ``info()``, ``files()`` and
+        ``scan_plan()`` with no travel send that pin, so the definition and
+        the file list come from one snapshot. A new ``ns.table(name)`` is
+        the only way to take a new pin. ``at_timestamp`` travels, and the
+        server resolves it against the table's own catalog; ``snapshot=``
+        and ``changes()`` take ids of this catalog and raise ``ValueError``.
+        Every write raises :class:`HoglakeError` before any upload or
+        request.
+        """
+        return self._remote
+
+    def _refuse_if_remote(self, what: str) -> None:
+        if self._remote:
+            _refuse_remote_write(f"table {self.namespace}.{self.name}", what)
+
+    @property
     def columns(self):
         return self._info.columns
 
@@ -1641,7 +1745,14 @@ class Table:
         must see that DDL, not race a head read that could miss or
         overshoot it. With no pin (a table this client only ever read),
         it is None and the read goes to head as before.
+
+        A remote table refuses ``snapshot`` (an id of this catalog), lets
+        ``at_timestamp`` through alone, and otherwise reads at its pin.
         """
+        if self._remote:
+            if snapshot is not None:
+                raise _remote_snapshot_refused(f"table {self.namespace}.{self.name}")
+            return None if at_timestamp is not None else self._pin
         if snapshot is not None or at_timestamp is not None:
             return snapshot
         return self._ddl_snapshot_id
@@ -1666,7 +1777,12 @@ class Table:
         Sending the parameter is safe against a server that predates it:
         unknown query parameters are ignored and the totals come back as
         before.
+
+        A remote table reads at its pin, as :meth:`scan_plan` does, and
+        never adopts the answer: it never reads at head.
         """
+        if self._remote:
+            snapshot = self._read_snapshot(snapshot, at_timestamp)
         params = _travel_params(snapshot, at_timestamp)
         if not totals:
             params["totals"] = "false"
@@ -1760,7 +1876,14 @@ class Table:
         Raises :class:`ExpiredError` (410) when part of the range has been
         expired — reconcile from a full scan. A window crossing TRUNCATE raises
         :class:`ReconciliationRequiredError` (409); reconcile before checkpointing.
+        A remote table raises ``ValueError``: the range is in ids of this
+        catalog.
         """
+        if self._remote:
+            raise ValueError(
+                f"changes() refused for table {self.namespace}.{self.name}: in "
+                "a remote schema the snapshot ids of this catalog mean nothing"
+            )
         body = self._namespace._catalog._client._request(
             "GET",
             self._path("/changes"),
@@ -1802,6 +1925,7 @@ class Table:
         column. :func:`pyhoglake.ops.add_column` refuses it before the
         round trip; a hand-built op meets the server's refusal.
         """
+        self._refuse_if_remote("alter")
         body = self._namespace._catalog._client._request(
             "POST",
             self._path("/alter"),
@@ -1828,6 +1952,7 @@ class Table:
         return self._info
 
     def drop(self, *, author: str, message: str) -> CommitResult:
+        self._refuse_if_remote("drop")
         body = self._namespace._catalog._client._request(
             "DELETE",
             self._path(),
@@ -1845,6 +1970,7 @@ class Table:
 
     def truncate(self, *, author: str, message: str) -> CommitResult:
         """Clear live rows without changing table identity. Do not retry an unknown outcome."""
+        self._refuse_if_remote("truncate")
         body = self._namespace._catalog._client._request(
             "POST",
             self._path("/truncate"),
@@ -1978,6 +2104,7 @@ class Table:
         is checked before any request and ignored on a table without the
         option.
         """
+        self._refuse_if_remote("append")
         catalog = self._namespace._catalog
         client = catalog._client
 
@@ -2474,6 +2601,9 @@ class Table:
         """
         uploaded: list[str] = []
         try:
+            self._refuse_if_remote(
+                "prepare_append_tables" if from_tables else "prepare_append_files"
+            )
             _uuid.UUID(idempotency_key)
             # Pure, so it runs before the reads: a bad codec costs no
             # request. Only the Arrow-table path encodes; a prepared
