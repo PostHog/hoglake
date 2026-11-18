@@ -94,6 +94,7 @@ class RemoteSchemaClientTest {
     private val pair = TestTokens.keyPair()
     private val mapper = wireObjectMapper()
     private val hogliteId = UUID.fromString("5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
+    private val postgresId = UUID.fromString("7b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
     private val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
     private val schema = "/v1/catalogs/lake/namespaces/posthog"
     private val relayed = listOf(schema, "$schema/tables", "$schema/tables/events", "$schema/tables/events/scan")
@@ -234,17 +235,20 @@ class RemoteSchemaClientTest {
         val budget = if (engine.endsWith(":9")) 1 else 5_000
         val backend = """"id":"$hogliteId","kind":"hoglite","url":"$engine","retry_budget_ms":$budget"""
         Files.writeString(file, """{"backends":[{$backend}]}""")
-        return Config(backendsFile = file.toString(), defaultBackend = defaultBackend, authMode = "enforce")
+        return Config(
+            backendsFile = file.toString(),
+            defaultBackend = defaultBackend,
+            // A server with no PostgreSQL catalogs must not name a PostgreSQL backend, which needs a connection.
+            postgresBackendId = if (defaultBackend == "none") "" else postgresId.toString(),
+            authMode = "enforce",
+        )
     }
 
     /**
-     * A hoglite engine that answers the one read a remote schema needs of it,
-     * the catalog's metadata row, and counts every request it gets. With
-     * [holds] false it has no such row: the catalog does not exist there.
+     * A hoglite engine that answers the catalog's metadata row and counts
+     * every request it gets.
      */
-    private inner class StubEngine(
-        private val holds: Boolean = true,
-    ) : AutoCloseable {
+    private inner class StubEngine : AutoCloseable {
         val requests = java.util.concurrent.atomic.AtomicInteger()
         private val server =
             HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
@@ -253,8 +257,7 @@ class RemoteSchemaClientTest {
                     val sql = mapper.readTree(exchange.requestBody.readBytes()).path("sql").asText()
                     if (sql.startsWith("SELECT name, data_path,")) {
                         val row = """["lake","s3://bucket/lake",3,2,0,null,null,0]"""
-                        val rows = if (holds) "[$row]" else "[]"
-                        exchange.json(200, """{"cols":[],"rows":$rows,"affected":0}""")
+                        exchange.json(200, """{"cols":[],"rows":[$row],"affected":0}""")
                     } else {
                         exchange.sendResponseHeaders(503, -1)
                     }
@@ -464,16 +467,16 @@ class RemoteSchemaClientTest {
                     }
                     assertThat(host.seen.map { it.rawPath }).isEqualTo(relayed + relayed)
                 }
-                // Each relayed request asked its catalog's own backend one thing: that the catalog exists.
+                // Only the unrouted write token asks PostgreSQL; the verified rtg proves a hoglite catalog, so the
+                // engine is asked nothing.
                 assertThat(calls.map { it.first to it.second }).isEqualTo(List(4) { "getCatalog" to listOf("lake") })
-                assertThat(engine.requests.get()).isEqualTo(4)
+                assertThat(engine.requests.get()).isZero()
             }
         }
     }
 
     @Test
     fun `a remote schema is relayed only in a catalog this server holds`() {
-        val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
         StubHost().use { host ->
             // PostgreSQL: the token names a catalog that does not exist, with the claim.
             client(host) {
@@ -485,6 +488,15 @@ class RemoteSchemaClientTest {
                     assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
                     assertThat(response.bodyAsText()).describedAs(path).isEqualTo(listing.bodyAsText())
                 }
+                // A Postgres rtg is no proof: the catalog is still read, and a missing one is the store's 404.
+                calls.clear()
+                val postgresRtg = """{"b":"postgres","be":"$postgresId"}"""
+                val path = relayed[1].replace("/lake/", "/ghost/")
+                val response = get(path, scoped(cat = """{"ghost":["read"]}""", rtg = postgresRtg))
+                assertThat(response.status).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(calls.map { it.first to it.second }).containsExactly("getCatalog" to listOf("ghost"))
+                assertThat(host.seen).isEmpty()
+                calls.clear()
                 // A write there is the missing catalog too, not the schema's read-only answer.
                 val write = send(HttpMethod.Post, "/v1/catalogs/ghost/namespaces/posthog/tables", ghost)
                 assertThat(write.status).isEqualTo(HttpStatusCode.NotFound)
@@ -501,17 +513,6 @@ class RemoteSchemaClientTest {
                 // A request that names no remote schema is not asked whether its catalog exists.
                 get("/v1/catalogs/lake/namespaces/team_7/tables", operator())
                 assertThat(calls.map { it.first }).containsExactly("listTables")
-            }
-            // hoglite: the engine the token routes to has no such catalog.
-            StubEngine(holds = false).use { engine ->
-                client(host, engine = engine.url) {
-                    for (path in relayed) {
-                        val response = get(path, scoped(rtg = routed))
-                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
-                        assertThat(response.bodyAsText()).describedAs(path).contains("catalog 'lake'")
-                    }
-                }
-                assertThat(engine.requests.get()).isEqualTo(relayed.size)
             }
             // A server with no PostgreSQL catalogs, and a token that routes nowhere: no backend holds it.
             client(host, defaultBackend = "none") {
@@ -1074,9 +1075,8 @@ class RemoteSchemaClientTest {
                 }
                 assertThat(host.seen.map { it.rawPath }).containsExactly("$schema/tables")
             }
-            // The engine was asked once for each of the reader's two requests whose path names the
-            // schema, whether the catalog exists, and nothing else: no namespace, table or commit.
-            assertThat(engine.requests.get()).isEqualTo(2)
+            // The verified rtg proves the catalog, so the engine was asked nothing at all.
+            assertThat(engine.requests.get()).isZero()
             assertThat(calls).isEmpty()
         } finally {
             engine.close()
@@ -1339,6 +1339,83 @@ class RemoteSchemaClientTest {
 
     private fun teamNamed() =
         calls.filter { (_, args) -> args.any { (it as? String)?.let(TeamNamespaces::hasShape) == true } }
+
+    /** A hoglite engine that refuses every request, as a real one does a scoped token on its SQL routes. */
+    private class RefusingEngine : AutoCloseable {
+        val requests = CopyOnWriteArrayList<String>()
+        private val server =
+            HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+                createContext("/") { exchange ->
+                    requests += "${exchange.requestMethod} ${exchange.requestURI}"
+                    exchange.requestBody.readBytes()
+                    val bytes = """{"error":"forbidden"}""".toByteArray()
+                    exchange.responseHeaders.add("Content-Type", "application/json")
+                    exchange.sendResponseHeaders(403, bytes.size.toLong())
+                    exchange.responseBody.use { it.write(bytes) }
+                    exchange.close()
+                }
+                start()
+            }
+        val url: String get() = "http://127.0.0.1:${server.address.port}"
+
+        override fun close() = server.stop(0)
+    }
+
+    @Test
+    fun `a team schema on a hoglite-placed catalog is relayed and the refusing engine is never asked`() {
+        val rtg = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
+
+        fun token(catalog: String = "lake") =
+            TestTokens.mint(
+                pair,
+                TestTokens.scopedClaims(
+                    prd = """{"team_id":{"9400":"read"}}""",
+                    catalogs = """{"$catalog":["read"]}""",
+                    extra = TestTokens.sessionProfile(catalog, """{"team":["read"]}""") + ""","rtg":$rtg""",
+                ),
+            )
+        RefusingEngine().use { engine ->
+            StubHost().use { host ->
+                host.answer = { it.json(200, """{"name":"team_9400"}""") }
+                client(host, matches = family, engine = engine.url) {
+                    val jwt = token()
+                    for (path in teamRoutes("team_9400")) {
+                        val response = get(path, jwt)
+                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.OK)
+                        assertThat(response.bodyAsText()).describedAs(path).isEqualTo("""{"name":"team_9400"}""")
+                    }
+                    assertThat(host.seen.map { it.rawPath }).isEqualTo(teamRoutes("team_9400"))
+                    for (seen in host.seen) assertThat(seen.headers["authorization"]).containsExactly("Bearer $jwt")
+                    host.seen.clear()
+
+                    // What the engine holds is unobservable on this path: nothing asks it, so there is no separate
+                    // "catalog not held" case, and a placed catalog it lost is the Host's to answer.
+                    // A team the token does not hold is the remote schema's 404, and nothing is sent anywhere.
+                    for (path in teamRoutes("team_2")) {
+                        val response = get(path, jwt)
+                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                        assertThat(response.bodyAsText()).contains("namespace 'team_2' in catalog 'lake'")
+                    }
+                    // A token whose cat does not name the catalog gets the catalog's 404.
+                    for (path in teamRoutes("team_9400")) {
+                        val response = get(path, token("other"))
+                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
+                        assertThat(response.bodyAsText()).describedAs(path).contains("catalog 'lake'")
+                    }
+                    assertThat(host.seen).isEmpty()
+                    assertThat(engine.requests).isEmpty()
+
+                    // A non-team local namespace still goes to the engine with the caller's token, which refuses it.
+                    val local = get("/v1/catalogs/lake/namespaces/reports", jwt)
+                    assertThat(local.status).isEqualTo(HttpStatusCode.Forbidden)
+                    assertThat(local.bodyAsText()).contains("backend refused request authority")
+                    assertThat(engine.requests).hasSize(1)
+                    assertThat(host.seen).isEmpty()
+                }
+            }
+        }
+        assertThat(calls).isEmpty()
+    }
 
     @Test
     fun `the team family relays the team schemas the caller's prd holds and no other`() {
