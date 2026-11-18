@@ -152,13 +152,9 @@ jobs:
           retention-days: 7
 
   trino-test:
-    # The connector lives in PostHog/trino (repo PR #1); this runs the
-    # in-repo integration harness against the fork's PUBLIC server
-    # image (ghcr.io/posthog/trino, mirrored by its publish workflow on
-    # every master push). The image is arm64-only, hence the ARM
-    # runner. Deliberately NOT in deploy's `needs` and not a required
-    # check: a broken fork build or a flaky ~1GB pull must never wedge
-    # hoglake CD (that failure mode killed the original job).
+    # Test the connector in the public ghcr.io/posthog/truffle image.
+    # The image requires an ARM64 runner. Keep this job optional.
+    # The deploy job must not depend on this check.
     needs: changes
     if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-24.04-arm
@@ -175,12 +171,9 @@ jobs:
           java-version: "25"
           cache: gradle
 
-      # Image selection: the HOGLAKE_TRINO_IMAGE repo variable pins an
-      # exact ref when set; otherwise resolve the newest ordered
-      # release tag (r<position>-<sha6>, lexicographically sortable by
-      # construction) from the public ghcr mirror — anonymous, no
-      # cross-repo auth, and new fork releases are picked up with zero
-      # changes here.
+      # The HOGLAKE_TRINO_IMAGE repository variable overrides the default.
+      # Otherwise, select the greatest release tag from the public GHCR mirror.
+      # The r<position>-<sha6> tags sort in lexicographic order.
       - name: Resolve Trino image
         id: image
         env:
@@ -191,12 +184,12 @@ jobs:
             echo "Using pinned image: $PINNED"
             exit 0
           fi
-          token=$(curl -fsS "https://ghcr.io/token?scope=repository:posthog/trino:pull" | jq -r .token)
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:posthog/truffle:pull" | jq -r .token)
           tag=$(curl -fsS -H "Authorization: Bearer $token" \
-            "https://ghcr.io/v2/posthog/trino/tags/list?n=1000" \
+            "https://ghcr.io/v2/posthog/truffle/tags/list?n=1000" \
             | jq -r '.tags[]' | grep -E '^r[0-9]{12}-[0-9a-f]{6}$' | sort | tail -1)
-          [ -n "$tag" ] || { echo "::error::No ordered release tag found on ghcr.io/posthog/trino"; exit 1; }
-          echo "ref=ghcr.io/posthog/trino:$tag" >> "$GITHUB_OUTPUT"
+          [ -n "$tag" ] || { echo "::error::No ordered release tag found on ghcr.io/posthog/truffle"; exit 1; }
+          echo "ref=ghcr.io/posthog/truffle:$tag" >> "$GITHUB_OUTPUT"
           echo "Resolved latest fork release: $tag"
 
       - name: Trino connector integration tests
