@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionFieldDef
@@ -65,7 +66,7 @@ class TableCreationService(
     private val catalogs: CatalogService,
     private val commits: CommitService,
     private val lockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
-) {
+) : TableCreationBackend {
     private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
     private val mapper =
@@ -73,7 +74,7 @@ class TableCreationService(
             SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS,
         )
 
-    fun prepare(
+    override fun prepare(
         catalog: String,
         operationId: UUID,
         definition: TableCreationDefinition,
@@ -149,8 +150,9 @@ class TableCreationService(
 
     /**
      * Where a creation's files go: `<data_path>/data/<uuid>/`, or, in a
-     * contained namespace (V33), `<data_path>/data/<namespace>/<uuid>/`,
-     * the only place its files may be registered. A namespace marked
+     * contained namespace (V33), `<uuid>/` under the namespace's prefix
+     * ([Containment.namespaceRoot]), the only place its files may be
+     * registered. A namespace marked
      * after prepare fails the publish with `containment_violation`, and
      * the writer re-prepares.
      */
@@ -160,12 +162,12 @@ class TableCreationService(
         uuid: UUID,
     ): String =
         if (ns.containment != null) {
-            dataPath.trimEnd('/') + "/data/${ns.name}/$uuid/"
+            Containment.namespaceRoot(dataPath, ns.name, ns.containment) + "$uuid/"
         } else {
             dataPath.trimEnd('/') + "/data/$uuid/"
         }
 
-    fun status(
+    override fun status(
         catalog: String,
         operationId: UUID,
     ): TableCreation =
@@ -174,7 +176,7 @@ class TableCreationService(
             load(h, cat.catalogId, operationId)
         }
 
-    fun abort(
+    override fun abort(
         catalog: String,
         operationId: UUID,
     ): TableCreation {
@@ -192,7 +194,7 @@ class TableCreationService(
         }
     }
 
-    fun publish(
+    override fun publish(
         catalog: String,
         operationId: UUID,
         files: List<FileRegistration>,

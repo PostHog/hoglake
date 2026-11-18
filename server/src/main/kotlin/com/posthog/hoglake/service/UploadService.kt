@@ -61,8 +61,8 @@ class UploadService(
      * rows (CleanupService, HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS).
      */
     private val ledgerRetentionSeconds: Long = CleanupService.LEDGER_RETENTION_SECONDS,
-) {
-    fun claim(
+) : UploadBackend {
+    override fun claim(
         catalog: String,
         id: UUID,
         owner: UUID,
@@ -100,12 +100,12 @@ class UploadService(
         }
 
     /** Renewal may win against expiry, but can never revive a fenced claim. */
-    fun renew(
+    override fun renew(
         catalog: String,
         owner: UUID,
     ): Int = inCatalog(catalog, "upload_renew") { h, catalogId -> renewClaims(h, catalogId, owner) }
 
-    fun abandon(
+    override fun abandon(
         catalog: String,
         owner: UUID,
         paths: List<String>,
@@ -122,9 +122,9 @@ class UploadService(
         }
 
     /** Explicit operator action only. No new background sweep is enabled by this feature. */
-    fun scheduleExpired(
+    override fun scheduleExpired(
         catalog: String,
-        limit: Int = 1000,
+        limit: Int,
     ): Int =
         com.posthog.hoglake.observability.Audit.audited("upload_schedule_expired", catalog, null) {
             if (limit !in 1..10000) throw HoglakeException.Validation("limit must be between 1 and 10000")

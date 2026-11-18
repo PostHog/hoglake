@@ -154,6 +154,92 @@ class VariantShreddingApiTest {
                 .containsExactly("id", "r", "properties")
         }
 
+    @Test
+    fun `set_variant_shredding replaces a declaration as sent, and null or absent clears it`() =
+        api { client ->
+            val name = table()
+            client.postJson(
+                tablesUrl,
+                """{"name": "$name", "columns": [
+                    {"name": "id", "type": "long"},
+                    {"name": "properties", "type": "variant", "type_params": {"shredding": {"type": "string"}}}]}""",
+            )
+            val alterUrl = "$tablesUrl/$name/alter"
+            val replaced =
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "set_variant_shredding", "name": "properties", "shredding": $declaration}]}""",
+                )
+            assertThat(replaced.status).describedAs(replaced.bodyAsText()).isEqualTo(HttpStatusCode.OK)
+            val expected = json.readTree("""{"shredding": $declaration}""")
+            assertThat(body(replaced)["columns"][1]["type_params"]).isEqualTo(expected)
+            assertThat(body(client.get("$tablesUrl/$name"))["columns"][1]["type_params"]).isEqualTo(expected)
+
+            // The same declaration again, respelt (every object's keys in
+            // another order): a no-op that answers the unmoved head, over
+            // the wire too.
+            val again =
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "set_variant_shredding", "name": "properties", "shredding":
+                        {"fields": [
+                            {"type": "string", "name": "${'$'}browser"},
+                            {"scale": 2, "precision": 18, "type": "decimal8", "name": "price"},
+                            {"element": {"type": "string"}, "type": "array", "name": "tags"},
+                            {"fields": [{"type": "string", "name": "plan"}], "type": "object", "name": "${'$'}set"}],
+                         "type": "object"}}]}""",
+                )
+            assertThat(again.status).describedAs(again.bodyAsText()).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(again)["snapshot_id"]).isEqualTo(body(replaced)["snapshot_id"])
+            assertThat(body(again)["read_snapshot_id"]).isEqualTo(body(replaced)["read_snapshot_id"])
+            assertThat(body(again)["columns"][1]["type_params"]).isEqualTo(expected)
+            assertThat(
+                body(client.get("$tablesUrl/$name"))["read_snapshot_id"],
+            ).isEqualTo(body(replaced)["snapshot_id"])
+
+            val cleared =
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "set_variant_shredding", "name": "properties", "shredding": null}]}""",
+                )
+            assertThat(cleared.status).describedAs(cleared.bodyAsText()).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(cleared)["columns"][1].has("type_params")).isFalse()
+            assertThat(body(client.get("$tablesUrl/$name"))["columns"][1].has("type_params")).isFalse()
+
+            // Absent clears as null does (the set_column_comment rule).
+            client.postJson(
+                alterUrl,
+                """{"ops": [{"op": "set_variant_shredding", "name": "properties", "shredding": $declaration}]}""",
+            )
+            val absent =
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "set_variant_shredding", "name": "properties"}]}""",
+                )
+            assertThat(absent.status).describedAs(absent.bodyAsText()).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(client.get("$tablesUrl/$name"))["columns"][1].has("type_params")).isFalse()
+
+            // The refusals are the ones a column definition meets, by name.
+            assertValidation(
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "set_variant_shredding", "name": "id", "shredding": {"type": "string"}}]}""",
+                ),
+                "a long column",
+                "column 'id' is 'long', and only a variant column can declare type_params.shredding",
+            )
+            assertValidation(
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "set_variant_shredding", "name": "properties",
+                        "shredding": {"type": "int128"}}]}""",
+                ),
+                "an unknown type",
+                "variant column 'properties' has an invalid type_params.shredding: $ has an unknown type 'int128'",
+            )
+            assertThat(body(client.get("$tablesUrl/$name"))["columns"][1].has("type_params")).isFalse()
+        }
+
     private fun table(): String = "t${counter.incrementAndGet()}"
 
     private suspend fun assertValidation(

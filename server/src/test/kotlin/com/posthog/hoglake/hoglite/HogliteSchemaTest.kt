@@ -69,4 +69,50 @@ class HogliteSchemaTest {
         assertThat(jsons).isNotEmpty()
         assertThat(integers.max()).describedAs("files columns: %s", names).isLessThan(jsons.min())
     }
+
+    @Test
+    fun `listing and changefeed keyset indexes include table and every continuation key`() {
+        val indexes = HogliteSchema.DDL.map(::normalized)
+        assertThat(indexes).contains(
+            "CREATE INDEX IF NOT EXISTS files_listing ON files(table_id, begin_snapshot, row_id_start, id)",
+            "CREATE INDEX IF NOT EXISTS dvs_changes ON dvs(table_id, begin_snapshot, delete_file_id)",
+        )
+    }
+
+    @Test
+    fun `receipt retention has a non-partial covering index for cutoff and ordering`() {
+        val indexes = HogliteSchema.DDL.map(::normalized).filter { it.contains(" ON receipts(") }
+        assertThat(indexes).containsExactly(
+            "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
+        )
+    }
+
+    @Test
+    fun `ledger retention indexes match the cutoff ordering and cover row ids`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",
+        )
+    }
+
+    @Test
+    fun `queue arm indexes walk only their own undrained id range`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS removals_staging_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND reason = 'compaction_staging'",
+            "CREATE INDEX IF NOT EXISTS removals_bulk_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND (reason IS NULL OR reason <> 'compaction_staging')",
+        )
+    }
+
+    @Test
+    fun `status indexes cover live backlogs and bounded loop reads`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS files_live_stats ON files(stats_state) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_live_size ON files(file_size_bytes) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS removals_queued_at ON removals(queued_at) WHERE drained_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_loop ON maintenance_runs(task, id, started_at) " +
+                "WHERE run_trigger = 'loop'",
+        )
+    }
 }

@@ -1,7 +1,9 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.service.VariantShredding
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
@@ -11,14 +13,18 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
 import java.math.BigInteger
+import java.nio.ByteBuffer
+import java.security.MessageDigest
 
 /**
  * A group compaction refuses because a VARIANT column's storage in one of
- * its inputs is not the layout the rewrite writes: the column's
- * declaration, laid out as [VariantLayout] lays it out. A subclass of
- * [UnconvertibleSchemaException], so the sweep skips the group exactly as
- * it skips any other shape it cannot rewrite; its own type is what
- * [reason] is counted under (`hoglake_compaction_variant_layout_mismatch_total`).
+ * its inputs is not the layout the rewrite writes for it — the layout the
+ * group's inputs share ([VariantLayout.canonical]), the column's
+ * declaration when nothing says otherwise — or is no VARIANT group at
+ * all. A subclass of [UnconvertibleSchemaException], so the sweep skips
+ * the group exactly as it skips any other shape it cannot rewrite; its
+ * own type is what [reason] is counted under
+ * (`hoglake_compaction_variant_layout_mismatch_total`).
  */
 class VariantLayoutMismatchException(
     message: String,
@@ -43,10 +49,16 @@ class VariantLayoutMismatchException(
  *
  * Compaction COPIES a variant (hoglake#70 is in parquet-java's Variant
  * reader, which the rewrite never uses): each input's subtree goes to the
- * output as plain groups, leaf by leaf, and the output's subtree comes from
- * here so the output schema stays a function of the catalog. The copy is
- * positional, so an input whose subtree differs from this one in any way
- * [layoutMismatch] checks would misplace values; such a group is refused instead.
+ * output as plain groups, leaf by leaf. The copy is positional, so every
+ * input of one rewrite must hold the subtree the output is written with,
+ * in every way [layoutMismatch] checks, or values would land under the
+ * wrong names. A group whose inputs hold MORE THAN ONE layout (a
+ * declaration changed, or a writer that did not honour it) is therefore
+ * rewritten per layout ([VariantLayoutGroups]): each input's subtree is
+ * read off its footer as [canonical], the inputs sharing one are
+ * rewritten together, and that rewrite's output is written in THAT
+ * layout — the declared one ([groupType]) when the inputs hold it, which
+ * is what every writer honouring the catalog produces.
  */
 object VariantLayout {
     /**
@@ -85,16 +97,49 @@ object VariantLayout {
      */
     fun shape(column: Column): Pair<Int, Boolean>? {
         val group = runCatching { groupType(column, Type.Repetition.OPTIONAL) }.getOrNull() ?: return null
+        return shape(group)
+    }
+
+    /** The leaves (primitive nodes) of a layout group: what an output schema holding it adds to its column count. */
+    fun leaves(group: GroupType): Int {
+        var leaves = 0
+
+        fun walk(type: Type) {
+            if (type.isPrimitive) leaves++ else type.asGroupType().fields.forEach(::walk)
+        }
+        walk(group)
+        return leaves
+    }
+
+    /**
+     * [shape] of a layout as a group — a file's [canonical] subtree, which
+     * is what a rewrite of files in another layout decodes a row of, and
+     * so what sizes THAT rewrite's chunk (`CompactionConfig.spillChunkRows`
+     * with the part's layouts): the declared layout's shape would size the
+     * chunk for a narrower row than the one held after a declaration was
+     * cleared or narrowed.
+     */
+    fun shape(group: GroupType): Pair<Int, Boolean> {
         var nodes = 0
-        var list = false
+        var nested = false
 
         fun walk(type: Type) {
             nodes++
-            if (type.logicalTypeAnnotation is LogicalTypeAnnotation.ListLogicalTypeAnnotation) list = true
+            // A LIST or a MAP layer holds any number of entries per row: the
+            // node count below it is a floor, and `nestedSortExpansion`
+            // stands in for the lengths (CompactionConfig.spillChunkRows).
+            // The declaration grammar lays out lists only; a file's own
+            // layout ([canonical]) may hold a map.
+            when (type.logicalTypeAnnotation) {
+                is LogicalTypeAnnotation.ListLogicalTypeAnnotation,
+                is LogicalTypeAnnotation.MapLogicalTypeAnnotation,
+                -> nested = true
+                else -> {}
+            }
             if (!type.isPrimitive) type.asGroupType().fields.forEach(::walk)
         }
         walk(group)
-        return nodes to list
+        return nodes to nested
     }
 
     /**
@@ -138,6 +183,183 @@ object VariantLayout {
             return children.firstNotNullOfOrNull { (g, w) -> diff(g, w, "$path.${w.name}", top = false) }
         }
         return diff(src, expected, expected.name, top = true)
+    }
+
+    /**
+     * [src], an input file's field bound to the variant [column], as the
+     * output would write it: the top group OPTIONAL, named and
+     * id-stamped for [column] as [groupType] stamps it, and below it
+     * every node of [src] rebuilt from exactly the attributes
+     * [layoutMismatch] compares — name, repetition, logical type,
+     * physical type and length, children in order — and from nothing
+     * else (no field ids below the top, no legacy converted type the
+     * logical type does not imply). So two inputs whose subtrees
+     * [layoutMismatch] would pass against each other canonicalize to
+     * EQUAL groups, which is what lets a group's inputs be partitioned
+     * by layout with `==`, and [groupType]'s own output canonicalizes to
+     * itself.
+     *
+     * Null when [layoutOf] refuses [src]: no VARIANT group at all, or a
+     * subtree the copy cannot carry whole.
+     */
+    fun canonical(
+        src: Type,
+        column: Column,
+    ): GroupType? = (layoutOf(src, column) as? Layout.Of)?.group
+
+    /** [layoutOf]'s answer: the canonical layout, or why there is none. */
+    sealed interface Layout {
+        class Of(val group: GroupType) : Layout
+
+        class Refused(val reason: String) : Layout
+    }
+
+    /**
+     * [canonical], with the reason when there is no layout. Refused when
+     * [src] is no VARIANT group at all — a leaf, a REPEATED group, a group
+     * without the VARIANT annotation, or one without the REQUIRED BINARY
+     * `metadata` field every Variant layout holds (found by NAME: the
+     * specification fixes no order, and Spark writes `value` first) — or
+     * when any node of its subtree is one the rewrite's positional copy
+     * cannot carry WHOLE: a REPEATED node anywhere but as the single
+     * repeated group of a LIST (one child) or a MAP (a REQUIRED key and a
+     * value), the two container layers `ParquetRewriter.identityStep`
+     * walks. Every other repetition the copy would read at its first
+     * value only, and the output — right in row count, short in values —
+     * would commit. Such a shape is not another layout: there is no
+     * output it could be copied into, so it is refused as `layout`,
+     * whichever policy met it, before it can become a part's layout.
+     */
+    fun layoutOf(
+        src: Type,
+        column: Column,
+    ): Layout {
+        fun refused(detail: String) = Layout.Refused("the input field is `${describe(src)}`, $detail")
+        if (src.isPrimitive || src.isRepetition(Type.Repetition.REPEATED)) return refused("not one VARIANT group")
+        val group = src.asGroupType()
+        val annotation =
+            group.logicalTypeAnnotation as? LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+                ?: return refused("not one VARIANT group")
+        val metadata = group.fields.firstOrNull { it.name == "metadata" }
+        if (metadata == null || !metadata.isPrimitive || !metadata.isRepetition(Type.Repetition.REQUIRED) ||
+            metadata.asPrimitiveType().primitiveTypeName != PrimitiveTypeName.BINARY
+        ) {
+            return refused("not one VARIANT group: it has no REQUIRED BINARY `metadata` field")
+        }
+        group.fields.forEach {
+                field ->
+            uncopyable(field, "${column.def.name}.${field.name}")?.let { return refused(it) }
+        }
+        return Layout.Of(
+            Types.buildGroup(Type.Repetition.OPTIONAL)
+                .`as`(annotation)
+                .addFields(*group.fields.map(::rebuild).toTypedArray())
+                .id(Math.toIntExact(column.fieldId))
+                .named(column.def.name),
+        )
+    }
+
+    /**
+     * Why the positional copy cannot carry [type] (at [path]) whole, or
+     * null when it can: the shapes [ParquetRewriter.identityStep] walks
+     * and nothing else. A REPEATED node is admitted only as the repeated
+     * group of a LIST (exactly one child) or a MAP (exactly two, the key
+     * REQUIRED); a group annotated LIST or MAP must hold exactly that; any
+     * other REPEATED node, leaf or group, is a value the copy would
+     * truncate to its first.
+     */
+    private fun uncopyable(
+        type: Type,
+        path: String,
+    ): String? {
+        if (type.isRepetition(Type.Repetition.REPEATED)) {
+            return "and `$path` is REPEATED outside a LIST or MAP layer, which the copy would read at its first " +
+                "value only"
+        }
+        if (type.isPrimitive) return null
+        val group = type.asGroupType()
+        val entry =
+            when (group.logicalTypeAnnotation) {
+                is LogicalTypeAnnotation.ListLogicalTypeAnnotation -> 1
+                is LogicalTypeAnnotation.MapLogicalTypeAnnotation -> 2
+                else -> null
+            }
+        if (entry == null) return group.fields.firstNotNullOfOrNull { uncopyable(it, "$path.${it.name}") }
+        val layer = group.fields.singleOrNull()
+        if (layer == null || layer.isPrimitive || !layer.isRepetition(Type.Repetition.REPEATED) ||
+            layer.asGroupType().fieldCount != entry
+        ) {
+            return "and `$path` is annotated ${group.logicalTypeAnnotation} without the one repeated group of " +
+                "$entry field(s) that encoding has"
+        }
+        val children = layer.asGroupType().fields
+        if (entry == 2 && !children[0].isRepetition(Type.Repetition.REQUIRED)) {
+            return "and `$path` is a MAP whose key is not REQUIRED"
+        }
+        return children.firstNotNullOfOrNull { uncopyable(it, "$path.${layer.name}.${it.name}") }
+    }
+
+    /** [layout] (a [canonical] or [groupType] group) with [repetition] on its top group and nothing else changed. */
+    fun withRepetition(
+        layout: GroupType,
+        repetition: Type.Repetition,
+    ): GroupType {
+        if (layout.repetition == repetition) return layout
+        return Types.buildGroup(repetition)
+            .`as`(layout.logicalTypeAnnotation)
+            .addFields(*layout.fields.toTypedArray())
+            .id(layout.id.intValue())
+            .named(layout.name)
+    }
+
+    /**
+     * The declared layout of every VARIANT node of [columns], in
+     * `allNodes` order, keyed by field id: what the rewrite writes a
+     * column as when its inputs say nothing else, and the layout tuple
+     * the planner prefers. Throws [UnconvertibleSchemaException] for a
+     * declaration no layout can be derived from, like [groupType].
+     */
+    fun declared(columns: List<Column>): Map<Long, GroupType> =
+        columns.allNodes()
+            .filter { it.def.type == ColType.VARIANT }
+            .associate { it.fieldId to groupType(it, Type.Repetition.OPTIONAL) }
+
+    /**
+     * A 64-bit fingerprint of one file's variant layouts ([canonical]
+     * per variant column, keyed by field id), equal for files whose
+     * layouts are equal: what the planner remembers per file so it can
+     * pack files of one layout together without holding the layouts
+     * themselves (a declaration of a thousand fields is a few thousand
+     * Parquet nodes; the files are hundreds of thousands). A collision
+     * costs nothing but a group the rewrite then splits; the rewrite
+     * partitions by the groups themselves, never by this.
+     */
+    fun fingerprint(layouts: Map<Long, GroupType>): Long {
+        val digest = MessageDigest.getInstance("SHA-256")
+        for ((fieldId, layout) in layouts.toSortedMap()) {
+            digest.update(fieldId.toString().toByteArray())
+            digest.update(0)
+            digest.update(layout.toString().toByteArray())
+            digest.update(0)
+        }
+        return ByteBuffer.wrap(digest.digest()).getLong()
+    }
+
+    /** One node of a file's subtree rebuilt from the attributes [layoutMismatch] compares; see [canonical]. */
+    private fun rebuild(type: Type): Type {
+        if (type.isPrimitive) {
+            val primitive = type.asPrimitiveType()
+            var builder = Types.primitive(primitive.primitiveTypeName, primitive.repetition)
+            if (primitive.primitiveTypeName == PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
+                builder = builder.length(primitive.typeLength)
+            }
+            primitive.logicalTypeAnnotation?.let { builder = builder.`as`(it) }
+            return builder.named(type.name)
+        }
+        val group = type.asGroupType()
+        val builder = Types.buildGroup(group.repetition)
+        group.logicalTypeAnnotation?.let { builder.`as`(it) }
+        return builder.addFields(*group.fields.map(::rebuild).toTypedArray()).named(type.name)
     }
 
     /**

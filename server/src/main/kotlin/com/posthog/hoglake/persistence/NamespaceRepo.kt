@@ -1,5 +1,6 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
@@ -73,7 +74,7 @@ object NamespaceRepo {
     ): NamespaceInfo? =
         handle.createQuery(
             """
-            SELECT n.namespace_id, n.name, n.contained_field, n.contained_value
+            SELECT n.namespace_id, n.name, n.contained_field, n.contained_value, n.contained_org
             $VISIBLE_FROM
             WHERE n.catalog_id = :catalogId AND n.name = :name AND $VISIBLE_WHERE
             """,
@@ -107,7 +108,7 @@ object NamespaceRepo {
      */
     internal val LIST_AT_SQL =
         """
-            SELECT n.namespace_id, n.name, n.contained_field, n.contained_value
+            SELECT n.namespace_id, n.name, n.contained_field, n.contained_value, n.contained_org
             $VISIBLE_FROM
             WHERE n.catalog_id = :catalogId AND $VISIBLE_WHERE
             ORDER BY n.name
@@ -134,12 +135,59 @@ object NamespaceRepo {
     ): NamespaceInfo? =
         handle.createQuery(
             """
-            SELECT namespace_id, name, contained_field, contained_value FROM hog_namespace
+            SELECT namespace_id, name, contained_field, contained_value, contained_org FROM hog_namespace
             WHERE catalog_id = :catalogId AND name = :name AND NOT dropped
             """,
         )
             .bind("catalogId", catalogId)
             .bind("name", name)
+            .map(::namespaceRow)
+            .findOne()
+            .orElse(null)
+
+    /**
+     * The namespace a READ of [cat] resolves [name] to, or NotFound. A
+     * head read ([pinned] false) resolves the live namespace. A pinned
+     * read (`snapshot` / `at_timestamp` given) resolves the incarnation
+     * alive at [at] ([findAt]): a pinned reader must still see a
+     * namespace dropped after its pin, and must not see one recreated
+     * under the same name after it. Every read that takes a pin
+     * (getTable, listTables, listFiles, partitionValues, fileStats,
+     * changes, planScan) resolves through here, so they agree on the
+     * incarnation; [at] alone cannot tell a head read from a pinned read
+     * that names head, hence the flag.
+     */
+    fun requireForRead(
+        handle: Handle,
+        cat: CatalogInfo,
+        name: String,
+        at: Long,
+        pinned: Boolean,
+    ): NamespaceInfo =
+        if (!pinned) {
+            findLiveByName(handle, cat.catalogId, name)
+                ?: throw HoglakeException.NotFound("namespace '$name' in catalog '${cat.name}'")
+        } else {
+            findAt(handle, cat.catalogId, name, at)
+                ?: throw HoglakeException.NotFound("namespace '$name' in catalog '${cat.name}' at snapshot $at")
+        }
+
+    /** The live namespace contained for `field = value`: one probe of `hog_namespace_live_containment`. */
+    fun findLiveContained(
+        handle: Handle,
+        catalogId: Long,
+        field: String,
+        value: Long,
+    ): NamespaceInfo? =
+        handle.createQuery(
+            """
+            SELECT namespace_id, name, contained_field, contained_value, contained_org FROM hog_namespace
+            WHERE catalog_id = :catalogId AND NOT dropped AND contained_field = :field AND contained_value = :value
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("field", field)
+            .bind("value", value)
             .map(::namespaceRow)
             .findOne()
             .orElse(null)
@@ -150,7 +198,7 @@ object NamespaceRepo {
     ): List<NamespaceInfo> =
         handle.createQuery(
             """
-            SELECT namespace_id, name, contained_field, contained_value FROM hog_namespace
+            SELECT namespace_id, name, contained_field, contained_value, contained_org FROM hog_namespace
             WHERE catalog_id = :catalogId AND NOT dropped
             ORDER BY name
             """,
@@ -167,7 +215,7 @@ object NamespaceRepo {
         return NamespaceInfo(
             rs.getLong("namespace_id"),
             rs.getString("name"),
-            field?.let { NamespaceContainment(it, rs.getLong("contained_value")) },
+            field?.let { NamespaceContainment(it, rs.getLong("contained_value"), rs.getString("contained_org")) },
         )
     }
 
@@ -186,7 +234,7 @@ object NamespaceRepo {
         try {
             handle.createUpdate(
                 """
-                UPDATE hog_namespace SET contained_field = :field, contained_value = :value
+                UPDATE hog_namespace SET contained_field = :field, contained_value = :value, contained_org = :org
                 WHERE catalog_id = :catalogId AND namespace_id = :namespaceId AND NOT dropped
                 """,
             )
@@ -194,6 +242,7 @@ object NamespaceRepo {
                 .bind("namespaceId", namespaceId)
                 .bind("field", containment?.field)
                 .bind("value", containment?.value)
+                .bind("org", containment?.org)
                 .execute()
         } catch (e: UnableToExecuteStatementException) {
             if (Pg.isUniqueViolation(e)) {

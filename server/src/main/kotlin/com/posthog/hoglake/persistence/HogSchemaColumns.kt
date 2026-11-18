@@ -21,7 +21,7 @@ object HogSchemaColumns {
             "hog_commit_receipt" to
                 setOf(
                     "catalog_id", "idempotency_key", "request", "fingerprint",
-                    "snapshot_id", "schema_version", "created_at",
+                    "snapshot_id", "schema_version", "created_at", "ended_files",
                 ),
             // MaintenanceSummarySampler: published samples + durable scan
             // checkpoints, and the published generation's live totals
@@ -59,13 +59,17 @@ object HogSchemaColumns {
             // SnapshotRepo.insertChange, CommitService change batch,
             // CommitService.checkConflicts.
             "hog_snapshot_change" to setOf("catalog_id", "snapshot_id", "kind", "object_id"),
+            // V34: MountRegistry.postgresSwitch reads `enabled`.
+            "hog_mount_switch" to setOf("singleton", "enabled"),
+            // V35: MountStore.
+            "hog_mount" to setOf("name", "revision", "enabled", "mount_values"),
             // NamespaceRepo.
-            // V33: contained_field/contained_value, read by NamespaceRepo and
+            // V33/V37: contained_field/contained_value/contained_org, read by NamespaceRepo and
             // CommitTail.READ_SQL's `contained` CTE.
             "hog_namespace" to
                 setOf(
                     "catalog_id", "namespace_id", "name", "dropped", "created_at",
-                    "contained_field", "contained_value",
+                    "contained_field", "contained_value", "contained_org",
                 ),
             // TableRepo (identity + drop marking).
             "hog_table" to

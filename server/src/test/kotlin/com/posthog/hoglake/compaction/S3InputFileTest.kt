@@ -1,13 +1,22 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.io.api.Binary
+import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
@@ -20,6 +29,7 @@ import java.io.EOFException
 import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.Random
 
 /**
  * [S3InputFile] against a real parquet file served out of memory.
@@ -118,10 +128,10 @@ class S3InputFileTest {
 
     @Test
     fun `the sortedness pre-pass's key source fetches the key column, not the file`() {
-        // The pre-pass reads only `id`'s column chunk. Its ranged read is
-        // padded to the readahead: at the merge's 8 MiB that is the rest
-        // of the file (the payload column after it); at
-        // KEY_COLUMN_READAHEAD_BYTES it is the chunk plus at most that.
+        // The pre-pass profiles headers, then reads `id`'s column data.
+        // Each pass can over-read by one source buffer.
+        // The merge's 8 MiB buffer covers the payload too.
+        // The key buffer keeps both passes below the payload's size.
         val path = sampleFile()
         val bytes = Files.readAllBytes(path)
         val (idChunk, payload) =
@@ -155,8 +165,122 @@ class S3InputFileTest {
         assertThat(fetchedWith(S3InputFile.DEFAULT_READAHEAD_BYTES))
             .describedAs("the merge's readahead over-reads into the payload")
             .isGreaterThan(idChunk + payload / 2)
-        assertThat(fetchedWith(S3InputFile.KEY_COLUMN_READAHEAD_BYTES))
-            .isLessThanOrEqualTo(idChunk + S3InputFile.KEY_COLUMN_READAHEAD_BYTES)
+        val keyBytes = fetchedWith(S3InputFile.KEY_COLUMN_READAHEAD_BYTES)
+        assertThat(keyBytes).isLessThanOrEqualTo(2 * (idChunk + S3InputFile.KEY_COLUMN_READAHEAD_BYTES))
+        assertThat(keyBytes).isLessThan(payload)
+    }
+
+    @Test
+    fun `a fixed near-target dictionary input shares reader excess without spilling`() {
+        val rows = 60_000
+        val target = 8L * 1024 * 1024
+        val nearSchema =
+            Types.buildMessage()
+                .addField(Types.required(PrimitiveTypeName.INT64).id(1).named("id"))
+                .addField(
+                    Types.required(PrimitiveTypeName.BINARY).`as`(LogicalTypeAnnotation.stringType())
+                        .id(2).named("category"),
+                )
+                .addField(Types.required(PrimitiveTypeName.BINARY).id(3).named("payload"))
+                .named("near_target")
+
+        fun payload(id: Long) = ByteArray(112).also { Random(553L xor (id * -7046029254386353131L)).nextBytes(it) }
+
+        fun category(position: Int) = "c" + (position / 2).toString().padStart(7, '0')
+        val sourcePath = tmp.resolve("near-target-input.parquet")
+        val factory = SimpleGroupFactory(nearSchema)
+        // Default pages and dictionaries exercise the producer's normal decoder state.
+        ExampleParquetWriter.builder(LocalOutputFile(sourcePath))
+            .withType(nearSchema)
+            .withCompressionCodec(CompressionCodecName.SNAPPY)
+            .build().use { writer ->
+                repeat(rows) { position ->
+                    val id = (rows - position - 1).toLong()
+                    writer.write(
+                        factory.newGroup()
+                            .append("id", id)
+                            .append("category", category(position))
+                            .append("payload", Binary.fromConstantByteArray(payload(id))),
+                    )
+                }
+            }
+        val sourceBytes = Files.readAllBytes(sourcePath)
+        assertThat(sourceBytes.size.toLong()).isBetween(target * 85 / 100, target - 1)
+        ParquetFileReader.open(LocalInputFile(sourcePath)).use { reader ->
+            assertThat(reader.footer.blocks).hasSize(1)
+            assertThat(reader.footer.blocks.single().columns[1].hasDictionaryPage()).isTrue()
+        }
+        val source =
+            S3InputFile(
+                FakeStore(sourceBytes),
+                "s3://b/near-target.parquet",
+                sourceBytes.size.toLong(),
+                footerSizeOf(sourcePath),
+            )
+        val live =
+            listOf(
+                Column(1, 0, ColumnDef("id", ColType.LONG, nullable = false)),
+                Column(2, 1, ColumnDef("category", ColType.STRING, nullable = false)),
+                Column(3, 2, ColumnDef("payload", ColType.BINARY, nullable = false)),
+            )
+        val config =
+            CompactionConfig(
+                sortedHeapBytes = 64L * 1024 * 1024,
+                targetBytes = target,
+                parallelGroups = 1,
+                maxGroupsPerRun = 1,
+                spillDir = Files.createDirectory(tmp.resolve("near-target-spills")),
+            )
+        val readerEvents = ArrayList<Map<String, Long>>()
+        val spill = config.sortSpill(live)
+        assertThat(spill.readerBudgetBytes).isEqualTo(16L * 1024 * 1024)
+        spill.memoryObserver = { event, values -> if (event == "reader") readerEvents += values }
+        val out = tmp.resolve("near-target-output.parquet")
+        val result =
+            ParquetRewriter.rewrite(
+                listOf(
+                    ParquetRewriter.Input(
+                        source,
+                        "near-target",
+                        100_000,
+                        fileSizeBytes = sourceBytes.size.toLong(),
+                        survivingRecords = rows.toLong(),
+                    ),
+                ),
+                live,
+                listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)),
+                LocalDiscardableOutput(out),
+                spill = spill,
+            )
+        assertThat(result.rowsWritten).isEqualTo(rows.toLong())
+        assertThat(result.runsSpilled).isZero()
+        assertThat(readerEvents).hasSize(1)
+        val event = readerEvents.single()
+        assertThat(event.getValue("extraBytes")).isPositive()
+        assertThat(event.getValue("readerBytes"))
+            .isBetween(spill.readerBudgetBytes + 1, spill.readerBudgetBytes + config.sortedHeapBytes)
+        var seen = 0L
+        ParquetFileReader.open(LocalInputFile(out)).use { reader ->
+            val outputSchema = reader.footer.fileMetaData.schema
+            val columnIO = ColumnIOFactory().getColumnIO(outputSchema)
+            while (true) {
+                val pages = reader.readNextRowGroup() ?: break
+                pages.use {
+                    val records = columnIO.getRecordReader(pages, GroupRecordConverter(outputSchema))
+                    repeat(pages.rowCount.toInt()) {
+                        val row = records.read()
+                        val position = rows - seen.toInt() - 1
+                        check(row.getLong(0, 0) == seen)
+                        check(row.getString(1, 0) == category(position))
+                        check(row.getBinary(2, 0).bytes.contentEquals(payload(seen)))
+                        check(row.getLong(3, 0) == 100_000L + position)
+                        seen++
+                    }
+                }
+            }
+        }
+        assertThat(seen).isEqualTo(rows.toLong())
+        Files.list(config.spillDir).use { assertThat(it.count()).isZero() }
     }
 
     @Test

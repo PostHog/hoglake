@@ -90,7 +90,10 @@ FROM python:3.13-slim-trixie
 RUN groupadd --system --gid 10001 hoglake \
  && useradd --system --uid 10001 --gid 10001 hoglake
 COPY --from=build /opt/hoglake-bench/venv/ /opt/hoglake-bench/venv/
-ENV PATH="/opt/hoglake-bench/venv/bin:$PATH"
+# The system user has no home directory. Downloaded benchmark inputs need
+# the same writable volume as results, including under a read-only rootfs.
+ENV PATH="/opt/hoglake-bench/venv/bin:$PATH" \
+    XDG_CACHE_HOME="/work/.cache"
 # The results journal is written to the cwd, so /work belongs to the
 # run user. Everything else stays read-only-rootfs friendly: nothing
 # outside /work and /tmp is written.

@@ -222,14 +222,18 @@ class ObjectPrefixViolationError(ValidationError):
     too). The whole commit is refused, with zero writes.
 
     :attr:`re_prepare`, as the server's ``retry: re-prepare`` says:
-    replaying the payload cannot succeed, but a writer that read the
-    table before it had the option can re-read it and write its files
-    again under the prefix. Only a writer that builds its keys with
-    :mod:`pyhoglake.object_prefix` can: ``Table.append``,
-    ``prepare_append_tables`` and ``prepare_append_files`` write under the
-    table root, so on such a table they are refused every time, and a
-    caller must not retry them on this flag. None of them retries on its
-    own.
+    replaying the payload cannot succeed; a NEW one, prepared against a
+    fresh read of the table, can. ``Table.append``,
+    ``prepare_append_tables`` and ``prepare_append_files`` place their
+    files under the prefix while the ``TableInfo`` they resolve carries
+    the field (see "Object-prefix tables" in the README), so from them
+    this refusal means the write's basis predates the option — the table
+    was read before ``set_object_prefix_field`` landed, and the files went
+    under the table root — and the next call, which re-reads (the
+    refusal drops the ``Table``'s cached info), places them. From a
+    writer that builds its own keys it means the keys or the stats were
+    wrong; re-read and rebuild them with :mod:`pyhoglake.object_prefix`.
+    None of the three retries on its own.
 
     A :class:`ValidationError`, so an existing ``except ValidationError``
     still catches it. :attr:`table` names the qualified table, off the

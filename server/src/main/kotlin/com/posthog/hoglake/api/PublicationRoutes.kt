@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -19,14 +20,26 @@ import io.ktor.server.routing.routing
  * rejecting a body shape the implementation may still change would
  * over-commit the contract.
  */
-fun Application.installPublicationRoutes() {
+fun Application.installPublicationRoutes(selector: CatalogStoreSelector? = null) {
     routing {
         route("/v1/catalogs/{catalog}/publications") {
-            get { call.respondNotImplemented() }
-            post { call.respondNotImplemented() }
+            get {
+                selector?.requirePostgres(call, call.catalog())
+                call.respondNotImplemented()
+            }
+            post {
+                selector?.requirePostgres(call, call.catalog())
+                call.respondNotImplemented()
+            }
             route("/{publication}") {
-                get { call.respondNotImplemented() }
-                delete { call.respondNotImplemented() }
+                get {
+                    selector?.requirePostgres(call, call.catalog())
+                    call.respondNotImplemented()
+                }
+                delete {
+                    selector?.requirePostgres(call, call.catalog())
+                    call.respondNotImplemented()
+                }
             }
         }
     }

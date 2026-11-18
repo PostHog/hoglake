@@ -12,6 +12,7 @@ import {
   RunSummary,
 } from "../src/components/maintenance";
 import type { MaintenanceRun } from "../src/api/types";
+import { listMaintenanceRuns } from "../src/api/client";
 import { maintenanceRunsFixture } from "./fixtures";
 import { jsonResponse, mockFetch } from "./helpers";
 
@@ -249,6 +250,64 @@ describe("maintenance outcome and history", () => {
     );
     // The historical counter stays out of the badge while it is zero.
     expect(screen.queryByText(/heap-budget/)).not.toBeInTheDocument();
+  });
+
+  it("shows oversized rows as a subset of refused groups", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, merge_budget_exceeded: "5", oversized_row_groups: "3" },
+        }}
+      />,
+    );
+    const aggregate = screen.getByText("merge-budget 5");
+    expect(aggregate.parentElement).toHaveTextContent(
+      "skipped 0, dv-superseded 0, unconvertible 0, invalid-data 0, merge-budget 5 (includes 3 groups with oversized rows)",
+    );
+    expect(screen.getByText("(includes 3 groups with oversized rows)")).toHaveAttribute(
+      "title",
+      expect.stringContaining("not rows or Parquet row groups"),
+    );
+    expect(screen.queryByText(/merge-budget 8/)).not.toBeInTheDocument();
+  });
+
+  it.each([undefined, "0"])("omits the oversized-row subset when its count is %s", (count) => {
+    const { oversized_row_groups: _dropped, ...older } = compaction.result!;
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...older, merge_budget_exceeded: "5", ...(count === undefined ? {} : { oversized_row_groups: count }) },
+        }}
+      />,
+    );
+    expect(screen.getByText("merge-budget 5")).toBeInTheDocument();
+    expect(screen.queryByText(/oversized rows/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/—/)).not.toBeInTheDocument();
+  });
+
+  it("preserves an oversized-row count above 2^53 from the ledger response through display", async () => {
+    const body = JSON.stringify({
+      runs: [{
+        ...compaction,
+        result: {
+          ...compaction.result!,
+          merge_budget_exceeded: "9007199254740995",
+          oversized_row_groups: "raw-count",
+        },
+      }],
+      has_more: false,
+    }).replace('"raw-count"', "9007199254740993");
+    mockFetch(() => new Response(body, { headers: { "Content-Type": "application/json" } }));
+    const page = await listMaintenanceRuns("analytics");
+    const run = page.runs[0];
+    expect(run.task).toBe("compaction");
+    if (run.task !== "compaction") throw new Error("Expected a compaction run");
+    expect(run.result?.oversized_row_groups).toBe("9007199254740993");
+    render(<RunSummary run={run} />);
+    expect(screen.getByText("merge-budget 9,007,199,254,740,995")).toBeInTheDocument();
+    expect(screen.getByText("(includes 9,007,199,254,740,993 groups with oversized rows)")).toBeInTheDocument();
   });
 
   it("shows how a sorted rewrite merged, and a spill directory left behind", () => {
@@ -650,6 +709,15 @@ describe("isQuietRun", () => {
       expect(isQuietRun(withField(quiet.compaction, field, "3"))).toBe(true);
     },
   );
+
+  it("keeps an oversized-row subset within the existing quiet-budget classification", () => {
+    const refused = withField(quiet.compaction, "merge_budget_exceeded", "5");
+    const run = withField(refused, "oversized_row_groups", "3");
+    expect(isQuietRun(run)).toBe(true);
+    render(<RunOutcomeBadge run={run} />);
+    expect(screen.getByText("ok")).toBeInTheDocument();
+    expect(screen.queryByText("issues")).not.toBeInTheDocument();
+  });
 
   it("keeps a compaction sweep that left a spill directory on disk", () => {
     expect(isQuietRun(withField(quiet.compaction, "spill_cleanup_failures", "1"))).toBe(false);

@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.schema.Type
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -445,7 +446,8 @@ class CompactionConfigTest {
         val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
         assertThat(app)
             .containsPattern(
-                """(?s)fun startBackground\(\): AutoCloseable \{.{0,900}if \(cfg\.compactionIntervalMs > 0\) \{\s*""" +
+                """(?s)fun startPostgresBackground\(\): AutoCloseable \{.{0,900}""" +
+                    """if \(cfg\.compactionIntervalMs > 0\) \{\s*""" +
                     """com\.posthog\.hoglake\.compaction\.SpillDirectory\.sweepLeftovers""" +
                     """.{0,200}val loops = BackgroundLoops\(\)""",
             )
@@ -498,17 +500,30 @@ class CompactionConfigTest {
     }
 
     @Test
-    fun `the default allowance leaves process headroom on the maintenance pod`() {
+    fun `the default is sized for the pod the maintenance deployment actually has`() {
+        // Charge the full row allowance, not the former 0.79 measured fraction.
+        // Preserve the deployment's 70%-of-heap inequality.
+        // This envelope covers the calibrated flat event schema and ordinary metadata.
         val mib = 1024.0 * 1024
         val heap = 4.0 * 1024 * mib * 0.70
-        val budget = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES
-        val memory = SortMemory(budget)
-        assertThat(memory.chunkBytes + memory.readerBytes + memory.rowBytes).isLessThan(budget)
-        assertThat(memory.mergeBytes).isEqualTo(budget / 2)
-        // Reserve additional space for the hydrator and object-store buffers.
-        // This inequality checks the configured allowance, not a universal process-peak guarantee.
-        val configured = budget + 256 * mib + 16 * mib
-        assertThat(configured / heap).isLessThan(0.7)
+        val budget = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
+        val outputWriter = 147_502.0 * 1024
+        val merge = budget + outputWriter + 16 * mib
+        val eventColumns = (1L..10L).map { Column(it, (it - 1).toInt(), ColumnDef("field$it", ColType.LONG)) }
+        val reader = defaulted().sortSpill(eventColumns).readerBudgetBytes.toDouble()
+        assertThat(reader).isEqualTo(534 * mib)
+        val chunk = budget + reader + 37 * mib
+        val single = budget + outputWriter + 5 * mib
+        val metadataAndCaches = (16 + 40) * mib
+        val peak = maxOf(merge, chunk, single) + metadataAndCaches + 256 * mib
+        assertThat(peak / mib).isEqualTo(1907.0)
+        assertThat(peak / heap)
+            .describedAs(
+                "worst-case peak %.0f MiB against a %.0f MiB heap — raise the pod before the knob",
+                peak / mib,
+                heap / mib,
+            )
+            .isLessThan(0.7)
     }
 
     @Test
@@ -620,17 +635,17 @@ class CompactionConfigTest {
 
     @Test
     fun `N concurrent sorted groups cannot exceed the heap one group was allowed`() {
-        // Divide advisory ceilings and enforced allowances across concurrent groups.
+        // THE heap-gating property, stated as the arithmetic it is: the
+        // budget is DIVIDED, so N groups each at their ceiling cost what
+        // one group used to. Asserted in the unit the heap holds — rows
+        // times the per-node cost — rather than on the knob, because the
+        // knob is not what OOMs.
         val heap = 1024L * 1024 * 1024
         val one = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, sortedHeapBytes = heap)
         val nodesPlusCarrier = flatColumns.size + 1
         val perRowBytes = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesPlusCarrier
         for (n in listOf(1, 2, 4, 8, 64)) {
             val many = one.copy(parallelGroups = n)
-            assertThat(SortMemory(many.sortedHeapBytesPerGroup).chunkBytes * n)
-                .isLessThanOrEqualTo(SortMemory(heap).chunkBytes)
-            assertThat(SortMemory(many.sortedHeapBytesPerGroup).readerBytes * n)
-                .isLessThanOrEqualTo(SortMemory(heap).readerBytes)
             val concurrentBytes = many.spillChunkRows(flatColumns) * perRowBytes * n
             assertThat(concurrentBytes)
                 .describedAs("%d concurrent sorted chunks", n)
@@ -1114,6 +1129,39 @@ class CompactionConfigTest {
         assertThat(app)
             .containsPattern("""variantCompaction\s*=\s*cfg\.compactionVariant\b""")
             .containsPattern("""variantCompactionCatalogs\s*=\s*cfg\.compactionVariantCatalogs""")
+    }
+
+    @Test
+    fun `remembered historical shapes use exactly the runtime reader reserve`() {
+        val bare = Column(2, 1, ColumnDef("v", ColType.VARIANT))
+        val typed =
+            bare.copy(
+                def = bare.def.copy(typeParams = mapOf("shredding" to mapOf("type" to "int64"))),
+            )
+        val config = defaulted()
+        for ((declared, historical) in listOf(bare to typed, typed to bare)) {
+            val live = flatColumns + declared
+            val layout = VariantLayout.groupType(historical, Type.Repetition.OPTIONAL)
+            val (nodes, nested) = VariantLayout.shape(layout)
+            val shapes = mapOf(2L to VariantLayoutMemory.Shape(nodes, nested, VariantLayout.leaves(layout)))
+            val runtime = config.sortSpill(live, mapOf(2L to layout))
+            val remembered = config.sortSpillOfShapes(live, shapes)
+            assertThat(remembered).isEqualTo(runtime)
+            assertThat(remembered.readerBudgetBytes).isNotEqualTo(config.sortSpill(live).readerBudgetBytes)
+            assertThat(
+                config.sortSpillOfShapes(live, shapes + (999L to VariantLayoutMemory.Shape(9, true, 4))),
+            ).describedAs("layouts of absent columns do not change the output").isEqualTo(runtime)
+        }
+    }
+
+    @Test
+    fun `remembered shape leaf counts cannot wrap into an affordable reader reserve`() {
+        val live = flatColumns + Column(2, 1, ColumnDef("v", ColType.VARIANT))
+        for (leaves in listOf(-1, 0, Int.MAX_VALUE)) {
+            assertThatThrownBy {
+                defaulted().sortSpillOfShapes(live, mapOf(2L to VariantLayoutMemory.Shape(4, false, leaves)))
+            }.isInstanceOf(InvalidDataException::class.java)
+        }
     }
 
     @Test

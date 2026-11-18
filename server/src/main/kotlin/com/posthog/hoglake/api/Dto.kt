@@ -31,6 +31,7 @@ import com.posthog.hoglake.model.SnapshotResolution
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.TableFileEnds
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.model.ViewInfo
@@ -84,6 +85,8 @@ data class ApiErrorDto(
 
 // ---- catalogs ------------------------------------------------------------
 
+private const val ORG_MARKED_CONTAINMENT = "org-marked-containment-v1"
+
 data class CatalogDto(
     val name: String,
     val dataPath: String,
@@ -107,6 +110,9 @@ data class CatalogDto(
             "claimed-uploads-v1",
             "atomic-dml-transactions-v1",
             "object-prefix-layout-v1",
+            "mutable-variant-shredding-v1",
+            "atomic-partition-replacement-v1",
+            ORG_MARKED_CONTAINMENT,
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -140,6 +146,8 @@ data class CatalogDto(
      * An instant, not an age: the client renders "3 days ago" live.
      */
     val oldestSnapshotTime: Instant? = null,
+    /** True on a mount, which serves reads only; absent (NON_NULL) on every other catalog. */
+    val readOnly: Boolean? = null,
 )
 
 /**
@@ -160,11 +168,20 @@ fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
         headSnapshotId = headSnapshotId,
         schemaVersion = schemaVersion,
         earliestSnapshotTime = earliestSnapshotTime,
+        capabilities =
+            CatalogDto("", "", 0, 0).capabilities.filter { orgMarkedContainment || it != ORG_MARKED_CONTAINMENT },
         tableCount = totals?.tableCount,
         liveRows = totals?.liveRows,
         liveSizeBytes = totals?.liveBytes,
         oldestSnapshotTime = totals?.oldestSnapshotTime,
     )
+
+/**
+ * A mount's catalog: its source's row (data path, snapshot clock) under the
+ * mount's [name]. No capability, since every one advertised gates a write,
+ * and no sampler totals, which count the whole source.
+ */
+fun CatalogInfo.toMountDto(name: String) = toDto().copy(name = name, capabilities = emptyList(), readOnly = true)
 
 data class CreateCatalogRequestDto(
     val name: String,
@@ -186,15 +203,23 @@ data class OperationMetadataDto(
 
 data class NamespaceDto(
     val name: String,
-    val namespaceId: Long,
+    /** Present on every namespace this server holds; absent on a remote schema, which has no id here. */
+    val namespaceId: Long? = null,
     /** Present when the namespace is contained (V33). */
     val containment: NamespaceContainmentDto? = null,
+    /**
+     * Present, and true, only on a remote schema: a read-only namespace
+     * another hoglake serves (docs/auth-tenancy.md §6.5c). A namespace
+     * listing writes such an entry from configuration and the caller's
+     * token, so it carries a name and this flag and nothing else.
+     */
+    val remote: Boolean? = null,
 )
 
-data class NamespaceContainmentDto(val field: String, val value: Long)
+data class NamespaceContainmentDto(val field: String, val value: Long, val org: String? = null)
 
 fun NamespaceInfo.toDto() =
-    NamespaceDto(name, namespaceId, containment?.let { NamespaceContainmentDto(it.field, it.value) })
+    NamespaceDto(name, namespaceId, containment?.let { NamespaceContainmentDto(it.field, it.value, it.org) })
 
 data class CreateNamespaceRequestDto(
     val name: String,
@@ -202,6 +227,8 @@ data class CreateNamespaceRequestDto(
     val author: String? = null,
     @JsonDeserialize(using = OperationTextDeserializer::class)
     val message: String? = null,
+    /** Operator-only: the namespace is created already marked, as `PUT .../containment` marks one. */
+    val containment: NamespaceContainmentDto? = null,
 )
 
 // ---- tables --------------------------------------------------------------
@@ -536,11 +563,57 @@ data class CommitRequestDto(
         )
 }
 
-data class CommitReceiptDto(val operationId: UUID, val snapshotId: Long, val schemaVersion: Long)
+data class TableFileEndsDto(
+    val namespace: String,
+    val table: String,
+    val expectedTableUuid: UUID,
+    val partitions: List<List<String?>>? = null,
+    val allFiles: Boolean = false,
+) {
+    fun toModel() = TableFileEnds(namespace, table, expectedTableUuid, partitions, allFiles)
+}
 
-data class CommitResultDto(val snapshotId: Long, val schemaVersion: Long)
+/**
+ * The body of `POST /commit/replacements/prepared`: a [CommitRequestDto] plus
+ * [fileEnds]. A separate type so the older commit routes keep rejecting
+ * `file_ends` as an unknown property rather than ignoring it. `deletes` and
+ * `require_unchanged_tables` are accepted only so the route can refuse them
+ * with the 400 the contract names, instead of a parse error that says less.
+ */
+data class ReplacementRequestDto(
+    val readSnapshot: Long? = null,
+    val appends: List<TableAppendDto> = emptyList(),
+    val deletes: List<TableDeletesDto> = emptyList(),
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+    val idempotencyKey: UUID? = null,
+    val requireUnchangedTables: Boolean? = null,
+    val fileEnds: List<TableFileEndsDto>? = null,
+) {
+    fun toModel() =
+        CommitRequest(
+            readSnapshot = readSnapshot,
+            appends = appends.map { it.toModel() },
+            author = author,
+            message = message,
+            idempotencyKey = idempotencyKey,
+            fileEnds = fileEnds?.map { it.toModel() },
+        )
+}
 
-fun CommitResult.toDto() = CommitResultDto(snapshotId, schemaVersion)
+data class CommitReceiptDto(
+    val operationId: UUID,
+    val snapshotId: Long,
+    val schemaVersion: Long,
+    val endedFiles: Long? = null,
+)
+
+/** [endedFiles] is NON_NULL on the wire: only a replacement reports it. */
+data class CommitResultDto(val snapshotId: Long, val schemaVersion: Long, val endedFiles: Long? = null)
+
+fun CommitResult.toDto() = CommitResultDto(snapshotId, schemaVersion, endedFiles)
 
 // ---- files + changefeed --------------------------------------------------
 
@@ -816,12 +889,19 @@ fun DeleteFile.toDto() =
 data class ScanFileDto(
     val dataFile: DataFileDto,
     val deleteFile: DeleteFileDto? = null,
+    /**
+     * The file's team id, carried only by a mount's scoped scan (plan row
+     * 1.3h) so the Client can vend a per-team credential for it; NON_NULL
+     * omits it on every ordinary scan.
+     */
+    val teamId: Long? = null,
 )
 
 fun ScanFile.toDto() =
     ScanFileDto(
         dataFile = dataFile.toDto(),
         deleteFile = deleteFile?.toDto(),
+        teamId = teamId,
     )
 
 data class ChangePlanDto(

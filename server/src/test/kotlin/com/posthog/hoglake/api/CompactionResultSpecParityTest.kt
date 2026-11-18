@@ -104,7 +104,7 @@ class CompactionResultSpecParityTest {
                 runsDemoted = 20,
                 spillBytes = 21,
                 spillBudgetExceeded = 22,
-                mergeBudgetExceeded = 23,
+                mergeBudgetExceeded = 35,
                 spillCleanupFailures = 24,
                 filesVerified = 25,
                 filesUnsorted = 26,
@@ -115,6 +115,8 @@ class CompactionResultSpecParityTest {
                 filesUnranged = 31,
                 bucketsSkippedClaimed = 32,
                 objectPrefixUnresolvable = 33,
+                layoutProbeOnly = 34,
+                oversizedRowGroups = 23,
             )
         val dto = result.toDto()
         assertThat(dto.groupsCompacted).isEqualTo(1)
@@ -146,7 +148,7 @@ class CompactionResultSpecParityTest {
         assertThat(dto.runsDemoted).isEqualTo(20)
         assertThat(dto.spillBytes).isEqualTo(21)
         assertThat(dto.spillBudgetExceeded).isEqualTo(22)
-        assertThat(dto.mergeBudgetExceeded).isEqualTo(23)
+        assertThat(dto.mergeBudgetExceeded).isEqualTo(35)
         assertThat(dto.spillCleanupFailures).isEqualTo(24)
         // The sortedness pre-pass's verdicts.
         assertThat(dto.filesVerified).isEqualTo(25)
@@ -166,6 +168,10 @@ class CompactionResultSpecParityTest {
         // The object-prefix planner refusal (2.1d), a group counter beside
         // the budget refusals.
         assertThat(dto.objectPrefixUnresolvable).isEqualTo(33)
+        // The variant-layout probe that found nothing to rewrite: an
+        // attempt with no rewrite, beside the other charged skips.
+        assertThat(dto.layoutProbeOnly).isEqualTo(34)
+        assertThat(dto.oversizedRowGroups).isEqualTo(23)
     }
 
     @Test
@@ -199,6 +205,7 @@ class CompactionResultSpecParityTest {
                 "spill_bytes",
                 "spill_budget_exceeded",
                 "merge_budget_exceeded",
+                "oversized_row_groups",
                 "spill_cleanup_failures",
                 "files_verified",
                 "files_unsorted",
@@ -215,6 +222,8 @@ class CompactionResultSpecParityTest {
                 "buckets_skipped_claimed",
                 // The object-prefix planner refusal (2.1d).
                 "object_prefix_unresolvable",
+                // The variant-layout probe that found nothing to rewrite.
+                "layout_probe_only",
             )
         assertThat(properties(block)).containsAll(added)
         assertThat(requiredOf(block)).doesNotContainAnyElementsOf(added)

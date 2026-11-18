@@ -1,7 +1,173 @@
 package com.posthog.hoglake
 
-/** Process configuration, environment-sourced. No config files in v1. */
+import com.fasterxml.jackson.core.JsonParser
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.auth.JwtVerifier
+import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
+import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.service.OperatorTeamNamespaces
+import com.posthog.hoglake.service.ReservedNamespaces
+import com.posthog.hoglake.service.TeamNamespaces
+import com.posthog.hoglake.storage.BrokerUrls
+import com.posthog.hoglake.store.BackendKind
+import com.posthog.hoglake.store.MountHost
+import com.posthog.hoglake.store.MountMatch
+import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.ServedFamily
+import com.posthog.hoglake.store.ServedStream
+import io.github.oshai.kotlinlogging.KotlinLogging
+import java.net.URI
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.UUID
+
+/**
+ * A configuration value that must not print: `toString` redacts it, so a
+ * data-class dump, a log line or an exception message that interpolates the
+ * config shows `<redacted>` and not the secret. Equality is by value.
+ */
+class SecretString(
+    val value: String,
+) {
+    override fun toString(): String = if (value.isEmpty()) "" else "<redacted>"
+
+    override fun equals(other: Any?): Boolean = other is SecretString && other.value == value
+
+    override fun hashCode(): Int = value.hashCode()
+}
+
+private val servedNamespacesLog = KotlinLogging.logger {}
+
+/** Process configuration, with an optional backend allowlist file. */
 data class Config(
+    /**
+     * Optional JSON file: {"backends": [{"id": UUID, "kind": "hoglite", "url": HTTP_URL}]}.
+     * Optional keys: whale_url, owner_url_pattern, connect_timeout_ms, read_timeout_ms,
+     * commit_timeout_ms, retry_budget_ms, circuit_failure_threshold, circuit_open_ms.
+     * Entries contain endpoints, never credentials. Each id must be unique and canonical.
+     */
+    val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
+    /** PostgreSQL is the only default backend. `none` disables fallback and opens PostgreSQL only on a routed request. */
+    val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
+    /** Optional allowlist id for this process's PostgreSQL backend. */
+    val postgresBackendId: String = env("HOGLAKE_POSTGRES_BACKEND_ID", ""),
+    /**
+     * The PostgreSQL catalog every mount reads (one per instance, e.g.
+     * `millrace-dev`); its row is each mount's catalog. Empty (the default):
+     * none, so a mount that resolves answers 500 rather than a catalog.
+     */
+    val mountSourceCatalog: String = env("HOGLAKE_MOUNT_SOURCE_CATALOG", ""),
+    /**
+     * The one table every mount reads, pinned by its `table_uuid` (#291
+     * decision 3; hoglake#557's `hog_mount` stores no source table). Empty
+     * (the default): no table pinned, so a mount's read routes answer 500.
+     * The reader resolves the uuid to its live (namespace, name) per request,
+     * so a drop/recreate of the source needs a new value here.
+     */
+    val mountSourceTableUuid: String = env("HOGLAKE_MOUNT_SOURCE_TABLE_UUID", ""),
+    /**
+     * The field id of the mount's source (partition) field — `team_id` —
+     * that `ReadScope` (1.2) scopes on and that each scanned file carries.
+     * Empty (the default): unset, so a mount's read routes answer 500.
+     */
+    val mountSourceFieldId: String = env("HOGLAKE_MOUNT_SOURCE_FIELD_ID", ""),
+    /**
+     * The most files one mount scan's scoped plan may return before it is
+     * refused with 422 `mount_scan_too_many_files` (plan row 1.3h / M10):
+     * a whale org's cold scan is bounded rather than allowed to build an
+     * unbounded result in memory. The scope is the token's, so a caller
+     * cannot narrow it; this is a Host protection.
+     */
+    val mountScanFileBudget: Int = env("HOGLAKE_MOUNT_SCAN_FILE_BUDGET", "2000000").toInt(),
+    /**
+     * The deadline (ms) one mount scan's SQL may run before it is refused
+     * with 503 `mount_scan_timeout` (`SET LOCAL statement_timeout`); 0
+     * disables it. This bounds the time, the file budget the returned rows;
+     * the Postgres InitPlan array ReadScope collects is bounded by neither.
+     */
+    val mountScanDeadlineMs: Long = env("HOGLAKE_MOUNT_SCAN_DEADLINE_MS", "60000").toLong(),
+    /**
+     * The one shared cap over ALL export (mount) scans in flight, on the
+     * scan route only (plan row 1.3h, 1.6's deferred cap): a non-blocking
+     * `tryAcquire` answers 503 `mount_scan_busy` when it is full, so Trino
+     * reads cannot starve ingest writers on the shared request dispatcher.
+     * Org fairness comes from Trino resource groups, not from this cap
+     * (user, 2026-11-09). 0 disables the cap.
+     */
+    val mountScanMaxConcurrent: Int = env("HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT", "8").toInt(),
+    /**
+     * Client mode (plan row 1.3c). Optional JSON file naming the remote
+     * hosts this server proxies mounts to, and which catalog names each one
+     * serves:
+     * {"hosts": [{"id": UUID, "match": {"type": "events"}, "kind": "hoglake",
+     * "url": HTTP_URL, "auth": "forward"}]}.
+     * `match` is {"type": "events"} (every mount name, `<orgID>-events`),
+     * {"type": "catalog", "name": NAME} (one mount name) or
+     * {"type": "namespace", "name": NAME} (a remote schema: the namespace
+     * NAME of every catalog this server holds itself, read-only, relayed to
+     * the host; NAME is then reserved as [reservedNamespaceNames] are) or
+     * {"type": "namespace_family", "family": "team"} (every canonical
+     * `team_<id>` namespace, relayed as a `namespace` entry is; every
+     * `team_<digits>` name, in any case and with any leading zeros, is then
+     * reserved, and a `namespace` entry of such a name is refused as an
+     * overlap). The caller reaches a team schema through the `team` entry of
+     * its `remote_schemas` claim and a `team_id` in its `prd`. Only the
+     * family `team` exists.
+     * `kind` is what the host speaks (only `hoglake`), `auth` how this
+     * server authenticates to it (only `forward`: the caller's bearer
+     * token, unchanged). Optional
+     * keys: timeout_ms, max_response_bytes, max_concurrent, and on a
+     * namespace entry allow_insecure_http (a boolean, default false). A
+     * namespace entry's URL must be https unless that key is true: the token
+     * relayed for a remote schema can carry storage credentials, and http
+     * sends it without transport encryption. The key is refused on the
+     * other match types, whose URLs may be http as before. A namespace
+     * entry may also set remote_name, the schema's name on the host (default
+     * NAME): NAME is what this server shows and reserves, while the relayed
+     * path and the token's `remote_schemas` use remote_name. Refused on the other
+     * match types; no two namespace entries, on any hosts, may have one
+     * name on their hosts. Entries contain
+     * endpoints, never credentials; each id must be unique and canonical,
+     * each URL a bare http(s) origin, and no name may match two entries.
+     *
+     * Empty (the default), or an empty list: no proxy, today's behaviour.
+     * With hosts, a request for a matched name is checked here as a mount
+     * reader's (a remote schema's needs the token's `remote_schemas` claim)
+     * and then sent to that host and nowhere else. Refused at boot
+     * with [mountAllowlist] (a server is a Host or a Client), under
+     * `HOGLAKE_AUTH_MODE=off`, or without [authPredicateFields] (a mount
+     * serves only verified scoped tokens). A `namespace` entry is also
+     * refused unless [authSessionProfile] is `on`: only a token carrying
+     * the session profile can name a remote schema.
+     */
+    val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
+    /**
+     * HOGLAKE_SERVED_NAMESPACES_FILE: this server is a Host that serves
+     * namespaces to a Client's relayed readers (docs/auth-tenancy.md §6.5d).
+     * A JSON object with exactly a `families` array of
+     * `{"family": "team", "source_catalog": "<catalog>", "predicate_field":
+     * "<field>"}`: a read of a canonical `team_<id>` under a catalog this
+     * server does not hold is answered from the namespace of the same name in
+     * the source catalog, read-only, when that namespace is marked
+     * `predicate_field = <id>` for the caller's org and a scoped
+     * session-profile caller of that org holds the team. `predicate_field`
+     * must be one of [authPredicateFields]. An entry may also carry
+     * `"stream": {"catalog": "<catalog>", "namespace": "<namespace>",
+     * "tables": ["events", ...]}`: the same `team_<id>` then also shows those
+     * published tables of that namespace, shared by every team, with the
+     * rows of team `<id>` only; a published name hides an import of that name
+     * in any ASCII case. The namespace may not have a team's shape, and the
+     * tables must be non-empty, valid and distinct in ASCII case. Without
+     * `stream` only the imports are served. Unknown keys, a second entry for
+     * a family, and the former `namespaces` list are refused. Empty (the
+     * default): nothing is served. Refused at boot under
+     * `HOGLAKE_AUTH_MODE=off`, without [authSessionProfile] `on` or
+     * [authPredicateFields], with
+     * [mountHostsFile] (a server is a Host or a Client), or when PostgreSQL
+     * is not the default backend.
+     */
+    val servedNamespacesFile: String = env("HOGLAKE_SERVED_NAMESPACES_FILE", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -32,9 +198,10 @@ data class Config(
     val instanceName: String = env("HOGLAKE_INSTANCE_NAME", ""),
     /** Color theme for the webui. Empty keeps the default palette. */
     val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
-    val jdbcUrl: String = env("HOGLAKE_JDBC_URL", "jdbc:postgresql://localhost:5432/hoglake"),
-    val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
-    val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
+    val jdbcUrl: String =
+        env("HOGLAKE_JDBC_URL", if (defaultBackend == "postgres") "jdbc:postgresql://localhost:5432/hoglake" else ""),
+    val dbUser: String = env("HOGLAKE_DB_USER", if (defaultBackend == "postgres") "hoglake" else ""),
+    val dbPassword: String = env("HOGLAKE_DB_PASSWORD", if (defaultBackend == "postgres") "hoglake" else ""),
     val dbPoolSize: Int = env("HOGLAKE_DB_POOL_SIZE", "10").toInt(),
     /**
      * How many threads serve blocking route handlers (#218).
@@ -156,6 +323,44 @@ data class Config(
     val s3SecretKey: String = env("HOGLAKE_S3_SECRET_KEY", ""),
     val s3PathStyle: Boolean = boolEnv("HOGLAKE_S3_PATH_STYLE", true),
     /**
+     * Where the server's OWN jobs get S3 credentials (docs/auth.md,
+     * "Storage credentials"): `ambient` | `static` | `broker`. Empty —
+     * the default — is `static` when both S3 keys are set and `ambient`
+     * otherwise, which is exactly what the server did before the knob
+     * existed. Resolved by [effectiveStorageProvider]; the combination is
+     * validated at boot.
+     */
+    val storageProvider: String = env("HOGLAKE_STORAGE_PROVIDER", ""),
+    /** `broker` only: the URL that vends a session for `{catalog, prefix, access}`. */
+    val storageBrokerUrl: String = env("HOGLAKE_STORAGE_BROKER_URL", ""),
+    /** `broker` only: the OAuth token URL the server's client credential is exchanged at. */
+    val storageBrokerTokenUrl: String = env("HOGLAKE_STORAGE_BROKER_TOKEN_URL", ""),
+    val storageBrokerClientId: String = env("HOGLAKE_STORAGE_BROKER_CLIENT_ID", ""),
+    val storageBrokerClientSecret: String = env("HOGLAKE_STORAGE_BROKER_CLIENT_SECRET", ""),
+    /**
+     * `broker` only: the `audience` the token request asks for. The
+     * default is the one the clients use; a broker that wants its own
+     * audience on the bearer it receives sets it here.
+     */
+    val storageBrokerAudience: String = env("HOGLAKE_STORAGE_BROKER_AUDIENCE", "hoglake"),
+    /**
+     * `broker` only: how long before a session's expiry it is refreshed.
+     * A refresh that fails keeps the held session for the rest of this
+     * window, so it is also how much broker downtime a running job rides
+     * through.
+     */
+    val storageBrokerRefreshMarginSeconds: Long = env("HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS", "300").toLong(),
+    /**
+     * `broker` only: accept `http` broker and token URLs to ANY host, not
+     * just the loopback one. Off by default; an operator turns it on to
+     * say the hop to the broker runs inside a network they already trust
+     * — a broker's in-cluster listener reached by its Service name, the
+     * same convention that broker uses for its own token URL. Explicit
+     * rather than a hostname pattern, because "trusted network" is a
+     * statement for the values file to make.
+     */
+    val storageBrokerAllowHttp: Boolean = boolEnv("HOGLAKE_STORAGE_BROKER_ALLOW_HTTP", false),
+    /**
      * Authentication at the HTTP boundary (docs/auth-tenancy.md):
      * `off` | `warn` | `enforce` (§11).
      *
@@ -209,6 +414,76 @@ data class Config(
      * in its `prd` claim. Empty (the default) refuses every scoped token.
      */
     val authPredicateFields: String = env("HOGLAKE_AUTH_PREDICATE_FIELDS", ""),
+    /**
+     * The longest a `ten: scoped` token may live, `exp - iat`, in seconds.
+     *
+     * A scoped token's predicate is a snapshot of its holder's access, and
+     * this bounds how stale that snapshot can get. 900 (15 minutes) by
+     * default; an issuer that mints longer-lived scoped tokens needs it
+     * raised. Must be positive: zero or less is refused at boot.
+     */
+    val authScopedMaxLifetimeSeconds: Long =
+        env("HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS", "${JwtVerifier.DEFAULT_SCOPED_MAX_LIFETIME_SECONDS}").let {
+            it.trim().toLongOrNull()
+                ?: throw IllegalArgumentException(
+                    "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be an integer, got '$it'",
+                )
+        },
+    /**
+     * Extra `client` label classes for `hoglake_auth_requests_total`,
+     * comma-separated User-Agent product tokens (`name` of `name/1.0`), each
+     * counted under its own name rather than `other`: e.g. an issuer's own
+     * provisioner. Lowercase, at most $MAX_AUTH_CLIENT_CLASSES, never `none` or
+     * `other`. Empty (the default): only the built-in generic classes.
+     */
+    val authClientClasses: Set<String> = nameList(env("HOGLAKE_AUTH_CLIENT_CLASSES", "")),
+    /**
+     * Whether the verifier accepts tokens carrying the session profile
+     * (docs/auth.md, "Session profile with embedded storage credentials"):
+     * `off` (the default) refuses them with `profile_not_enabled`; `on`
+     * validates the profile and records its read-only remote schemas. hoglake
+     * never uses the credentials such a token carries.
+     */
+    val authSessionProfile: String = env("HOGLAKE_AUTH_SESSION_PROFILE", "off"),
+    /**
+     * The server's own ES256 signing key, for `HOGLAKE_AUTH_MODE=local` only
+     * (docs/auth.md, "Local issuer"): a private P-256 JWK, base64url, as
+     * `hoglake token keygen` prints it. ENV-ONLY by decision — no key file and
+     * nothing persisted — so the one place a standalone install's key lives is
+     * the environment the server and the minting shell share. Refused outside
+     * `local` (a key the server would ignore is a deployment that believes it
+     * is local and is not) and required under it. Held as a [SecretString] so
+     * no `toString` of this config prints it.
+     */
+    val authSigningKey: SecretString = SecretString(env("HOGLAKE_AUTH_SIGNING_KEY", "")),
+    /**
+     * The orgs whose mount may serve, comma-separated: the `<id>` of each
+     * mount `<id>-events`, matching the orgs the mount writer manages. `*` admits every mount. Empty (the default) admits none, and no
+     * mount name is then looked up at all. Writes are not gated by it, so a
+     * mount can always be disabled.
+     */
+    val mountAllowlist: Set<String> = nameList(env("HOGLAKE_MOUNT_ALLOWLIST", "")),
+    /**
+     * The `sub` of the one operator token that may write mounts
+     * (`PUT /v1/mounts/{name}`), verified, so under `off` none may: the
+     * issuer's events mount loop. Empty (the default): no caller may.
+     */
+    val mountWriterSubject: String = env("HOGLAKE_MOUNT_WRITER_SUBJECT", ""),
+    /**
+     * Namespace names no caller may create in any catalog, comma-separated,
+     * matched ignoring ASCII case ([ReservedNamespaces]). Empty (the default)
+     * reserves none. PostHog's customer hoglake reserves `posthog`, the
+     * schema its Trino connector serves from the org's events mount.
+     */
+    val reservedNamespaceNames: Set<String> = nameList(env("HOGLAKE_RESERVED_NAMESPACES", "")),
+    /**
+     * Catalogs, comma-separated, where only an operator creates a namespace
+     * named `team_<digits>` (any case, any leading zeros). Empty, the
+     * default, lists none. A per-team scoped writer reaches such a
+     * namespace through an operator's org mark; this keeps a tenant from
+     * creating the name first.
+     */
+    val operatorTeamNamespaceCatalogs: Set<String> = nameList(env("HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS", "")),
     /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
@@ -1110,10 +1385,15 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_PLAN_STATEMENT_TIMEOUT_MS}",
         ).toLong(),
     /**
-     * Derate the advisory chunk-row ceiling for nested sorted tables.
-     * The decoder separately charges actual repeated nodes and binary payloads.
-     * Groups still pack to the configured byte target.
-     * See CompactionConfig.nestedSortExpansion.
+     * Sorted-path CHUNK derate for NESTED tables: the rows per spill
+     * chunk of a table with both nested columns and a live sort order is
+     * divided by this. A chunk is materialized to be sorted, and a nested
+     * row's node count is not knowable from the catalog (list lengths
+     * are data) — measured at 30-70x its compressed bytes — so the
+     * per-node accounting below cannot see it. 1 disables the derate,
+     * which is the setting to reach for only with a heap sized for it.
+     * Sizes chunks only; groups pack to the byte target. See
+     * CompactionConfig.nestedSortExpansion.
      */
     val compactionNestedSortExpansion: Int =
         env(
@@ -1121,14 +1401,22 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
         ).toInt(),
     /**
-     * Set the sorted rewrite's heap allowance before division by HOGLAKE_COMPACTION_PARALLEL_GROUPS.
-     * The default remains 1 GiB.
-     * The external merge sort limits decoded chunk bytes, individual rows, input readers, and merge runs.
-     * It reserves writer and transient headroom within each group's allowance.
-     * Large pages, large rows, or excessive runs can cause typed merge refusals.
-     * The advisory schema-row estimate does not bound payload bytes.
+     * How much HEAP one sorted rewrite may hold, per phase (divided by
+     * HOGLAKE_COMPACTION_PARALLEL_GROUPS), default 1 GiB. A sorted rewrite
+     * is an external merge sort: it bounds the CHUNK (rows sorted in
+     * memory before each spill, via the live schema's node count) and
+     * the MERGE (one row group per run; trusted runs admitted largest
+     * first, the rest demoted to the spill path). It no longer bounds the
+     * group, which packs to HOGLAKE_COMPACTION_TARGET_BYTES.
      *
-     * Size process memory for concurrent groups and other server allocations.
+     * The default fits the 4 GiB maintenance pod (~2.8 GiB of heap at
+     * the image's MaxRAMPercentage=70): worst-case process peak ~1614
+     * MiB, 56% of that heap — the chunk phase with a target-sized input
+     * row group (or the merge: the budget, the output writer's buffered
+     * row group, flat at ~140 MiB, and the S3 part buffer), plus the
+     * hydrator's whole-object ceiling. Raise it only together
+     * with the pod's memory (server/README.md has the pod table); it buys
+     * fewer spill files and more trusted runs read in place.
      * See CompactionConfig.sortedHeapBytes.
      */
     val compactionSortedHeapBytes: Long =
@@ -1238,7 +1526,245 @@ data class Config(
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
     val maintenanceSummaryRefreshSeconds: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS", "60").toLong(),
 ) {
+    val hogliteBackends: Map<UUID, HogliteBackend> = readBackends(backendsFile)
+
+    /** [authSessionProfile] resolved: true for `on`. */
+    val authSessionProfileEnabled: Boolean = authSessionProfile.trim().lowercase() == "on"
+
+    val backendKinds: Map<UUID, BackendKind> =
+        hogliteBackends.keys.associateWith { BackendKind.HOGLITE } +
+            if (postgresBackendId.isEmpty()) {
+                emptyMap()
+            } else {
+                mapOf(canonicalBackendId(postgresBackendId) to BackendKind.POSTGRES)
+            }
+
+    /** Whether [HOGLAKE_MOUNT_ALLOWLIST][mountAllowlist] admits the mount [name]. */
+    fun mountAdmitted(name: String): Boolean =
+        MountNames.isReserved(name) && ("*" in mountAllowlist || name.removeSuffix("-events") in mountAllowlist)
+
+    /** The pinned source [table_uuid][mountSourceTableUuid], or null when unset. */
+    val mountSourceTableUuidOrNull: UUID? = mountSourceTableUuid.takeIf { it.isNotBlank() }?.let(UUID::fromString)
+
+    /** The pinned source [field id][mountSourceFieldId], or null when unset. */
+    val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
+
+    /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
+    val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
+
+    /** The families of [servedNamespacesFile]; empty when this server serves none. */
+    val servedFamilies: List<ServedFamily> = readServedFamilies(servedNamespacesFile)
+
+    /**
+     * [reservedNamespaceNames], checked at boot: each must be a valid
+     * namespace name. Every remote schema [mountHosts] configures is
+     * reserved with them: its name always means the remote schema.
+     */
+    val reservedNamespaces: ReservedNamespaces =
+        ReservedNamespaces(
+            reservedNamespaceNames + mountHosts.mapNotNull { (it.match as? MountMatch.Namespace)?.name },
+            teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
+        )
+
+    /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
+    val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
+
+    /** The storage credential provider kinds `HOGLAKE_STORAGE_PROVIDER` names. */
+    enum class StorageProviderKind(val wire: String) {
+        AMBIENT("ambient"),
+        STATIC("static"),
+        BROKER("broker"),
+        ;
+
+        companion object {
+            fun parse(raw: String): StorageProviderKind =
+                entries.firstOrNull { it.wire == raw.trim().lowercase() }
+                    ?: throw IllegalArgumentException(
+                        "HOGLAKE_STORAGE_PROVIDER must be one of ${entries.joinToString { it.wire }}, got '$raw'",
+                    )
+        }
+    }
+
+    /**
+     * [storageProvider] resolved: the named kind, or — unset — the
+     * pre-knob rule, `static` when both keys are set and `ambient`
+     * otherwise.
+     */
+    val effectiveStorageProvider: StorageProviderKind =
+        if (storageProvider.isBlank()) {
+            if (s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()) {
+                StorageProviderKind.STATIC
+            } else {
+                StorageProviderKind.AMBIENT
+            }
+        } else {
+            StorageProviderKind.parse(storageProvider)
+        }
+
     init {
+        val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
+        when (effectiveStorageProvider) {
+            StorageProviderKind.STATIC ->
+                require(s3Keys) {
+                    "HOGLAKE_STORAGE_PROVIDER=static needs both HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY"
+                }
+            // Keys beside an explicit `ambient` are not a preference to
+            // resolve: whoever set both believes the keys are in use.
+            StorageProviderKind.AMBIENT ->
+                require(storageProvider.isBlank() || !(s3AccessKey.isNotBlank() || s3SecretKey.isNotBlank())) {
+                    "HOGLAKE_STORAGE_PROVIDER=ambient uses the SDK's credential chain; unset " +
+                        "HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY, or select static"
+                }
+            StorageProviderKind.BROKER -> {
+                require(
+                    storageBrokerUrl.isNotBlank() && storageBrokerTokenUrl.isNotBlank() &&
+                        storageBrokerClientId.isNotBlank() && storageBrokerClientSecret.isNotBlank(),
+                ) {
+                    "HOGLAKE_STORAGE_PROVIDER=broker needs HOGLAKE_STORAGE_BROKER_URL, " +
+                        "HOGLAKE_STORAGE_BROKER_TOKEN_URL, HOGLAKE_STORAGE_BROKER_CLIENT_ID and " +
+                        "HOGLAKE_STORAGE_BROKER_CLIENT_SECRET"
+                }
+                require(s3AccessKey.isBlank() && s3SecretKey.isBlank()) {
+                    "HOGLAKE_STORAGE_PROVIDER=broker vends every session; unset " +
+                        "HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY"
+                }
+                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_URL", storageBrokerUrl, storageBrokerAllowHttp)
+                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_TOKEN_URL", storageBrokerTokenUrl, storageBrokerAllowHttp)
+                require(storageBrokerAudience.isNotBlank()) { "HOGLAKE_STORAGE_BROKER_AUDIENCE must not be blank" }
+                require(storageBrokerRefreshMarginSeconds >= 0) {
+                    "HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS must not be negative, " +
+                        "got $storageBrokerRefreshMarginSeconds"
+                }
+            }
+        }
+        require(
+            authClientClasses.size <= MAX_AUTH_CLIENT_CLASSES &&
+                authClientClasses.all { CLIENT_CLASS.matches(it) && it !in RESERVED_CLIENT_CLASSES },
+        ) {
+            "HOGLAKE_AUTH_CLIENT_CLASSES takes at most $MAX_AUTH_CLIENT_CLASSES lowercase User-Agent product " +
+                "tokens ([a-z][a-z0-9._-]{0,31}, not 'none' or 'other'), got $authClientClasses"
+        }
+        require(authSessionProfile.trim().lowercase() in setOf("off", "on")) {
+            "HOGLAKE_AUTH_SESSION_PROFILE must be off or on, got '$authSessionProfile'"
+        }
+        require(authScopedMaxLifetimeSeconds > 0) {
+            "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be positive, got $authScopedMaxLifetimeSeconds"
+        }
+        require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
+            "HOGLAKE_MOUNT_ALLOWLIST takes org ids (canonical lowercase UUIDs) or *, got $mountAllowlist"
+        }
+        // Parsed eagerly so a malformed pin fails at boot, not on the first scan.
+        require(mountSourceTableUuid.isBlank() || mountSourceTableUuidOrNull != null) {
+            "HOGLAKE_MOUNT_SOURCE_TABLE_UUID must be a UUID, got '$mountSourceTableUuid'"
+        }
+        require(mountSourceFieldId.isBlank() || (mountSourceFieldIdOrNull?.let { it >= 0 } == true)) {
+            "HOGLAKE_MOUNT_SOURCE_FIELD_ID must be a non-negative integer, got '$mountSourceFieldId'"
+        }
+        require(mountScanFileBudget >= 1) { "HOGLAKE_MOUNT_SCAN_FILE_BUDGET must be >= 1, got $mountScanFileBudget" }
+        require(mountScanDeadlineMs >= 0) { "HOGLAKE_MOUNT_SCAN_DEADLINE_MS must be >= 0, got $mountScanDeadlineMs" }
+        require(mountScanMaxConcurrent >= 0) {
+            "HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT must be >= 0, got $mountScanMaxConcurrent"
+        }
+        if (mountHosts.isNotEmpty()) {
+            require(mountAllowlist.isEmpty()) {
+                "HOGLAKE_MOUNT_HOSTS_FILE (this server is a mount Client) cannot be set with " +
+                    "HOGLAKE_MOUNT_ALLOWLIST (this server is a mount Host): a server is one or the other"
+            }
+            require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+                "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
+                    "a mount serves only verified callers"
+            }
+            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
+                "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS (the hosts' own): a mount serves " +
+                    "only scoped tokens, and none verifies without them"
+            }
+            require(
+                mountHosts.none { it.match is MountMatch.NamespaceFamily } ||
+                    TeamNamespaces.PREDICATE_FIELD in authPredicateFields.split(',').map { it.trim() },
+            ) {
+                "a namespace_family entry in HOGLAKE_MOUNT_HOSTS_FILE requires " +
+                    "'${TeamNamespaces.PREDICATE_FIELD}' in HOGLAKE_AUTH_PREDICATE_FIELDS: the team family is held " +
+                    "through that field"
+            }
+            // Off, no token can carry `remote_schemas`: the name would be reserved and never readable.
+            require(authSessionProfileEnabled || mountHosts.none { it.match is MountMatch.RemoteSchemaMatch }) {
+                "a namespace entry in HOGLAKE_MOUNT_HOSTS_FILE (a remote schema) requires " +
+                    "HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying the session profile can read one"
+            }
+        }
+        if (servedFamilies.isNotEmpty()) {
+            require(mountHosts.isEmpty()) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE (this server is a Host) cannot be set with " +
+                    "HOGLAKE_MOUNT_HOSTS_FILE (this server is a Client): a server is one or the other"
+            }
+            require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
+                    "a served namespace serves only verified callers"
+            }
+            if (authMode.trim().lowercase() == "warn") {
+                servedNamespacesLog.warn {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE is set with HOGLAKE_AUTH_MODE=warn: under warn, anonymous and " +
+                        "tenant callers are let through on /v1/catalogs/<source_catalog>/, so every team's imports " +
+                        "in the source catalog are readable without a scoped token. Run a Host with enforce."
+                }
+            }
+            require(authSessionProfileEnabled) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_SESSION_PROFILE=on: only a token carrying " +
+                    "the session profile can name a served namespace"
+            }
+            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS: a served namespace is " +
+                    "read only through a scoped token's predicate"
+            }
+            val predicateFields = authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            servedFamilies.forEach { family ->
+                require(family.predicateField == TeamNamespaces.PREDICATE_FIELD) {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE predicate_field for the '${family.family}' family must be " +
+                        "'${TeamNamespaces.PREDICATE_FIELD}', got '${family.predicateField}': a token's team " +
+                        "schema is held through that field"
+                }
+                require(family.predicateField in predicateFields) {
+                    "HOGLAKE_SERVED_NAMESPACES_FILE predicate_field '${family.predicateField}' is not one of " +
+                        "HOGLAKE_AUTH_PREDICATE_FIELDS"
+                }
+            }
+            require(defaultBackend == "postgres") {
+                "HOGLAKE_SERVED_NAMESPACES_FILE requires HOGLAKE_DEFAULT_BACKEND=postgres: the source catalog is " +
+                    "read from this process's PostgreSQL"
+            }
+        }
+        if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
+            require(jdbcUrl.isNotBlank()) { "HOGLAKE_JDBC_URL is required for a PostgreSQL backend" }
+            require(dbUser.isNotBlank()) { "HOGLAKE_DB_USER is required for a PostgreSQL backend" }
+            require(dbPassword.isNotEmpty()) { "HOGLAKE_DB_PASSWORD is required for a PostgreSQL backend" }
+        }
+        require(defaultBackend == "postgres" || defaultBackend == "none") {
+            "HOGLAKE_DEFAULT_BACKEND must be postgres or none; hoglite cannot be a default backend"
+        }
+        require(backendsFile.isBlank() || authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+            "HOGLAKE_BACKENDS_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: hoglite needs auth"
+        }
+        // The local issuer's key goes with its mode and with nothing else. Checked
+        // here, by name, before AuthService decodes it: every message names the
+        // variable an operator has to set or unset, and none echoes the key.
+        if (authMode.trim().lowercase() == "local") {
+            require(authSigningKey.value.isNotBlank()) {
+                "HOGLAKE_AUTH_MODE=local requires HOGLAKE_AUTH_SIGNING_KEY: run `hoglake token keygen` " +
+                    "and export the line it prints"
+            }
+            require(authJwksFile.isBlank() && authJwksUrl.isBlank()) {
+                "HOGLAKE_AUTH_MODE=local derives its JWKS from HOGLAKE_AUTH_SIGNING_KEY: " +
+                    "unset HOGLAKE_AUTH_JWKS_FILE and HOGLAKE_AUTH_JWKS_URL"
+            }
+        } else {
+            require(authSigningKey.value.isBlank()) {
+                "HOGLAKE_AUTH_SIGNING_KEY is read only under HOGLAKE_AUTH_MODE=local (it is set, and the mode is " +
+                    "'${authMode.trim()}'): unset it, or set the mode"
+            }
+        }
+        require(postgresBackendId.isEmpty() || canonicalBackendId(postgresBackendId) !in hogliteBackends) {
+            "HOGLAKE_POSTGRES_BACKEND_ID duplicates a hoglite backend id"
+        }
         checkRemovedEnv(System::getenv)
         // THE SPILL DIRECTORY IS CHECKED AT BOOT, and only where the
         // compaction loop runs — priced per workload like the pool check
@@ -1347,7 +1873,7 @@ data class Config(
                 "and HOGLAKE_METRICS_PORT=$metricsPort"
         }
         require(publicPort == 0 || authMode.trim().lowercase() != "off") {
-            "HOGLAKE_PUBLIC_PORT=$publicPort requires HOGLAKE_AUTH_MODE warn or enforce: the public listener " +
+            "HOGLAKE_PUBLIC_PORT=$publicPort requires HOGLAKE_AUTH_MODE warn, enforce or local: the public listener " +
                 "always enforces, so it needs HOGLAKE_AUTH_ISSUER and a JWKS source"
         }
         // Netty refuses a group of zero with an IllegalArgumentException
@@ -1566,6 +2092,11 @@ data class Config(
          */
         const val MAX_EXPIRY_PURGE_PAGE = 50_000
 
+        /** The most extra `client` label classes `HOGLAKE_AUTH_CLIENT_CLASSES` may name: a label is a series. */
+        const val MAX_AUTH_CLIENT_CLASSES = 16
+
+        private val CLIENT_CLASS = Regex("[a-z][a-z0-9._-]{0,31}")
+
         /**
          * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so
          * the boot refusal above can quote it rather than restate the
@@ -1704,4 +2235,273 @@ data class Config(
 
         fun fromEnv(): Config = Config()
     }
+}
+
+/** Parse backend ids without UUID.fromString's abbreviated forms. */
+private fun canonicalBackendId(value: String): UUID {
+    val id = UUID.fromString(value)
+    require(id.toString() == value) { "backend id must be a canonical lowercase UUID" }
+    return id
+}
+
+private fun readBackends(file: String): Map<UUID, HogliteBackend> {
+    if (file.isBlank()) return emptyMap()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root.isObject && root.properties().map { it.key }.toSet() == setOf("backends")) {
+        "HOGLAKE_BACKENDS_FILE must contain only a backends array"
+    }
+    val entries = root.get("backends")
+    require(entries.isArray) { "backends must be an array" }
+    val result = linkedMapOf<UUID, HogliteBackend>()
+    for (entry in entries) {
+        require(entry.isObject) { "backend entry must be an object" }
+        val keys =
+            setOf(
+                "id", "kind", "url", "whale_url", "owner_url_pattern", "connect_timeout_ms", "read_timeout_ms",
+                "commit_timeout_ms", "retry_budget_ms", "circuit_failure_threshold", "circuit_open_ms",
+            )
+        require(entry.properties().all { it.key in keys }) { "backend entry has unknown fields" }
+
+        fun text(
+            key: String,
+            default: String? = null,
+        ): String {
+            val node = entry.get(key) ?: return requireNotNull(default) { "backend requires $key" }
+            require(node.isTextual) { "backend $key must be a string" }
+            return node.asText()
+        }
+
+        fun positive(
+            key: String,
+            default: Long,
+        ): Long {
+            val node = entry.get(key) ?: return default
+            require(
+                node.isIntegralNumber && node.canConvertToLong() && node.asLong() > 0,
+            ) { "backend $key must be positive" }
+            return node.asLong()
+        }
+
+        fun url(
+            key: String,
+            default: String? = null,
+        ): String {
+            val value = text(key, default)
+            if (value.isEmpty() && default != null) return value
+            val uri = URI(value)
+            require(uri.scheme in setOf("http", "https") && !uri.host.isNullOrEmpty() && uri.userInfo == null) {
+                "backend $key must be an http(s) URL without credentials"
+            }
+            return value
+        }
+        val id = canonicalBackendId(text("id"))
+        require(id !in result) { "duplicate backend id" }
+        require(text("kind") == "hoglite") { "backend entries support only kind hoglite" }
+        val owner = text("owner_url_pattern", "")
+        require(owner.isEmpty() || "{owner}" in owner) { "owner_url_pattern must contain {owner}" }
+        if (owner.isNotEmpty()) {
+            val uri = URI(owner.replace("{owner}", "owner"))
+            require(uri.scheme in setOf("http", "https") && !uri.host.isNullOrEmpty() && uri.userInfo == null) {
+                "owner_url_pattern must be an http(s) URL without credentials"
+            }
+        }
+        val threshold = positive("circuit_failure_threshold", 10)
+        require(threshold <= Int.MAX_VALUE) { "circuit_failure_threshold is too large" }
+        result[id] =
+            HogliteBackend(
+                id = id,
+                url = url("url"),
+                whaleUrl = url("whale_url", ""),
+                ownerUrlPattern = owner,
+                connectTimeoutMs = positive("connect_timeout_ms", 2000),
+                readTimeoutMs = positive("read_timeout_ms", 5000),
+                commitTimeoutMs = positive("commit_timeout_ms", 10000),
+                retryBudgetMs = positive("retry_budget_ms", 8000),
+                circuitFailureThreshold = threshold.toInt(),
+                circuitOpenMs = positive("circuit_open_ms", 5000),
+            )
+    }
+    return result
+}
+
+/**
+ * Parse HOGLAKE_SERVED_NAMESPACES_FILE, as strictly as [readMountHosts] parses
+ * its file: an unknown key or a second entry for a family is refused, and the
+ * per-name `namespaces` list it once took is refused by name.
+ */
+private fun readServedFamilies(file: String): List<ServedFamily> {
+    if (file.isBlank()) return emptyList()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root == null || !root.isObject || !root.has("namespaces")) {
+        "HOGLAKE_SERVED_NAMESPACES_FILE no longer takes a namespaces list: serve the team schemas with " +
+            """{"families":[{"family":"team","source_catalog":"...","predicate_field":"team_id"}]}"""
+    }
+    require(root != null && root.isObject && root.properties().map { it.key }.toSet() == setOf("families")) {
+        "HOGLAKE_SERVED_NAMESPACES_FILE must contain only a families array"
+    }
+    val entries = root.get("families")
+    require(entries.isArray) { "families must be an array" }
+    val result = mutableListOf<ServedFamily>()
+    val keys = setOf("family", "source_catalog", "predicate_field")
+
+    fun keysOf(node: JsonNode): Set<String>? = if (node.isObject) node.properties().map { it.key }.toSet() else null
+    for (entry in entries) {
+        require(keysOf(entry).let { it == keys || it == keys + "stream" }) {
+            "a served family entry is an object with exactly a family, a source_catalog and a predicate_field, " +
+                "and optionally a stream"
+        }
+
+        fun text(
+            node: JsonNode,
+            key: String,
+        ): String {
+            val value = node.get(key)
+            require(value != null && value.isTextual) { "a served family requires a string $key" }
+            return value.asText()
+        }
+        val stream =
+            entry.get("stream")?.let { node ->
+                require(keysOf(node) == setOf("catalog", "namespace", "tables")) {
+                    "a served family's stream is an object with exactly a catalog, a namespace and a tables array"
+                }
+                val tables = node.get("tables")
+                require(tables.isArray && tables.all { it.isTextual }) {
+                    "a served stream's tables is an array of strings"
+                }
+                ServedStream(text(node, "catalog"), text(node, "namespace"), tables.map { it.asText() })
+            }
+        val served =
+            ServedFamily(text(entry, "family"), text(entry, "source_catalog"), text(entry, "predicate_field"), stream)
+        require(result.none { it.family == served.family }) { "duplicate served family '${served.family}'" }
+        result += served
+    }
+    return result
+}
+
+/**
+ * Parse HOGLAKE_MOUNT_HOSTS_FILE, as strictly as [readBackends] parses its
+ * file: an unknown key, kind, auth mode or matcher is refused, so a host
+ * this server cannot serve correctly never boots half-understood.
+ */
+private fun readMountHosts(file: String): List<MountHost> {
+    if (file.isBlank()) return emptyList()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root != null && root.isObject && root.properties().map { it.key }.toSet() == setOf("hosts")) {
+        "HOGLAKE_MOUNT_HOSTS_FILE must contain only a hosts array"
+    }
+    val entries = root.get("hosts")
+    require(entries.isArray) { "hosts must be an array" }
+    val hosts = mutableListOf<MountHost>()
+    for (entry in entries) {
+        require(entry.isObject) { "mount host entry must be an object" }
+        val keys =
+            setOf("id", "match", "kind", "url", "auth", "timeout_ms", "max_response_bytes", "max_concurrent") +
+                setOf("allow_insecure_http", "remote_name")
+        require(entry.properties().all { it.key in keys }) { "mount host entry has unknown fields" }
+        val insecure = entry.get("allow_insecure_http")
+        require(insecure == null || insecure.isBoolean) { "mount host allow_insecure_http must be true or false" }
+
+        fun text(
+            node: com.fasterxml.jackson.databind.JsonNode,
+            key: String,
+        ): String {
+            val value = node.get(key)
+            require(value != null && value.isTextual) { "mount host requires a string $key" }
+            return value.asText()
+        }
+
+        fun positive(
+            key: String,
+            default: Long,
+        ): Long {
+            val node = entry.get(key) ?: return default
+            require(node.isIntegralNumber && node.canConvertToLong() && node.asLong() > 0) {
+                "mount host $key must be positive"
+            }
+            return node.asLong()
+        }
+        val id =
+            try {
+                canonicalBackendId(text(entry, "id"))
+            } catch (_: IllegalArgumentException) {
+                throw IllegalArgumentException("mount host id must be a canonical lowercase UUID")
+            }
+        require(hosts.none { it.id == id }) { "duplicate mount host id" }
+        val matcher = entry.get("match")
+        require(matcher != null && matcher.isObject) { "mount host requires a match object" }
+        val match =
+            when (val type = text(matcher, "type")) {
+                "events" -> {
+                    require(matcher.size() == 1) { "an events match takes no other field" }
+                    MountMatch.Events
+                }
+                "catalog" -> {
+                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "name")) {
+                        "a catalog match takes exactly a name"
+                    }
+                    MountMatch.Catalog(text(matcher, "name"))
+                }
+                "namespace" -> {
+                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "name")) {
+                        "a namespace match takes exactly a name"
+                    }
+                    MountMatch.Namespace(text(matcher, "name"))
+                }
+                "namespace_family" -> {
+                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "family")) {
+                        "a namespace_family match takes exactly a family"
+                    }
+                    MountMatch.NamespaceFamily(text(matcher, "family"))
+                }
+                else ->
+                    throw IllegalArgumentException(
+                        "mount host match type must be events, catalog, namespace or namespace_family, got '$type'",
+                    )
+            }
+        // Not a general switch: the key itself is refused where it would mean nothing.
+        require(insecure == null || match is MountMatch.RemoteSchemaMatch) {
+            "allow_insecure_http is only for a mount host that matches a namespace"
+        }
+        val kindText = text(entry, "kind")
+        val kind =
+            requireNotNull(MountHost.Kind.entries.firstOrNull { it.wire == kindText }) {
+                "mount host kind '$kindText' is not supported: only ${MountHost.Kind.entries.map { it.wire }}"
+            }
+        val authText = text(entry, "auth")
+        val auth =
+            requireNotNull(MountHost.Auth.entries.firstOrNull { it.wire == authText }) {
+                "mount host auth '$authText' is not supported: only ${MountHost.Auth.entries.map { it.wire }}"
+            }
+        val origin =
+            requireNotNull(MountHost.origin(text(entry, "url"))) {
+                "mount host url must be http(s)://host[:port], with no user-info, path, query or fragment"
+            }
+        val concurrent = positive("max_concurrent", MountHost.DEFAULT_MAX_CONCURRENT.toLong())
+        require(concurrent <= MountHost.MAX_CONCURRENT_CEILING) {
+            "mount host max_concurrent must be at most ${MountHost.MAX_CONCURRENT_CEILING}"
+        }
+        val timeout = positive("timeout_ms", MountHost.DEFAULT_TIMEOUT_MS)
+        require(timeout <= MountHost.TIMEOUT_CEILING_MS) {
+            "mount host timeout_ms must be at most ${MountHost.TIMEOUT_CEILING_MS}"
+        }
+        hosts +=
+            MountHost(
+                id = id,
+                match = match,
+                kind = kind,
+                origin = origin,
+                auth = auth,
+                timeoutMs = timeout,
+                maxResponseBytes = positive("max_response_bytes", MountHost.DEFAULT_MAX_RESPONSE_BYTES),
+                maxConcurrent = concurrent.toInt(),
+                allowInsecureHttp = insecure?.asBoolean() == true,
+                // Grammar and match type are checked by MountHost itself.
+                remoteName = if (entry.has("remote_name")) text(entry, "remote_name") else null,
+            )
+    }
+    MountHost.requireDisjoint(hosts)
+    return hosts
 }

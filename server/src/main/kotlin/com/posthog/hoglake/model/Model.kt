@@ -349,6 +349,7 @@ enum class ChangeKind {
     TABLE_INSERTED_INTO,
     TABLE_DELETED_FROM,
     TABLE_COMPACTED,
+    TABLE_REPLACED,
     VIEW_CREATED,
     VIEW_DROPPED,
     ;
@@ -390,13 +391,14 @@ enum class ChangeKind {
                 TABLE_INSERTED_INTO,
                 TABLE_DELETED_FROM,
                 TABLE_COMPACTED,
+                TABLE_REPLACED,
             )
 
         /**
          * The kinds whose `object_id` is NOT a table id.
          *
          * Its only purpose is to make [TABLE_SCOPED] a decision about
-         * every kind rather than about six of them: the two sets must
+         * every kind rather than about seven of them: the two sets must
          * partition the vocabulary exactly, which is what the
          * vocabulary test asserts. A new kind that lands in neither
          * reds, and the author has to say which it is.
@@ -648,6 +650,21 @@ sealed class AlterOp {
      * no unset: see AlterService.setObjectPrefixField.
      */
     data class SetObjectPrefixField(val name: String) : AlterOp()
+
+    /**
+     * Replace the shredded layout the top-level variant column [name]
+     * declares in `type_params.shredding` ([shredding] is the JSON
+     * declaration as the wire mapper decodes it; null clears it, and the
+     * column then carries no `type_params`). The declaration is the
+     * target writers and compaction lay the column out in; no file is
+     * checked against it or rewritten for it. Validated as a column
+     * definition's declaration is (VariantShredding), refused on a
+     * column of another type or a nested variant. Re-declaring what the
+     * column already declares (compared as JSON values) writes nothing,
+     * and a request of only such ops mints no snapshot: see
+     * AlterService.setVariantShredding.
+     */
+    data class SetVariantShredding(val name: String, val shredding: Any?) : AlterOp()
 }
 
 data class CatalogInfo(
@@ -672,6 +689,8 @@ data class CatalogInfo(
     /** Expiry never passes the min consumer offset when true. */
     val consumerFloor: Boolean = true,
     val earliestSnapshotId: Long = 0,
+    /** False on a backend that cannot store a namespace's org mark; gates the `org-marked-containment-v1` capability. */
+    val orgMarkedContainment: Boolean = true,
 )
 
 /**
@@ -770,13 +789,18 @@ data class NamespaceInfo(
 
 /**
  * A namespace marked contained for `field = value`: its tables register
- * files only under `<data_path>/data/<namespace>/`, and no other table
- * registers files there. What a `ten: scoped` caller holding `value` for
- * `field` is given; operator-managed.
+ * files only under its prefix ([Containment.namespaceRoot]), and no other
+ * table registers files there. What a `ten: scoped` caller holding `value`
+ * for `field` is given; operator-managed.
+ *
+ * [org] is the optional org mark: it moves the prefix to
+ * `<data_path>/org_id=<org>/<field>=<value>/`. It can be replaced or cleared only
+ * while the namespace has never held a table or view and no file sits under its prefix.
  */
 data class NamespaceContainment(
     val field: String,
     val value: Long,
+    val org: String? = null,
 )
 
 /**
@@ -1174,6 +1198,13 @@ data class DeleteFile(
 data class ScanFile(
     val dataFile: DataFile,
     val deleteFile: DeleteFile?,
+    /**
+     * The file's team id — its proven partition value on a mount's source
+     * field (`team_id`). Set only by a mount's scoped scan (plan row
+     * 1.3h), so the Client can vend a per-team credential for each file;
+     * null on every ordinary (non-mount) scan.
+     */
+    val teamId: Long? = null,
 )
 
 data class ColumnStats(
@@ -1312,11 +1343,42 @@ data class CommitRequest(
     val requireUnchangedTables: Boolean = false,
     @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
     val allowPendingDeletes: Boolean = false,
+    /**
+     * Whole live data files to end in the same snapshot as [appends]
+     * (`POST /commit/replacements/prepared` only). LAST, and nullable, so a
+     * request without it serializes exactly as before: the receipt
+     * fingerprint is a persisted format (see COMMIT_FINGERPRINT_VERSION),
+     * and a property declared earlier or a non-null default would change
+     * every existing key's digest.
+     */
+    val fileEnds: List<TableFileEnds>? = null,
+)
+
+/**
+ * The live data files of one table a replacement ends: those whose
+ * partition tuple is in [partitions], or every live file when [allFiles].
+ * Exactly one of the two is set; [CommitService] and the hoglite commit
+ * enforce it, as they enforce every other shape rule of a request.
+ *
+ * A tuple holds one value per field of the live partition spec, in the
+ * encoding of [FileRegistration.partitionValues] (a `day` transform is the
+ * days since the epoch as a decimal string; null is a null partition
+ * value). A tuple that matches no live file ends nothing and is not an
+ * error. [expectedTableUuid] is required: ending files is never blind.
+ */
+data class TableFileEnds(
+    val namespace: String,
+    val table: String,
+    val expectedTableUuid: UUID,
+    val partitions: List<List<String?>>? = null,
+    val allFiles: Boolean = false,
 )
 
 data class CommitResult(
     val snapshotId: Long,
     val schemaVersion: Long,
+    /** Data files ended by a replacement; null on every other commit, and on a receipt written before it was stored. */
+    val endedFiles: Long? = null,
 )
 
 data class ConsumerOffset(
@@ -1703,21 +1765,23 @@ data class CompactionResult(
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val spillBytes: Long = 0,
     /**
-     * Sorted groups refused because their spill would exceed
-     * HOGLAKE_COMPACTION_SPILL_BYTES: in metadata at planning from the
-     * registered input bytes (no IO), or stopped by the rewrite the moment
-     * the bytes actually written would cross it (output discarded). A
-     * spill directory is an emptyDir whose overrun EVICTS the pod, which
-     * is why the bound is in-process. Configuration, not fault; not
-     * charged to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+     * Count sorted groups that exceed HOGLAKE_COMPACTION_SPILL_BYTES.
+     * Metadata admission checks registered input sizes without IO.
+     * Runtime guards stop before another write exceeds this allowance.
+     * The rewrite discards aborted output.
+     *
+     * A spill-volume overrun can evict the pod.
+     * Metadata-only refusals spend no attempt.
+     * A runtime refusal spends one HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN slot.
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val spillBudgetExceeded: Long = 0,
     /**
      * Sorted groups refused because their merge cannot fit the sorted
      * heap budget (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / parallel
-     * groups) even with every trusted input spilled. Reachable only by
-     * configuration; not charged, like [spillBudgetExceeded].
+     * groups) even with every trusted input spilled. Metadata-only refusals spend no attempt.
+     * Runtime guards consume an attempt.
+     * The worker caches deterministic memory refusals.
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val mergeBudgetExceeded: Long = 0,
@@ -1824,6 +1888,23 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val objectPrefixUnresolvable: Long = 0,
+    /**
+     * Groups of a VARIANT table (HOGLAKE_COMPACTION_VARIANT) whose
+     * layout probe read every input's footer and found nothing worth a
+     * rewrite: each variant layout among the inputs held too few files
+     * for one, or every input was DuckDB-written. The files are left as
+     * they are and the compactor remembers their layouts, so the same
+     * group is not planned again until files of its layouts arrive; but
+     * the footers were read, so this IS charged to
+     * HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+     * `hoglake_compaction_skipped_total{reason="layout_probe_only"}`.
+     * `NON_DEFAULT`, for [claimedElsewhere]'s stored-payload reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val layoutProbeOnly: Long = 0,
+    /** Groups with a row above the byte allowance, included in [mergeBudgetExceeded]. */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val oversizedRowGroups: Long = 0,
 )
 
 /**
@@ -2545,6 +2626,81 @@ data class ChangesPlan(
 
 /** Service-level failures the API layer maps to status codes. */
 sealed class HoglakeException(message: String) : RuntimeException(message) {
+    /** The selected backend does not implement this operation. */
+    class NotSupported(detail: String) : HoglakeException(detail)
+
+    /** Any non-read route on a mount, which is read-only -> 403 `read_only_catalog`. */
+    class ReadOnlyCatalog(detail: String) : HoglakeException(detail)
+
+    /** A read route a mount does not serve -> 501 `mount_operation_unavailable`. */
+    class MountOperationUnavailable(detail: String) : HoglakeException(detail)
+
+    /** A mount write at a revision the mount is not at -> 409 `mount_revision_conflict`. */
+    class MountRevisionConflict(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan whose scoped plan would return more files than the
+     * instance's file-count budget -> 422 `mount_scan_too_many_files`. The
+     * scope is the token's, so the caller cannot narrow it; the budget
+     * protects the Host from a whale org's cold scan (plan row 1.3h, M10).
+     */
+    class MountScanTooManyFiles(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan that ran past the instance's scan deadline -> 503
+     * `mount_scan_timeout` + Retry-After. Retryable backpressure: the DB
+     * was slow, not the scan unbounded (the file budget bounds that).
+     */
+    class MountScanTimeout(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan refused because the one shared export-scan concurrency
+     * cap is full -> 503 `mount_scan_busy` + Retry-After. Non-blocking, so
+     * Trino reads cannot starve ingest writers on the request dispatcher.
+     */
+    class MountScanBusy(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client (HOGLAKE_MOUNT_HOSTS_FILE): the Host could not be
+     * reached, or did not answer inside the deadline -> 503
+     * `mount_host_unavailable` + Retry-After. Nothing was refused.
+     */
+    class MountHostUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the Host answered with something that is not its
+     * contract (a redirect, a body that is not JSON, an error without a
+     * code, a body over the cap) -> 502 `mount_host_invalid_response`. The
+     * detail never carries what the Host sent.
+     */
+    class MountHostInvalidResponse(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the host's cap over proxied requests in flight is
+     * full -> 503 `mount_proxy_busy` + Retry-After. Non-blocking, as
+     * [MountScanBusy] is on the Host.
+     */
+    class MountProxyBusy(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the Host's own typed refusal, answered to the
+     * caller with the Host's [status], [code] and detail (and Retry-After
+     * when the Host sent one). [code] has passed the error-code grammar and
+     * the detail is capped, so nothing of an unexpected shape gets through.
+     */
+    class MountHostRefused(
+        val status: Int,
+        val code: String,
+        detail: String,
+        val retryAfterSeconds: Long? = null,
+    ) : HoglakeException(detail)
+
+    /** Narrow the result before retrying. This refusal is not backend unavailability. */
+    class BackendResultTooLarge(detail: String) : HoglakeException(detail)
+
+    /** Narrow the query before retrying. This refusal is not backend unavailability. */
+    class BackendQueryTimeout(detail: String) : HoglakeException(detail)
+
     class PartitionLookupInvalidRequest(detail: String) : HoglakeException(detail)
 
     class PartitionLookupUnavailable(val reason: String, detail: String) : HoglakeException(detail)
@@ -2555,6 +2711,16 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     /** A changefeed window crosses a deletion it cannot represent; never blindly retry or skip it. */
     class ReconciliationRequired(detail: String) : HoglakeException(detail)
+
+    /**
+     * A partition-based file end on a table that still has live files
+     * written under another partition spec -> HTTP 409
+     * `partition_spec_mismatch`. A tuple means different things under
+     * different specs, so the ends cannot be addressed by partition;
+     * `all_files` still works. Not retryable as sent: the table has to be
+     * compacted or rewritten onto the live spec first.
+     */
+    class PartitionSpecMismatch(detail: String) : HoglakeException(detail)
 
     /**
      * OPEN, for [DdlSinceReadSnapshot] alone. Subclassing is what keeps
@@ -2735,7 +2901,7 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      *
      * Not all of [CommitService.checkConflicts]' refusals are this:
      * ROW-CONTENT conflicts ('table_created' / 'table_inserted_into' /
-     * 'table_deleted_from' on a guarded request's delete targets) stay
+     * 'table_deleted_from' / 'table_replaced' on a guarded request's delete targets) stay
      * [CommitConflict], because re-reading and replanning IS the
      * recovery there and the same payload can succeed on the next try.
      * A refusal that mixes both is the conservative answer, i.e. also

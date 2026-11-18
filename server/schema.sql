@@ -72,7 +72,7 @@ CREATE TABLE hog_snapshot_change (
                     'namespace_created', 'namespace_dropped',
                     'table_created', 'table_dropped', 'table_altered',
                     'table_inserted_into', 'table_deleted_from',
-                    'table_compacted',
+                    'table_compacted', 'table_replaced',
                     'view_created', 'view_dropped')),
     -- table_id, namespace_id, or view_id. Every kind in the vocabulary
     -- names an object; a NULL here would be a conflict row the conflict
@@ -116,11 +116,19 @@ CREATE TABLE hog_namespace (
     -- table registers files there. Both or neither; operator-only.
     contained_field text,
     contained_value bigint,
+    -- V37: the org mark. Moves the prefix to
+    -- `<data_path>/org_id=<org>/<field>=<value>/`; replaceable only while the
+    -- namespace has never held a table.
+    contained_org text,
     PRIMARY KEY (catalog_id, namespace_id),
     CONSTRAINT hog_namespace_containment_shape CHECK (
         (contained_field IS NULL AND contained_value IS NULL)
         OR (contained_field IS NOT NULL AND contained_value IS NOT NULL
             AND contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
+    ),
+    CONSTRAINT hog_namespace_containment_org_shape CHECK (
+        contained_org IS NULL
+        OR (contained_field IS NOT NULL AND contained_org ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
     )
 );
 CREATE UNIQUE INDEX hog_namespace_live_name
@@ -845,6 +853,9 @@ CREATE TABLE hog_commit_receipt (
     -- V24: the retention key. Fast default, so every pre-V24 row carries
     -- the migration's timestamp rather than its own (unknowable) age.
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- V36: the data files a replacement ended; NULL = not a replacement, or a
+    -- receipt written before V36.
+    ended_files BIGINT,
     PRIMARY KEY (catalog_id, idempotency_key)
 );
 -- The purge's ordered walk (V24). The primary key leads on a random UUID
@@ -932,3 +943,22 @@ CREATE INDEX hog_compaction_claim_expiry
 -- 1,157 MiB at 5M rows, 243 bytes/row.
 CREATE INDEX hog_data_file_path ON hog_data_file (catalog_id, path);
 CREATE INDEX hog_delete_file_path ON hog_delete_file (catalog_id, path);
+
+-- V34: the instance-wide mount switch. One row, off by default; while it
+-- is off no catalog name resolves to a mount.
+CREATE TABLE hog_mount_switch (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    enabled   boolean NOT NULL DEFAULT false
+);
+
+INSERT INTO hog_mount_switch DEFAULT VALUES;
+
+-- V35: mounts, written only through PUT /v1/mounts/{name} under CAS on
+-- `revision`, never deleted. `mount_values` is ascending and distinct.
+CREATE TABLE hog_mount (
+    name         text    PRIMARY KEY
+        CHECK (name ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-events$'),
+    revision     bigint  NOT NULL CHECK (revision > 0),
+    enabled      boolean NOT NULL,
+    mount_values bigint[] NOT NULL
+);

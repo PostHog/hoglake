@@ -5,13 +5,13 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.4.9-dev"
+version = "1.4.13-dev"
 
 repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.5.2"
+val ktorVersion = "3.6.1"
 val jdbiVersion = "3.55.0"
 // Current stable, looked up on Maven Central rather than recalled (the
 // 11.8.2 this replaced was 16 months old). Anything before ~11.10 warns
@@ -25,10 +25,10 @@ val jdbiVersion = "3.55.0"
 // the transactional lock through the typed configuration extension. See
 // the comment there — losing that setting HANGS every migration rather
 // than failing it.
-val flywayVersion = "13.11.1"
+val flywayVersion = "13.12.1"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.57.4"
+val awsSdkVersion = "2.57.12"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -42,8 +42,8 @@ dependencies {
     implementation("io.ktor:ktor-serialization-jackson:$ktorVersion")
     implementation("io.ktor:ktor-server-status-pages:$ktorVersion")
     implementation("io.ktor:ktor-server-call-logging:$ktorVersion")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.22.4")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.22.4")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.23.0")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.23.0")
 
     // Persistence
     implementation("org.postgresql:postgresql:42.7.14")
@@ -99,11 +99,11 @@ dependencies {
     // Compaction applies DVs at rewrite time (PuffinDeletionVector.kt), and
     // the Java RoaringBitmap serialize/deserialize format IS the portable
     // interoperable format the spec requires.
-    implementation("org.roaringbitmap:RoaringBitmap:1.6.27")
+    implementation("org.roaringbitmap:RoaringBitmap:1.6.29")
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.6")
-    implementation("io.github.oshai:kotlin-logging-jvm:8.0.4")
+    implementation("io.github.oshai:kotlin-logging-jvm:8.0.6")
     implementation("net.logstash.logback:logstash-logback-encoder:8.1")
     implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")
     implementation("io.micrometer:micrometer-registry-prometheus:1.17.2")
@@ -208,6 +208,9 @@ tasks.test {
     // `./gradlew :test -PpgImage=postgres:19`. Unset, the harness pins
     // the version production runs.
     (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
+    // `just server contract-vectors`: regenerate oauth/contract-vectors.json
+    // (ContractVectorsGenerator), which every other run only checks.
+    if (project.hasProperty("updateContractVectors")) systemProperty("hoglake.updateContractVectors", "true")
     if (project.hasProperty("unitOnly")) {
         exclude("**/*IntegrationTest*")
     }
@@ -220,7 +223,9 @@ tasks.test {
         .withPropertyName("sharedVectors")
         .withPathSensitivity(PathSensitivity.RELATIVE)
     // The hoglite live tests skip without HOGLITE_BINARY, and fail instead
-    // with HOGLITE_REQUIRED=1 (the hoglite-live CI job). Both are inputs,
+    // with HOGLITE_REQUIRED=1 (the hoglite-live CI job, and locally
+    // `just test-hoglite`: ci/hoglite-live-local.sh, a Linux container,
+    // since hoglited ships for Linux only). Both are inputs,
     // so a change of engine, or of the switch, re-runs :test instead of
     // leaving UP-TO-DATE reports from another engine (or from none).
     val hogliteBinary = providers.environmentVariable("HOGLITE_BINARY").orNull.orEmpty()
@@ -297,6 +302,8 @@ val fuzzSoakTargets =
         "TableCreationDefinitionCodecFuzzTest",
         "CommitReceiptFuzzTest",
         "VariantShreddingFuzzTest",
+        "JwtAudienceFuzzTest",
+        "NamespaceFieldRewriteFuzzTest",
     )
 
 val fuzzSweepTargets =

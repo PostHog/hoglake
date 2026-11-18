@@ -34,9 +34,19 @@ enum class AuthMode(
 
     /** The plugin is authoritative. */
     ENFORCE("enforce"),
+
+    /**
+     * [ENFORCE] with the server's own key as the issuer (docs/auth.md, "Local
+     * issuer"): the verifier trusts the public half of
+     * `HOGLAKE_AUTH_SIGNING_KEY` and nothing else, and `hoglake token mint`
+     * signs with the private half, offline. A standalone install gets real
+     * authentication without running an issuer; nothing about the decision
+     * differs from `enforce`.
+     */
+    LOCAL("local"),
     ;
 
-    val isEnforcing: Boolean get() = this == ENFORCE
+    val isEnforcing: Boolean get() = this == ENFORCE || this == LOCAL
 
     val resolvesCallers: Boolean get() = this != OFF
 

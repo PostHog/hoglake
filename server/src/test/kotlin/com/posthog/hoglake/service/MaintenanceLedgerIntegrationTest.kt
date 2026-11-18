@@ -203,6 +203,7 @@ class MaintenanceLedgerIntegrationTest {
                 "spill_bytes",
                 "spill_budget_exceeded",
                 "merge_budget_exceeded",
+                "oversized_row_groups",
                 "spill_cleanup_failures",
                 "files_verified",
                 "files_unsorted",
@@ -216,6 +217,8 @@ class MaintenanceLedgerIntegrationTest {
                 "files_unranged",
                 // And the object-prefix planner refusal (2.1d).
                 "object_prefix_unresolvable",
+                // And the variant-layout probe that found nothing to rewrite.
+                "layout_probe_only",
             )
         for (counter in mergeSortCounters) {
             assertThat(result[counter]?.asLong())

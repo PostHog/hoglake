@@ -149,13 +149,10 @@ class ParquetRewriterTest {
 
     @Test
     fun `the writer never sees an output SimpleGroup`() {
-        // hoglake#134 package D2: every row used to be copied into an
-        // output-shaped SimpleGroup that the example writer then walked
-        // into parquet's record consumer — two materializations per row.
-        // Structural, because the property is an absence: the writer's only
-        // record entry point takes a decoded Row and its plan, and no
-        // production source in the package builds a Group or an example
-        // writer any more. (Test fixtures still write inputs with them.)
+        // hoglake#134 removes the second materialization.
+        // The writer takes a decoded Row and its plan.
+        // Production writers and plans never build an output Group.
+        // OwnedGroupMaterializer alone builds the decoded input graph.
         assertThat(
             OutputWriter::class.java.declaredMethods
                 .filter { it.name == "write" }
@@ -170,8 +167,15 @@ class ParquetRewriterTest {
                 .doesNotContain("SimpleGroupFactory(")
                 .doesNotContain("ExampleParquetWriter.builder")
                 .doesNotContain("newGroup()")
-                .doesNotContain(".addGroup(")
                 .doesNotContain("ParquetWriter<Group>")
+            if (source.fileName.toString() != "OwnedGroupMaterializer.kt") {
+                assertThat(Files.readString(source)).doesNotContain(".addGroup(")
+            } else {
+                assertThat(Files.readString(source))
+                    .contains("RecordMaterializer<Group>")
+                    .doesNotContain("RecordConsumer")
+                    .doesNotContain("RowPlan")
+            }
         }
     }
 

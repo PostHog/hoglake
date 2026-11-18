@@ -38,23 +38,33 @@ env:
   UV_PYTHON: "3.13"
 
 jobs:
+  # Both jobs' names are static, and `target` is the one matrix axis:
+  # GitHub appends the axis value to the name, so a leg shows as
+  # "Wheel (x86_64-unknown-linux-gnu)", while a skipped job shows as
+  # "Wheel". A `name:` that reads the matrix renders raw on a skipped
+  # job ("Wheel (${{ matrix.target }})"), as the matrix is never
+  # evaluated there. The `include` entries, keyed by target, carry the
+  # other keys without appearing in the name.
   manylinux:
-    name: Wheel (${{ matrix.target }})
+    name: Wheel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
         include:
           # Each job names every key the shared steps read.
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
             compatibility: manylinux_2_28
             sdist: true
             container: ""
             smoke-only: false
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
             compatibility: manylinux_2_28
     defaults: &defaults
       run:
@@ -64,9 +74,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           rust-src-dir: pyhoglake-variant-codec
           target: ${{ matrix.target }}
@@ -117,27 +127,33 @@ jobs:
   # The same steps for the other platforms, on a release (YAML aliases).
   others:
     if: inputs.all-platforms
-    name: Wheel (${{ matrix.target }})
+    name: Wheel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - x86_64-pc-windows-msvc
         include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
             compatibility: musllinux_1_2
             container: ghcr.io/astral-sh/uv:0.13.4-python3.13-alpine
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
             compatibility: musllinux_1_2
             container: ghcr.io/astral-sh/uv:0.13.4-python3.13-alpine
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
             smoke-only: true
             sdist: false
     defaults: *defaults

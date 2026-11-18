@@ -16,8 +16,9 @@ from __future__ import annotations
 import io
 import os
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal, NamedTuple, TypeAlias
 
 import pyarrow as pa
@@ -26,6 +27,7 @@ from thrift.protocol.TCompactProtocol import TCompactProtocol
 from thrift.Thrift import TType
 from thrift.transport.TTransport import TMemoryBuffer
 
+from ._memo import Memo
 from ._variant_backend import structure_fault
 from ._variant_codec import ParquetElement, Plan, member
 from .errors import UnsupportedTypeError, ValidationError
@@ -318,7 +320,22 @@ def prepared_schema_matches(found: pa.Schema, want: pa.Schema) -> bool:
     file that annotates its uuid column but misnumbers it, or that
     numbers a map's key or value differently, is refused exactly as
     before.
+
+    The verdict is remembered by the two schemas' IPC bytes, the hit
+    confirmed by ``equals`` with metadata on both (an extension type and
+    its storage type under the extension's metadata serialise alike): the
+    writer asks this of every partition group's file, all of one
+    destination, and the two normalisations walk every leaf of a shredded
+    variant's read form in Python.
     """
+    key = (found.serialize().to_pybytes(), want.serialize().to_pybytes())
+    hit = _SCHEMA_MATCHES.get(key)
+    if (
+        hit is not None
+        and found.equals(hit[0], check_metadata=True)
+        and want.equals(hit[1], check_metadata=True)
+    ):
+        return hit[2]
 
     def comparable(schema: pa.Schema) -> pa.Schema:
         schema = uuid_storage_form_schema(schema)
@@ -327,7 +344,14 @@ def prepared_schema_matches(found: pa.Schema, want: pa.Schema) -> bool:
             metadata=schema.metadata,
         )
 
-    return comparable(found).equals(comparable(want), check_metadata=True)
+    verdict = comparable(found).equals(comparable(want), check_metadata=True)
+    return _SCHEMA_MATCHES.put(key, (found, want, verdict))[2]
+
+
+#: (found, want, verdict) by the two schemas' IPC bytes. The verdict is
+#: computed on the schema objects, and served to a pair equal to them.
+_SCHEMA_MATCHES: Memo[tuple[bytes, bytes], tuple[pa.Schema, pa.Schema, bool]]
+_SCHEMA_MATCHES = Memo(64)
 
 
 def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) -> None:
@@ -540,6 +564,23 @@ def stamp_variant_footer(
     rather than have it publish a layout nobody checked.
     """
     start, footer = _footer_bytes(raw)
+    patched, elements, _ = _stamp_footer(footer, stamps)
+    return start, _tail(patched), elements
+
+
+def _tail(patched: bytes) -> bytes:
+    """What replaces a file from its footer on: the patched footer, its
+    length and ``PAR1``."""
+    return b"".join((patched, struct.pack("<I", len(patched)), b"PAR1"))
+
+
+def _stamp_footer(
+    footer: bytes, stamps: Sequence[FooterStamp]
+) -> tuple[bytes, list[dict[int, Any]], int]:
+    """:func:`stamp_variant_footer` on the footer itself: the patched
+    footer, its elements, and the offset in ``footer`` just past its schema
+    list (the last element's STOP), before which every byte the splice read
+    or changed lies."""
     elements = _positioned_elements(footer)
     found: dict[tuple[str, ...], list[SchemaElement]] = {}
     for element in elements[1:]:
@@ -568,8 +609,42 @@ def stamp_variant_footer(
     groups = sum(stamp.kind == "variant" for stamp in stamps)
     if len(patched) != len(footer) + 7 * groups + 14 * (len(stamps) - groups):
         raise ValueError("stamped footer has the wrong length")
-    tail = b"".join((patched, struct.pack("<I", len(patched)), b"PAR1"))
-    return start, tail, [_stamped(e.fields, stamped.get(e.path)) for e in elements]
+    read = [_stamped(e.fields, stamped.get(e.path)) for e in elements]
+    return patched, read, elements[-1].stop + 1
+
+
+#: What :func:`_stamp_footer` made of a footer whose schema list was the
+#: same bytes, per stamps: the schema list as it was, as it is patched, and
+#: the elements, most recent first. A footer starts with the version and the
+#: schema list, which pyarrow writes the same for one Arrow schema file after
+#: file; what follows (row counts, row groups, their offsets) the splice
+#: neither reads nor changes. So a footer that starts with a schema list
+#: stamped before is stamped as that one was, and the Python Thrift walk
+#: (milliseconds for a shredded column of tens of fields, a file at a time)
+#: is paid once a schema. The bytes decide alone, never the schema object:
+#: a pyarrow that wrote the same schema otherwise misses, and is walked.
+#: The list under a key is replaced, never changed, so a reader of one
+#: needs no lock.
+_STAMPED_FOOTERS: Memo[tuple[FooterStamp, ...], list[tuple[bytes, bytes, list[Any]]]]
+_STAMPED_FOOTERS = Memo(64)
+
+
+def _stamped_footer(
+    footer: bytes, stamps: Sequence[FooterStamp]
+) -> tuple[bytes, list[dict[int, Any]]]:
+    """:func:`_stamp_footer`'s patched footer and elements, through
+    :data:`_STAMPED_FOOTERS`."""
+    key = tuple(stamps)
+    seen = _STAMPED_FOOTERS.get(key) or []
+    for schema, patched_schema, elements in seen:
+        if footer.startswith(schema):
+            return patched_schema + footer[len(schema) :], elements
+    patched, elements, end = _stamp_footer(footer, stamps)
+    grown = len(patched) - len(footer)
+    _STAMPED_FOOTERS.put(
+        key, [(footer[:end], patched[: end + grown], elements), *seen[:3]]
+    )
+    return patched, elements
 
 
 def _annotation(stamp: FooterStamp, element: SchemaElement) -> bytes:
@@ -753,6 +828,7 @@ def write_variant_parquet(
     *,
     row_group_size: int | None = None,
     write_options: Mapping[str, Any] | None = None,
+    _structure_checked: Collection[str] = (),
 ) -> VariantParquet:
     """Write ``table``, whose variant columns hold their storage in the
     write form of their declarations, as the Parquet file of those
@@ -796,6 +872,11 @@ def write_variant_parquet(
     raises ValidationError before anything is uploaded. How pyarrow reads
     the file back (a plain struct, never an extension type) is pinned by
     the tests' canaries, on every pyarrow CI runs.
+
+    ``_structure_checked`` is the writer's own: the variant columns whose
+    storage the Rust codec encoded in this write and the backend held to
+    ``structure_fault`` as it accepted it (``VariantReport.encoded_by``),
+    not checked again here. Every other column's is, as ever.
     """
     by_name = {column.name: column for column in columns}
     fields, data, stamps = [], [], []
@@ -843,16 +924,17 @@ def write_variant_parquet(
         # metadata, so a caller's PARQUET:field_id on a child would
         # otherwise be written below the group (D14) and blamed on the
         # writer by the layout check.
-        kind = _integer_view(plan.write_type)
+        kind = _plan_integer_view(plan)
         fields.append(field.with_type(kind))
         chunks = table.column(field.name).chunks
         # A null in a REQUIRED field under a present parent (metadata, an
         # object's field, a list's element) pyarrow writes as the masked
         # children's values or empty bytes; structure_fault names its path.
-        for chunk in chunks:
-            fault = structure_fault(chunk)
-            if fault is not None:
-                raise _RefusedTable(f"{field.name}: {fault}")
+        if field.name not in _structure_checked:
+            for chunk in chunks:
+                fault = structure_fault(chunk)
+                if fault is not None:
+                    raise _RefusedTable(f"{field.name}: {fault}")
         # Arrow's view refuses a null anywhere in a non-nullable child's
         # buffer, so what is left for it is a null under a SQL NULL row (as
         # take on a null index and pa.nulls build) or outside a slice's rows:
@@ -866,7 +948,9 @@ def write_variant_parquet(
                 "build the storage with the encoder"
             ) from error
         data.append(pa.chunked_array(views, kind))
-        expected = plan.expected_elements(column)
+        expected = _expected_elements(
+            plan, column.name, column.nullable, column.field_id
+        )
         stamps += variant_stamps(column, plan, expected=expected)
         planned.append((column, plan, expected))
     if not planned:
@@ -891,7 +975,9 @@ def write_variant_parquet(
     metadata = writer.writer.metadata
     try:
         with sink.getbuffer() as written:
-            start, tail, elements = stamp_variant_footer(written, stamps)
+            start, footer = _footer_bytes(written)
+        patched, elements = _stamped_footer(footer, stamps)
+        tail = _tail(patched)
     except ValueError as error:
         raise ValidationError(
             f"cannot annotate VARIANT footer: {error}", status_code=None
@@ -935,6 +1021,23 @@ def _footer_size(raw: bytes) -> int:
     """
     (meta_len,) = struct.unpack("<I", raw[-8:-4])
     return meta_len
+
+
+@lru_cache(maxsize=256)
+def _expected_elements(
+    plan: Plan, name: str, nullable: bool, field_id: int
+) -> Expected:
+    """:meth:`Plan.expected_elements` of the column so named, once a
+    column: the list is read by the stamps and the layout check, never
+    changed."""
+    return plan.expected_elements(Column(name, "variant", field_id, 0, nullable))
+
+
+@lru_cache(maxsize=256)
+def _plan_integer_view(plan: Plan) -> pa.DataType:
+    """:func:`_integer_view` of ``plan``'s write form, once a plan (plans
+    are compile_plan's, one an object per declaration)."""
+    return _integer_view(plan.write_type)
 
 
 def _integer_view(kind: pa.DataType) -> pa.DataType:

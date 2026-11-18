@@ -111,6 +111,12 @@ data class AlterOpDto(
     val sortFields: List<AlterSortFieldDto>? = null,
     val comment: String? = null,
     val properties: Map<String, String>? = null,
+    /**
+     * set_variant_shredding only: the declaration, as decoded JSON
+     * (maps, lists, strings, numbers). Null or absent clears it, as a
+     * null `comment` removes a comment.
+     */
+    val shredding: Any? = null,
 ) {
     fun toModel(): AlterOp {
         // `parent` belongs to add_column alone. Silently ignoring it on
@@ -142,6 +148,11 @@ data class AlterOpDto(
             // than the op answers 400 "unknown alter op", which is the
             // fail-closed answer for a layout it would not enforce.
             "set_object_prefix_field" -> AlterOp.SetObjectPrefixField(required(name, "name"))
+            // The declaration is validated by the service, with the
+            // column in hand: whether it is a top-level variant decides
+            // which refusal answers, and the grammar is one walk shared
+            // with create/add_column (VariantShredding).
+            "set_variant_shredding" -> AlterOp.SetVariantShredding(required(name, "name"), shredding)
             else -> throw BadRequestException("unknown alter op '$op'")
         }
     }

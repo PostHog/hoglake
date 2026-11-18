@@ -406,6 +406,40 @@ class JwtVerifierTest {
     }
 
     @Test
+    fun `an absent ten means tenant`() {
+        val claims = TestTokens.tenantClaims().replace("\"ten\":\"tenant\",", "")
+        assertThat(claims).doesNotContain("\"ten\"")
+        val caller = verifier().verify(mint(claims))
+        assertThat(caller.kind).isEqualTo(Caller.Kind.TENANT)
+        assertThat(caller.catalogScopes.keys).containsExactly("lake")
+    }
+
+    @Test
+    fun `a ten that is present but not a string is refused, not read as absent`() {
+        for (value in listOf("null", "7", "true", "[\"tenant\"]")) {
+            val token = mint(TestTokens.tenantClaims().replace("\"ten\":\"tenant\"", "\"ten\":$value"))
+            assertThatThrownBy { verifier().verify(token) }
+                .describedAs(value)
+                .isInstanceOf(JwtViolation::class.java)
+                .extracting("reason").isEqualTo(JwtViolation.MISSING_CLAIM)
+        }
+    }
+
+    @Test
+    fun `an operator token without ten is a tenant token without cat, and refused`() {
+        val claims = TestTokens.operatorClaims().replace("\"ten\":\"operator\",", "")
+        assertThat(claims).doesNotContain("\"ten\"")
+        assertThatThrownBy { verifier().verify(mint(claims)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MISSING_CLAIM)
+        // Even when it names an org: it still grants no catalog.
+        val withOrg = claims.replace("\"iat\"", "\"org\":\"11111111-1111-1111-1111-111111111111\",\"iat\"")
+        assertThatThrownBy { verifier().verify(mint(withOrg)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MISSING_CLAIM)
+    }
+
+    @Test
     fun `a non-integer exp is refused, so 1e400 cannot become infinity`() {
         val token = mint(TestTokens.tenantClaims().replace("\"exp\":4000000000", "\"exp\":1e400"))
         assertThatThrownBy { verifier().verify(token) }
@@ -623,6 +657,59 @@ class JwtVerifierTest {
         }
         val exactly200 = (1..200).joinToString(",") { "\"$it\":\"read\"" }
         assertThat(scopedReason(TestTokens.scopedClaims(prd = """{"team_id":{$exactly200}}"""))).isEqualTo("accepted")
+    }
+
+    @Test
+    fun `a scoped token without ten is refused rather than widened to a tenant token`() {
+        // Read as a tenant token it would drop prd and grant the whole catalog.
+        val claims = TestTokens.scopedClaims().replace("\"ten\":\"scoped\",", "")
+        assertThat(claims).doesNotContain("\"ten\"")
+        assertThat(scopedReason(claims)).isEqualTo(JwtViolation.MALFORMED)
+        // The same claims with ten stated verify, so prd is what refuses it.
+        assertThat(scopedReason(TestTokens.scopedClaims())).isEqualTo("accepted")
+    }
+
+    @Test
+    fun `the scoped lifetime cap defaults to 900s and is configurable`() {
+        val keys = StaticSigningKeys(TestTokens.KID, pair.public as java.security.interfaces.ECPublicKey)
+
+        fun reason(
+            lifetime: Long,
+            cap: Long? = null,
+        ): String {
+            val v =
+                if (cap == null) {
+                    JwtVerifier(TestTokens.ISSUER, TestTokens.AUDIENCE, keys, predicateFields = setOf("team_id")) {
+                        1_700_000_100L
+                    }
+                } else {
+                    JwtVerifier(
+                        TestTokens.ISSUER,
+                        TestTokens.AUDIENCE,
+                        keys,
+                        predicateFields = setOf("team_id"),
+                        scopedMaxLifetimeSeconds = cap,
+                    ) { 1_700_000_100L }
+                }
+            return try {
+                v.verify(TestTokens.mint(pair, TestTokens.scopedClaims(exp = 1_700_000_000L + lifetime)))
+                "accepted"
+            } catch (e: JwtViolation) {
+                e.reason
+            }
+        }
+        assertThat(JwtVerifier.DEFAULT_SCOPED_MAX_LIFETIME_SECONDS).isEqualTo(900L)
+        assertThat(reason(900)).isEqualTo("accepted")
+        assertThat(reason(901)).isEqualTo(JwtViolation.MALFORMED)
+        assertThat(reason(3600, cap = 3600)).isEqualTo("accepted")
+        assertThat(reason(3601, cap = 3600)).isEqualTo(JwtViolation.MALFORMED)
+        assertThat(reason(300, cap = 300)).isEqualTo("accepted")
+        assertThat(reason(301, cap = 300)).isEqualTo(JwtViolation.MALFORMED)
+        for (bad in listOf(0L, -1L)) {
+            assertThatThrownBy {
+                JwtVerifier(TestTokens.ISSUER, TestTokens.AUDIENCE, keys, scopedMaxLifetimeSeconds = bad)
+            }.isInstanceOf(IllegalArgumentException::class.java)
+        }
     }
 
     @Test

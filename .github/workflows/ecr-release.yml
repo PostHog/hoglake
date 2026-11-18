@@ -4,9 +4,8 @@ name: ECR release
 # shared-services ECR. A Kargo Warehouse in PostHog/charts reads both
 # repositories. Kargo promotes the two images as one release group.
 #
-# This path is ADDITIVE. The deploy jobs in server.yml and webui.yml
-# continue to push to ghcr.io. They continue to dispatch to the
-# gigahog state files. This workflow does not read or change them.
+# The deploy jobs in server.yml and webui.yml continue to publish
+# images to GHCR. Neither job sends a legacy state callback.
 #
 # The Warehouse makes Freight only when all of these are true:
 #   - The newest tag in EACH repository matches ^r[0-9]{12}-[0-9a-f]{6}$.
@@ -21,8 +20,8 @@ name: ECR release
 # A completed Server or Webui run on main starts this workflow. The
 # gate job reads the server-checks and webui-test results for that
 # commit. The gate publishes only when no gate failed and one passed.
-# The gate does NOT read the deploy jobs. Thus a gigahog failure does
-# not stop this path. The names "Server" and "Webui" below must agree
+# The gate does not read the deploy jobs. A GHCR publication failure
+# does not stop this path. The names "Server" and "Webui" below must agree
 # with the name: fields of server.yml and webui.yml.
 #
 # A pull request that changes this workflow or its script starts a

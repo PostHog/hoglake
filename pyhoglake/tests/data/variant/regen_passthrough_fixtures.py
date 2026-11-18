@@ -11,6 +11,11 @@ into server/src/test/resources/variant/passthrough/:
 - mismatch.parquet: ``props`` laid out from ANOTHER declaration, under the
   same field id: what a foreign writer, or the declaration of a dropped and
   re-added column, can leave in a table.
+- other_a.parquet, other_b.parquet: ``a`` and ``b`` again (the same ids and
+  rows, ``other_a`` in row groups of five) with ``props`` in ``mismatch``'s
+  declaration: the files a table holds after ``set_variant_shredding``
+  changed ``props``, which compaction rewrites per layout
+  (``VariantLayoutGroups``). other.json is that table's columns.
 - duckdb.parquet: ``b`` with its footer's ``created_by`` overwritten, in
   place and at the same length, to DuckDB's.
 
@@ -182,15 +187,10 @@ def main() -> None:
         json.dumps(COLUMNS, indent=1, ensure_ascii=False) + "\n"
     )
     # Even ids in a, odd in b, each in no order: the sorted merge interleaves them.
-    _write(
-        "a.parquet",
-        columns,
-        [(7 * i) % 24 for i in range(24) if (7 * i) % 24 % 2 == 0],
-        row_group_size=5,
-    )
-    b = _write(
-        "b.parquet", columns, [(5 * i) % 24 for i in range(24) if (5 * i) % 24 % 2 == 1]
-    )
+    a_ids = [(7 * i) % 24 for i in range(24) if (7 * i) % 24 % 2 == 0]
+    b_ids = [(5 * i) % 24 for i in range(24) if (5 * i) % 24 % 2 == 1]
+    _write("a.parquet", columns, a_ids, row_group_size=5)
+    b = _write("b.parquet", columns, b_ids)
     other = dict(
         COLUMNS[1],
         type_params={
@@ -203,11 +203,14 @@ def main() -> None:
             }
         },
     )
-    _write(
-        "mismatch.parquet",
-        [columns[0], Column.from_wire(other), *columns[2:]],
-        [30, 31, 32],
+    other_wire = [COLUMNS[0], other, *COLUMNS[2:]]
+    other_columns = [Column.from_wire(c) for c in other_wire]
+    (OUT / "other.json").write_text(
+        json.dumps(other_wire, indent=1, ensure_ascii=False) + "\n"
     )
+    _write("mismatch.parquet", other_columns, [30, 31, 32])
+    _write("other_a.parquet", other_columns, a_ids, row_group_size=5)
+    _write("other_b.parquet", other_columns, b_ids)
     body = b.read_bytes()
     stamp = pq.ParquetFile(b).metadata.created_by.encode()
     duck = b"DuckDB version v1.5.6 (build x)".ljust(len(stamp), b" ")[: len(stamp)]

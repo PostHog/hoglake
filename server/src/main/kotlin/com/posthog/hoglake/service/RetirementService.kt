@@ -247,7 +247,7 @@ class RetirementService(
     private val nanoTime: () -> Long = System::nanoTime,
     /** The inter-batch pause, injected so a test does not sleep. */
     private val sleep: (Long) -> Unit = { Thread.sleep(it) },
-) {
+) : RetirementBackend {
     private val log = KotlinLogging.logger {}
 
     /** The run ledger; records after the run resolves, never inside it. */
@@ -305,9 +305,9 @@ class RetirementService(
      * which is what makes "no dropped table is eligible yet"
      * distinguishable from "nothing is sweeping this catalog".
      */
-    fun runOnce(
+    override fun runOnce(
         catalog: String,
-        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+        trigger: MaintenanceTrigger,
     ): RetirementResult =
         runStore.recorded(catalog, MaintenanceTask.RETIREMENT, trigger) {
             runSweep(catalog)

@@ -16,15 +16,26 @@ import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.OperatorTeamNamespaces
+import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
+import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.MountReadService
+import com.posthog.hoglake.store.remoteSchemaRefusal
+import com.posthog.hoglake.store.servedNamespaceRefusal
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.Parameters
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.receive
 import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
+import io.ktor.server.routing.RoutingCall
+import io.ktor.server.routing.RoutingPipelineCall
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -35,6 +46,18 @@ import java.time.Instant
 import java.time.format.DateTimeParseException
 import java.util.UUID
 
+/** Install the default PostgreSQL-only API without extra backend configuration. */
+fun Application.installApiRoutes(
+    store: CatalogStore,
+    instanceName: String = "",
+    instanceTotals: () -> InstanceTotals? = { null },
+    catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
+    uiTheme: String = "",
+) = installApiRoutes(CatalogStoreSelector(store), instanceName, instanceTotals, catalogTotals, uiTheme)
+
+/** Install the default PostgreSQL-only scan route. */
+fun Application.installScanRoutes(scan: CatalogStore) = installScanRoutes(CatalogStoreSelector(scan))
+
 /**
  * The /v1 routes, one-to-one with openapi/hoglake.yaml. Handlers only
  * translate wire <-> model and pick status codes; behavior (locking,
@@ -42,17 +65,25 @@ import java.util.UUID
  * whose HoglakeExceptions are mapped by ErrorMapping.
  */
 fun Application.installApiRoutes(
-    store: CatalogStore,
+    selector: CatalogStoreSelector,
     instanceName: String = "",
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
+    /**
+     * Serves a mount's five scoped read routes (plan row 1.3h). A provider,
+     * not the instance, so a PG-free boot never forces it (it builds a
+     * PostgreSQL-backed reader); it resolves to null where no mount can serve.
+     */
+    mountRead: () -> MountReadService? = { null },
+    /** Names `POST .../namespaces` refuses for every caller (HOGLAKE_RESERVED_NAMESPACES). */
+    reservedNamespaces: ReservedNamespaces = ReservedNamespaces.NONE,
+    /** Names only an operator creates in the listed catalogs (HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS). */
+    operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces.NONE,
 ) {
     // The handlers keep the receiver names `catalogs.` and `commits.`.
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
     // sites by these names. Both names refer to the one CatalogStore.
-    val catalogs: CatalogStore = store
-    val commits: CatalogStore = store
     routing {
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -104,20 +135,62 @@ fun Application.installApiRoutes(
                 // token reads the whole fleet's catalog roster off the first
                 // request it makes. Under HOGLAKE_AUTH_MODE=off the caller is
                 // null and the filter is "everything", i.e. today's behaviour.
-                val totals = catalogTotals()
+                //
+                // An anonymous caller reaches this handler only under `warn`,
+                // whose point is to let a refusal through while counting it.
+                // The plugin counted this request's missing token already, so
+                // it lists everything as `off` does, and the store's own
+                // refusal of "*" (auth/StoreGrant.kt) adds no second count.
+                // Only the totals are withheld: the fleet's sizes are not an
+                // unauthenticated caller's, as /v1/info above decides too.
+                val listing = selector.forListing(call)
+                val catalogs = listing.store
+                // The sampler reads PostgreSQL only. Catalog names are not unique across backends.
+                val totals = if (listing.usePostgresTotals) catalogTotals() else emptyMap()
                 val visible =
                     when (val auth = call.hoglakeAuth) {
                         is AuthState.Off -> null
-                        // Only reachable in `warn`, which lets a refusal through.
-                        is AuthState.Anonymous -> emptySet()
-                        is AuthState.Authenticated -> auth.caller.visibleCatalogs()
+                        is AuthState.Anonymous -> null
+                        is AuthState.Authenticated -> listing.catalogs
                     }
-                // Totals are catalog-wide, so a scoped caller gets none.
-                val scoped = (call.hoglakeAuth as? AuthState.Authenticated)?.caller?.kind == Caller.Kind.SCOPED
-                call.respond(catalogs.listCatalogs(visible).map { it.toDto(if (scoped) null else totals[it.name]) })
+                // Totals are catalog-wide, so a scoped caller gets none; nor
+                // does an anonymous one, as above.
+                val withoutTotals =
+                    when (val auth = call.hoglakeAuth) {
+                        is AuthState.Off -> false
+                        is AuthState.Anonymous -> true
+                        is AuthState.Authenticated -> auth.caller.kind == Caller.Kind.SCOPED
+                    }
+                // A catalog a mount shadows answers as the mount on every
+                // route, so it is not listed. The caller's own mounts follow,
+                // unsorted: re-sorting could reorder the backend's listing.
+                val listed = catalogs?.listCatalogs(visible).orEmpty()
+                val mounts = selector.mountsAmong(call, listed.map { it.name } + listing.mounts)
+                val local =
+                    listed.filterNot { it.name in mounts }
+                        .map { it.toDto(if (withoutTotals) null else totals[it.name]) }
+                val shown = listing.mounts.filter { it in mounts }
+                // A mount Client asks each host once, with the caller's
+                // token, and shows the entries the host returns for these
+                // names as the host wrote them.
+                val remote = if (shown.isEmpty()) null else selector.remoteCatalogs(call, shown)
+                if (shown.isEmpty()) {
+                    call.respond(local)
+                } else if (remote != null) {
+                    call.respond<List<Any>>(local + remote)
+                } else {
+                    val source = selector.mountSource()
+                    call.respond(local + shown.map { source.toMountDto(it) })
+                }
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
+                // Before placement picks a backend, so no backend can create
+                // a catalog that shares a name with a mount.
+                if (MountNames.isReserved(req.name)) {
+                    throw HoglakeException.Validation("catalog name '${req.name}' is reserved for mounts")
+                }
+                val catalogs = selector.forCatalog(call, req.name)
                 call.respond(
                     HttpStatusCode.Created,
                     catalogs.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
@@ -126,9 +199,18 @@ fun Application.installApiRoutes(
 
             route("/{catalog}") {
                 get {
-                    call.respond(catalogs.getCatalog(call.catalog()).toDto())
+                    // The one route a mount serves so far (AuthPolicy.MOUNT_ROUTES).
+                    when (val binding = selector.resolve(call, call.catalog())) {
+                        is CatalogBinding.Local -> call.respond(binding.store.getCatalog(call.catalog()).toDto())
+                        is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
+                        is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
+                        // Unreachable: this path names no namespace.
+                        is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+                        is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
+                    }
                 }
                 delete {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     call.respond(
                         catalogs.dropCatalog(
                             call.catalog(),
@@ -139,6 +221,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/storage-usage") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     // A footprint has no read snapshot: historical/dropped registrations
                     // remain tracked until their manifest rows are physically removed.
                     if (call.request.queryParameters.contains("snapshot") ||
@@ -152,25 +235,72 @@ fun Application.installApiRoutes(
                 route("/namespaces") {
                     get {
                         val catalog = call.catalog()
-                        // A scoped caller sees only the contained namespaces
-                        // it may use (AuthPolicy.SCOPED_ROUTES); everyone
-                        // else, everything.
-                        val scoped = call.hoglakeAuth.callerOrNull?.takeIf { it.kind == Caller.Kind.SCOPED }
-                        call.respond(
-                            catalogs.listNamespaces(
-                                catalog,
-                                call.longQuery("snapshot"),
-                                call.instantQuery("at_timestamp"),
-                            ).filter { ns ->
-                                scoped == null ||
-                                    ns.containment?.let {
-                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
-                                    } == true
-                            }.map { it.toDto() },
-                        )
+                        when (val binding = selector.resolve(call, catalog)) {
+                            // A mount lists only the pinned table's namespace (plan row 1.3h).
+                            is CatalogBinding.Mount ->
+                                call.respond(
+                                    checkNotNull(mountRead()).namespaces(
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).map { it.toDto() },
+                                )
+                            is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
+                            // Unreachable: this path names no namespace.
+                            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
+                            is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
+                            is CatalogBinding.Local -> {
+                                val catalogs = binding.store
+                                // A scoped caller sees only the contained
+                                // namespaces it may use (AuthPolicy.SCOPED_ROUTES);
+                                // everyone else, everything.
+                                val scoped = call.hoglakeAuth.callerOrNull?.takeIf { it.kind == Caller.Kind.SCOPED }
+                                // A remote schema's name is never a local
+                                // namespace: one of that name is left out, and
+                                // the schemas the token allows follow, from
+                                // configuration alone. No Host is asked, so its
+                                // outage cannot fail the listing.
+                                call.respond(
+                                    catalogs.listNamespaces(
+                                        catalog,
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).filter { ns ->
+                                        !selector.isRemoteSchema(ns.name) &&
+                                            (
+                                                scoped == null ||
+                                                    ns.containment?.let {
+                                                        scoped.mayUseContained(
+                                                            catalog,
+                                                            it.field,
+                                                            it.value,
+                                                            it.org,
+                                                            Scope.READ,
+                                                        )
+                                                    } == true
+                                            )
+                                    }.map { it.toDto() } +
+                                        selector.visibleRemoteSchemas(call, catalog).map {
+                                            NamespaceDto(name = it, remote = true)
+                                        },
+                                )
+                            }
+                        }
                     }
                     post {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val req = call.receive<CreateNamespaceRequestDto>()
+                        // Before the store: the only path that creates a namespace, on every backend.
+                        reservedNamespaces.refuse(req.name)
+                        // Auth off has no callers to tell apart: it is the operator, as for a drop.
+                        val operator = call.hoglakeAuth.callerOrNull?.kind?.isOperator() ?: true
+                        operatorTeamNamespaces.refuse(call.catalog(), req.name, operator)
+                        // The mark is the operator's alone (PUT .../containment is OPERATOR in AuthPolicy), and
+                        // this route is WRITE, so the body decides.
+                        if (req.containment != null && !operator) {
+                            throw com.posthog.hoglake.model.HoglakeException.Forbidden(
+                                "only an operator may create a namespace with a containment mark",
+                            )
+                        }
                         call.respond(
                             HttpStatusCode.Created,
                             catalogs.createNamespace(
@@ -178,15 +308,40 @@ fun Application.installApiRoutes(
                                 req.name,
                                 call.actorOrRefuse(req.author),
                                 req.message,
+                                req.containment?.let { NamespaceContainment(it.field, it.value, it.org) },
                             ).toDto(),
                         )
                     }
                     get("/{namespace}") {
-                        call.respond(
-                            catalogs.getNamespace(call.catalog(), call.namespace()).toDto(),
-                        )
+                        when (val binding = selector.resolve(call, call.catalog())) {
+                            is CatalogBinding.Mount ->
+                                call.respond(
+                                    checkNotNull(mountRead()).namespace(
+                                        call.namespace(),
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).toDto(),
+                                )
+                            is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
+                            is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
+                            is CatalogBinding.Served ->
+                                call.respond(
+                                    // No id: it is a counter of the shared source catalog.
+                                    NamespaceDto(
+                                        remote = true,
+                                        name =
+                                            binding.reader.namespace(
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).name,
+                                    ),
+                                )
+                            is CatalogBinding.Local ->
+                                call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
+                        }
                     }
                     delete("/{namespace}") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.dropNamespace(
                                 call.catalog(),
@@ -202,17 +357,19 @@ fun Application.installApiRoutes(
                     }
                     // Containment (V33): operator-only in AuthPolicy.
                     put("/{namespace}/containment") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val req = call.receive<NamespaceContainmentDto>()
                         call.respond(
                             catalogs.setNamespaceContainment(
                                 call.catalog(),
                                 call.namespace(),
-                                NamespaceContainment(req.field, req.value),
+                                NamespaceContainment(req.field, req.value, req.org),
                                 call.actorOrRefuse(null),
                             ).toDto(),
                         )
                     }
                     delete("/{namespace}/containment") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.setNamespaceContainment(
                                 call.catalog(),
@@ -224,16 +381,40 @@ fun Application.installApiRoutes(
                     }
                     route("/{namespace}/tables") {
                         get {
-                            call.respond(
-                                catalogs.listTables(
-                                    call.catalog(),
-                                    call.namespace(),
-                                    call.longQuery("snapshot"),
-                                    call.instantQuery("at_timestamp"),
-                                ).map { it.toDto() },
-                            )
+                            when (val binding = selector.resolve(call, call.catalog())) {
+                                // The pinned table only, with SCOPED totals (plan row 1.3h).
+                                is CatalogBinding.Mount ->
+                                    call.respond(
+                                        checkNotNull(mountRead()).tables(
+                                            call.hoglakeAuth.callerOrNull,
+                                            binding.mount,
+                                            call.namespace(),
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
+                                is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
+                                is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
+                                is CatalogBinding.Served ->
+                                    call.respond(
+                                        binding.reader.tables(
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
+                                is CatalogBinding.Local ->
+                                    call.respond(
+                                        binding.store.listTables(
+                                            call.catalog(),
+                                            call.namespace(),
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
+                            }
                         }
                         post {
+                            val catalogs = selector.forCatalog(call, call.catalog())
                             val req = call.receive<CreateTableRequestDto>()
                             call.respond(
                                 HttpStatusCode.Created,
@@ -250,25 +431,51 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
-                                call.respond(
-                                    catalogs.getTable(
-                                        call.catalog(),
-                                        call.namespace(),
-                                        call.table(),
-                                        call.longQuery("snapshot"),
-                                        call.instantQuery("at_timestamp"),
-                                        // Defaults TRUE: the field set a
-                                        // client already gets does not
-                                        // shrink because a parameter was
-                                        // added. `totals=false` is the
-                                        // identity read (#232), which no
-                                        // client in this tree sends yet —
-                                        // see CatalogService.getTable.
-                                        totals = call.boolQuery("totals") ?: true,
-                                    ).toDto(),
-                                )
+                                when (val binding = selector.resolve(call, call.catalog())) {
+                                    // A mount serves the pinned table only, totals omitted (plan row 1.3h).
+                                    is CatalogBinding.Mount ->
+                                        call.respond(
+                                            checkNotNull(mountRead()).table(
+                                                call.namespace(),
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).toDto(),
+                                        )
+                                    is CatalogBinding.Remote ->
+                                        binding.host.table(call, binding.name, call.namespace(), call.table())
+                                    is CatalogBinding.RemoteSchema ->
+                                        binding.host.schemaTable(call, binding, call.table())
+                                    is CatalogBinding.Served ->
+                                        call.respond(
+                                            binding.reader.table(
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).toDto(),
+                                        )
+                                    is CatalogBinding.Local ->
+                                        call.respond(
+                                            binding.store.getTable(
+                                                call.catalog(),
+                                                call.namespace(),
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                                // Defaults TRUE: the field set a
+                                                // client already gets does not
+                                                // shrink because a parameter was
+                                                // added. `totals=false` is the
+                                                // identity read (#232), which no
+                                                // client in this tree sends yet —
+                                                // see CatalogService.getTable.
+                                                totals = call.boolQuery("totals") ?: true,
+                                            ).toDto(),
+                                        )
+                                }
                             }
                             delete {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.dropTable(
                                         call.catalog(),
@@ -281,6 +488,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             post("/truncate") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 val expected =
                                     call.expectedTableUuid()
                                         ?: throw BadRequestException("expected_table_uuid is required")
@@ -310,6 +518,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/files") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 val sort =
                                     call.request.queryParameters["sort"]?.let {
                                         FileRepo.FileSortColumn.fromWire(it)
@@ -393,6 +602,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/partitions/values") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.partitionValues(
                                         call.catalog(),
@@ -404,6 +614,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/files/{fileId}/stats") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.fileStats(
                                         call.catalog(),
@@ -416,6 +627,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/changes") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 val from =
                                     call.longQuery("from_snapshot")
                                         ?: throw BadRequestException(
@@ -436,6 +648,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/snapshots/resolve") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     val at =
                         call.instantQuery("at_timestamp")
                             ?: throw BadRequestException("query parameter 'at_timestamp' is required")
@@ -443,6 +656,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/snapshots") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     val after = call.longQuery("after") ?: 0L
                     val before = call.longQuery("before")
                     val limit = (call.intQuery("limit") ?: 1000).coerceAtMost(10_000)
@@ -454,6 +668,7 @@ fun Application.installApiRoutes(
                 // Dedicated endpoint prevents old servers silently ignoring the
                 // new request key and degrading retries to at-least-once.
                 post("/commit/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null) {
                         throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
@@ -463,8 +678,30 @@ fun Application.installApiRoutes(
                     )
                 }
 
+                // Ends whole live files and appends in ONE snapshot. A dedicated
+                // endpoint, so an older server answers 404 instead of ignoring
+                // `file_ends` and publishing only the appends (a doubled day).
+                post("/commit/replacements/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
+                    val req = call.receiveReplacement()
+                    if (req.deletes.isNotEmpty() || req.requireUnchangedTables == true) {
+                        throw BadRequestException(
+                            "a replacement cannot carry deletes or require_unchanged_tables",
+                        )
+                    }
+                    if (req.idempotencyKey == null || req.readSnapshot == null || req.fileEnds.isNullOrEmpty()) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "a replacement requires idempotency_key, read_snapshot and file_ends",
+                        )
+                    }
+                    call.respond(
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                    )
+                }
+
                 // Distinct endpoint fences replicas that predate the DELETE contract.
                 post("/commit/deletes/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.appends.isNotEmpty() ||
                         req.deletes.isEmpty() || req.deletes.any { it.expectedTableUuid == null }
@@ -485,6 +722,7 @@ fun Application.installApiRoutes(
                 // A separate endpoint fences old replicas and includes the stronger
                 // conflict contract in the durable full-payload receipt.
                 post("/commit/mutations/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.deletes.isEmpty() ||
                         req.deletes.any { it.expectedTableUuid == null } ||
@@ -504,6 +742,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit/uploads") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
@@ -529,6 +768,7 @@ fun Application.installApiRoutes(
                 // append-only transaction keeps the ordinary DDL-only
                 // conflict rule and does not 409 on a concurrent INSERT.
                 post("/commit/transaction") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
@@ -549,17 +789,21 @@ fun Application.installApiRoutes(
                 }
 
                 get("/commit/receipts/{operation}") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val operation =
                         try {
-                            UUID.fromString(call.parameters["operation"])
+                            UUID.fromString(call.pathParam("operation"))
                         } catch (_: IllegalArgumentException) {
                             throw BadRequestException("invalid operation UUID")
                         }
                     val receipt = commits.receipt(call.catalog(), operation)
-                    call.respond(CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion))
+                    call.respond(
+                        CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion, receipt.endedFiles),
+                    )
                 }
 
                 post("/commit") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     call.respond(
                         commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
@@ -567,30 +811,44 @@ fun Application.installApiRoutes(
                 }
 
                 get("/consumers") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
+                    // An offset on a table of a namespace a remote schema
+                    // hides is not listed: its row would name the namespace.
                     call.respond(
-                        catalogs.listConsumers(call.catalog()).toConsumerListDto(),
+                        catalogs.listConsumers(call.catalog())
+                            .filterNot { it.namespace?.let(selector::isRemoteSchema) == true }
+                            .toConsumerListDto(),
                     )
                 }
 
                 route("/consumers/{consumer}/offsets") {
                     get {
+                        val catalogs = selector.forCatalog(call, call.catalog())
+                        val hidden = selector.hiddenTables(catalogs, call.catalog())
                         call.respond(
                             catalogs.listOffsets(call.catalog(), call.consumer())
+                                .filterNot { it.tableUuid in hidden }
                                 .map { it.toDto() },
                         )
                     }
                     get("/{tableUuid}") {
-                        call.respond(
-                            catalogs.getOffset(
-                                call.catalog(),
-                                call.consumer(),
-                                call.uuidPath("tableUuid"),
-                            ).toDto(),
-                        )
+                        val catalogs = selector.forCatalog(call, call.catalog())
+                        val tableUuid = call.uuidPath("tableUuid")
+                        call.refuseHiddenTable(selector, catalogs, tableUuid) {
+                            HoglakeException.NotFound(
+                                "no offset for consumer '${call.consumer()}' on table $tableUuid " +
+                                    "in catalog '${call.catalog()}'",
+                            )
+                        }
+                        call.respond(catalogs.getOffset(call.catalog(), call.consumer(), tableUuid).toDto())
                     }
                     put("/{tableUuid}") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val tableUuid = call.uuidPath("tableUuid")
                         val req = call.receive<CommitOffsetRequestDto>()
+                        call.refuseHiddenTable(selector, catalogs, tableUuid) {
+                            HoglakeException.Validation("unknown table_uuid $tableUuid in catalog '${call.catalog()}'")
+                        }
                         call.respond(
                             catalogs.commitOffset(
                                 call.catalog(),
@@ -607,6 +865,29 @@ fun Application.installApiRoutes(
 }
 
 /**
+ * Refuse a request that addresses, by UUID alone, a table of a namespace a
+ * remote schema hides, as a request naming that namespace is refused
+ * ([CatalogStoreSelector.refuseRemoteSchemas]). The request named no
+ * namespace, so where that answer is "no such namespace" the caller gets
+ * [unknown] instead: what this route answers for a UUID the catalog does
+ * not have, in the stores' own words. A no-op, with nothing read, on a
+ * server that configures no remote schema.
+ */
+private fun ApplicationCall.refuseHiddenTable(
+    selector: CatalogStoreSelector,
+    catalogs: CatalogStore,
+    tableUuid: UUID,
+    unknown: () -> HoglakeException,
+) {
+    val namespace = selector.hiddenTables(catalogs, catalog())[tableUuid] ?: return
+    try {
+        selector.refuseRemoteSchemas(this, catalog(), listOf(namespace))
+    } catch (_: HoglakeException.NotFound) {
+        throw unknown()
+    }
+}
+
+/**
  * GET .../tables/{table}/scan?snapshot= — read planning (openapi
  * planScan): data files paired with their visible deletion vectors, and
  * with `include=column_stats` each provided file's column statistics
@@ -614,7 +895,10 @@ fun Application.installApiRoutes(
  * stored row-group start offsets. Installed separately so App.kt wires
  * it with its own CatalogStore.
  */
-fun Application.installScanRoutes(scan: CatalogStore) {
+fun Application.installScanRoutes(
+    selector: CatalogStoreSelector,
+    mountRead: () -> MountReadService? = { null },
+) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
@@ -622,18 +906,54 @@ fun Application.installScanRoutes(scan: CatalogStore) {
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
+            // A mount Client relays the request as it came (plan row 1.3c):
+            // the Host parses it, plans the scoped scan and applies its caps.
+            selector.remote(call, call.catalog())?.let { remote ->
+                return@get remote.host.scan(call, remote.name, call.namespace(), call.table())
+            }
+            // A remote schema's scan is relayed the same way.
+            selector.remoteSchema(call, call.catalog())?.let { schema ->
+                return@get schema.host.schemaScan(call, schema, call.table())
+            }
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
-            call.respond(
-                scan.planScan(
-                    call.catalog(),
-                    call.namespace(),
-                    call.table(),
-                    call.longQuery("snapshot"),
-                    call.instantQuery("at_timestamp"),
-                    columnStats = request.columnStats,
-                    splitOffsets = request.splitOffsets,
-                ).map { it.toDto() },
-            )
+            val files =
+                when (val binding = selector.resolve(call, call.catalog())) {
+                    is CatalogBinding.Remote, is CatalogBinding.RemoteSchema ->
+                        error("a remote binding is relayed before the scan is parsed")
+                    is CatalogBinding.Local ->
+                        binding.store.planScan(
+                            call.catalog(),
+                            call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                    is CatalogBinding.Served ->
+                        binding.reader.scan(
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                    // The export's scoped scan (plan row 1.3h): ReadScope in
+                    // SQL, each file its team id, under the shared cap, the
+                    // file budget and the deadline.
+                    is CatalogBinding.Mount ->
+                        checkNotNull(mountRead()).scan(
+                            call.hoglakeAuth.callerOrNull,
+                            binding.mount,
+                            call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                }
+            call.respond(files.map { it.toDto() })
         }
     }
 }
@@ -824,8 +1144,24 @@ internal fun parseStatsFields(raw: String): Set<Long> {
 // ---- parameter helpers ---------------------------------------------------
 // internal (not private): ViewRoutes.kt shares them.
 
+/**
+ * A route value: the `{name}` segment of the path this call matched. Route
+ * values come from the path only, the same path the route table reads
+ * (auth/AuthPolicy.kt). The call's merged parameters also hold the query
+ * string's, so no handler reads a route value from them; a query value is
+ * read from `request.queryParameters`. RoutePathValuesTest holds every file
+ * under `api/` to this.
+ */
 internal fun ApplicationCall.pathParam(name: String): String =
-    parameters[name] ?: throw BadRequestException("missing path parameter '$name'")
+    pathValues()[name] ?: throw BadRequestException("missing path parameter '$name'")
+
+/** The matched route's path parameters; only a call inside a route handler has them. */
+private fun ApplicationCall.pathValues(): Parameters =
+    when (this) {
+        is RoutingCall -> pathParameters
+        is RoutingPipelineCall -> pathParameters
+        else -> error("a route value was read outside a route handler")
+    }
 
 internal fun ApplicationCall.catalog() = pathParam("catalog")
 
@@ -924,6 +1260,19 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
 internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
     receive<CommitRequestDto>().attributed(hoglakeAuth).also { req ->
         requireScopedNamespaces(catalog(), req.appends.map { it.namespace } + req.deletes.map { it.namespace })
+    }
+
+/**
+ * A replacement's body, attributed and held to a scoped caller's namespaces:
+ * the namespaces of its appends AND of the tables whose files it ends.
+ */
+internal suspend fun ApplicationCall.receiveReplacement(): ReplacementRequestDto =
+    receive<ReplacementRequestDto>().let { it.copy(author = resolveActor(hoglakeAuth, it.author)) }.also { req ->
+        requireScopedNamespaces(
+            catalog(),
+            req.appends.map { it.namespace } + req.deletes.map { it.namespace } +
+                req.fileEnds.orEmpty().map { it.namespace },
+        )
     }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))

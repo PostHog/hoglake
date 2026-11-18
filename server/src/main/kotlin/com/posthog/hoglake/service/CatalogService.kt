@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ChangesPlan
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileColumnStats
@@ -67,6 +68,7 @@ class CatalogService(private val jdbi: Jdbi) {
         /** The prefix scan's bound when marking a namespace contained; see setNamespaceContainment. */
         const val CONTAINMENT_SCAN_TIMEOUT_MS = 10_000L
         private val CONTAINMENT_FIELD = Regex("^[a-z][a-z0-9_]{0,62}$")
+        private val CONTAINMENT_ORG = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
         /**
          * Ceiling on a catalog's `data_path`.
@@ -430,7 +432,9 @@ class CatalogService(private val jdbi: Jdbi) {
      * - no other live namespace to hold the same `field = value`.
      *
      * Marking the same containment again is a no-op; changing it means
-     * clearing first. Clearing requires no live table or view.
+     * clearing first. Clearing requires no live table or view. An org mark
+     * is permanent: it is neither changed nor cleared (`commit_conflict`),
+     * and the namespace is dropped instead.
      *
      * SCALE. The prefix check reads the catalog's file rows, so it runs
      * BEFORE the commit lock, bounded by [CONTAINMENT_SCAN_TIMEOUT_MS]; a
@@ -453,54 +457,61 @@ class CatalogService(private val jdbi: Jdbi) {
             if (containment == null) "namespace_containment_clear" else "namespace_containment_set",
             catalog,
             namespace,
-            detail = { "containment=${containment?.let { "${it.field}=${it.value}" }}" },
+            detail = { "containment=${containment?.let(::auditDetail)}" },
             actor = { author },
         ) {
-            containment?.let {
-                if (!CONTAINMENT_FIELD.matches(it.field)) {
-                    throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
-                }
-                if (it.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
-            }
-            val (cat, scannedFrom) =
+            containment?.let(::requireValidContainment)
+            val (cat, scannedFrom, scannedPrefix) =
                 jdbi.inTransactionUnchecked { h ->
                     val cat = requireCatalog(h, catalog)
                     val ns = requireNamespace(h, cat, namespace)
-                    // Both read BEFORE the scan, so everything allocated
-                    // after it sits above them; see [ScanWatermark].
-                    val from =
-                        ScanWatermark(
-                            fileId =
-                                h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
-                                    .bind("c", cat.catalogId).mapTo(Long::class.java).one(),
-                            removalId =
-                                h.createQuery("SELECT coalesce(max(removal_id), 0) FROM hog_file_removal")
-                                    .mapTo(Long::class.java).one(),
-                        )
+                    val from = scanWatermark(h, cat.catalogId)
                     // The cheap refusals first, so a namespace that holds
                     // tables is told so rather than that its own files sit
                     // under its prefix. Repeated under the lock below.
-                    if (containment != null && ns.containment == null) {
+                    var scanned: String? = null
+                    val current = ns.containment
+                    if (current?.org != null && current != containment) {
+                        requireOrgMarkReplaceable(h, cat, namespace, ns, current, null)
+                    }
+                    if (containment != null && current != containment && (current == null || current.org != null)) {
                         requireNeverHeld(h, cat.catalogId, ns)
-                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, null)?.let {
+                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, containment, null)?.let {
                             throw prefixTaken(namespace, it)
                         }
+                        scanned = Containment.namespaceRoot(cat.dataPath, namespace, containment)
                     }
-                    cat to from
+                    Triple(cat, from, scanned)
                 }
             jdbi.inTransactionUnchecked { h ->
                 Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 val ns = requireNamespace(h, cat, namespace)
                 if (ns.containment == containment) return@inTransactionUnchecked ns
+                // An org mark outlives every file registered under its prefix
+                // and every reader token minted against it, so it is replaced
+                // or cleared only while nothing can depend on it.
+                val current = ns.containment
+                if (current?.org != null) {
+                    requireOrgMarkReplaceable(h, cat, namespace, ns, current, scannedFrom)
+                }
                 if (containment != null) {
-                    if (ns.containment != null) {
+                    if (current != null && current.org == null) {
                         throw HoglakeException.CommitConflict(
                             "namespace '$namespace' is already contained for " +
                                 "${ns.containment.field} = ${ns.containment.value}; clear it first",
                         )
                     }
+                    // The locked pass reads only what was allocated since the
+                    // watermark, so it stands in for the full scan of THIS prefix
+                    // alone. A namespace that was marked, or marked for another
+                    // prefix, when the scan was decided has had no such scan.
+                    if (scannedPrefix != Containment.namespaceRoot(cat.dataPath, namespace, containment)) {
+                        throw HoglakeException.CommitConflict(
+                            "namespace '$namespace' containment changed concurrently; retry",
+                        )
+                    }
                     requireNeverHeld(h, cat.catalogId, ns)
-                    foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, scannedFrom)?.let {
+                    foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, containment, scannedFrom)?.let {
                         throw prefixTaken(namespace, it)
                     }
                 } else {
@@ -518,9 +529,36 @@ class CatalogService(private val jdbi: Jdbi) {
             }
         }
 
+    private fun requireValidContainment(containment: NamespaceContainment) {
+        if (!CONTAINMENT_FIELD.matches(containment.field)) {
+            throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
+        }
+        if (containment.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
+        if (containment.org != null && !CONTAINMENT_ORG.matches(containment.org)) {
+            throw HoglakeException.Validation("containment org must match ${CONTAINMENT_ORG.pattern}")
+        }
+    }
+
+    /** Read BEFORE the unlocked scan, so everything allocated after it sits above it; see [ScanWatermark]. */
+    private fun scanWatermark(
+        h: org.jdbi.v3.core.Handle,
+        catalogId: Long,
+    ) = ScanWatermark(
+        fileId =
+            h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
+                .bind("c", catalogId).mapTo(Long::class.java).one(),
+        removalId =
+            h.createQuery("SELECT coalesce(max(removal_id), 0) FROM hog_file_removal")
+                .mapTo(Long::class.java).one(),
+    )
+
+    private fun auditDetail(containment: NamespaceContainment): String =
+        "${containment.field}=${containment.value}" + (containment.org?.let { " org=$it" } ?: "")
+
     /**
      * Another table's file, DV, live upload claim or undrained removal
-     * under [namespace]'s prefix, in any spelling a percent-decoding reader
+     * under [namespace]'s prefix ([Containment.namespaceRoot] of
+     * [containment]), in any spelling a percent-decoding reader
      * resolves to it (what [com.posthog.hoglake.model.Containment.segments]
      * compares at commit), or null.
      *
@@ -539,10 +577,19 @@ class CatalogService(private val jdbi: Jdbi) {
         catalogId: Long,
         dataPath: String,
         namespace: String,
+        containment: NamespaceContainment,
         from: ScanWatermark?,
     ): String? {
         val fromFileId = from?.fileId
         val root = dataPath.trimEnd('/') + "/"
+        val prefix = Containment.namespaceRoot(dataPath, namespace, containment)
+        val spelled =
+            if (containment.org == null) {
+                "^" + spelledAs("data") + "/" + spelledAs(namespace) + "/"
+            } else {
+                "^" + spelledAs("org_id=${containment.org}") + "/" +
+                    spelledAs("${containment.field}=${containment.value}") + "/"
+            }
         val ids = if (fromFileId == null) "" else "AND %s >= :from"
         // The literal prefix, or a path with a `%` whose `<dir>/<segment>/`
         // spells `data/<namespace>/`. Nothing broader: an unrelated escaped
@@ -584,14 +631,14 @@ class CatalogService(private val jdbi: Jdbi) {
                     ${if (fromFileId == null) unlockedOnly else lockedRemovals}
                 ) hit LIMIT 1
                 """,
-            ).bind("c", catalogId).bind("prefix", root + "data/" + namespace + "/").bind("root", root)
-                .bind("spelled", "^" + spelledAs("data") + "/" + spelledAs(namespace) + "/")
+            ).bind("c", catalogId).bind("prefix", prefix).bind("root", root)
+                .bind("spelled", spelled)
                 .also { q -> from?.let { q.bind("from", it.fileId).bind("fromRemoval", it.removalId) } }
                 .mapTo(String::class.java).findOne().orElse(null)
         } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
             if (Pg.isQueryCanceled(e)) {
                 throw HoglakeException.ContainmentUnverified(
-                    "could not check ${root}data/$namespace/ for other tables' files within its time bound; " +
+                    "could not check $prefix for other tables' files within its time bound; " +
                         "the namespace was not marked",
                 )
             }
@@ -614,19 +661,54 @@ class CatalogService(private val jdbi: Jdbi) {
             "(?:$c|%${hex[0]}$second)"
         }
 
+    /** Has [ns] ever held a table or view, at any snapshot, dropped ones included? */
+    private fun everHeld(
+        h: org.jdbi.v3.core.Handle,
+        catalogId: Long,
+        ns: NamespaceInfo,
+    ): Boolean =
+        h.createQuery(
+            """
+            SELECT EXISTS (SELECT 1 FROM hog_table_version WHERE catalog_id = :c AND namespace_id = :n)
+                OR EXISTS (SELECT 1 FROM hog_view WHERE catalog_id = :c AND namespace_id = :n)
+            """,
+        ).bind("c", catalogId).bind("n", ns.namespaceId).mapTo(Boolean::class.java).one()
+
+    /**
+     * An org mark may be replaced or cleared only while nothing depends on it:
+     * the namespace has never held a table or view and no file, upload claim
+     * or undrained removal sits under its prefix. [from] is the watermark of
+     * the pass under the commit lock, null for the unlocked full scan.
+     */
+    private fun requireOrgMarkReplaceable(
+        h: org.jdbi.v3.core.Handle,
+        cat: CatalogInfo,
+        namespace: String,
+        ns: NamespaceInfo,
+        current: NamespaceContainment,
+        from: ScanWatermark?,
+    ) {
+        if (everHeld(h, cat.catalogId, ns)) {
+            throw HoglakeException.CommitConflict(
+                "namespace '$namespace' carries an org mark and has held a table or view; " +
+                    "the mark is permanent once anything can depend on it",
+            )
+        }
+        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, current, from)?.let {
+            throw HoglakeException.CommitConflict(
+                "namespace '$namespace' carries an org mark and '$it' is registered or claimed under its " +
+                    "prefix; the mark is permanent once anything can depend on it",
+            )
+        }
+    }
+
     /** Refuse a namespace that has ever held a table or view, or whose name another namespace has had. */
     private fun requireNeverHeld(
         h: org.jdbi.v3.core.Handle,
         catalogId: Long,
         ns: NamespaceInfo,
     ) {
-        val held =
-            h.createQuery(
-                """
-                SELECT EXISTS (SELECT 1 FROM hog_table_version WHERE catalog_id = :c AND namespace_id = :n)
-                    OR EXISTS (SELECT 1 FROM hog_view WHERE catalog_id = :c AND namespace_id = :n)
-                """,
-            ).bind("c", catalogId).bind("n", ns.namespaceId).mapTo(Boolean::class.java).one()
+        val held = everHeld(h, catalogId, ns)
         if (held) {
             throw HoglakeException.NamespaceNotEmpty(
                 "namespace '${ns.name}' has held a table or view; only a namespace that never has can be " +
@@ -640,12 +722,19 @@ class CatalogService(private val jdbi: Jdbi) {
         // namespace's, every resolution of it at any snapshot is this
         // namespace or nothing, and authorizing the live one authorizes them
         // all. A later namespace reusing the name (after this one is dropped)
-        // is refused here in turn.
+        // is refused here in turn. A dropped namespace of that name that never
+        // held a table or view serves nothing at any snapshot, so it does not
+        // count.
         val reused =
             h.createQuery(
                 """
-                SELECT EXISTS (SELECT 1 FROM hog_namespace
-                                WHERE catalog_id = :c AND name = :name AND namespace_id <> :n)
+                SELECT EXISTS (
+                    SELECT 1 FROM hog_namespace o
+                     WHERE o.catalog_id = :c AND o.name = :name AND o.namespace_id <> :n
+                       AND (EXISTS (SELECT 1 FROM hog_table_version t
+                                     WHERE t.catalog_id = :c AND t.namespace_id = o.namespace_id)
+                            OR EXISTS (SELECT 1 FROM hog_view v
+                                        WHERE v.catalog_id = :c AND v.namespace_id = o.namespace_id)))
                 """,
             ).bind("c", catalogId).bind("name", ns.name).bind("n", ns.namespaceId)
                 .mapTo(Boolean::class.java).one()
@@ -664,22 +753,53 @@ class CatalogService(private val jdbi: Jdbi) {
         "cannot mark namespace '$namespace' contained: '$path' is already registered or claimed under its prefix",
     )
 
+    /**
+     * Create [name], and with a [containment] mark it in the same transaction,
+     * under the commit lock and with the checks [setNamespaceContainment]
+     * makes: it is never visible unmarked, and a refused mark leaves no
+     * namespace, snapshot or change row. The namespace is new, so it has held
+     * nothing; the prefix scan, the reused-name rule and the one-namespace-
+     * per-value index are what can refuse.
+     */
     fun createNamespace(
         catalog: String,
         name: String,
         author: String? = null,
         message: String? = null,
+        containment: NamespaceContainment? = null,
     ): NamespaceInfo =
         Audit.audited(
             "namespace_create",
             catalog,
             name,
+            detail = { created -> created.containment?.let { "containment=${auditDetail(it)}" } },
             actor = { author },
             message = { message },
         ) {
             Identifiers.validate("namespace", name)
+            containment?.let(::requireValidContainment)
+            // The scan runs before the lock, as the mark's does; under the lock
+            // only what was allocated since is re-read.
+            val scanned =
+                containment?.let {
+                    jdbi.inTransactionUnchecked { h ->
+                        val cat = requireCatalog(h, catalog)
+                        // Before the scan: an existing namespace's own files sit under its prefix.
+                        if (NamespaceRepo.findLiveByName(h, cat.catalogId, name) != null) {
+                            throw HoglakeException.AlreadyExists("namespace '$name' already exists")
+                        }
+                        val from = scanWatermark(h, cat.catalogId)
+                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, name, it, null)?.let { path ->
+                            throw prefixTaken(name, path)
+                        }
+                        cat.catalogId to from
+                    }
+                }
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
+                if (scanned != null && scanned.first != cat.catalogId) {
+                    throw HoglakeException.CommitConflict("catalog '$catalog' changed concurrently; retry")
+                }
                 Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 if (NamespaceRepo.findLiveByName(h, cat.catalogId, name) != null) {
                     throw HoglakeException.AlreadyExists("namespace '$name' already exists")
@@ -694,7 +814,14 @@ class CatalogService(private val jdbi: Jdbi) {
                     ChangeKind.NAMESPACE_CREATED,
                     namespaceId,
                 )
-                NamespaceRepo.insert(h, cat.catalogId, namespaceId, name)
+                val created = NamespaceRepo.insert(h, cat.catalogId, namespaceId, name)
+                if (containment == null) return@inTransactionUnchecked created
+                requireNeverHeld(h, cat.catalogId, created)
+                foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, name, containment, scanned?.second)?.let {
+                    throw prefixTaken(name, it)
+                }
+                NamespaceRepo.setContainment(h, cat.catalogId, namespaceId, containment)
+                created.copy(containment = containment)
             }
         }
 
@@ -724,6 +851,20 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = CatalogRepo.findByName(h, catalog) ?: return@withHandleUnchecked null
             NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)?.containment
+        }
+
+    /** The live namespace contained for `field = value`, by `hog_namespace_live_containment`; null when none. */
+    fun liveContainedFor(
+        catalog: String,
+        field: String,
+        value: Long,
+    ): Pair<String, NamespaceContainment>? =
+        jdbi.withHandleUnchecked { h ->
+            val cat = CatalogRepo.findByName(h, catalog) ?: return@withHandleUnchecked null
+            NamespaceRepo.findLiveContained(h, cat.catalogId, field, value)?.let {
+                    ns ->
+                ns.containment?.let { ns.name to it }
+            }
         }
 
     fun getNamespace(
@@ -1167,12 +1308,6 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
-            val t =
-                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-                    ?: throw HoglakeException.NotFound(
-                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-                    )
             // Asked for by the CALLER, not derived from `at`:
             // resolveReadSnapshot returns head when neither parameter is
             // given, so `at` alone cannot tell a head read from a
@@ -1180,105 +1315,59 @@ class CatalogService(private val jdbi: Jdbi) {
             // must answer differently, one from the sample and one from
             // the manifest.
             val timeTravel = snapshot != null || atTimestamp != null
-            val sampled =
-                if (totals && !timeTravel) {
-                    sampledTotals(h, cat.catalogId, t.tableId)
-                } else {
-                    null
-                }
-            val exact =
-                if (totals && timeTravel) {
-                    FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
-                } else {
-                    null
-                }
-            val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at)
-            TableInfo(
-                tableId = t.tableId,
-                tableUuid = t.tableUuid,
-                comment = t.comment,
-                properties = t.properties,
-                namespace = ns.name,
-                name = t.name,
-                columns = columns,
-                // The snapshot every field above was resolved at, which
-                // a writer sends back as a commit's read_snapshot.
-                readSnapshotId = at,
-                recordCount = exact?.recordCount ?: sampled?.recordCount,
-                fileCount = exact?.fileCount ?: sampled?.fileCount,
-                fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
-                // Only a SAMPLE is dated. An exact aggregate carries no
-                // freshness, and stamping it would tell a client the
-                // number might be stale when it cannot be.
-                totalsSnapshotId = sampled?.snapshotId,
-                totalsAsOf = sampled?.asOf,
-                // The specs visible at the requested snapshot (null =
-                // unpartitioned/unsorted there); listTables skips both.
-                partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
-                sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
-                // The option as it was at `at`, named by the column at `at`:
-                // the field is top-level, and while the option is on it can
-                // be neither dropped nor renamed, so the lookup cannot miss.
-                objectPrefixField =
-                    LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, at)?.let { id ->
-                        columns.single { it.fieldId == id }.def.name
-                    },
-            )
+            retainedPinnedRead(h, cat, at, timeTravel) {
+                val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = timeTravel)
+                val t =
+                    TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                        ?: throw HoglakeException.NotFound(
+                            "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                        )
+                val sampled =
+                    if (totals && !timeTravel) {
+                        sampledTotals(h, cat.catalogId, t.tableId)
+                    } else {
+                        null
+                    }
+                val exact =
+                    if (totals && timeTravel) {
+                        FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
+                    } else {
+                        null
+                    }
+                val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at)
+                TableInfo(
+                    tableId = t.tableId,
+                    tableUuid = t.tableUuid,
+                    comment = t.comment,
+                    properties = t.properties,
+                    namespace = ns.name,
+                    name = t.name,
+                    columns = columns,
+                    // The snapshot every field above was resolved at, which
+                    // a writer sends back as a commit's read_snapshot.
+                    readSnapshotId = at,
+                    recordCount = exact?.recordCount ?: sampled?.recordCount,
+                    fileCount = exact?.fileCount ?: sampled?.fileCount,
+                    fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
+                    // Only a SAMPLE is dated. An exact aggregate carries no
+                    // freshness, and stamping it would tell a client the
+                    // number might be stale when it cannot be.
+                    totalsSnapshotId = sampled?.snapshotId,
+                    totalsAsOf = sampled?.asOf,
+                    // The specs visible at the requested snapshot (null =
+                    // unpartitioned/unsorted there); listTables skips both.
+                    partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
+                    sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
+                    // The option as it was at `at`, named by the column at `at`:
+                    // the field is top-level, and while the option is on it can
+                    // be neither dropped nor renamed, so the lookup cannot miss.
+                    objectPrefixField =
+                        LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, at)?.let { id ->
+                            columns.single { it.fieldId == id }.def.name
+                        },
+                )
+            }
         }
-
-    /** A usable per-table sample: the three totals plus what dates them. */
-    private data class SampledTotals(
-        val recordCount: Long,
-        val fileCount: Long,
-        val fileSizeBytes: Long,
-        val snapshotId: Long,
-        val asOf: Instant,
-    )
-
-    /**
-     * The published generation's totals for one table, or null when that
-     * generation is not an answer for it — the three cases enumerated in
-     * [getTable]'s KDoc, in the order they are checked here.
-     *
-     * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
-     * `PartitionStatsService`, which both discard a sample computed
-     * under a different `targetBytes` / min / max. Those read
-     * `small_count`, `small_bytes` and `selected`, which ARE the policy's
-     * output. `file_count`, `record_count` and `total_bytes` are counts
-     * of files, rows and bytes: the policy cannot change them, so
-     * discarding a sample over it would throw away a correct answer.
-     * That is also why this service needs no policy knobs in its
-     * constructor.
-     */
-    private fun sampledTotals(
-        h: Handle,
-        catalogId: Long,
-        tableId: Long,
-    ): SampledTotals? {
-        // 1. the sampler has no row for the catalog at all (warm-up),
-        //    or it has one with no published sample, or with a sample
-        //    this build cannot parse — the sampler's own lenient read,
-        //    because a newer replica's shape must degrade the numbers
-        //    rather than 500 a request path.
-        val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
-        val sample = tier.sample ?: return null
-        // 2. the scan never saw this table.
-        if (tier.createdSnapshot > sample.snapshotId) return null
-        // 3. rows may be undercounted for the whole generation.
-        if (!tier.measured) return null
-        return SampledTotals(
-            recordCount = tier.recordCount,
-            fileCount = tier.fileCount,
-            fileSizeBytes = tier.fileSizeBytes,
-            snapshotId = sample.snapshotId,
-            // startedAt, NOT the summary row's sampled_at: a generation
-            // runs for tens of minutes, so the publish instant is up to
-            // that far after the numbers were true. `startedAt` is when
-            // `snapshotId` was captured, so the pair makes ONE claim —
-            // the distinction PartitionListing's own comment records.
-            asOf = sample.startedAt,
-        )
-    }
 
     /**
      * Live tables at head, each with its comment, its file rollup and
@@ -1315,14 +1404,10 @@ class CatalogService(private val jdbi: Jdbi) {
                 TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
             } else {
                 val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-                // The namespace AT the snapshot, not the live one: a pinned
-                // reader must still list a namespace dropped after its pin.
-                val ns =
-                    NamespaceRepo.findAt(h, cat.catalogId, namespace, at)
-                        ?: throw HoglakeException.NotFound(
-                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
-                        )
-                TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
+                retainedPinnedRead(h, cat, at, pinned = true) {
+                    val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = true)
+                    TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
+                }
             }
         }
 
@@ -1343,7 +1428,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1393,7 +1479,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1537,7 +1624,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1607,25 +1695,32 @@ class CatalogService(private val jdbi: Jdbi) {
                         "snapshot instead of consuming this feed",
                 )
             }
-            val ns = requireNamespace(h, cat, namespace)
+            // An explicit to_snapshot pins the feed: its table and namespace
+            // are the ones alive at `to`, as for every other pinned read.
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, to, pinned = toSnapshot != null)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, to)
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $to",
                     )
-            // TRUNCATE and replacement have no newly registered DV to carry its deletion through this
-            // append-oriented feed. The paired change kinds identify its DDL barrier.
+            // TRUNCATE and replacement end files and register no deletion vector for
+            // this append-oriented feed to carry the deletion. Truncate is the
+            // 'table_altered' + 'table_deleted_from' pair of one snapshot; a
+            // replacement that ended files of the table is its 'table_replaced'
+            // row. Both are change rows, which retention keeps for exactly the
+            // snapshots it keeps, so the barrier holds at the floor too.
             val truncated =
                 h.createQuery(
                     """
                     SELECT c.snapshot_id FROM hog_snapshot_change c
                     WHERE c.catalog_id = :catalogId AND c.object_id = :tableId
-                      AND c.kind = 'table_deleted_from'
                       AND c.snapshot_id > :fromSnapshot AND c.snapshot_id <= :toSnapshot
-                      AND EXISTS (
-                        SELECT 1 FROM hog_snapshot_change ddl
-                        WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
-                          AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')
+                      AND (
+                        c.kind = 'table_replaced'
+                        OR (c.kind = 'table_deleted_from' AND EXISTS (
+                          SELECT 1 FROM hog_snapshot_change ddl
+                          WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
+                            AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')))
                     ORDER BY c.snapshot_id LIMIT 1
                     """,
                 ).bind("catalogId", cat.catalogId)
@@ -1889,6 +1984,20 @@ class CatalogService(private val jdbi: Jdbi) {
         return s
     }
 
+    /** Only pinned reads need a final floor check after their dependent metadata statements. */
+    private inline fun <T> retainedPinnedRead(
+        h: Handle,
+        cat: CatalogInfo,
+        at: Long,
+        pinned: Boolean,
+        body: () -> T,
+    ): T =
+        try {
+            body()
+        } finally {
+            if (pinned) resolveReadSnapshot(h, cat, at, null)
+        }
+
     /**
      * Point-in-time read target for getTable/listFiles: at most one of
      * [snapshot] / [atTimestamp] (both -> Validation); a timestamp
@@ -1928,4 +2037,61 @@ class CatalogService(private val jdbi: Jdbi) {
         }
         return at
     }
+}
+
+/** A usable per-table sample: the three totals plus what dates them. */
+internal data class SampledTotals(
+    val recordCount: Long,
+    val fileCount: Long,
+    val fileSizeBytes: Long,
+    val snapshotId: Long,
+    val asOf: Instant,
+)
+
+/**
+ * The published generation's totals for one table, or null when that
+ * generation is not an answer for it — the three cases enumerated in
+ * [CatalogService.getTable]'s KDoc, in the order they are checked here.
+ * One indexed row read, never a file scan: what a head GET answers with,
+ * and what an alter that changed nothing answers with (AlterService),
+ * since neither has a snapshot of its own to be exact for.
+ *
+ * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
+ * `PartitionStatsService`, which both discard a sample computed
+ * under a different `targetBytes` / min / max. Those read
+ * `small_count`, `small_bytes` and `selected`, which ARE the policy's
+ * output. `file_count`, `record_count` and `total_bytes` are counts
+ * of files, rows and bytes: the policy cannot change them, so
+ * discarding a sample over it would throw away a correct answer.
+ * That is also why CatalogService needs no policy knobs in its
+ * constructor.
+ */
+internal fun sampledTotals(
+    h: Handle,
+    catalogId: Long,
+    tableId: Long,
+): SampledTotals? {
+    // 1. the sampler has no row for the catalog at all (warm-up),
+    //    or it has one with no published sample, or with a sample
+    //    this build cannot parse — the sampler's own lenient read,
+    //    because a newer replica's shape must degrade the numbers
+    //    rather than 500 a request path.
+    val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
+    val sample = tier.sample ?: return null
+    // 2. the scan never saw this table.
+    if (tier.createdSnapshot > sample.snapshotId) return null
+    // 3. rows may be undercounted for the whole generation.
+    if (!tier.measured) return null
+    return SampledTotals(
+        recordCount = tier.recordCount,
+        fileCount = tier.fileCount,
+        fileSizeBytes = tier.fileSizeBytes,
+        snapshotId = sample.snapshotId,
+        // startedAt, NOT the summary row's sampled_at: a generation
+        // runs for tens of minutes, so the publish instant is up to
+        // that far after the numbers were true. `startedAt` is when
+        // `snapshotId` was captured, so the pair makes ONE claim —
+        // the distinction PartitionListing's own comment records.
+        asOf = sample.startedAt,
+    )
 }

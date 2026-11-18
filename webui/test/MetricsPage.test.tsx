@@ -313,6 +313,28 @@ describe("MetricsPage", () => {
     renderApp("/metrics");
 
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("GET /metrics failed: HTTP 500");
+    expect(alert).toHaveTextContent("HTTP 500");
+  });
+
+  it("says /metrics needs an operator token on a refusal and stops polling", async () => {
+    // /metrics is OPERATOR on the server: a 403 is the caller's grant,
+    // not an outage, so the page says so and does not keep polling a
+    // route it may not read.
+    let calls = 0;
+    mockFetch((url) => {
+      if (url !== "/metrics") return undefined;
+      calls += 1;
+      return new Response(JSON.stringify({ error: "forbidden", detail: "operator only" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    renderApp("/metrics");
+
+    const notice = await screen.findByRole("status");
+    expect(notice).toHaveTextContent("needs an operator token");
+    expect(screen.queryByRole("alert")).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls).toBe(1);
   });
 });

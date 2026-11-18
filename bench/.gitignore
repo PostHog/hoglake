@@ -2,3 +2,10 @@
 __pycache__/
 .pytest_cache/
 bench-results.jsonl
+
+# Runtime configuration, downloaded data and unreviewed local output.
+costbench.private.json
+costbench-artifacts/
+hits.parquet
+costbench-load-state.json
+costbench-load.json

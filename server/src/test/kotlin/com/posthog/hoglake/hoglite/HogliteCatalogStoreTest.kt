@@ -2,6 +2,7 @@ package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.api.toDto
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
@@ -12,6 +13,8 @@ import org.assertj.core.api.Assertions.catchThrowable
 import org.assertj.core.api.Assertions.entry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -79,6 +82,7 @@ class HogliteCatalogStoreTest {
 
     /** When set, a containment scan read answers with this (status, body). */
     private var scanAnswer: Pair<Int, Map<String, Any?>>? = null
+    private var authorityRefusal: Pair<String, Int>? = null
 
     private val server: HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
@@ -110,6 +114,8 @@ class HogliteCatalogStoreTest {
         requests += "${ex.requestMethod} $path" + (first?.let { " :: $it" } ?: "")
         val (status, answer) =
             when {
+                path == authorityRefusal?.first ->
+                    authorityRefusal!!.second to mapOf("code" to "refused", "error" to "authority refused")
                 ex.requestMethod == "PUT" -> {
                     tenants.putIfAbsent(tenantId, Tenant())
                     200 to mapOf("ok" to true)
@@ -439,6 +445,43 @@ class HogliteCatalogStoreTest {
 
     // ---- namespace containment -------------------------------------------
 
+    @ParameterizedTest
+    @ValueSource(ints = [401, 403])
+    fun `release authority refusal retains its definite API type`(status: Int) {
+        seed("t-wh-1", "wh")
+        authorityRefusal = "/v1/t/t-wh-1/release" to status
+        val expected =
+            if (status == 401) HoglakeException.Unauthenticated::class.java else HoglakeException.Forbidden::class.java
+        assertThat(catchThrowable { store.dropCatalog("wh", null, null) }).isInstanceOf(expected)
+        assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = [404, 409, 413])
+    fun `release preserves existing non-authentication refusal semantics`(status: Int) {
+        seed("t-wh-1", "wh")
+        authorityRefusal = "/v1/t/t-wh-1/release" to status
+        val failure = catchThrowable { store.dropCatalog("wh", null, null) }
+        if (status == 409) {
+            assertThat(failure).isNull()
+            assertThat(requests.any { it.startsWith("DELETE") }).isTrue()
+        } else {
+            assertThat(failure).isExactlyInstanceOf(HogliteRejected::class.java)
+            assertThat((failure as HogliteRejected).status).isEqualTo(status)
+            assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
+        }
+    }
+
+    @Test
+    fun `tenant lifecycle refusal precedes every storage call and fence`() {
+        seed("t-wh-1", "wh")
+        val tenantStore = HogliteCatalogStore(client, { "t-wh-1" }, operatorAuthority = false)
+        assertThat(catchThrowable { tenantStore.dropCatalog("wh", null, null) })
+            .isInstanceOf(HoglakeException.Forbidden::class.java)
+        assertThat(requests).isEmpty()
+        assertThat(tenants["t-wh-1"]!!.dropping).isFalse()
+    }
+
     private val team42 = NamespaceContainment("team_id", 42)
 
     /** Catalog "wh" with live namespaces "team_42" (id 1) and "other" (id 2). */
@@ -513,6 +556,29 @@ class HogliteCatalogStoreTest {
         )
         assertThat(tx[2]).contains("contained_field IS NOT NULL")
         assertThat(tx[7]).contains("contained_field = ? AND contained_value = ?")
+    }
+
+    @Test
+    fun `an org mark is refused before any write, and the catalog does not advertise it`() {
+        seedNamespaces()
+
+        assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42.copy(org = "acme"), "op") })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("needs the Postgres backend")
+        assertThat(writes()).isEmpty()
+        assertThat(store.getCatalog("wh").toDto().capabilities)
+            .contains("object-prefix-layout-v1")
+            .doesNotContain("org-marked-containment-v1")
+    }
+
+    @Test
+    fun `creating a namespace with a containment mark is refused before any write`() {
+        seedNamespaces()
+
+        assertThat(catchThrowable { store.createNamespace("wh", "team_43", "op", null, team42) })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("needs the Postgres backend")
+        assertThat(writes()).isEmpty()
     }
 
     @Test
@@ -615,14 +681,20 @@ class HogliteCatalogStoreTest {
     }
 
     @Test
-    fun `an engine query guard refusal during the scan is containment_unverified`() {
+    fun `deterministic engine limits during containment scans stay nonretryable and do not mark the namespace`() {
         seedNamespaces()
-        scanAnswer = 504 to mapOf("error" to "query timed out", "code" to "query_timeout")
-
-        assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42, null) })
-            .isInstanceOf(HoglakeException.ContainmentUnverified::class.java)
-            .hasMessageContaining("s3://bucket/wh/data/team_42/")
-        assertThat(writes()).isEmpty()
+        val limits =
+            listOf(
+                Triple(504, "query_timeout", HoglakeException.BackendQueryTimeout::class.java),
+                Triple(413, "result_too_large", HoglakeException.BackendResultTooLarge::class.java),
+                Triple(507, "out_of_memory", HoglakeException.Validation::class.java),
+            )
+        for ((status, code, type) in limits) {
+            scanAnswer = status to mapOf("error" to "engine refused the scan", "code" to code)
+            assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42, null) })
+                .isExactlyInstanceOf(type)
+            assertThat(writes()).isEmpty()
+        }
     }
 
     @Test

@@ -37,6 +37,7 @@ just hedgerow unit
 just millrace unit
 just live-python    # builds this checkout, starts isolated services, fails on skips
 just millrace live  # the Kafka-ingestion live stack (PG + MinIO + Kafka), fails on skips
+just test-hoglite   # the hoglite live classes on the newest hoglited, in a Linux container, fails on skips
 just webui test
 just webui build
 ```
@@ -76,6 +77,19 @@ The server builds through the **checked-in Gradle wrapper**
 `server/gradle/wrapper/gradle-wrapper.properties`) — never a
 system-installed gradle. The `just server ...` recipes route through it
 too, so `just test-all` (server + pyhoglake) stays equivalent.
+
+The hoglite live classes (`com.posthog.hoglake.hoglite.*IntegrationTest`,
+`HogliteConformanceEngine`) need a `hoglited`, which hoglite ships for
+Linux only, so `just server test` SKIPS them on a Mac and that green does
+not cover them; CI's `hoglite-live` (in the required `server-checks`
+gate) runs them against the newest tested build. `just test-hoglite
+[filter]` is the local equivalent: `ci/hoglite-live-local.sh` fetches
+that build for the daemon's arch (`ci/fetch-hoglited.sh`, checksum and
+provenance verified), runs the classes under a Linux JDK container on
+the host's Docker daemon and network, with its own Gradle cache under
+`~/.cache/hoglake/hoglite-live/`, and ends with `ci/check-hoglite-live.sh`,
+the fail-closed check CI runs: classes ran, none skipped. It is not in
+`just test-all` (a container, the GitHub API and a few minutes).
 
 The DuckDB extension is built and tested separately (it is not in
 `just`): `cd duckdb-client && ./test/run-live-tests.sh`, which needs
@@ -172,7 +186,7 @@ path-scoped per component, posthog-monorepo style:
 | `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | on a PR that changes the codec's source, `codec-version` (a new or `.dev` codec version). pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. millrace: uv sync, ruff, mypy, pytest, and the mutmut survivors gate. When `pyhoglake-variant-codec/**`, `uv.lock` or the codec's wheel workflow or scripts changed, `variant-codec-wheels.yml` too, for the manylinux wheels and the sdist. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake as a uv workspace member from the root `uv.lock`, so the root manifest, the lock, pyhoglake and every member's `pyproject.toml` must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `millrace-image.yml` | `millrace/**` `pyhoglake/**` `pyhoglake-variant-codec/**` root `pyproject.toml` `uv.lock` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) for amd64 and, under QEMU, arm64, and smokes each — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's, and the Rust VARIANT codec (cross-built by zig in a `$BUILDPLATFORM` stage) is installed, off by default (`PYHOGLAKE_VARIANT_CODEC=python`), and with `native` encodes as the Python codec does. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
-| `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the Kargo path for the customer hoglake instance, ADDITIVE to the gigahog CD below. A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
+| `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the gigahog CD entry point: it makes the images the Kargo Warehouse turns into Freight (CD paragraph below). A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
 | `python-live.yml` | reusable: server, Python checks, benchmark image, millrace image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark and millrace image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags (not `pyhoglake-variant-codec-v*`); PRs touching the workflow | `pyhoglake-checks.yml`, then the built wheel with its `variant-codec` extra in a clean env, the pinned codec from PyPI (`ci/variant_codec_smoke.py`), and the variant suites through it, so a pin not on PyPI fails every run; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `variant-codec-wheels.yml` | reusable: Python checks (manylinux only), codec publishing (every platform, on a tag or a manual run) | `pyhoglake-variant-codec`'s abi3 wheels (manylinux_2_28 and musllinux_1_2 x86_64/aarch64 through zig, macOS arm64/x86_64, Windows x86_64) and sdist, each installed into pyhoglake's locked env on its own platform (`ci/variant-codec-wheel.sh`: the parity smoke `ci/variant_codec_smoke.py`, then the variant suites except on Windows) and uploaded as an artifact |
@@ -216,30 +230,73 @@ them. Two rules fall out: a PR that adds a gate merges green on that
 gate, and no suite in this repo lives outside CI (a suite that only
 runs locally rots; the live suites did for four releases).
 
-CD is the charts state-file mechanism (same as duckgres, millpond,
-viaduck): a push to main touching `server/**` or `webui/**` runs the
-`deploy` job of `server.yml` / `webui.yml`, which builds a
-**multi-arch** image (build stages are pinned to `$BUILDPLATFORM`; the
-mw fleet runs Graviton), push `ghcr.io/posthog/hoglake-server|-webui`,
-and dispatch `commit_state_update` with the multi-arch MANIFEST digest
-(never a per-arch digest) to `state/gigahog-server.yaml` /
-`state/gigahog-webui.yaml`. Dev auto-promotes; prod goes through the
-charts `promote-to-prod.yml` workflow behind the
-`prod-promote-managed-warehouse` approval gate. Unlike millpond and
-duckgres (where CD runs in parallel with CI), the deploy job is GATED:
-it `needs` the test jobs, so a red main push never builds, publishes,
-or dispatches (decided 2026-09-11). A flaky-failure rerun that goes
-green deploys on the rerun — the procedure in
-millpond's AGENT.md applies verbatim with `app=gigahog-server` /
-`app=gigahog-webui`.
+CD is Kargo: project `gigahog` in PostHog/charts
+(`argocd/gigahog/kargo/manifests/`). Nothing in this repo dispatches to
+charts; the charts state files `state/gigahog-*.yaml` and the
+`promote-to-prod.yml` path no longer apply to gigahog. A main push
+becomes Freight in three steps. (1) `Server` and `Webui` run on every
+main push, and each completion starts `ecr-release.yml` (table above);
+its gate publishes once neither `server-checks` nor `webui-test`
+failed and at least one passed, so a red main push never publishes and
+a push touching neither tree publishes nothing. (2) `publish` builds
+BOTH **multi-arch** images (build stages are pinned to
+`$BUILDPLATFORM`; the mw fleet runs Graviton) and pushes both to the
+shared-services ECR (`hoglake-server`, `hoglake-webui`, us-east-1)
+under ONE tag, `r<UTC minute>-<sha6>`. (3) The Warehouse
+`gigahog-release` polls every 5m the two repositories in BOTH
+us-east-1 and eu-central-1 (`Lexical`, `discoveryLimit: 1`, tags
+`^r[0-9]{12}-[0-9a-f]{6}$`) plus the gigahog paths of charts `main`,
+and makes Freight only when all four images have the same tag, the
+same 40-hex `org.opencontainers.image.revision` whose first six
+characters are the tag suffix, `source` = this repository, and the
+same digest per image in both regions. This repo pushes only
+us-east-1; the eu-central-1 copies arrive outside it, and until they
+match there is no Freight. A charts commit to a watched path also
+makes new Freight (same images, new charts commit).
 
-The customer hoglake instance uses a second, separate path:
-`ecr-release.yml` (table above) publishes both images to ECR for a
-Kargo Warehouse in PostHog/charts. It does not replace or gate the
-ghcr push or the state-file dispatch. A change to the `deploy` jobs
-must keep the gigahog path working without it. Keep the `name:` fields
-`Server` and `Webui` and the job names `changes`, `server-checks` and
-`webui-test`: the ECR gate reads them by name.
+There are nine Stages, `gigahog-{server,webui,maintenance}-{dev,prod-us,prod-eu}`.
+Each promotion runs the `materialize-release-v3` ClusterPromotionTask:
+it renders `charts/posthog-app` into PostHog/k8s-rendered-manifests
+(`kargo/rendered/gigahog/<app>/<stage>`) with the Freight digest of the
+regional repository named by
+`shared/gigahog/kargo-image.<server|webui>.<region>.yaml`; the Argo CD
+Applications (`argocd/gigahog/application.*`) have automated sync off
+and name their Stage in `kargo.akuity.io/authorized-stage`.
+`gigahog-maintenance` has no image of its own: it runs the
+`hoglake-server` image with `apps/gigahog-maintenance/` values. dev and
+prod-us read us-east-1, prod-eu reads eu-central-1. The three dev
+Stages take Freight directly from the Warehouse and auto-promote the
+newest (`project-config.yaml`). The six prod Stages are manual and
+request only Freight that has passed the SAME app's dev Stage
+(`sources.stages: [gigahog-<app>-dev]`; server-prod needs server-dev,
+not webui-dev). Promote prod in the Kargo UI (project `gigahog`) or
+with `kargo promote --project gigahog --stage <stage> --freight <name>`,
+one Stage at a time: `gigahog-server-prod-us`, `gigahog-webui-prod-us`,
+`gigahog-maintenance-prod-us`, then the same three `-prod-eu`. Nothing
+enforces promoting the three from the same Freight;
+`argocd/gigahog/release-group.yaml` (platformctl) lists them as one
+group. The `gigahog-kargo-project` Application ignores drift on
+`autoPromotionEnabled`, so the live policy can differ from git: check
+the Kargo UI, not the file.
+
+A flaky-failure rerun: rerun the failed jobs of `Server` or `Webui`;
+the completed run starts `ecr-release.yml` again, the gate reads the
+latest attempt, the release publishes, and dev auto-promotes the new
+Freight. A rerun of `ecr-release.yml` reuses the commit's existing tag
+and pushes only a missing image. A commit that first publishes late
+gets a LATER minute in its tag than newer commits already published,
+so the Warehouse (`Lexical`, newest tag only) makes Freight from the
+OLDER commit and dev auto-promotes it. A manual dispatch on main
+releases the head of main, not an older commit.
+
+The `deploy` jobs of `server.yml` / `webui.yml` deploy nothing. Gated
+on `server-checks` / `webui-test`, they push multi-arch
+`ghcr.io/posthog/hoglake-server|-webui` (sha + `latest`) for test and
+benchmark consumers, and their builds fill the GHA cache scopes
+`server` / `webui` that `ecr-release.yml` reads (never writes). The ECR
+gate does not read them, so a GHCR failure does not block CD. Keep the
+`name:` fields `Server` and `Webui` and the job names `changes`,
+`server-checks` and `webui-test`: the ECR gate reads them by name.
 
 ### Versioning
 
@@ -1573,7 +1630,18 @@ ran on the local stack and what it showed.
   tool could also create). The planner's `spill_budget_exceeded`
   / `merge_budget_exceeded` call `ExternalMergeSort.admit` rather than
   restating its arithmetic; keep it that way. `heap_budget_exceeded` is
-  historical (reads 0) and stays on the wire. (4) Every other input of
+  historical (reads 0) and stays on the wire.
+
+  Metadata admission predicts ordinary allocations.
+  Arbitrary payloads can exceed that prediction.
+  Runtime guards can refuse an admitted group.
+  Deterministic memory refusals enter the bounded, worker-local immutable-identity cache.
+
+  Schema, sort, layout, DV, input, or effective-budget changes invalidate that identity.
+  Planner, remembered-layout parts, borrowing, and execution must share this admission predicate.
+  Never restore the claim that runtime can only improve metadata admission.
+
+  (4) Every other input of
   at least `HOGLAKE_COMPACTION_VERIFY_MIN_BYTES` (16 MiB) is VERIFIED
   by the sortedness pre-pass (`SortednessCheck`: a projected read of
   its key columns, plus the carrier for an explicit-row-id file, every
@@ -1733,9 +1801,8 @@ ran on the local stack and what it showed.
   now true. (It would not take production down: the chart sets
   `maxUnavailable: 0`, so the old ReplicaSet keeps serving and the
   failure is a STALLED ROLLOUT plus a Degraded Application paging
-  `#alerts-managed-warehouse`, in dev only — prod is behind
-  `require_prod_approval` and the `prod-promote-managed-warehouse`
-  reviewer gate.) A positive value is refused because it is an operator
+  `#alerts-managed-warehouse`, in dev only — the prod Kargo Stages
+  are manual promotions of Freight that has passed dev.) A positive value is refused because it is an operator
   asking for invariant checks that no longer exist, and silence there
   would leave them believing a catalog is being scrubbed.
   `RemovedEnvConfigTest` pins both tiers; neither had a test before.
@@ -1801,9 +1868,11 @@ ran on the local stack and what it showed.
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
 - **Auth**: the ENFORCEMENT layer has landed — JWT verification, the
   route-to-scope table ([server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt](server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt)),
-  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce` flag. It is
-  `off` by default, i.e. today's behaviour. TOKEN ISSUANCE does not exist
-  yet, so `enforce` in a real cluster refuses everything; deploy `warn`
+  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce|local` flag
+  (`local`: the server is its own issuer, key in `HOGLAKE_AUTH_SIGNING_KEY`,
+  tokens from `hoglake token mint`; docs/auth.md "Local issuer"). It is
+  `off` by default, i.e. today's behaviour. `enforce` refuses every caller
+  that has no token from the configured issuer, so deploy `warn` first
   and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
   zero for every `client` class. `warn` PERMITS EVERYTHING `enforce` WOULD REFUSE, including
   `DELETE /v1/catalogs/{catalog}` and the maintenance routes: it is a
@@ -1811,13 +1880,14 @@ ran on the local stack and what it showed.
   writes freely while it is on. Deploy it where that is acceptable, which
   is anywhere the current behaviour is already "no auth at all". `/metrics` on the main port is operator-only; set
   `HOGLAKE_METRICS_PORT` before `enforce` and scrape that infra listener,
-  which serves the same registry with no auth and needs no token. Issuance and per-tenant S3 credential
-  vending live in `PostHog/hogtower`, not here: it already holds the
-  tenant→catalog→IAM-role→bucket mapping, an `sts:AssumeRole` broker and the
-  warehouse-scoped machine credentials. hoglake is a resource server — set
-  `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL` to hogtower's, then flip
-  the mode. [docs/auth-tenancy.md](docs/auth-tenancy.md) §17 has the
-  reasoning and the two-repo stack.
+  which serves the same registry with no auth and needs no token. hoglake is
+  a resource server: it issues nothing on the request path and calls nothing
+  to decide a request. Set `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL`
+  (or `_FILE`) to whichever issuer the deployment runs — any identity
+  provider that emits the token contract in [docs/auth.md](docs/auth.md);
+  PostHog's is hogtower — then flip the mode. hoglake owns the contract and
+  its test vectors; issuers conform to them. Never add code that names
+  hogtower or PostHog teams: the PostHog behaviour is configuration.
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).
@@ -1828,6 +1898,20 @@ ran on the local stack and what it showed.
   files fail `ruff format --check` (ruff 0.17.1). Format it and wire it in
   (add the `lint` recipe) as its own change, so the
   reformat lands as a reviewable diff rather than noise inside another.
+
+## Cross-repo specs for PostHog's deployment
+
+hoglake is issuer-neutral and `docs/auth.md` stays that way. The specs for
+how PostHog deploys it — the shared `hoglake` catalog on its Trino pools,
+Remote Schemas to its internal `gigahog` deployment, the session token with
+embedded storage credentials, and the cross-repo burndown lists — live in
+PostHog/hogtower under `docs/` (indexed in that repo's `AGENTS.md`):
+`docs/remote_schema.md`, `docs/truffle-hoglake-catalog-routing.md`,
+`docs/gigahog-imports-and-partitioning.md`, `docs/jwt-aws-session-design.md`,
+`docs/hoglake-auth-posthog-profile.md`. Read the relevant one before changing
+a cross-service contract; a design change goes into that spec first, and the
+contract itself into `docs/auth.md` here (hoglake owns the token contract;
+issuers conform to it).
 
 ## Doc index
 

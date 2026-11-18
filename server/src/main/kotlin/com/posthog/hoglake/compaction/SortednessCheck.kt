@@ -65,13 +65,20 @@ internal object SortednessCheck {
      * the `explicit_row_ids` registration; a file that contradicts its
      * registration is refused here exactly as the rewrite would refuse it
      * ([InvalidDataException]).
+     * The caller owns [reader].
+     * Read only its footer metadata.
      */
     fun isSorted(
         input: Input,
         reader: ParquetFileReader,
         sortFields: List<SortFieldDef>,
-        memory: SortMemory? = null,
+        memory: SortMemory = SortMemory(Long.MAX_VALUE),
+        readerAllowanceBytes: Long = Long.MAX_VALUE,
+        decodeStats: SortMemory.DecodeStats? = null,
     ): Boolean {
+        if (reader.footer.blocks.any { it.rowCount < 0 }) {
+            throw InvalidDataException("${input.label} has a negative row-group count")
+        }
         val schema = reader.footer.fileMetaData.schema
         if (FooterStats.missingFieldIds(schema)) return false
         val present = ArrayList<SortFieldDef>()
@@ -104,44 +111,50 @@ internal object SortednessCheck {
                 return false
             }
         val carrierIndex = if (carrier == null) null else projection.getFieldIndex(ParquetRewriter.ROW_ID_COLUMN)
-        reader.setRequestedSchema(projection)
-        memory?.checkReader(reader.footer.blocks, projection, input.label)
+        val footer = reader.footer
+
         val columnIO = ColumnIOFactory().getColumnIO(projection)
-        val budget =
-            ParquetRewriter.NodeBudget(
-                ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
-                input.label,
-                memory?.rowBytes ?: Long.MAX_VALUE,
-            )
         var previous: Row? = null
         var position = 0L
-        while (true) {
-            val pages = reader.readNextRowGroup() ?: return true
-            val records = columnIO.getRecordReader(pages, ParquetRewriter.budgetedMaterializer(projection, budget))
-            // A Long count, not toIntExact: a row group past 2^31 rows is
-            // legal parquet, and an ArithmeticException here would fail the
-            // group every sweep rather than check it.
-            var left = pages.rowCount
-            while (left > 0) {
-                left--
-                val group = records.read()
-                val rowId =
-                    if (carrierIndex == null) {
-                        position
-                    } else if (group.getFieldRepetitionCount(carrierIndex) == 0) {
-                        // A null carrier is invalid data the rewrite will
-                        // refuse with its row number; not a run to trust.
-                        return false
-                    } else {
-                        group.getLong(carrierIndex, 0)
+        val rowBudget = memory.RowBudget(input.label, maxOf(1, memory.bytes / 2))
+        val nodeBudget = ParquetRewriter.NodeBudget(Int.MAX_VALUE, input.label)
+        for (block in footer.blocks) {
+            if (block.rowCount == 0L) continue
+            val one = org.apache.parquet.hadoop.metadata.ParquetMetadata(footer.fileMetaData, listOf(block))
+            val profile = ParquetRewriter.readerProfile(input, one, projection, readerAllowanceBytes, rowBudget.limit)
+            profile.open(input.source, one, ParquetRewriter.dataStream(input.source)).use { guarded ->
+                if (decodeStats != null) decodeStats.readers++
+                val pages = guarded.readRowGroup(0)
+                var records: org.apache.parquet.io.RecordReader<org.apache.parquet.example.data.Group>? =
+                    columnIO.getRecordReader(
+                        pages,
+                        ParquetRewriter.budgetedMaterializer(projection, nodeBudget, rowBudget),
+                    )
+                try {
+                    var left = pages.rowCount
+                    while (left > 0) {
+                        left--
+                        val group = records!!.read()
+                        if (decodeStats != null) decodeStats.rows++
+                        val rowId =
+                            if (carrierIndex == null) {
+                                position
+                            } else if (group.getFieldRepetitionCount(carrierIndex) == 0) {
+                                return false
+                            } else {
+                                group.getLong(carrierIndex, 0)
+                            }
+                        position++
+                        val row = Row(group, rowId, keys.extract(group, input.label, rowBudget))
+                        if (previous != null && keys.comparator.compare(previous, row) > 0) return false
+                        previous = row
                     }
-                position++
-                budget.charge(SortMemory.NODE_BYTES * (1L + keys.fields.size))
-                val row = Row(group, rowId, keys.extract(group, input.label))
-                if (previous != null && keys.comparator.compare(previous!!, row) > 0) return false
-                previous = row
+                } finally {
+                    records = null
+                }
             }
         }
+        return true
     }
 
     /**
@@ -186,6 +199,8 @@ internal object SortednessCheck {
  * one readahead more per non-adjacent read.
  */
 internal class ByteCountingInputFile(private val delegate: InputFile) : InputFile {
+    val readaheadBytes: Long get() = (delegate as? S3InputFile)?.readaheadBytes?.toLong() ?: 0
+
     @Volatile
     var bytesRead = 0L
         private set
@@ -203,6 +218,10 @@ internal class ByteCountingInputFile(private val delegate: InputFile) : InputFil
     override fun getLength(): Long = delegate.length
 
     override fun newStream(): SeekableInputStream = Counted(delegate.newStream())
+
+    /** `S3InputFile.newDataStream` when the delegate is one (a reader that already holds the footer), else [newStream]. */
+    fun newDataStream(): SeekableInputStream =
+        Counted((delegate as? S3InputFile)?.newDataStream() ?: delegate.newStream())
 
     override fun toString(): String = delegate.toString()
 

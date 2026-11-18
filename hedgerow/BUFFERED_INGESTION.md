@@ -103,7 +103,7 @@ endpoint rather than silently ignoring an unfamiliar request field.
   prepared request replayed after that re-publishes its files as a new snapshot.
 - Native VARIANT is not JSON. The DuckDB writer keeps payloads inside DuckDB,
   at the version [DUCKDB_WRITER.md](DUCKDB_WRITER.md) pins. Catalog types and prepared-file physical validation are implemented; VARIANT
-  statistics are omitted. VARIANT compaction is behind the server's `HOGLAKE_COMPACTION_VARIANT` (default off; a group with an input not in the declared layout is refused); reader interoperability still needs implementation. No Arrow payload rewrite may be inserted: ordinary
+  statistics are omitted. VARIANT compaction is behind the server's `HOGLAKE_COMPACTION_VARIANT` (default off; a group's inputs are rewritten per layout, and a file DuckDB wrote, as this writer's are, is excluded and left uncompacted, unless it holds no live variant column, in which case it compacts with the column null-filled); reader interoperability still needs implementation. No Arrow payload rewrite may be inserted: ordinary
   PyArrow read/write drops the native VARIANT annotation. Source-to-destination
   JSON column mappings are explicit at the library boundary; the CLI defaults
   only `properties` as described in the README.

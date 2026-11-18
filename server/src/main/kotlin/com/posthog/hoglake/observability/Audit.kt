@@ -1,6 +1,7 @@
 package com.posthog.hoglake.observability
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.persistence.partialHoglakeCause
 import net.logstash.logback.argument.StructuredArgument
 import net.logstash.logback.argument.StructuredArguments.kv
 import org.slf4j.LoggerFactory
@@ -147,7 +148,12 @@ object Audit {
 
     /** Failure outcome vocabulary for audit lines (ErrorMapping's cousin). */
     fun failureOutcome(e: Throwable): String =
-        when (e) {
+        when (e.partialHoglakeCause() ?: e) {
+            is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
+            is HoglakeException.BackendUnavailable -> "backend_unavailable"
+            is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"
+            is HoglakeException.BackendQueryTimeout -> "backend_query_timeout"
+            is HoglakeException.NotSupported -> "not_supported_on_backend"
             is HoglakeException.AlreadyExists -> "conflict"
             // A commit into a dropped table is a 409 like the other
             // two, and it used to arrive here as Validation. Without
@@ -165,7 +171,9 @@ object Audit {
             // "conflict" would be the same as having no arm.
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
+            is HoglakeException.MountRevisionConflict -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"

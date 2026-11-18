@@ -1,5 +1,13 @@
 # Auth, tenancy and S3 data-plane entitlement
 
+> **Superseded as a description of the design.** [docs/auth.md](auth.md) is
+> canonical: hoglake is a resource server that verifies tokens from whichever
+> issuer the deployment configures, owns the token contract and its vectors,
+> and depends on no particular issuer. Where this document says hogtower is
+> *the* authority, read "PostHog's issuer, for PostHog's deployment". It is
+> kept for the threat model and the reasoning; §0–§16 describe a design that
+> was not built.
+
 **Status:** the hoglake side has shipped.
 [#460](https://github.com/PostHog/hoglake/pull/460) is the enforcement layer:
 `HOGLAKE_AUTH_MODE=off|warn|enforce`, ES256 JWT verification against a JWKS file
@@ -439,7 +447,7 @@ ship). Cache hit rate should approach 100% per (tenant, scope) warm pair.
   private key bytes never enter a pod; a mounted PEM is the dev fallback. Signing
   rate is low (token exchange and refresh only), so KMS latency is not on any
   hot path.
-- **Token TTL**: 10 minutes. Refresh with the same credential. `nbf`/`iat` skew
+- **Token TTL**: 15 minutes. Refresh with the same credential. `nbf`/`iat` skew
   tolerance 60 s.
 - **Revocation without a per-request DB read**: `hog_tenant.credential_epoch`
   is baked into the token as `ep`. Verification compares against an in-process
@@ -447,7 +455,7 @@ ship). Cache hit rate should approach 100% per (tenant, scope) warm pair.
   whole fleet). Bumping the epoch revokes every outstanding token for a tenant
   within 30 s. Deleting a client revokes its ability to *renew* immediately.
 - **STS revocation**: cannot be revoked, only outlived. That is why
-  `DurationSeconds` is capped at 1 h and why token TTL is 10 min — the worst-case
+  `DurationSeconds` is capped at 1 h and why token TTL is 15 min — the worst-case
   blast radius of a stolen secret is one hour of one prefix, on one role, under a
   session name that identifies the token.
 - **Break-glass**: `platform:admin` tokens (operator, from a projected SA token
@@ -484,7 +492,7 @@ the per-org Trino deployment gets its own ServiceAccount (which
   "aud": "hoglake",
   "sub": "client:0193c1e2-…",           // or "sa:duckgres:trino-<org>"
   "iat": 1764547200,
-  "exp": 1764547800,                    // +600s
+  "exp": 1764548100,                    // +900s
   "jti": "0193c1e2-9f0a-7…",
 
   "ten": "tenant",                      // kind: "tenant" | "scoped" | "operator" (§6.2a)
@@ -515,6 +523,70 @@ Deliberate omissions:
   verifier so the absence of `tab` means "all tables in `cat`" — which is what
   every v1 token means — and the field can be added without a version bump.
 
+### Routing amendment to §6.2
+
+The stateless deployment model adds an optional `rtg` placement claim.
+The earlier omission remains valid for storage credentials, but does not prohibit this routing claim.
+No server-side catalog-to-tenant derivation exists in this model.
+The issuer is the single placement authority. The backend-id allowlist limits its routing authority.
+The token carries no endpoints, secrets, or AWS credentials.
+
+A hoglite placement has exactly three string fields:
+
+```json
+{"b":"hoglite","be":"5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","t":"t_3fa8c1d9e2_1"}
+```
+
+`be` is a canonical lowercase UUID. It must identify a configured backend of kind `b`.
+Unknown ids and kind mismatches return 401 `unknown_backend`.
+`t` is opaque. It contains 1–128 ASCII letters, digits, dots, underscores, or hyphens.
+It cannot start with a dot or contain two consecutive dots.
+Hoglake does not split the incarnation suffix or derive the tenant from the catalog name.
+A PostgreSQL placement has exactly `b` and `be`. It forbids `t`.
+It needs `HOGLAKE_POSTGRES_BACKEND_ID` to identify this process's PostgreSQL backend.
+Unknown fields, invalid shapes, or multiple `cat` entries return 401 `invalid_token`.
+
+Every routed token names exactly one `cat` entry, including catalog operator tokens.
+Catalog operators retain `ten: operator` and operator authority; `cat` identifies only their placement.
+Legacy tokens without `rtg` keep their previous behavior.
+
+`HOGLAKE_BACKENDS_FILE` points to a JSON object with a `backends` array.
+Each entry has `id`, `kind: hoglite`, and `url`.
+Optional endpoint and timeout keys are documented in `Config`.
+This file contains server-controlled endpoints, not secrets.
+It requires auth mode `warn` or `enforce`.
+`HOGLAKE_DEFAULT_BACKEND` accepts `postgres` or `none`. Hoglite cannot be the default.
+The default is `postgres`. In that mode, startup opens PostgreSQL, applies migrations,
+and starts the PostgreSQL maintenance loops as before. This keeps Gigahog unchanged.
+
+With `none`, startup does not create a PostgreSQL pool or Jdbi instance and does not
+apply migrations. If `HOGLAKE_POSTGRES_BACKEND_ID` is set, `HOGLAKE_JDBC_URL`,
+`HOGLAKE_DB_USER`, and `HOGLAKE_DB_PASSWORD` are required at startup. The first
+request routed to that backend opens one pool, applies migrations, and creates Jdbi.
+Concurrent requests share this initialization. Later requests reuse the pool.
+A failed open or migration closes the failed pool and returns 503 `backend_unavailable`;
+a later request can retry. If no PostgreSQL backend is configured, no PostgreSQL
+connection settings are needed. A PostgreSQL placement then returns 401 `unknown_backend`.
+
+`/livez` never checks a backend. `/healthz` checks all configured hoglite backends,
+but skips PostgreSQL until it has initialized. The probe itself never opens the request
+pool or runs migrations. After initialization, it also checks PostgreSQL through its
+separate bounded probe connection. PostgreSQL background loops and catalog metrics
+samplers start only after PostgreSQL initializes; a hoglite-only process never starts them.
+
+| Request | Store |
+| --- | --- |
+| Matching catalog and verified `rtg` | The configured backend and opaque tenant from the token |
+| No `rtg`, or a different catalog | PostgreSQL default, or 404 when the default is `none` |
+| Hoglite catalog listing | Only the token's routed catalog |
+| Publications or the maintenance export on hoglite | 501 `not_supported_on_backend` |
+| A mount name (§6.5a) | Resolved first: never a store |
+| A name a mount host serves (§6.5b) | Resolved before that: forwarded to the host |
+| A configured served namespace named in the path, in a catalog this server does not hold (§6.5d) | Resolved before all of the above, whatever the token's `rtg`: read from its source catalog in PostgreSQL, or refused |
+| A remote schema named in the path, in a catalog that is none of the two above (§6.5c) | Resolved next, before any store: relayed to its host, or refused |
+
+Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
+
 ### 6.2a Scoped tokens (`ten: scoped`)
 
 A scoped token is a tenant token narrowed by a predicate: it may touch only
@@ -543,9 +615,10 @@ contract vector is `scoped_team` in `oauth/contract-vectors.json`.
 - **A value's permission** is the lower of its own and `cat`'s for the catalog.
 - **Fails closed.** A scoped caller may use `AUTHENTICATED` routes (listings,
   filtered to `cat`, with catalog totals withheld) and, in a catalog it names,
-  only the routes listed in `AuthPolicy.SCOPED_ROUTES`. Every other catalog
-  route answers `403`, under `warn` too, and a route added to the table stays
-  closed to scoped callers until it is listed.
+  only the routes listed in `AuthPolicy.SCOPED_ROUTES` (and, on a mount-shaped
+  name, `AuthPolicy.MOUNT_ROUTES`: §6.5a). Every other catalog route answers
+  `403`, under `warn` too, and a route added to the table stays closed to
+  scoped callers until it is listed.
 - **Reads, by namespace.** The listed routes are the namespace-scoped reads (a
   namespace, its tables and views, and a table's metadata, files, scan plan,
   partitions, changes and file stats) and the namespace listing. A
@@ -636,8 +709,119 @@ is any lowercase identifier, the value a positive id, and the convention that
 - **Operators only.** Marking and clearing are operator routes; a tenant
   token cannot drop a contained namespace (403). Clearing requires the
   namespace to be empty.
+- **Org mark.** The body may also carry `"org": "<org>"` (a canonical lowercase UUID, `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`;
+  capability `org-marked-containment-v1`, Postgres catalogs only, 422 on
+  hoglite). It moves the namespace's prefix to
+  `<data_path>/org_id=<org>/<field>=<value>/`: its tables register files only
+  there (literally spelled), table creation's `write_path` is
+  `<prefix><uuid>/`, a scoped upload claim must spell the prefix, and a
+  compacted output lands in `<prefix><table>/`. `data/<n>/` is then no
+  prefix of its own. No other table registers a path whose first two
+  segments are `org_id=<org>` and `<field>=<value>`, compared raw and
+  percent-decoded per segment; the commit finds the owner by
+  `(field, value)` and compares its org, so the same value under another org
+  is not foreign. Marking scans for foreign files under the hive prefix as
+  it does under `data/<n>/`. A scoped caller uses an org-marked
+  namespace only when its token's `org` claim equals the mark (a team belongs
+  to one org); on any other org every route answers as for a missing
+  namespace (404), and the namespace is absent from its listings. Tenant and
+  operator callers are unaffected. The mark can be replaced or cleared only
+  while the namespace has never held a table or view (at any snapshot, dropped
+  ones included) and no file is registered under its prefix; after that
+  re-marking with anything but the identical containment, and clearing, are
+  `commit_conflict`. A name whose earlier, dropped namespaces never held a
+  table or view can be marked again. A table with the object-prefix layout in
+  an org-marked namespace is unsupported (compaction keeps its path, the
+  commit refuses it).
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
+- **One call.** `POST /v1/catalogs/{c}/namespaces` takes an optional
+  `"containment": {"field": "team_id", "value": 7, "org": "<org>"}`, the body
+  of the containment `PUT`. It is operator-only (403 `forbidden` otherwise,
+  decided in the handler because the route is `write`): the namespace is
+  created already marked, in one transaction under the commit lock, with
+  the checks the mark makes (field, value and org validation, the prefix
+  scan, the reused-name rule and one live namespace per value). A refused
+  mark (422 `validation`, 409 `commit_conflict` or `already_exists`) creates
+  nothing: no snapshot and no namespace row, and the namespace is never visible
+  unmarked. Postgres catalogs only: hoglite answers 422.
+
+### 6.2c Reserved namespace names
+
+`HOGLAKE_RESERVED_NAMESPACES` (comma-separated) lists namespace names that no
+caller may create in any catalog on the server. Empty, the default, reserves
+none. PostHog's customer hoglake sets `posthog`: its Trino connector shows the
+org's events mount (`<orgID>-events`, §6.5a/§6.5b) as the read-only schema
+`posthog` inside the org's catalog, so user data must never sit under that name.
+hoglake reserves no name itself.
+
+- **One path.** `POST /v1/catalogs/{c}/namespaces` is the only way a namespace
+  is created: there is no rename, and table, view, commit and table-creation
+  routes need an existing namespace (404 otherwise). The handler refuses a
+  reserved name after the body is read and before the store is called, so
+  no snapshot is allocated and nothing reaches PostgreSQL or a hoglite engine.
+  Every client (Trino, DuckDB, pyhoglake, the web UI) goes through it.
+- **Every caller.** Operators, tenants and auth `off` alike; a scoped token
+  cannot create namespaces at all (403 before the handler).
+- **Matching.** Equal after folding ASCII `A`-`Z` to lowercase; nothing else
+  is folded, trimmed or prefix-matched (`PostHog` is refused, `posthog_raw` is
+  not). Both backends compare namespace names case-sensitively, and Trino folds
+  identifiers to lowercase and lets the mount shadow any case variant of
+  `posthog`, so an exact match would let a direct client create a namespace
+  Trino hides.
+- **The team family.** A `namespace_family` entry in the hosts file (§6.5c)
+  reserves every `team_<digits>` name, matched on the shape alone: any ASCII
+  case and any leading zeros, so `TEAM_5` and `team_007` are refused with
+  `team_5`. `team_x` and `teams` are not.
+- **The error.** 422 `validation`, "namespace name '<name>' is reserved on this
+  server", as `POST /v1/catalogs` refuses a mount-shaped catalog name.
+- **Boot.** Each entry must match the namespace identifier pattern, else the
+  server does not start.
+- **Existing namespaces are left alone.** One created before its name was
+  reserved stays listed, readable, writable and droppable; once dropped, no
+  case variant of it can be created again. The server does not look for them
+  at boot (that would scan every catalog, and open every hoglite engine). Before
+  setting the variable, look once on PostgreSQL:
+  `SELECT c.name, n.name FROM hog_namespace n JOIN hog_catalog c USING (catalog_id) WHERE NOT n.dropped AND lower(n.name) = 'posthog';`
+  and in each hoglite-placed catalog:
+  `SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND lower(name) = 'posthog';`
+- **Mounts.** A mount or mount Client catalog refuses every write first
+  (403 `read_only_catalog`), so it never reaches this check.
+- **Remote schemas.** A name the hosts file configures as a remote schema
+  (§6.5c) is reserved as if it were listed here, with the same matching and
+  the same error. Unlike a listed name, a namespace that already has such a
+  name is not left alone: it is hidden on every route.
+- **Reserve only names nobody provisions.** The provisioner's `team_<id>`
+  namespaces (§6.2b) are created by an operator token, which the guard does not
+  exempt.
+
+### 6.2d Operator-only team namespaces
+
+`HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS` (comma-separated catalog names)
+lists the catalogs where only an operator creates a namespace named
+`team_<digits>`. Empty, the default, lists none. A per-team scoped writer
+(§6.2a) reaches `team_<id>` through an operator's org mark (§6.2b), so a
+tenant that created the name first would hold the namespace the mark is meant
+to claim.
+
+- **One path.** The check is in `POST /v1/catalogs/{c}/namespaces`, the only
+  way a namespace is created (§6.2c: no rename, no implicit creation), so it
+  holds for every backend. It runs after the reserved-name check and before the
+  store is called, so a refusal writes nothing.
+- **Matching.** `team_` followed by one or more ASCII digits and nothing else,
+  ASCII-case-insensitively: `team_5`, `TEAM_5`, `Team_05` and `team_007` all
+  match; `team_`, `team_5a` and `myteam_5` do not. Catalog names are compared
+  exactly.
+- **Callers.** A non-operator gets 403 `forbidden`: a tenant, and a scoped
+  token, which cannot create namespaces at all. Operators are unaffected, and
+  so is auth `off`, which has no callers to tell apart.
+- **Auth modes.** Under `warn`, a request with no valid token is treated as
+  the operator, as everywhere else, so this rule is enforced only in `enforce`
+  mode or on the public listener.
+- **Boot.** Each entry must match the catalog-name pattern, else the server
+  does not start.
+- **Existing namespaces are left alone.** One created before its catalog was
+  listed stays readable, writable and droppable.
 
 ### 6.3 Scope vocabulary
 
@@ -677,6 +861,7 @@ As shipped; `auth/AuthPolicy.kt` is the authoritative table.
 | `…/publications*` | `read` (GET) / `maintenance` (POST, DELETE) | ✓ |
 | `/v1/maintenance/status`, `/runs` | operator only (§7.1) | ✓ |
 | `/v1/database/health` | operator only | ✓ |
+| `/v1/mounts*` | operator only; `PUT` only for `HOGLAKE_MOUNT_WRITER_SUBJECT` (§6.5a) | ✓ |
 | `/v1/debug/*` | operator only | ✓ |
 | `/v1/info` | public; **totals projected onto the caller's catalogs, omitted when anonymous** | all |
 | `/livez`, `/healthz`, `/openapi.yaml` | public | n/a |
@@ -717,6 +902,683 @@ and the repository layer asserts `catalog_id == TenantContext.catalogId` for the
 catalog it resolved — a cheap invariant, one `require`. Cost is zero on the happy
 path and it turns "a new route forgot the plugin" into a 500 in tests rather than
 a cross-tenant read in production.
+
+**The store is bound to the token as well** (built, at the catalog level). The
+plugin decides on the catalog the request path names. `CatalogStoreSelector`, which
+every catalog route and the namespace gate go through to get a store, asks the
+plugin's rules again for the name the handler passes, before it resolves a remote
+binding, a mount or a store (`auth/StoreEntitlement.kt`):
+
+- A request with no caller gets 401.
+- A name the token does not name (`Caller.knowsCatalog`; an operator knows every
+  catalog) gets the plugin's 404.
+- A name the token holds without the scope the route asks for gets the plugin's
+  403, so a write route is not served from a catalog held only for read.
+- The modes are the plugin's: no check under `off`; under `warn` the refusal is
+  counted and let through, except for a scoped caller.
+- A refusal is counted in `hoglake_auth_requests_total` (and a 403 in
+  `hoglake_auth_denials_total`) and audited as `auth_refused` with `at=store` and
+  the catalog that was refused. A request adds at most one, and none when the
+  plugin already counted a refusal for it under `warn` and let it through. When
+  the plugin allowed the path's catalog and the store then refuses the handler's,
+  the request has the plugin's `ok` and the store's refusal: the plugin counts
+  before the handler runs, and the pair shows a handler that asked for a name
+  other than the path's.
+
+This covers catalogs, and remote schemas (§6.5c): a remote schema's binding is
+handed out by the same file's second check, only to a token that allows the
+schema, in every mode. A scoped caller's other namespaces are the gate's and the
+handlers'. The PostgreSQL store that is handed out takes a catalog name again on
+each call. The view a handler gets of the store (below) checks both again, behind
+them: the catalog of every call, and a scoped caller's namespaces.
+
+**What a handler gets is a view of the store** (built). Under every mode that
+resolves a caller, the selector hands a handler a view of the store and of each
+sub-backend (uploads, table creations, alters, views, partitions, maintenance) in
+place of the object itself (`store/BoundCatalogStore.kt`, `store/BoundBackends.kt`).
+Each operation first asks the request's rule (`auth/StoreGrant.kt`) with the
+catalog and the namespace the handler passed:
+
+- Every caller kind: the view answers only for the catalog it was handed out
+  for. Another name gets the plugin's 404 for a catalog the token does not name.
+  The catalog listing's store lists only names the token names.
+- A scoped caller: a namespace must be live, contained, and contained for a value
+  the token holds for the operation: read or write, the lower of `prd` and `cat`.
+  The route table is not asked. Any other namespace gets the gate's 404 for a
+  missing namespace. This covers a namespace in the path, in a body (a commit's
+  appends, deletes and the tables whose files it ends, a table creation, the
+  prefix of an upload claim) and behind an id (a table creation's operation).
+- A table creation in a namespace the caller may not use answers the 404 of a
+  creation that does not exist, here and in the route's own check, so neither its
+  existence nor its namespace shows. The audit names the namespace.
+- A scoped caller gets 403 for every operation that names no namespace, such as
+  storage usage, snapshots, receipts, consumer offsets and maintenance. Reading
+  the catalog stays open, and so do renewing and abandoning upload claims: they
+  name a claim owner and no namespace, and the view holds them to the catalog
+  only, not to whose claims they are.
+- This is a second layer. The namespace gate and the handlers' own checks
+  (`requireScopedNamespaces`, `requireScopedUploadPrefix` and the table-creation
+  routes' `requireScopedCreation`) still decide first. They read through the view,
+  or for a table creation through the selector, and what they read is kept for the
+  request: a request whose handler passes its own route's values reads nothing more
+  than before and is never refused at the store. A refusal audited `at=store` is
+  one the first layer did not make.
+- The modes, the counting and the audit are those of the catalog check above
+  (`at=store`, at most one refusal for a request). Under `off` the selector hands
+  out the store itself.
+- The views are written out method by method, with no delegation by default. A
+  method added to `CatalogStore` or to a sub-backend without a body does not
+  compile until its view is written. One added with a default body compiles, and
+  `BoundStoreTest` fails until its rule is listed there.
+  `ScopedRouteHandlersIntegrationTest` sends a scoped caller's request on every
+  route open to it through the real handlers, and fails on any refusal at the
+  store.
+
+Not covered:
+
+- The publication routes and the maintenance export answer 501 and call no
+  service. `requirePostgres` checks their catalog's placement and returns nothing
+  to wrap. An implementation must hand its handler a view, as the sub-backend
+  accessors do.
+- The instance-wide routes read PostgreSQL with no view: `GET
+  /v1/maintenance/status`, `GET /v1/maintenance/runs`, `GET /v1/database/health`,
+  `GET /v1/mounts` and `GET /v1/mounts/{mount}`. They are operator routes, and the
+  plugin refuses a scoped caller on each of them.
+- A mount's reads (§6.5a: its catalog row, and the export's scan) read
+  PostgreSQL with no view. They serve a scoped reader of the mount by design: the
+  row is the source catalog's under the mount's name, and ReadScope bounds the
+  scan in SQL.
+- The `remote_schemas` claim is not read here.
+
+### 6.5a Mount dispatch
+
+A mount is a read-only catalog name over a table in this instance's PostgreSQL
+catalogs (#291, self-mount only). Its name is `<orgID>-events`, with the org id
+a canonical lowercase UUID (`MountNames.PATTERN`).
+
+- **Reserved names.** `POST /v1/catalogs` refuses that shape with 422 before
+  placement selects a backend, whatever the switch below says. So no catalog
+  created through it can take a mount's name. A PostgreSQL name taken earlier
+  is for the mount write to refuse; a hoglite one is kept out by the issuer's
+  `cat` grammar. Where both exist, the mount resolves first on every
+  `{catalog}` route, and `GET /v1/catalogs` hides the catalog from every
+  caller.
+- **One choke point.** `CatalogStoreSelector.resolve` is #291's
+  `CatalogRegistry.resolve`. It runs before token placement picks a store. Every
+  catalog route and the namespace gate reach it through `forCatalog`, except
+  `GET /v1/catalogs/{catalog}`, which calls it directly to serve a mount. A name
+  resolves to a mount only if it has the reserved shape, PostgreSQL is the
+  default backend, its org is in `HOGLAKE_MOUNT_ALLOWLIST`, `hog_mount` holds
+  it enabled, and `hog_mount_switch.enabled` is true. Otherwise the request is
+  served as before.
+- **Who it serves.** Only a verified `ten: scoped` caller whose `cat` names the
+  mount, in every auth mode. Any other caller that gets past the plugin gets a
+  404 worded as a missing catalog. Under `off` no caller is verified, so a
+  mount serves no one. A scoped reader whose `rtg` places the mount on hoglite
+  gets 501 `not_supported_on_backend`.
+- **What it serves.** Its catalog: `GET /v1/catalogs/{catalog}`, and the
+  listing, which shows a caller the reserved names in its own `cat` that it
+  may read as mounts (`mountVisibility`); no one else sees a mount. The body
+  is the row of the instance's source catalog (`HOGLAKE_MOUNT_SOURCE_CATALOG`:
+  data path, snapshot clock) under the mount's name, with `read_only: true`,
+  no capabilities (each one gates a write) and no sampler totals; unset or
+  missing, the mount and its reader's listing answer 500. Every other route refuses before any
+  service call: a non-read route with 403 `read_only_catalog`, a read route
+  with 501 `mount_operation_unavailable`. The route table (§6.4) gives the
+  class.
+- **The mount column.** `AuthPolicy.MOUNT_ROUTES` lists the routes a mount
+  serves; every other route is unavailable on a mount. On a listed route a
+  mount-shaped name is open to a scoped caller by its `cat` alone, and the
+  binding serves the mount (a reserved name that is no mount is served as
+  the catalog it is, which shows the caller what its listing already does).
+  So no route narrowed per namespace or per body is listed. Elsewhere, under
+  `warn` and `enforce`, `AuthPolicy` answers a scoped caller 403 `forbidden`
+  on routes outside its scoped set or beyond its `cat` scope, before
+  dispatch.
+- **Read scope.** `ReadScope` (`store/ReadScope.kt`) compiles what a mount
+  read may see: the table's files visible at the read snapshot whose
+  identity partition value on the mount's field is in the caller's `prd`
+  values intersected with the mount's (`*` means the mount's values), and
+  whose stats prove it (`provided AND NOT prefix_quarantined`). An empty set
+  compiles to `FALSE`. The read is refused, and
+  `hoglake_mount_integrity_errors_total` counts it, when the table's
+  object-prefix field at the read snapshot is not the mount's, or on
+  corruption (a spec row with no fields or with key indexes other than
+  0..n-1, no spec with the identity field, a negative mount value). A file
+  bound to an absent spec row cannot exist on such a table (expiry keeps
+  spec rows since #479, which predates the option); it would be left out.
+  No route uses it yet.
+- **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
+  only for a name `hog_mount` holds enabled. To turn it on:
+  `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). It has
+  no API.
+- **The mounts.** `hog_mount` (V35) holds each mount's revision, `enabled`
+  flag and values (the identity-partition values it admits: team ids). The
+  table a mount reads is the instance's, not the row's.
+  - Operators read mounts with `GET /v1/mounts` and `GET /v1/mounts/{name}`.
+    A mount that was never written reads as revision 0.
+  - `PUT /v1/mounts/{name}` replaces a mount. Only the operator token whose
+    `sub` is `HOGLAKE_MOUNT_WRITER_SUBJECT` (hogtower's events mount loop) may
+    call it, and only with a verified token, so under `off` nobody may. Every
+    other caller is refused, including other operators and `platform:admin`.
+    A missing token gets 401 under `enforce` and 403 under `off` or `warn`.
+    Empty (the default) means nobody
+    may write. The subject must be one that no other operator token carries.
+    Every hogtower operator token is `hogtower:provisioner` today, so the loop
+    needs a subject of its own.
+  - A write is CAS on the revision the writer read, and moves the mount to
+    the next revision. A stale write gets 409 `mount_revision_conflict`. The
+    write gets 422 for a name that any `hog_catalog` row holds, more than
+    10,000 values, or a negative or repeated value. A mount is never deleted,
+    so its revision never resets.
+  - Every write attempt that reaches the handler is one `mount_write` audit
+    line. It carries the actor and, when there is a token, the `jti`. A write
+    that lands also carries the values added and removed, the first 100 of
+    each. A refusal by the route table is an `auth_refused` line instead.
+  - `HOGLAKE_MOUNT_ALLOWLIST` lists the org ids (the `<id>` of `<id>-events`)
+    whose mounts may serve; `*` means all of them. It is empty by default, and
+    then no mount name is looked up at all. It gates serving only, so a mount
+    can always be disabled.
+- **Metrics.** Each of the binding's four refusals (`not_found`,
+  `not_supported_on_backend`, `read_only_catalog`,
+  `mount_operation_unavailable`; not the plugin's 403) counts once in
+  `hoglake_mount_refusals_total{catalog,reason}`, by its error code. The label
+  is only a name the registry holds, so request input cannot add a series;
+  team ids are never labels. For a scoped caller on a namespaced route, the
+  gate counts the request's `hoglake_auth_requests_total` outcome when its
+  lookup answers: `ok` for a reader on a route the mount does not serve (as
+  the plugin counts it on the routes it allows outright) and `other` for a mount
+  placed on hoglite; for any catalog, a 404 because no backend holds it
+  (#554's `none` default) counts `not_entitled`.
+
+### 6.5b Mount Client
+
+A server with `HOGLAKE_MOUNT_HOSTS_FILE` is a mount **Client** (#291's
+`RemoteCatalog`): it forwards a mount's reader to the **Host** that serves the
+mount (§6.5a). Readers keep reading the Host's objects directly; only catalog
+requests go through the Client.
+
+```json
+{"hosts": [{"id": "3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+            "match": {"type": "events"},
+            "kind": "hoglake",
+            "url": "http://gigahog-server.gigahog:8080",
+            "auth": "forward"}]}
+```
+
+- **The mapping.** Each entry is one host: a stable `id` (a canonical
+  lowercase UUID, as a hoglite backend's), the names it serves, what it is,
+  where it is and how the Client authenticates to it. Optional per-host
+  bounds: `timeout_ms` (75,000; at most 600,000), `max_response_bytes`
+  (1 GiB), `max_concurrent` (16; at most 256). A request holds its permit
+  for at most `timeout_ms` plus 10 s for a slow caller. Endpoints only,
+  never credentials. Checked at boot:
+  ids are unique, no name matches two entries, each `url` is a bare http(s)
+  origin (no user-info, path, query or fragment), unknown keys are refused.
+  No file, or an empty list, is a server that is not a Client.
+- **Matchers.** `{"type": "events"}` is every mount name (`<orgID>-events`).
+  `{"type": "catalog", "name": "<orgID>-events"}` is one mount name. A name
+  that is not a mount's is refused at boot: reservation, the issuer's `cat`
+  grammar, `AuthPolicy.MOUNT_ROUTES` and the listing are all keyed on the
+  mount shape, and any other name could be a catalog on a token-routed
+  backend.
+- **Kind and auth.** `kind` is `hoglake` only. `auth` is `forward` only: the
+  caller's bearer token, unchanged. That is sound only for a host that
+  verifies the same issuer's tokens for the same audience as this server:
+  the Client has verified the token, the host verifies it again and scopes
+  by its claims, and the Client holds no credential of its own. A host
+  under another authority, or one that is not a hoglake, needs its own auth
+  mode and reader; any other value is refused at boot.
+- **One seam.** `MountHostResolver.resolve(caller, catalog)` answers the
+  reader of the host that serves a name, or nothing. `CatalogStoreSelector`
+  asks it before the mount registry and before any backend lookup, and the
+  proxy (`MountHostClient`) knows only the host it was built for. The
+  resolver is static configuration today; it takes the verified caller so
+  that a routing claim naming a host `id` can be honoured later.
+- **A Host or a Client.** Refused at boot together with
+  `HOGLAKE_MOUNT_ALLOWLIST`, under `HOGLAKE_AUTH_MODE=off`, or without
+  `HOGLAKE_AUTH_PREDICATE_FIELDS` (the hosts' own fields: no scoped token
+  verifies without them).
+- **Checked here first.** The binding applies the mount reader's rule of
+  §6.5a before anything is sent: only a verified scoped caller whose `cat`
+  names the mount with `read`. Everyone else gets the same 404, a reader
+  whose `rtg` is hoglite the same 501, a write the same 403
+  `read_only_catalog` and an unserved read the same 501
+  `mount_operation_unavailable`, with no upstream call. A token needs no
+  `rtg`: the name alone selects the host, whatever backends the Client has.
+  The namespace gate skips containment for a remote binding, as for a mount.
+- **Not trusted for isolation.** The Client holds no team values and filters
+  nothing. The Host verifies the forwarded token again and applies its own
+  `ReadScope`; a Client that forwarded a request it should have refused
+  would be refused by the Host.
+- **What is forwarded.** `GET` for the catalog route and the five read
+  routes, with the caller's `Authorization` header and `X-Request-Id`, to a
+  path built from the mount name and identifier-grammar namespace and table
+  names (anything else is a local 404), with the query parameters
+  re-encoded. A query parameter named `catalog`, `namespace` or `table` (in
+  any letter case) is not forwarded: those are route values and come from
+  the path only. Redirects are not followed and no proxy is used. A 200 comes
+  back byte for byte (one with no length and no chunking, or with a content
+  encoding, is refused); `GET /v1/catalogs` asks each host once and keeps
+  the entries it returns for the names in the caller's `cat`.
+- **Limits.** The cap is per host, not per org: fairness between orgs is the
+  query engine's resource groups, as for the Host's scan cap. `forward`
+  sends the whole token, including any other catalog its `cat` names. A
+  caller that disconnects does not cancel its upstream request, which ends
+  at the host's answer or the deadline.
+- **Errors.** The Host's typed refusal passes through with its status, code,
+  detail and Retry-After. Unreachable or past the deadline: 503
+  `mount_host_unavailable`. The cap on requests in flight is full: 503
+  `mount_proxy_busy`. Anything else from the Host: 502
+  `mount_host_invalid_response`. None names the Host's address or echoes
+  what it sent. A large body is streamed; on a failure part-way, or a body
+  over the size cap, the caller's connection is closed instead of the body
+  being finished.
+- **Metrics.** `hoglake_mount_proxy_requests_total{catalog}` and the
+  `hoglake_mount_proxy_requests_seconds` histogram count and time every
+  request sent to a host; `hoglake_mount_proxy_upstream_errors_total{catalog,reason}`
+  counts those it did not serve (`unavailable`, `timeout`,
+  `invalid_response`, `response_too_large`, `http_<status>`). `http_401` is
+  a host refusing a token this server had just verified: its keys or issuer
+  differ. A shed request is `mount_proxy_busy` on
+  `hoglake_mount_refusals_total`. The `catalog` label is written only after
+  the reader check has passed, so it is a name from a verified `cat`. Logs
+  name a host by its `id`, never its URL.
+
+### 6.5c Remote schemas on the Client
+
+A remote schema is one namespace of a catalog that another hoglake serves,
+read-only. With a remote schema named `analytics`, a reader sees
+`<catalog>.analytics.<table>` beside the catalog's own namespaces, from every
+client, and the data comes from another deployment (the Host). The server
+that holds the catalog is the Client. For readers this replaces the separate
+mount catalog of §6.5a and §6.5b.
+
+The Host serves the relayed paths for the namespaces it is configured to
+serve from a source catalog (§6.5d, the imports) and, when configured, the
+published stream tables beside them. The Host verifies the relayed token
+itself, so it must accept the session profile too. Nothing turns this on in
+any deployment. §6.5a and §6.5b are unchanged and still describe the mount.
+
+```json
+{"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+            "match": {"type": "namespace", "name": "analytics"},
+            "kind": "hoglake",
+            "url": "https://host-hoglake.example",
+            "auth": "forward"}]}
+```
+
+- **Configuration.** A third matcher in `HOGLAKE_MOUNT_HOSTS_FILE` (§6.5b):
+  `{"type": "namespace", "name": "<schema>"}`. Such an entry matches no
+  catalog name. It applies to every catalog this server holds itself (bound
+  local: not a mount and not a mount Client's name, and present in the
+  backend that serves it). The name must be a namespace name. Two entries may not have the same name, or names that are
+  equal after folding ASCII case. Every other key, bound and boot check of
+  §6.5b applies, so a server with such an entry cannot run with auth `off`.
+  It also refuses to boot unless `HOGLAKE_AUTH_SESSION_PROFILE` is `on`: only
+  a token that carries the session profile can name a remote schema
+  ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)), so
+  with the profile off the name would be reserved and never readable.
+  Its `url` must be `https`. The token relayed for a remote schema can carry
+  storage credentials (the session profile), and `http` would send it without
+  transport encryption, so an `http` URL is refused at boot. An entry may opt
+  in with `"allow_insecure_http": true` (a boolean, default false; for a Host
+  reached only over a trusted network); the server then logs one warning at
+  boot that names the host's `id`. The key is refused on an `events` or
+  `catalog` entry: it is not a general switch.
+  Entries of the `events` and `catalog` types behave as before, with the
+  profile on or off and with `http` or `https`, and one file may hold all
+  of the types.
+- **A local name (alias).** The server that holds the catalog chooses the
+  name it shows. A `namespace` entry may set `"remote_name"`, the schema's
+  name on the Host (a namespace name; default: `name`):
+
+  ```json
+  {"id": "6d1d7e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f",
+   "match": {"type": "namespace", "name": "analytics"},
+   "remote_name": "shared",
+   "kind": "hoglake", "url": "https://host-hoglake.example", "auth": "forward"}
+  ```
+
+  Readers see `<catalog>.analytics`; the Host serves its schema `shared`. The
+  local name is the one every rule below uses: what is shown, reserved and
+  hidden, and the only name a request may use. The Host's name is used in
+  four places: the namespace segment of the relayed path; the token check
+  (the `remote_schemas` claim names `shared`); the Host's answers, whose
+  namespace field must be `shared` and is shown as `analytics` (see "What is
+  relayed"); and the boot check below. `shared` is not reserved here, so a
+  local namespace of that name stays an ordinary one. `remote_name` is refused
+  on every other match type, a `namespace_family` entry included. Two `namespace` entries whose Host names
+  are equal are refused at boot, whether they name one Host or two, comparing
+  names exactly as the claim does: a `remote_schemas` key names exactly one
+  configured schema on a server, so one claim never opens two.
+- **The team family.** A fourth matcher,
+  `{"type": "namespace_family", "family": "team"}`, serves every team schema
+  (`team_<id>`, the canonical form: `team_` and a decimal id that fits a
+  `Long`, with no leading zero, lowercase) from its host, exactly as a
+  `namespace` entry serves its name: the same boot checks, `https` unless
+  `allow_insecure_http`, the session profile on, read-only, the same four
+  relayed routes. `team` is the only family; any other value is a boot error.
+  A `namespace` entry whose name is `team_<digits>`, in any case and with any
+  leading zeros, is a boot error beside it, because one name would then have
+  two hosts, and so is a second family entry.
+  The family reserves every `team_<digits>` name locally, in any case and with
+  any leading zeros (`team_5`, `TEAM_5`, `team_007`), the way a `namespace`
+  entry reserves its name: creating one is refused, a local one is never
+  listed, read or written, and every route that names one (path, body, id,
+  query parameter, upload prefix) answers as it does for a remote schema.
+  Only the canonical name is relayed, and only to a caller that holds it; the
+  other spellings answer 404 to everyone. A name such as `team_x` or `teams`
+  is an ordinary local namespace. Metrics carry the label `team_*` for the
+  family, never a team id.
+  The team family has no alias: its local name and its Host name are the same
+  `team_<id>`, so `remote_name` is refused on a `namespace_family` entry.
+- **The team family entry.** A token reaches a team schema through the
+  `team` entry of `remote_schemas`
+  ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)):
+  `{"team": ["read"]}`, read only. The caller holds `team_<id>` when it has
+  the entry, `<id>` is canonical, and its `prd` has `team_id` with the value
+  `<id>` at any scope, or `*`. The predicate field is fixed to `team_id`. A
+  per-name entry for another schema (such as `analytics`) works as before,
+  and a per-name `team_<id>` entry still names that schema without the `prd`
+  check, but team schemas are meant to use the family entry. The Host's org
+  mark (§6.5d) bounds a `*`: the Client relays any `team_<digits>` for such a
+  token, and the Host serves only those of the token's org.
+- **The name always means the remote schema.** On a server that configures
+  `analytics`:
+  - creating a namespace of that name is refused (§6.2c), without listing it
+    in `HOGLAKE_RESERVED_NAMESPACES`;
+  - a local namespace of that name, made earlier, is never listed, read or
+    written through any route, whether or not the Host answers;
+  - a Host outage is an error on the schema, never a fallback to local data.
+
+  The same holds for a case variant (`Analytics`): it is not a local namespace
+  and it is not the remote schema either, so every request for it answers 404.
+  Only a request for the exact local name is relayed, under the Host's name.
+- **Caller rule, before anything is sent.** Access is off unless the token
+  allows it. The caller is `scoped`, its `cat` allows `read` on the catalog,
+  and its `remote_schemas` claim names the schema, by its name on the Host
+  ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)): an
+  issuer never needs to know a local name. For a team schema its `team`
+  family entry and `prd` hold it. The claim is part of the
+  session profile, whose `cat` names one catalog, so a token reads a remote
+  schema only in that catalog. Anyone else (a tenant, with or without the
+  claim; an operator; a scoped token without the claim; no caller) gets 404
+  `not_found`, "namespace '<schema>' in catalog '<catalog>'", as for a missing
+  namespace, on every route that names the schema and that the route table
+  (§6.4) opens to that caller. The route table decides first, as on any
+  namespace: a route it closes to the caller's kind answers its own 401 or
+  403 before the schema is looked at (a tenant on the containment routes, a
+  scoped token on a route outside its scoped set or beyond its `cat` scope).
+  The rule is checked where the schema's binding is handed out, after the
+  check that the token names the catalog, so a caller refused for the catalog
+  gets that answer and the schema is never looked at. Unlike that check, it
+  refuses in every auth mode, `warn` included: nothing is behind it to let a
+  request through to. A refusal is counted and audited once per request, as
+  `auth_refused` with `at=remote_schema`. As with the store's check (§6.5),
+  a request the plugin allowed and this rule then refuses has two outcomes
+  in `hoglake_auth_requests_total`: the plugin's `ok`, counted before the
+  handler runs, and this rule's `not_entitled`. That is every refused tenant
+  and operator request. A scoped caller's request has one outcome: the gate
+  or the body check counts it, `not_entitled` when the rule refuses and `ok`
+  when the token allows the schema, whatever the answer then is (the relay,
+  or the 403 or 501 below). Unlike a mount's reader, a token whose `rtg`
+  places the catalog on hoglite is served: the catalog is the caller's own.
+- **Only in a catalog this server holds.** Once the token allows the schema,
+  the server checks that the catalog exists in the backend that serves it
+  (one read per relayed or refused request, none for a caller the rule
+  refuses and none for any other request). A catalog that does not exist, or
+  one no backend of this server holds, answers that backend's 404 for the
+  catalog, and nothing is sent to the Host.
+- **What is relayed.** Four routes, `GET` only: the namespace, its tables, one
+  table, and the scan. The request goes to the Host with the same path
+  (`/v1/catalogs/<catalog>/namespaces/<schema>/...`, `<schema>` being the
+  Host's name), the same query and the
+  caller's `Authorization` header, unchanged. As for a mount (§6.5b), a query
+  parameter named `catalog`, `namespace` or `table` is not sent: route values
+  come from the path only. The Client holds no table list: the Host derives
+  what to serve from the catalog in the path, the schema and the token. A 200
+  comes back byte for byte, with one exception for an alias: the namespace's
+  `name` and the table's `namespace` carry the Host's name, and are rewritten
+  to the local name. Such an answer is parsed as it streams, under the same
+  `max_response_bytes`, and written out token by token: every value is kept
+  (a number by its text, so `1e10` stays `1e10`), while whitespace and string
+  escapes may change. It is refused as `mount_host_invalid_response` unless it
+  is one JSON object, with no key twice in any object and nothing after it,
+  whose top-level field is the Host's name. A refusal found in the first 64 KiB
+  is the 502, and none of the answer is sent; one found later closes the
+  caller's connection instead of finishing the answer, as a body over the size
+  cap does. Nothing else
+  changes: table names, ids, snapshots, file paths (which can hold the Host's
+  name), the tables listing and the scan pass as the Host sent them. A
+  refusal from the Host keeps its status, code and detail, so its detail may
+  name the schema by its Host name, which the caller's own token holds. The
+  scan is relayed before this server parses its parameters. Timeouts, the
+  size limit, the concurrency limit and the error mapping are the mount
+  Client's (§6.5b).
+- **Every other route refuses.** For the schema's reader, a write is 403
+  `read_only_catalog` and a read that is not relayed is 501
+  `mount_operation_unavailable`. This covers a namespace named in the path
+  (tables, views, files, partitions, changes, containment, the namespace's
+  drop), in a body (the `appends` and `deletes` of every commit route, a table
+  creation's namespace), in an upload claim's prefix (any caller's, when the
+  prefix lies under `<data_path>/data/<schema>/`, with either segment spelled
+  raw or percent-encoded), behind an id (a table
+  creation prepared before the name was configured; a consumer offset read or
+  committed by the UUID of one of the namespace's live tables), and in a query
+  parameter (`stats/partitions`, `maintenance/rehydrate`). A `namespace`
+  parameter on any other route names nothing: route values come from the path
+  only. A body's namespaces are checked in the order the body gives them,
+  this rule and a scoped caller's containment together, so the first one
+  that fails either is the answer. A request that names an id and no
+  namespace is answered in that route's own words when the caller is not the
+  schema's reader: 404 "table creation operation '<id>'", 404 "no offset for
+  consumer ..." on an offset read, and 422 "unknown table_uuid ..." on an
+  offset commit, which is what each answers for an id the catalog does not
+  have. The catalog-wide partition report and the consumer listings leave the
+  namespace's rows out. The partition report filters after its query, so a
+  page can hold fewer rows than `limit`, and `truncated` and
+  `stale_spec_groups` still count the hidden rows. A scoped token whose `cat`
+  lacks `write` gets the route table's 403 `forbidden` first.
+- **The listing.** `GET /v1/catalogs/{c}/namespaces` returns the local
+  namespaces, without one that has a remote schema's name, then one entry for
+  each remote schema the token allows: `{"name": "<schema>", "remote": true}`,
+  under its local name (the claim is checked by the Host's name).
+  For the team family, a caller that holds it gets one entry for each explicit
+  id in its `prd.team_id`, sorted numerically (`team_9` before `team_42`). A
+  `*` lists no team: it grants every team, and the listing names none. What a
+  `*` caller should see in the listing is open in the spec. The schemas are
+  still readable by name.
+  The entry has no `namespace_id`, because the namespace has no id on this
+  server. The listing is built from configuration and the token. No Host is
+  asked, so a Host outage does not fail it.
+- **Not trusted for isolation.** As in §6.5b: the Client filters nothing and
+  holds no org or team values. The Host must verify the forwarded token again
+  and scope the answer.
+- **What a pre-existing namespace still affects.** Routes that name no
+  namespace are unchanged, so for a namespace that had the name before it was
+  configured: `storage-usage` still counts its bytes, catalog-wide maintenance
+  still expires, compacts and cleans its files, `maintenance/rehydrate`
+  without a `namespace` still requeues its failed files with the rest of the
+  catalog's, and `snapshots` still lists its past changes by object id. A
+  consumer offset on a table of the namespace that has since been dropped is
+  still read by its UUID. Look for one before configuring a name, with the
+  queries of §6.2c.
+- **Metrics.** The mount Client's series (§6.5b), with the schema's local
+  name in the `catalog` label. The label never holds an org, a catalog, or a
+  name taken from a request. A caller the rule refuses is counted as
+  `not_found` on `hoglake_mount_refusals_total`.
+
+### 6.5d Served namespaces on the Host
+
+A Host reads the team namespaces it is configured to serve for a Client's
+relayed requests (§6.5c). The path's catalog is the customer's own, which this
+server does not hold; the data is a namespace of a source catalog in this
+server's PostgreSQL, such as the imports. One pattern covers every team, so no
+per-team entry is needed.
+
+```json
+{"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id"}]}
+```
+
+- **Configuration.** `HOGLAKE_SERVED_NAMESPACES_FILE` (empty, the default, is
+  off): an object with exactly a `families` array, each entry exactly a
+  `family` (only `team`), a `source_catalog` (a catalog name) and a
+  `predicate_field`, which must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`, and
+  optionally a `stream` block (below). At most one entry per family. Unknown
+  keys are refused, and so is the former `namespaces` list, with a message
+  that names this shape. Boot refuses it
+  under auth `off`, without `HOGLAKE_AUTH_SESSION_PROFILE=on`, without
+  `HOGLAKE_AUTH_PREDICATE_FIELDS`, with `HOGLAKE_MOUNT_HOSTS_FILE` (a server is
+  a Host or a Client), and unless PostgreSQL is the default backend. The
+  namespace in the source catalog has the same name as the served one.
+- **Resolution.** A request whose path names a canonical `team_<id>` (§6.5c:
+  no leading zero, lowercase, fits a `Long`; any other name is not a team
+  schema and is handled as any other namespace) under a catalog this server
+  does not hold resolves to the served namespace, before a remote schema or
+  the token's `rtg`. A mount's reserved name (`<org>-events`) is never a
+  served catalog. A catalog this server holds keeps its own path: an operator
+  reading `<source_catalog>.<name>` directly is unchanged. Only a `scoped`
+  caller enters the served rule. A tenant, an operator and no caller fall
+  through to normal handling, so the answer is the one for any catalog this
+  server does not hold, the same for every name.
+- **`rtg` is ignored.** A relayed customer token carries an `rtg.be` naming
+  the customer's own Hoglite backend, which this server does not list. On a
+  server that serves namespaces, a scoped token whose `rtg.be` is unknown
+  verifies with no routing instead of the 401 `unknown_backend`. A malformed
+  `rtg`, a known backend of another kind, and every other token kind are
+  refused as before, and a server that serves no namespace refuses an unknown
+  backend as before.
+  The ignored `rtg` leaves the caller with no placement
+  (`Caller.routingIgnored`), so it never reaches this server's default
+  backend, a mount or a mount Host: on every path but a served namespace it
+  gets the 404 of a catalog its token cannot see, and it lists no catalogs.
+- **Caller rule.** In every auth mode, `warn` included. Each failure is the
+  404 of a missing namespace, counted and audited once per request
+  (`at=served_namespace`), and nothing of the source is read for a caller
+  that fails an earlier step:
+  1. the token's `cat` names the path's catalog (§6.5);
+  2. the caller is `scoped`, its `cat` allows `read` on that catalog, and it
+     holds the schema `team_<id>` (§6.5c): the `team` family entry in
+     `remote_schemas` with `team_id = <id>` in its `prd` (or `*`), or a
+     per-name entry naming it;
+  3. the namespace of that name in the source catalog is live, contained with
+     `field` equal to the served `predicate_field` and `value` equal to
+     `<id>`, and its containment has an `org` equal to the caller's `org`;
+     an unmarked namespace, one marked without an org, and one marked for a
+     different value than its name says are never served;
+  4. the caller's `prd` holds that field and `<id>` with `read`. `*` counts,
+     because step 3 has already bound the namespace to the caller's org.
+  A namespace dropped from the source stops being served, for a pinned read
+  too: liveness is checked at head.
+- **Auth mode.** Boot accepts `warn` (dev runs it) and logs a WARN. Under
+  `warn` an anonymous or tenant caller is let through on
+  `/v1/catalogs/<source_catalog>/`, so the source catalog, every team's
+  imports, is open to unauthenticated and tenant reads. Run a Host with
+  `enforce`.
+- **What is served.** The four relayed routes, from the source catalog's own
+  snapshots: the namespace (its name only: no containment and no
+  `namespace_id`, which is a counter of the shared source catalog), its
+  tables, one table, and the scan. The reader is bound to the one namespace
+  and reads the store itself, not the caller's grant view, which names a
+  catalog the source is not. A head read of the namespace is one lookup; only
+  a pinned read lists namespaces.
+- **Errors.** A refusal from the source is rewritten in the caller's
+  catalog's terms: a missing table is 404 `table '<ns>.<t>' in catalog
+  '<catalog>'`, a snapshot out of range is 422 and one below the expiry floor
+  is 410, each without the source's name, ids or times.
+- **Known leak.** `read_snapshot_id`, `begin_snapshot` and `data_file_id`
+  are the shared source catalog's counters, so a reader can infer its
+  aggregate commit rate. They stay because readers pin the snapshot (P3).
+- **Read-only.** Every other route naming the namespace is refused as in
+  §6.5c: 403 `read_only_catalog` for a write, 501
+  `mount_operation_unavailable` for a read that is not relayed. A body that
+  names the namespace under a catalog this server does not hold fails on that
+  catalog; nothing reaches the source.
+
+**The stream half.** The family entry may also carry a `stream` block. The
+same `team_<id>` then shows the published stream tables beside the imports:
+
+```json
+{"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id",
+  "stream": {"catalog": "millrace-dev", "namespace": "ingest", "tables": ["events"]}}]}
+```
+
+- **Configuration.** `stream` has exactly `catalog` (a catalog name),
+  `namespace` (a namespace name without a team's shape) and `tables` (a
+  non-empty array of table names that differ in more than ASCII case). Boot
+  refuses anything else. Without `stream`, nothing below applies and the
+  server answers as before. The stream catalog is not checked at boot: if it
+  is missing, the listing, table and scan routes answer 500, and the body
+  names nothing.
+- **Which tables.** Only the listed names, and only those that are live
+  tables of that namespace in that catalog. A table is found by
+  (catalog, namespace, name), so a table of another namespace is never
+  reached. It must also have an object-prefix field equal to the top-level
+  column `predicate_field` at the read snapshot. Any other listed name is
+  left out of the listing, and its table and scan routes answer 404. A table
+  whose layout and specs disagree is left out of the listing and counted on
+  `hoglake_served_stream_unscopable_tables_total{family="team_*"}`. Its scan
+  answers 500. The tables keep their real names; the table response's
+  `namespace` is `team_<id>`.
+- **The org bound.** The caller rule above is unchanged, and the stream half
+  has no rule of its own. The team is bound to the caller's org by the org
+  mark on its stored import namespace, the same comparison step 3 makes. That
+  comparison is made in one place (`TeamOrgBound` in
+  `auth/StoreEntitlement.kt`). Only that comparison can create the
+  `ProvenTeam` that a stream read needs. So a team's events are served only
+  after Hogtower's provisioner has created and marked its namespace. A team
+  with no import namespace gets the 404, events included. A wrong mark now
+  exposes that team's events, not only its imports.
+- **A mark is not fixed until the namespace holds a table.** A team that
+  only has events keeps an empty import namespace, and an operator can change
+  its mark until that namespace holds a table. Under `off` and `warn`, a
+  caller with no token counts as an operator for this, so it can change the
+  mark too. The mark is read at head, so
+  after a change the new org reads every retained snapshot of the team's
+  events, not only the new ones. Keeping those marks right is the
+  provisioner's duty.
+- **The row filter.** The only value is the one team id, on the table's
+  object-prefix field. It is never the token's other values, so a token
+  holding teams 42 and 43 sees only team 42's rows in `team_42`. The token's
+  grant must still hold that id, and a file is returned only when its
+  statistics prove the value and it is not quarantined (`ReadScope`). The
+  spec's `org_id = <token org>` predicate waits for an `org_id` in the
+  layout. When it lands, it is a second condition in the same seam, not a
+  replacement for the mark.
+- **Totals and properties.** The listing's counts are the team's own files.
+  The table response never carries totals, `totals=true` included, because
+  whole-table counts are every team's. It never carries the table's
+  `properties` either: on a shared table they are PostHog's own metadata,
+  and no reader needs them.
+- **Name collision.** The stream table wins. An import whose name is a listed
+  name, in any ASCII case, is not listed. A case variant of a listed name
+  answers 404 on the table and scan routes.
+- **Snapshots.** A table and its scan resolve `snapshot` and `at_timestamp`
+  in the catalog that holds the table: for a stream table, `snapshot` is a
+  stream catalog id, and `read_snapshot_id` is that catalog's. The table
+  route resolves its snapshot once, so the definition it returns is the
+  table it checked. On the
+  listing, `at_timestamp` applies to both catalogs. `snapshot` is the import
+  catalog's, and the stream tables are then listed at their catalog's head.
+  Out of range is 422 and below the expiry floor is 410, worded as for the
+  imports.
+- **Limits.** A stream scan keeps the mount's shared cap
+  (`HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT`), file budget and deadline. The
+  listing takes one permit of the cap. The series are labelled `team_*`.
+- **The listing fails with the stream side.** With `stream` set, the listing
+  of `team_<id>` fails whenever its stream half does, imports included: 500
+  when the stream catalog is missing, 410 when `at_timestamp` is before the
+  stream catalog's earliest retained snapshot, and 503 `mount_scan_busy` when
+  the shared cap is full. One org's scans can fill the cap, so size it
+  before the stream half is turned on.
+- **Rollout.** In an environment that serves customers, before a stream
+  block is turned on, audit every `team_<digits>` mark against Hogtower's
+  team-to-org records. A mark written while the server ran `off` or `warn`
+  stays after a later switch to `enforce`.
+- **Not built.** The `org_id` predicate, `remote: true` on the table
+  response, the remote head snapshot fields of the Client's catalog snapshot
+  (P3), and removing `hog_mount`.
 
 ### 6.6 Client-supplied authority fields must die
 
@@ -941,6 +1803,18 @@ honest options:
 
 Recommend **(i)** in this plan, **(ii)** as a separate decision.
 
+**What the webui does today.** It accepts a pasted access token: a JWT the user
+gets from hogtower's `/oauth/token` with a hoglake credential created in PostHog.
+The token is kept in `sessionStorage` for the tab, sent as `Authorization: Bearer`
+on every `/v1` call and on `/metrics`, and dropped on a 401 or once its `exp`
+passes. The header shows its subject and expiry, decoded in the browser for
+display only. `/v1/info` does not report the auth mode, so the console never
+prompts up front: the sign-in panel opens on the first 401, and a "sign in"
+control is always in the header. Under `off` nothing else changes. Page
+JavaScript can read a token held in `sessionStorage`, which is acceptable for a
+token that lives 15 minutes. Option (ii), an SSO/redirect login with a server-side
+session that keeps the token out of JS, is still a separate decision.
+
 ---
 
 ## 9. Server-side background jobs
@@ -1120,6 +1994,8 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds, or on a mount Client one a verified `cat` names, or a remote schema's local name (§6.5c) |
+| `hoglake_mount_proxy_requests_total{catalog}`, `_seconds`, `hoglake_mount_proxy_upstream_errors_total{catalog,reason}` | a mount Client's requests to its hosts (§6.5b): count, latency, and the ones a host did not serve, by a closed `reason`. For a remote schema (§6.5c) `catalog` holds the schema's local name |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
@@ -1262,7 +2138,7 @@ control plane — shows that six of the seven decisions above put machinery in t
 wrong repo. This section is what the stack should actually be, and it is
 smaller, not larger.
 
-The short version: **hoglake is a resource server. hogtower is the authority.**
+The short version: **hoglake is a resource server; the issuer is outside it.** For PostHog's deployment that issuer is hogtower.
 hoglake verifies a token and authorizes catalog metadata, which is what the
 first PR already does. hogtower mints the token and vends the S3 credentials,
 because it already holds every input, already assumes the tenant roles, and is
@@ -1400,7 +2276,8 @@ the `RoleSessionName` argument and the rotation/revocation design transfer
 unchanged; the endpoint hosting them does not.
 
 **Superseded — §10 (schema).** No `hog_tenant`, no `hog_client`, no signing-key
-table, no `hog_grant`. hoglake gains no tables from this work.
+table, no `hog_grant`. hoglake gains no tables from this work. (Amended: the
+events mounts add `hog_mount`, written only by hogtower's mount loop; §6.5a.)
 
 **Superseded — §14 (work breakdown).** Phases 2, 3 and 4 move to hogtower and
 no longer gate anything here.
@@ -1439,6 +2316,7 @@ It must pin, at minimum:
   | `ten` | yes | `tenant` \| `operator` |
   | `org` | tenant | the org's catalog namespace |
   | `cat` | tenant | object: catalog name → array of scope names; non-empty, and an entry naming no known scope is dropped rather than carried |
+  | `rtg` | no | verified single-catalog placement; `b` and `be`, plus `t` only for hoglite; see the §6.2 routing amendment |
   | `cli` | no | human-facing client name |
   | `exp` | yes | expiry |
   | `iat` | no | issued-at; a value in the future is refused |

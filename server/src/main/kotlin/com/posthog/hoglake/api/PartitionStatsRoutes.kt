@@ -4,7 +4,9 @@ import com.fasterxml.jackson.annotation.JsonInclude
 import com.posthog.hoglake.model.PartitionDebt
 import com.posthog.hoglake.model.PartitionStatsReport
 import com.posthog.hoglake.model.PartitionValue
+import com.posthog.hoglake.service.PartitionStatsBackend
 import com.posthog.hoglake.service.PartitionStatsService
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -21,15 +23,29 @@ import java.util.UUID
  * HoglakeExceptions are mapped by ErrorMapping (404 unknown names, 422
  * for table-without-namespace / non-positive limit).
  */
-fun Application.installPartitionStatsRoutes(stats: PartitionStatsService) {
+fun Application.installPartitionStatsRoutes(
+    stats: PartitionStatsBackend,
+    selector: CatalogStoreSelector? = null,
+) = installPartitionStatsRoutes({ stats }, selector)
+
+fun Application.installPartitionStatsRoutes(
+    stats: () -> PartitionStatsBackend,
+    selector: CatalogStoreSelector? = null,
+) {
     routing {
         get("/v1/catalogs/{catalog}/stats/partitions") {
+            val stats = selector?.partitionStats(call, call.catalog(), stats) ?: stats()
+            val namespace = call.request.queryParameters["namespace"]
+            // A remote schema's name is never a local namespace: asking for
+            // it is refused, and the catalog-wide report leaves it out. The
+            // rows go after the backend's query, so a page can be shorter
+            // than the limit and the report's counts still include them.
+            selector?.refuseRemoteSchemas(call, call.catalog(), listOfNotNull(namespace))
+            val table = call.request.queryParameters["table"]
+            val report = stats.partitionStats(call.catalog(), namespace, table, call.statsLimit())
             call.respond(
-                stats.partitionStats(
-                    call.catalog(),
-                    call.request.queryParameters["namespace"],
-                    call.request.queryParameters["table"],
-                    call.statsLimit(),
+                report.copy(
+                    partitions = report.partitions.filterNot { selector?.isRemoteSchema(it.namespace) == true },
                 ).toDto(),
             )
         }

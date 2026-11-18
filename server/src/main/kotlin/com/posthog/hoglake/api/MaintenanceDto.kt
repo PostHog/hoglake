@@ -247,6 +247,13 @@ data class CompactionResultDto(
      * See CompactionResult.objectPrefixUnresolvable.
      */
     val objectPrefixUnresolvable: Long,
+    /**
+     * Variant-table groups whose layout probe found nothing to rewrite.
+     * See CompactionResult.layoutProbeOnly.
+     */
+    val layoutProbeOnly: Long,
+    /** Oversized-row refusals, included in mergeBudgetExceeded. */
+    val oversizedRowGroups: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -274,6 +281,7 @@ fun CompactionResult.toDto() =
         spillBytes = spillBytes,
         spillBudgetExceeded = spillBudgetExceeded,
         mergeBudgetExceeded = mergeBudgetExceeded,
+        oversizedRowGroups = oversizedRowGroups,
         spillCleanupFailures = spillCleanupFailures,
         filesVerified = filesVerified,
         filesUnsorted = filesUnsorted,
@@ -284,6 +292,7 @@ fun CompactionResult.toDto() =
         filesUnranged = filesUnranged,
         bucketsSkippedClaimed = bucketsSkippedClaimed,
         objectPrefixUnresolvable = objectPrefixUnresolvable,
+        layoutProbeOnly = layoutProbeOnly,
     )
 
 data class RehydrateResultDto(
@@ -395,6 +404,7 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "spill_bytes",
         "spill_budget_exceeded",
         "merge_budget_exceeded",
+        "oversized_row_groups",
         "spill_cleanup_failures",
         "files_verified",
         "files_unsorted",
@@ -405,6 +415,7 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "files_unranged",
         "buckets_skipped_claimed",
         "object_prefix_unresolvable",
+        "layout_probe_only",
     )
 
 /**

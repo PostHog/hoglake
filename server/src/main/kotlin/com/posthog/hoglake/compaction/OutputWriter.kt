@@ -5,6 +5,7 @@ import com.posthog.hoglake.compaction.ParquetRewriter.Row
 import com.posthog.hoglake.compaction.ParquetRewriter.WriterTuning
 import org.apache.parquet.column.ColumnWriteStore
 import org.apache.parquet.column.ParquetProperties
+import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.CodecFactory
 import org.apache.parquet.hadoop.ColumnChunkPageWriteStore
 import org.apache.parquet.hadoop.ParquetFileReader
@@ -73,13 +74,22 @@ internal class OutputWriter(
                     withDictionaryPageSize(tuning.pageBytes)
                     // The row-group check shares the page check's cadence;
                     // from the first row, so it adapts to the row size.
-                    withMinRowCountForPageSizeCheck(1)
-                    withMaxRowCountForPageSizeCheck(tuning.maxRowsPerSizeCheck)
+                    if (tuning.tuneChecks) {
+                        withMinRowCountForPageSizeCheck(1)
+                        withMaxRowCountForPageSizeCheck(tuning.maxRowsPerSizeCheck)
+                    }
+                    tuning.writerMemory?.let { withAllocator(it.allocator) }
                 }
             }
             .build()
 
-    private val codecFactory = CodecFactory(ParquetRewriter.writerConfiguration(codec), props.pageSizeThreshold)
+    private val codecFactory =
+        tuning?.writerMemory?.let {
+            GuardedCodecFactory(
+                ParquetRewriter.writerConfiguration(codec), props.pageSizeThreshold,
+                it.allocator, it::replaceExternalReservation,
+            )
+        } ?: CodecFactory(ParquetRewriter.writerConfiguration(codec), props.pageSizeThreshold)
     private val compressor = codecFactory.getCompressor(codec.name)
 
     /** The stream [ParquetFileWriter] writes to, captured so [abort] can close it. */
@@ -104,8 +114,21 @@ internal class OutputWriter(
 
     private val columnIO = ColumnIOFactory(false).getColumnIO(schema)
     private var pageStore: ColumnChunkPageWriteStore? = null
+    private var boundedPageStore: BoundedWriterPageStore? = null
+    private var valuesWriterFactory: GuardedValuesWriterFactory? = null
+    private var suppressedFooterStatistics = false
     private var columnStore: ColumnWriteStore? = null
     private var consumer: RecordConsumer? = null
+    private val memory = tuning?.measureRows
+    private val keyDecimalWidths = tuning?.keyDecimalWidths ?: intArrayOf()
+    private val writerMemory = tuning?.writerMemory
+
+    private var measuringConsumer: SortMemory.MeasuringConsumer? = null
+    private var largePageMode = false
+
+    /** Maximum charged row in the emitted representation, including its sort keys. */
+    var maxRowBytes: Long = 0
+        private set
 
     private var recordCount = 0L
     private var recordCountForNextCheck = props.minRowCountForPageSizeCheck.toLong()
@@ -122,20 +145,58 @@ internal class OutputWriter(
 
     /** The footer, once [close] has written it. */
     val footer: ParquetMetadata
-        get() = file.footer
+        get() {
+            val footer = file.footer
+            if (!suppressedFooterStatistics) return footer
+            // Normalize only after serialization.
+            // Never retain full Binary extrema in returned metadata.
+            val converter = ParquetMetadataConverter(props.statisticsTruncateLength)
+            return converter.fromParquetMetadata(converter.toParquetMetadata(1, footer))
+        }
 
     /** Write one row, emitted from its source by its plan. */
     fun write(row: Row) {
         check(!aborted) { "writer was aborted by an earlier failure" }
         try {
             val plan = checkNotNull(row.plan) { "row ${row.rowId} has no output plan" }
+            val large =
+                writerMemory != null &&
+                    writerMemory.encodedBytes(row) > rowGroupBytes / props.maxRowCountForPageSizeCheck
+            if (large && !largePageMode) {
+                flushRowGroup()
+                largePageMode = true
+            }
+            if (!beforeWrite(row) && recordCount > 0) {
+                flushRowGroup()
+                largePageMode = large
+                writerMemory?.beforeWrite(row)
+            }
             plan.write(consumer(), row.group, row.rowId)
+            maxRowBytes =
+                maxOf(
+                    maxRowBytes,
+                    SortMemory.add(measuringConsumer?.rowBytes ?: 0, memory?.keyBytes(row.key, keyDecimalWidths) ?: 0),
+                )
             recordCount++
-            checkRowGroupSize()
+            checkRowGroupSize(largePageMode)
         } catch (e: Throwable) {
             aborted = true
             throw e
         }
+    }
+
+    private fun beforeWrite(row: Row): Boolean {
+        val guard = writerMemory ?: return true
+        val factory = valuesWriterFactory ?: return guard.beforeWrite(row)
+        val growth =
+            if (guard.hasRepeatedValues) {
+                guard.dictionaryGrowthBound(row, factory::forecastGrowthBytes)
+            } else {
+                factory.nextGrowthBytes
+            }
+        if (guard.beforeWrite(row, growth)) return true
+        return guard.hasRepeatedValues &&
+            guard.beforeWrite(row, guard.dictionaryGrowthMeasured(row, factory::forecastGrowthBytes))
     }
 
     private fun consumer(): RecordConsumer {
@@ -150,17 +211,45 @@ internal class OutputWriter(
                 .withFileEncryptor(null)
                 .withRowGroupOrdinal(rowGroupOrdinal)
                 .build()
-        val columns = props.newColumnWriteStore(schema, pages, pages)
         pageStore = pages
+        val bounded = writerMemory?.let { BoundedWriterPageStore(pages) }
+        boundedPageStore = bounded
+        val factory = writerMemory?.let { GuardedValuesWriterFactory(it::replaceDictionaryReservation) }
+        valuesWriterFactory = factory
+        val columnProperties =
+            if (largePageMode || factory != null) {
+                ParquetProperties.copy(props)
+                    .apply {
+                        factory?.let { withValuesWriterFactory(it) }
+                        if (largePageMode) {
+                            withMinRowCountForPageSizeCheck(1)
+                            withMaxRowCountForPageSizeCheck(1)
+                        }
+                    }
+                    .build()
+            } else {
+                props
+            }
+        val columns = columnProperties.newColumnWriteStore(schema, bounded ?: pages, pages)
         columnStore = columns
-        return columnIO.getRecordWriter(columns).also { consumer = it }
+        val target = columnIO.getRecordWriter(columns)
+        return (
+            (memory ?: writerMemory?.memory)?.let {
+                it.MeasuringConsumer(
+                    schema, target,
+                    binaryObserved = writerMemory?.let { guard -> guard::observeBinary },
+                    measureRetained = memory != null,
+                )
+            }?.also { measuringConsumer = it } ?: target
+        )
+            .also { consumer = it }
     }
 
     /** `InternalParquetRecordWriter.checkBlockSizeReached`, 1.18.1. */
-    private fun checkRowGroupSize() {
+    private fun checkRowGroupSize(force: Boolean = false) {
         if (recordCount >= props.rowGroupRowCountLimit) {
             flushRowGroup()
-        } else if (recordCount >= recordCountForNextCheck) {
+        } else if (force || recordCount >= recordCountForNextCheck) {
             val memSize = checkNotNull(columnStore).bufferedSize
             val recordSize = memSize / recordCount
             // Flush within ~2 records of the limit: slightly under is much
@@ -189,22 +278,35 @@ internal class OutputWriter(
                 rowGroupOrdinal++
                 file.startBlock(recordCount)
                 checkNotNull(columnStore).flush()
+                boundedPageStore?.finishStatistics()
+                suppressedFooterStatistics =
+                    suppressedFooterStatistics || (boundedPageStore?.suppressedColumns ?: 0) > 0
                 checkNotNull(pageStore).flushToFileWriter(file)
                 recordCount = 0
                 file.endBlock()
+                writerMemory?.finishRowGroup(boundedPageStore?.retainedExtremaBytes ?: 0)
                 nextRowGroupBytes = minOf(file.nextRowGroupSize, rowGroupBytes)
             }
         } finally {
-            runCatching { columnStore?.close() }
-            runCatching { pageStore?.close() }
-            columnStore = null
-            pageStore = null
-            consumer = null
+            closeRowGroupResources()
         }
         // The library's `min(max(minCheck, recordCount / 2), maxCheck)`,
         // evaluated as it is there: after the count has been reset.
         recordCountForNextCheck =
             minOf(props.minRowCountForPageSizeCheck, props.maxRowCountForPageSizeCheck).toLong()
+    }
+
+    private fun closeRowGroupResources() {
+        runCatching { columnStore?.close() }
+        runCatching { valuesWriterFactory?.close() }
+        runCatching { boundedPageStore?.close() ?: pageStore?.close() }
+        columnStore = null
+        valuesWriterFactory = null
+        pageStore = null
+        boundedPageStore = null
+        consumer = null
+        measuringConsumer = null
+        largePageMode = false
     }
 
     /**
@@ -296,6 +398,7 @@ internal class OutputWriter(
         check(!aborted) { "writer was aborted by an earlier failure" }
         try {
             flushRowGroup()
+            writerMemory?.beforeFooter()
             file.end(mapOf(ParquetWriter.OBJECT_MODEL_NAME_PROP to MODEL_NAME))
         } catch (e: Throwable) {
             aborted = true
@@ -303,8 +406,7 @@ internal class OutputWriter(
             throw e
         } finally {
             closed = true
-            runCatching { columnStore?.close() }
-            runCatching { pageStore?.close() }
+            closeRowGroupResources()
             runCatching { file.close() }
             codecFactory.release()
         }
@@ -320,8 +422,7 @@ internal class OutputWriter(
         closed = true
         aborted = true
         file.abort()
-        runCatching { columnStore?.close() }
-        runCatching { pageStore?.close() }
+        closeRowGroupResources()
         runCatching { file.close() }
         runCatching { stream?.close() }
         codecFactory.release()

@@ -531,6 +531,49 @@ class ScanColumnStatsQueryPlanIntegrationTest {
     }
 
     @Test
+    fun `the scoped statement reads the named files' rows and no other file's`() {
+        // A mount's scoped plan names a few of a table's files. Its statement
+        // (FileRepo.providedColumnStatsOf) must cost those files' rows, not the
+        // 1.8M rows of the relation nor the planned table's 600,000.
+        val named = listOf(1L, 1L + TABLES, 1L + 1_000 * TABLES, FILES.toLong() - TABLES + 1)
+        val issued = CopyOnWriteArrayList<String>()
+        val instrumented = Database.jdbi(db.dataSource)
+        instrumented.setSqlLogger(
+            object : SqlLogger {
+                override fun logAfterExecution(context: StatementContext) {
+                    issued += context.renderedSql
+                }
+            },
+        )
+        val rows =
+            instrumented.withHandleUnchecked { h ->
+                FileRepo.providedColumnStatsOf(h, catalogId, PLANNED_TABLE, named, null)
+            }
+        assertThat(rows.keys).containsExactlyInAnyOrderElementsOf(named)
+        assertThat(rows.values).allSatisfy { assertThat(it).hasSize(COLUMNS) }
+
+        val sql = issued.single { it.contains("hog_file_column_stats") }
+        val text =
+            db.jdbi.inTransactionUnchecked { h ->
+                h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                h.createQuery("EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " + sql)
+                    .bind("catalogId", catalogId)
+                    .bind("tableId", PLANNED_TABLE)
+                    .bindArray("fileIds", Long::class.javaObjectType, named)
+                    .mapTo(String::class.java).list().joinToString("\n")
+            }
+        val stats = scanNodes(text, "hog_file_column_stats")
+        assertThat(stats).describedAs("the statement reads the stats relation:%n%s", text).isNotEmpty()
+        assertThat(stats.sumOf { it.rowsTouched })
+            .describedAs("stats rows looked at, against %d named files x %d columns:%n%s", named.size, COLUMNS, text)
+            .isLessThanOrEqualTo(named.size.toLong() * COLUMNS)
+        // At most one file lookup per stats row read: never a pass over the table's 20,000 files.
+        assertThat(scanNodes(text, "hog_data_file").sumOf { it.rowsTouched })
+            .describedAs("data file rows looked at, against %d named files:%n%s", named.size, text)
+            .isLessThanOrEqualTo(named.size.toLong() * COLUMNS)
+    }
+
+    @Test
     fun `hog_file_column_stats carries its primary key and no other index`() {
         // An index proves itself against the query it serves (AGENT.md).
         // Four candidates this statement invites were built and

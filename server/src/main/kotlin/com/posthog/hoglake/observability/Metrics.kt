@@ -63,6 +63,43 @@ object Metrics {
         private val lockHold = ConcurrentHashMap<Pair<String, String>, Timer>()
         private val lockWaiting = ConcurrentHashMap<String, AtomicInteger>()
         private val lockHeld = ConcurrentHashMap<String, AtomicInteger>()
+        private val mountScan = ConcurrentHashMap<String, Timer>()
+        private val mountScanInFlight = ConcurrentHashMap<String, AtomicInteger>()
+
+        fun mountScan(catalog: String): Timer =
+            mountScan.computeIfAbsent(catalog) { name ->
+                Timer.builder("hoglake_mount_scans")
+                    .description("Per-mount scoped scan latency, grant of the shared cap to the served plan")
+                    .tag("catalog", name)
+                    .publishPercentileHistogram()
+                    // A whale org's cold scan is minutes, which the default 30 s ceiling would fold into +Inf.
+                    .maximumExpectedValue(Duration.ofMinutes(10))
+                    .register(registry)
+            }
+
+        private val mountProxy = ConcurrentHashMap<String, Timer>()
+
+        fun mountProxy(catalog: String): Timer =
+            mountProxy.computeIfAbsent(catalog) { name ->
+                Timer.builder("hoglake_mount_proxy_requests")
+                    .description("Per-mount proxied request latency on a mount Client, send to the Host's last byte")
+                    .tag("catalog", name)
+                    .publishPercentileHistogram()
+                    // The Host's scan deadline is a minute; the default 30 s ceiling would fold it into +Inf.
+                    .maximumExpectedValue(Duration.ofMinutes(10))
+                    .register(registry)
+            }
+
+        fun mountScanInFlight(catalog: String): AtomicInteger =
+            mountScanInFlight.computeIfAbsent(catalog) { name ->
+                AtomicInteger().also { n ->
+                    Gauge.builder("hoglake_mount_scans_in_flight", n) { it.get().toDouble() }
+                        .description("Scoped scans of this mount in flight on this process right now")
+                        .tag("catalog", name)
+                        .strongReference(true)
+                        .register(registry)
+                }
+            }
 
         fun commitLockHold(
             catalog: String,
@@ -405,6 +442,28 @@ object Metrics {
     fun hydratorTransientError() = increment("hoglake_hydrator_transient_errors_total", 1.0)
 
     /**
+     * hoglake_mount_integrity_errors_total — mount reads refused because
+     * the mount's table cannot be scoped reliably (`ReadScope`: the
+     * table's object-prefix field at the read snapshot is not the mount's,
+     * a spec row has no readable fields (none, or key indexes other than
+     * 0..n-1), no spec has the identity field, or a mount value is not a
+     * canonical decimal). Each is a misbound mount or corruption, never
+     * load.
+     */
+    fun mountIntegrityError() = increment("hoglake_mount_integrity_errors_total", 1.0)
+
+    /**
+     * hoglake_served_stream_unscopable_tables_total{family} — published
+     * stream tables left out of a served `team_<id>`'s table listing
+     * (docs/auth-tenancy.md §6.5d) because their layout and specs disagree,
+     * one count per table per listing. Each is also on [mountIntegrityError].
+     * `family` is the served family's label (`team_*`): never a team id, an
+     * org or a table name.
+     */
+    fun servedStreamUnscopable(family: String) =
+        increment("hoglake_served_stream_unscopable_tables_total", 1.0, "family", family)
+
+    /**
      * hoglake_hydrator_claim_timeouts_total{catalog} — sweeps in which
      * this catalog's claim exceeded the hydrator's claim timeout and
      * was skipped (#269: the catalog lost its share of that sweep; no
@@ -561,6 +620,12 @@ object Metrics {
      * object-prefix layout refused in metadata because their prefix
      * cannot be named (CompactionResult.objectPrefixUnresolvable): a
      * broken invariant that re-refuses every sweep, so it needs a line.
+     *
+     * `layout_probe_only` counts variant-table groups whose layout probe
+     * read every footer and found nothing worth a rewrite
+     * (CompactionResult.layoutProbeOnly): charged IO with no output, and
+     * self-healing (the compactor remembers the layouts), so a steady
+     * rate means the memory is being lost — restarts, or its capacity.
      */
     fun compactionSkipped(
         catalog: String,
@@ -581,27 +646,88 @@ object Metrics {
 
     /**
      * hoglake_compaction_variant_layout_mismatch_total{catalog, reason} —
-     * groups refused because a VARIANT column's storage in an input is
-     * not the layout compaction copies it as (`reason="layout"`), or the
-     * input was written by DuckDB (`reason="duckdb"`, whatever its
-     * layout); see VariantLayoutMismatchException.
+     * what the variant-layout probe of a planned group found that the
+     * planner's metadata could not show (`compaction/VariantLayoutGroups.kt`):
+     *
+     *  - `split`: one per group whose inputs held MORE THAN ONE variant
+     *    layout, so it was rewritten per layout rather than as planned.
+     *    Expected for a while after `set_variant_shredding`; a steady rate
+     *    long after means a writer not honouring the declaration.
+     *  - `duckdb`: one per DuckDB-written input excluded from its group's
+     *    rewrites (Trino reads its top-level Variant nulls as SQL NULL by
+     *    `created_by`, which an output does not keep). The rest of the
+     *    group compacts; the file itself never does while the flag is on.
+     *  - `layout`: one per group REFUSED (`unconvertible_schema`) because
+     *    a variant column's input field is no VARIANT group at all — a
+     *    leaf, a REPEATED group, a group without the annotation — or, as
+     *    a backstop, because a rewrite met an input in another layout
+     *    after all (VariantLayoutMismatchException). The warning logged
+     *    with it names the table, column and input file.
      *
      * Its own series rather than a reason of
-     * `hoglake_compaction_skipped_total`, because those groups are already
-     * in that one's `unconvertible_schema`, and a second reason for them
-     * would count each twice in its sum. The compaction warning logged
-     * with each one names the table, column and input file. A `layout`
-     * refusal of a file pyhoglake's Table.append or prepare_append_tables
-     * or the Trino connector wrote means the server's layout port has
-     * drifted from theirs: turn HOGLAKE_COMPACTION_VARIANT off. One of a
-     * file registered from another writer (prepare_append_files) is just
-     * another layout.
+     * `hoglake_compaction_skipped_total`, because a `layout` group is
+     * already in that one's `unconvertible_schema`, and `split` and
+     * `duckdb` refuse no group. The outputs each split produced are
+     * [compactionVariantLayoutOutputs]; the files it left behind,
+     * [compactionVariantLayoutFilesLeft].
      */
     fun compactionVariantLayoutMismatch(
         catalog: String,
         reason: String,
+        count: Long = 1,
     ) {
-        increment("hoglake_compaction_variant_layout_mismatch_total", 1.0, "catalog", catalog, "reason", reason)
+        if (count > 0) {
+            increment(
+                "hoglake_compaction_variant_layout_mismatch_total",
+                count.toDouble(),
+                "catalog",
+                catalog,
+                "reason",
+                reason,
+            )
+        }
+    }
+
+    /**
+     * hoglake_compaction_variant_layout_outputs_total{catalog, layout} —
+     * compaction outputs of a VARIANT table (retirements included), by
+     * whether they were written in the DECLARED layout of every variant
+     * column (`layout="declared"`) or in a layout the inputs shared that
+     * the declaration does not name (`layout="other"`). The convergence
+     * signal after `set_variant_shredding`: `other` is the old layout's
+     * files being consolidated among themselves, and it falls to zero as
+     * they age out; `declared` is the steady state.
+     */
+    fun compactionVariantLayoutOutputs(
+        catalog: String,
+        layout: String,
+    ) {
+        increment("hoglake_compaction_variant_layout_outputs_total", 1.0, "catalog", catalog, "layout", layout)
+    }
+
+    /**
+     * hoglake_compaction_variant_layout_files_left_total{catalog} — inputs
+     * of a probed group left uncompacted because too few of its files
+     * shared their variant layout to be worth a rewrite
+     * (CompactionGrouping's minimum). Each file counts once per time the
+     * compactor LEARNS it is set aside (VariantLayoutMemory.Known.setAside):
+     * it remembers the file's layout and does not plan it again until
+     * enough files of that layout are known, and a file probed again — a
+     * remainder as the company of a loan (VariantLayoutGroups.borrow) that
+     * proved to be another layout, a declared file beside arrivals that
+     * did — and left again is not counted again. So this is files set
+     * aside, not sweeps spent and not loans missed — but not distinct files
+     * either: one probed again after a restart or an eviction is learned,
+     * and counted, anew. They are debt the maintenance summary still
+     * reports.
+     */
+    fun compactionVariantLayoutFilesLeft(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_compaction_variant_layout_files_left_total", count.toDouble(), "catalog", catalog)
+        }
     }
 
     /**
@@ -793,7 +919,9 @@ object Metrics {
      *
      * Outcomes: `ok` (authorized), `missing` (no token presented),
      * `invalid` (a token that did not verify), `forbidden` (verified, but
-     * short of a scope or not entitled), `unmapped` (no rule for the path).
+     * short of a scope; answered 403), `not_entitled` (answered 404),
+     * `unmapped` (no rule for the path), `other` (any other refusal, such
+     * as a mount placed on hoglite).
      *
      * `client` is a closed class read from `User-Agent` (see
      * `auth.clientClass`): the enforce flip is gated on zero refusals per
@@ -829,6 +957,89 @@ object Metrics {
         scope: String,
         reason: String,
     ) = increment("hoglake_auth_denials_total", 1.0, "catalog", catalog, "scope", scope, "reason", reason)
+
+    /**
+     * hoglake_auth_session_profile_total{outcome}: tokens carrying the session
+     * profile (auth/SessionProfile.kt), by what became of them — `accepted`,
+     * `refused_disabled` (the profile is off here: a rollout gap, not a bad
+     * issuer) or `refused_invalid`. A closed set; nothing from the token is a
+     * label.
+     */
+    fun authSessionProfile(outcome: String) = increment("hoglake_auth_session_profile_total", 1.0, "outcome", outcome)
+
+    /**
+     * hoglake_mount_refusals_total{catalog,reason}: requests refused on a
+     * mount (store/Mounts.kt), by the error code they were answered with.
+     * `catalog` is only a name the registry holds (`<orgID>-events`) or, on a
+     * mount Client, one a verified token's `cat` names, so a client cannot
+     * add series. A mount's team ids are its read scope and are never labels.
+     * For a remote schema `catalog` holds the schema's configured name, or
+     * the family's label (`team_*`) for a family entry, never the catalog,
+     * org or team id of the request.
+     */
+    fun mountRefused(
+        catalog: String,
+        reason: String,
+    ) = increment("hoglake_mount_refusals_total", 1.0, "catalog", catalog, "reason", reason)
+
+    /**
+     * hoglake_mount_scans_total{catalog} and the hoglake_mount_scans_seconds
+     * histogram (plan row 1.3h): one count and one timing per scoped scan
+     * the mount SERVED, recorded after the plan is in hand (a refused scan
+     * is on [mountRefused] instead). [nanos] is measured from the grant of
+     * the shared concurrency cap, so it includes the SQL but not the wait
+     * for the cap. `catalog` is the mount name, an opaque id.
+     */
+    fun mountScanServed(
+        catalog: String,
+        nanos: Long,
+    ) {
+        increment("hoglake_mount_scans_total", 1.0, "catalog", catalog)
+        timers?.mountScan(catalog)?.record(nanos, TimeUnit.NANOSECONDS)
+    }
+
+    /**
+     * `hoglake_mount_scans_in_flight{catalog}` gauge (plan row 1.3h): the
+     * counter behind it, or null with no registry bound. The CALLER
+     * increments on grant and decrements in a `finally`, holding the one
+     * instance across both so a registry rebound between them cannot
+     * decrement a fresh counter below zero (as [commitLockWaiting] does).
+     */
+    fun mountScanInFlight(catalog: String): AtomicInteger? = timers?.mountScanInFlight(catalog)
+
+    /**
+     * hoglake_mount_proxy_requests_total{catalog} and the
+     * hoglake_mount_proxy_requests_seconds histogram (plan row 1.3c): one
+     * count and one timing per request a mount Client sent to a host,
+     * whatever came back. A listing is one request to the host and is
+     * counted against each mount name it asked about. [nanos] runs from
+     * the send to the last byte of the answer (or the failure). `catalog`
+     * is written only for a request
+     * that passed the Client's own reader check, so it is a name from a
+     * verified token's `cat`, never raw request input. For a remote schema
+     * it is the schema's configured name, one series per schema whatever
+     * the number of catalogs that read it.
+     */
+    fun mountProxied(
+        catalog: String,
+        nanos: Long,
+    ) {
+        increment("hoglake_mount_proxy_requests_total", 1.0, "catalog", catalog)
+        timers?.mountProxy(catalog)?.record(nanos, TimeUnit.NANOSECONDS)
+    }
+
+    /**
+     * hoglake_mount_proxy_upstream_errors_total{catalog,reason}: proxied
+     * requests the Host did not serve. `reason` is closed: `unavailable`
+     * (no connection, or it broke), `timeout`, `invalid_response`,
+     * `response_too_large`, or `http_<status>` for a typed refusal the
+     * Client relayed (statuses from a fixed list). `http_401` on a token the
+     * Client had just verified is the Host failing to verify it.
+     */
+    fun mountProxyUpstreamError(
+        catalog: String,
+        reason: String,
+    ) = increment("hoglake_mount_proxy_upstream_errors_total", 1.0, "catalog", catalog, "reason", reason)
 
     /**
      * hoglake_auth_signing_keys — keys the token verifier holds right now.
@@ -966,6 +1177,11 @@ object Metrics {
     /** The commit counter's result tag for a failed commit. */
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {
+            is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
+            is HoglakeException.BackendUnavailable -> "backend_unavailable"
+            is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"
+            is HoglakeException.BackendQueryTimeout -> "backend_query_timeout"
+            is HoglakeException.NotSupported -> "not_supported_on_backend"
             // Counted, and counted as a conflict: it is a 409, and
             // before it was typed it was counted as "validation".
             // Left in the `else` it would stop being counted at all.
@@ -985,6 +1201,7 @@ object Metrics {
             // would be indistinguishable from having no arm at all.
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
             // Distinct, so "which writers still miss the object-prefix

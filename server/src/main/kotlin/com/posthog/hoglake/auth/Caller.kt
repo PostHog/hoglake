@@ -1,5 +1,8 @@
 package com.posthog.hoglake.auth
 
+import com.posthog.hoglake.store.BackendKind
+import java.util.UUID
+
 /**
  * The authenticated caller for one request, resolved from a verified token.
  *
@@ -18,7 +21,7 @@ package com.posthog.hoglake.auth
 data class Caller(
     /** `sub`: the client id (`client:…`) or service-account subject (`sa:…`). */
     val subject: String,
-    /** The org this caller acts for; null for [Kind.OPERATOR]. */
+    /** The org this caller acts for. Legacy operator tokens have none. */
     val orgId: String?,
     val kind: Kind,
     /** Catalog name -> the scopes held on it. Empty for [Kind.OPERATOR]. */
@@ -41,6 +44,27 @@ data class Caller(
     val predicates: Map<String, PredicateGrant> = emptyMap(),
     /** `usr`: an opaque end-user name for the audit log. Grants nothing. */
     val user: String? = null,
+    /** Verified placement for one catalog. Endpoints come only from server configuration. */
+    val routing: Routing? = null,
+    /**
+     * The token carried an `rtg` this instance does not know and ignored it
+     * (a Host serving namespaces, [Routing]). Such a caller may read a
+     * served namespace and nothing else: it has no placement, so it must
+     * never fall through to this instance's default backend.
+     */
+    val routingIgnored: Boolean = false,
+    /**
+     * `remote_schemas`, on a token carrying the session profile: the read-only
+     * remote schemas of the primary catalog this caller may use. Empty on every
+     * other token. The profile's credentials are never carried here.
+     */
+    val remoteSchemas: Set<String> = emptySet(),
+    /**
+     * The `remote_schemas` family entries of the same token (only `team`
+     * exists): each stands for every schema of that family the caller's
+     * `prd` holds, with `read`. Empty on every other token.
+     */
+    val remoteSchemaFamilies: Set<String> = emptySet(),
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */
@@ -96,18 +120,43 @@ data class Caller(
      * May this SCOPED caller use, with [scope], a namespace in [catalog]
      * contained for `field = value`? Its permission on the value is the lower
      * of the predicate's and the catalog's (`cat`), so both must satisfy
-     * [scope]. False for every other kind: a tenant's authority is [holds],
+     * [scope]. A namespace whose mark names an [org] is usable only by a
+     * token carrying that same org. False for every other kind: a tenant's authority is [holds],
      * and nothing here may widen it.
      */
     fun mayUseContained(
         catalog: String,
         field: String,
         value: Long,
+        org: String?,
         scope: Scope,
     ): Boolean {
         if (kind != Kind.SCOPED) return false
+        // A team belongs to one org: a mark naming another org than the
+        // token's is a namespace this caller does not have.
+        if (org != null && org != orgId) return false
         val held = catalogScopes[catalog] ?: return false
         if (held.none { it.satisfies(scope) }) return false
+        val perm =
+            when (val grant = predicates[field] ?: return false) {
+                is PredicateGrant.All -> grant.scope
+                is PredicateGrant.Values -> grant.values[value] ?: return false
+            }
+        return perm.satisfies(scope)
+    }
+
+    /**
+     * Does this caller's `prd` give it [scope] on `field = value`? The
+     * predicate alone: no catalog is named, so `cat` is not consulted. Only a
+     * caller whose reach has been bound to the object by some other check may
+     * rely on it, because `*` ([PredicateGrant.All]) holds for every value.
+     */
+    internal fun holdsPredicate(
+        field: String,
+        value: Long,
+        scope: Scope,
+    ): Boolean {
+        if (kind != Kind.SCOPED) return false
         val perm =
             when (val grant = predicates[field] ?: return false) {
                 is PredicateGrant.All -> grant.scope
@@ -212,3 +261,11 @@ sealed interface AuthDecision {
         val required: Scope,
     ) : AuthDecision
 }
+
+/** A placement verified against the server's backend allowlist. */
+data class Routing(
+    val catalog: String,
+    val backend: BackendKind,
+    val backendId: UUID,
+    val tenant: String?,
+)

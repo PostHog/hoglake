@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.4.9-dev
+  version: 1.4.13-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
@@ -14,14 +14,76 @@ info:
 
     Every operation except the four marked `security: []` below
     (`/livez`, `/healthz`, `/metrics`, `/info`) requires
-    `Authorization: Bearer <jwt>`; `/metrics` requires an OPERATOR
-    credential rather than none. The token is an ES256 compact JWS
-    issued by this instance, carrying the
+    `Authorization: Bearer <jwt>` when `HOGLAKE_AUTH_MODE` is `warn` or
+    `enforce`; `/metrics` requires an OPERATOR credential rather than
+    none. The token is an ES256 or RS256 compact JWS issued by the issuer
+    this server is configured to trust (`HOGLAKE_AUTH_ISSUER`, verified
+    against its JWKS; this server issues nothing itself), carrying the
     caller's kind (`ten`), org (`org`), and — for a tenant — a `cat`
-    map from catalog name to the scopes held on it. Scopes are
+    map from catalog name to the scopes held on it. The contract is
+    docs/auth.md. Scopes are
     PER-CATALOG, not global: `read`, `write`, `maintenance`, `admin`,
     nested so that `admin` implies all of them and `maintenance`
-    implies `write`.
+    implies `write`. The same grants may instead be carried in the
+    standard OAuth `scope` claim as space-separated
+    `hoglake:<catalog>:<scope>` values; a token carrying both must
+    have them agree.
+
+    Optional `rtg` selects a configured backend for the single `cat` catalog.
+    Hoglite uses exactly `b`, `be`, and `t`; PostgreSQL uses `b` and `be`.
+    Backend ids are canonical lowercase UUIDs. Unknown ids or kind mismatches
+    return 401 `unknown_backend`. Claims carry no endpoints or secrets.
+    Invalid shapes, unknown routing keys, and multiple catalogs return 401
+    `invalid_token`. Hoglite listings include only the routed catalog.
+
+    Hoglite supports catalog options, manual expiry, manual cleanup, and manual requeue.
+    Retirement runs before expiry; there is no public retirement trigger.
+    Other maintenance operations and publications return 501 `not_supported_on_backend`.
+    Engine result limits return 422 `backend_result_too_large`; query deadlines
+    return 422 `backend_query_timeout`. Narrow the query before retrying.
+    These deterministic refusals do not carry Retry-After.
+
+    A mount (`<orgID>-events`) is read-only and serves only a scoped caller
+    whose `cat` names it. That caller gets the mount from
+    GET /v1/catalogs/{catalog} and in GET /v1/catalogs (`read_only: true`),
+    and reads its one pinned source table through five scoped routes:
+    namespaces, namespace, tables, table and scan. Every file the scan plans
+    is scoped to the caller's `prd.team_id` intersected with the export's
+    values, and each carries its `team_id`. The table's totals are omitted
+    and the tables listing's totals are over that scope, never the whole
+    source. A scan may be refused with 422 `mount_scan_too_many_files` (the
+    scoped plan is over the file budget), 503 `mount_scan_timeout` (it ran
+    past the deadline) or 503 `mount_scan_busy` (the one shared export-scan
+    cap is full); the two 503s carry Retry-After. On the other routes open to
+    scoped callers within its `cat` scope, 403 `read_only_catalog` for a
+    write and 501 `mount_operation_unavailable` for a read a mount does not
+    serve (files, partitions, changes, stats). When its `rtg` places the
+    mount on hoglite, each of those routes answers it 501
+    `not_supported_on_backend` instead, and its listing leaves the mount out.
+    Other routes refuse it as any scoped caller (403 `forbidden`). Other
+    callers are answered as for any catalog: where they would reach it, 404;
+    no listing shows them a mount.
+
+    A server may instead be a mount Client (HOGLAKE_MOUNT_HOSTS_FILE): each
+    configured host serves the mount names its entry matches, and this
+    server forwards that mount's reader to it. The reader is checked here
+    first, exactly as above, so a caller the mount would not serve, a write
+    and an unserved read are refused here with the same statuses and codes
+    and nothing is sent. For the reader, the catalog route and the five read
+    routes are sent to the host with the caller's own bearer token and
+    X-Request-Id, and the host's answer comes back unchanged: the same
+    bodies, `data_path` and per-file `team_id`, and the host's own refusals
+    with their status, `error`, `detail` and Retry-After (a 401 keeps its
+    `WWW-Authenticate` challenge). GET /v1/catalogs asks each host once and
+    lists the mounts it returns for the names in the caller's `cat`. The
+    Client adds three answers of its own: 503 `mount_host_unavailable` (the
+    host could not be reached, or did not answer inside the deadline) and
+    503 `mount_proxy_busy` (the cap on proxied requests in flight is full),
+    both with Retry-After, and 502 `mount_host_invalid_response` (the host
+    answered with something that is not this contract). A namespace or
+    table name outside the identifier grammar is 404 here. A large answer is
+    streamed; if it fails part-way, or passes the size cap, the connection
+    is closed instead of the body being finished.
 
     Two refusals are worth distinguishing, because they mean different
     things to a client:
@@ -39,8 +101,8 @@ info:
       that does not exist.
 
     Instance-wide operational surfaces (`/metrics`, `/v1/database/health`,
-    `/v1/debug/*`, `/v1/maintenance/{status,runs}`, `POST /v1/catalogs`)
-    are OPERATOR-only: they report across tenants and cannot be
+    `/v1/debug/*`, `/v1/maintenance/{status,runs}`, `POST /v1/catalogs`,
+    `/v1/mounts*`) are OPERATOR-only: they report across tenants and cannot be
     meaningfully scoped. The per-catalog twins of the maintenance feeds
     are the tenant-facing ones.
 
@@ -61,6 +123,31 @@ paths:
   # an unready pod leaves the Service). The webui serves its own static
   # /health for its probes and proxies /healthz, /metrics and
   # /openapi.yaml through to the server.
+  /.well-known/jwks.json:
+    servers: [{ url: / }]
+    security: []
+    get:
+      operationId: localJwks
+      summary: >
+        The local issuer's public key (HOGLAKE_AUTH_MODE=local), as a JWKS
+        document — what a backend or a sibling that verifies the same tokens
+        fetches, the way it would fetch any issuer's. 404 in every other mode:
+        the server publishes no key it does not own. See docs/auth.md,
+        "Local issuer".
+      responses:
+        "200":
+          description: The one signing key, public half.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        "404":
+          description: Not the local issuer (`HOGLAKE_AUTH_MODE` is not `local`).
   /livez:
     servers: [{ url: / }]
     security: []
@@ -85,7 +172,7 @@ paths:
         Readiness — the catalog database must answer (SELECT 1 on the
         probe's own dedicated connection, not through the request pool,
         bounded by HOGLAKE_HEALTH_PROBE_TIMEOUT_MS). A busy request
-        pool reads 200; only a database that does not answer reads 503.
+        pool reads 200. Every configured hoglite backend must also answer.
         Use as the Kubernetes readiness probe.
       responses:
         "200":
@@ -108,6 +195,17 @@ paths:
     get:
       operationId: listCatalogs
       summary: List catalogs
+      description: >
+        Sampler totals describe PostgreSQL catalogs only. Hoglite-routed catalogs
+        omit table_count, live_rows, live_size_bytes, and oldest_snapshot_time.
+        A scoped caller's mounts (the names in its `cat` it may read as
+        mounts) follow the catalogs, with `read_only: true`; while the
+        instance's mount source is unset or missing, that caller's listing
+        answers 500. A catalog whose name a mount takes is not listed, as
+        every route answers for the mount instead. On a mount Client the
+        mounts are the entries its hosts list for those names, as the hosts
+        wrote them; while a host is unreachable, that caller's listing
+        answers 503 `mount_host_unavailable`.
       responses:
         "200":
           description: Catalogs
@@ -116,6 +214,9 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Catalog" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     post:
       operationId: createCatalog
       summary: Create a catalog
@@ -132,15 +233,23 @@ paths:
               schema: { $ref: "#/components/schemas/Catalog" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
-          description: Validation failure (bad name, blank data_path)
+          description: >-
+            Validation failure (bad name, blank data_path, or a name reserved
+            for mounts: a canonical lowercase UUID followed by `-events`)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}:
     get:
       operationId: getCatalog
       summary: Catalog info (head snapshot, schema version, data path)
+      description: >
+        On a mount, served only to a scoped caller whose `cat` names it: the
+        source catalog's data_path, head_snapshot_id, schema_version and
+        earliest_snapshot_time under the mount's name, `read_only: true` and
+        no capabilities.
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
       responses:
         "200":
@@ -149,6 +258,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropCatalog
       summary: Drop an empty catalog (metadata only; the data path is not touched)
@@ -205,6 +317,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/storage-usage:
     get:
@@ -251,6 +364,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces:
     get:
@@ -259,7 +373,11 @@ paths:
         The namespaces live at head, or at `snapshot`/`at_timestamp`.
         A pinned listing includes a namespace dropped after the pin and
         excludes one created after it, so it agrees with the pinned
-        table reads.
+        table reads. On a server that configures remote schemas, each
+        one the caller's token may read follows the catalog's own
+        namespaces as `{name, remote: true}`, whatever the pin, and a
+        namespace of the catalog that has a remote schema's name is
+        left out.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/snapshot" }
@@ -275,6 +393,8 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
     post:
       operationId: createNamespace
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
@@ -291,18 +411,45 @@ paths:
                 name:
                   type: string
                   pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+                containment:
+                  description: >
+                    Operator only. Creates the namespace already marked, as
+                    `PUT .../containment` marks one, in one transaction with
+                    the same checks: it is never visible unmarked, and a
+                    refused mark creates nothing. Another caller gets 403.
+                    Postgres catalogs only (422 elsewhere).
+                  allOf:
+                    - { $ref: "#/components/schemas/NamespaceContainment" }
       responses:
         "201":
-          description: Created
+          description: Created, with its `containment` when one was given.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "422":
-          description: Name fails the identifier pattern.
+        "403":
+          description: >-
+            A non-operator creating a `containment` mark, or a namespace named
+            `team_<digits>` (any case, any leading zeros) in a catalog listed in
+            `HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS`. Error `forbidden`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: >-
+            Name fails the identifier pattern, or is reserved on this server
+            (`HOGLAKE_RESERVED_NAMESPACES`, matched ignoring ASCII case),
+            error `validation`. A reserved name is refused for every caller
+            and every backend, before any write (a mount catalog answers its
+            own 403 `read_only_catalog` first); a namespace created before
+            its name was reserved keeps working but cannot be created again
+            once dropped. A `containment` with an invalid field, value or org is
+            `validation` too, and creates nothing; one whose prefix already
+            holds another table's files is a 409.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}:
     get:
@@ -317,6 +464,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropNamespace
       summary: Drop a namespace (DDL commit; produces a snapshot)
@@ -343,6 +493,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/containment:
     put:
@@ -359,6 +510,20 @@ paths:
         spelling that decodes to it (409 otherwise). At most one live namespace per (field, value) (409).
         Marking the same containment again is a no-op; to change it, clear
         it first. A contained namespace can be dropped only by an operator.
+
+        An optional `org` is the org mark (capability
+        `org-marked-containment-v1`, Postgres catalogs only; 422 elsewhere).
+        It moves the namespace's prefix to
+        `<data_path>/org_id=<org>/<field>=<value>/`, the prefix a table
+        creation's `write_path`, a scoped upload claim and a compaction
+        output are held to, and no other table registers files under it,
+        compared raw and percent-decoded per segment. Marking scans for
+        foreign files under that prefix. The org must be a canonical lowercase
+        UUID. An org-marked namespace can be re-marked or cleared only while
+        it has never held a table or view (at any snapshot) and no file is
+        registered under its prefix; otherwise 409. A scoped token may use an
+        org-marked namespace only when its `org` claim equals the mark; any
+        other org gets the answer a missing namespace gets.
         The prefix check reads the catalog's file rows under a time bound;
         503 `containment_unverified` when it cannot finish, and the
         namespace is left unmarked.
@@ -387,7 +552,11 @@ paths:
     delete:
       operationId: clearNamespaceContainment
       summary: Clear a namespace's containment (operator only)
-      description: Requires the namespace to hold no live table or view (409 otherwise). Clearing an uncontained namespace is a no-op.
+      description: >
+        Requires the namespace to hold no live table or view (409 otherwise).
+        Clearing an uncontained namespace is a no-op. A namespace with an org
+        mark is cleared only while it has never held a table or view (409
+        otherwise).
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -399,6 +568,8 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables:
     get:
@@ -440,6 +611,8 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
     post:
       operationId: createTable
       summary: Create a table (DDL commit; produces a snapshot)
@@ -464,6 +637,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
     get:
@@ -511,6 +685,9 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropTable
       summary: Drop a table (DDL commit; produces a snapshot)
@@ -546,6 +723,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/truncate:
     post:
@@ -598,6 +776,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
     post:
@@ -684,10 +863,15 @@ paths:
             different field than the one already set; and, while the
             option is on, a set_partition_spec without exactly one
             identity field on it, a drop_column or rename_column of it,
-            and a rename_table.
+            and a rename_table. And the set_variant_shredding refusals:
+            a column of another type, a variant nested in a struct, list
+            or map, or a declaration that breaks the grammar of
+            ColumnDef.type_params — the same messages a create_table or
+            add_column with that declaration meets.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
     get:
@@ -813,6 +997,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
     get:
@@ -887,6 +1072,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions:
     get:
@@ -975,6 +1161,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup:
     post:
@@ -1108,6 +1295,8 @@ paths:
               schema: { $ref: "#/components/schemas/PartitionValues" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files/{fileId}/stats:
     get:
@@ -1149,6 +1338,8 @@ paths:
               schema: { $ref: "#/components/schemas/FileStats" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
     get:
@@ -1195,6 +1386,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/options:
     get:
@@ -1207,6 +1400,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CatalogOptions" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+
     patch:
       operationId: patchCatalogOptions
       summary: >
@@ -1244,14 +1439,18 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/expire:
     post:
       operationId: runExpiry
       summary: >
-        Run one incremental expiry sweep now (the background loop calls
-        the same path). Bounded per run; never expires head; respects
-        the consumer floor when enabled.
+        Run one incremental expiry sweep now. PostgreSQL background
+        sweeps use the same operation. Hoglite supports manual sweeps
+        through token placement, without a background loop.
+        Each sweep is bounded, preserves head, and respects the enabled
+        consumer floor. Ended file rows enter the removal ledger;
+        expiry does not delete their objects.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -1262,6 +1461,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ExpiryResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/compact:
     post:
@@ -1299,6 +1499,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CompactionResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/rehydrate:
     post:
@@ -1312,6 +1513,12 @@ paths:
         supplying BOTH namespace and table (supplying only one is a
         422). Transient object-store failures never need this: they
         leave files 'pending' and retry on their own.
+      description: >
+        PostgreSQL and hoglite support this manual requeue operation.
+        The operation changes metadata only. It does not read object data.
+        The hoglite backend does not start a hydration sweep.
+        One transaction updates all matching failed live files.
+        The operation excludes ended files and dropped tables.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: namespace
@@ -1336,6 +1543,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/cleanup:
     post:
@@ -1357,6 +1565,8 @@ paths:
         HOGLAKE_CLEANUP_WORKERS when this pod's cleanup loop is disabled,
         so a hand-triggered drain cannot take more of the connection pool
         than the pod's configuration reserved for it.
+        Hoglite runs one bounded drain for the routed catalog. It uses the server's
+        object-store configuration, with one worker and no background sweep.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -1367,6 +1577,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /database/health:
     get:
@@ -1460,6 +1671,72 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /mounts:
+    get:
+      operationId: listMounts
+      summary: Every mount, enabled or not, by name (operator only)
+      description: >
+        A mount is a read-only catalog name `<orgID>-events` over this
+        instance's events table. Its values are the identity-partition
+        values it admits (team ids). Mounts are never deleted.
+      responses:
+        "200":
+          description: The mounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Mount" }
+
+  /mounts/{mount}:
+    parameters:
+      - name: mount
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-events$' }
+    get:
+      operationId: getMount
+      summary: One mount (operator only)
+      description: A mount never written answers 200 with revision 0, enabled false and no values.
+      responses:
+        "200":
+          description: The mount
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Mount" }
+        "422": { $ref: "#/components/responses/Validation" }
+    put:
+      operationId: putMount
+      summary: Replace a mount, at the revision the writer read (mount writer only)
+      description: >
+        Only the operator token whose `sub` is the server's
+        HOGLAKE_MOUNT_WRITER_SUBJECT may write, and only verified, so under
+        auth mode off nobody may. Every other caller is refused: 401 without
+        a verified token under enforce, 403 otherwise. The write succeeds only while the mount is
+        at `revision` (0: never written) and moves it to `revision + 1`;
+        otherwise 409 `mount_revision_conflict`, the only 409 here: read
+        the mount again. Null `values` is empty. 422 for a missing
+        `revision`, `enabled` or `value`; a name that is not a mount name,
+        or that any catalog holds; more than 10,000 values, a negative or
+        repeated value, or a non-null `retention_months`. A mount serves only while
+        enabled, its org is in HOGLAKE_MOUNT_ALLOWLIST and the instance's
+        mount switch is on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PutMountRequest" }
+      responses:
+        "200":
+          description: The mount, at revision + 1
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Mount" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+
   /catalogs/{catalog}/maintenance/status:
     get:
       operationId: getMaintenanceStatus
@@ -1497,6 +1774,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/MaintenanceStatus" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/runs:
     get:
@@ -1541,6 +1819,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/stats/partitions:
     get:
@@ -1601,6 +1880,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views:
     get:
@@ -1616,6 +1896,9 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/View" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     post:
       operationId: createView
       summary: Create a view (DDL commit; view SQL is stored verbatim with its dialect)
@@ -1644,6 +1927,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/View" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views/{view}:
     get:
@@ -1662,6 +1947,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/View" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropView
       parameters:
@@ -1681,6 +1969,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/snapshots/resolve:
     get:
@@ -1713,6 +2002,8 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/snapshots:
     get:
@@ -1747,6 +2038,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/table-creations/{operation}:
     put:
@@ -2194,9 +2486,17 @@ paths:
                   operation_id: { type: string, format: uuid }
                   snapshot_id: { type: integer, format: int64 }
                   schema_version: { type: integer, format: int64 }
+                  ended_files:
+                    type: integer
+                    format: int64
+                    description: >
+                      Only for a receipt of POST /commit/replacements/prepared
+                      written since it was stored: the data files it ended.
         "400":
           description: Invalid operation UUID
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/commit/prepared:
     post:
@@ -2335,6 +2635,7 @@ paths:
                   expires_at: { type: string, format: date-time }
         "409": { description: Upload identity reused with different intent }
         "422": { description: Invalid prefix or file kind }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/uploads/renew:
     post:
@@ -2360,6 +2661,8 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { renewed: { type: integer } } }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/uploads/abandon:
     post:
@@ -2383,6 +2686,8 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { abandoned: { type: integer } } }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/uploads/schedule-expired:
     post:
@@ -2416,6 +2721,7 @@ paths:
             application/json:
               schema: { type: object, properties: { scheduled: { type: integer } } }
         "422": { description: Limit outside allowed range }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/commit/uploads:
     post:
@@ -2851,6 +3157,154 @@ paths:
         "503":
           description: Commit admission timed out; retry the identical request
 
+  /catalogs/{catalog}/commit/replacements/prepared:
+    post:
+      operationId: commitPreparedReplacement
+      summary: Atomically end whole live data files of a table and append their replacements in one snapshot
+      description: >
+        Requires atomic-partition-replacement-v1, which a server that lacks
+        answers with 404 for this path. A dedicated endpoint, so an older
+        server never ignores `file_ends` and publishes only the appends.
+
+
+        Ends the live data files of a table, each with its live deletion
+        vector, and applies `appends` in the same snapshot: a reader at an
+        earlier snapshot sees the old files, a reader at this one sees only
+        the new ones, and none sees a day missing or doubled. Nothing is
+        deleted at commit; ended files follow the ordinary retention,
+        expiry and cleanup.
+
+
+        Requires idempotency_key, read_snapshot, author, message and
+        `file_ends`; refused with 400 when `deletes` or
+        `require_unchanged_tables: true` is present. `appends` may be empty,
+        which only ends files. Each `file_ends` entry names a table with its
+        `expected_table_uuid` and exactly one of `partitions` (non-empty
+        tuples, each as long as the live partition spec, in the encoding of
+        `partition_values`: a `year`, `month`, `day`, `hour` or `bucket`
+        value is a base-10 integer string, such as 20401 for a day, and any
+        other encoding is a 422; null is allowed) or `all_files: true`. A
+        tuple that matches no live file ends nothing and is not an error. A table may appear in one
+        entry only. Files appended by this request are never ended by it.
+
+
+        With `all_files`, the table must be unchanged since read_snapshot,
+        including inserts, deletes, ended files, replacements and DDL, or the
+        request is a 409 `commit_conflict`: re-read, replan and send again.
+        With `partitions`, only the target tuples must be unchanged: another
+        commit that began or ended a data file in one of them, or registered a
+        deletion vector against such a file, since read_snapshot is a 409
+        `commit_conflict`, as is any DDL on the table; appends to other
+        partitions do not conflict. Compaction never conflicts; it moves rows
+        between files, and the files ended are those live at commit. A
+        compaction that planned against an ended file skips it. The commit is
+        recorded as `table_deleted_from` (and `table_inserted_into` with
+        appends) on the table, and as `table_replaced` when it ended at least
+        one data file of it, so guarded writers that read before it conflict.
+        A changefeed window that crosses a `table_replaced` is 409
+        `reconciliation_required`, as it is for a truncate, whatever the
+        retention floor.
+
+
+        An appended path the catalog already records as a data file, live or
+        ended, is refused (422): ended files stay readable at earlier
+        snapshots, so their bytes cannot be overwritten.
+
+
+        Replay of the same key and request returns the original snapshot and
+        `ended_files` without writing, and `GET /commit/receipts/{operation}`
+        serves both; a receipt written before `ended_files` was stored omits
+        it. A changed payload under the same key is 422.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot, author, message, file_ends]
+                  properties:
+                    file_ends:
+                      type: array
+                      minItems: 1
+                      items: { $ref: "#/components/schemas/TableFileEnds" }
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "400":
+          description: >
+            The body is malformed, or carries `deletes` or
+            `require_unchanged_tables: true`.
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >
+            Conflict. `commit_conflict` is RETRYABLE: a data change landed on
+            a table named in file_ends since read_snapshot. Refresh
+            read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched table
+            after read_snapshot. Re-prepare against current table info;
+            replaying this payload cannot succeed. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare`.
+
+
+            `table_recreated` is the same family: an expected_table_uuid that
+            is not the live table's. The body names `tables` and
+            `retry: re-prepare`.
+
+
+            `partition_spec_mismatch`: the table still has live files written
+            under a partition spec other than the live one, so partitions
+            cannot address them. Rewrite or compact them, or end the files
+            with `all_files`. Not retryable as sent.
+
+
+            `table_dropped` likewise cannot be retried.
+
+
+            An appended path that is queued for removal is a 409 too: claim a
+            fresh path and retry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: its conflict
+            window is no longer retained. Re-read the table and prepare a new
+            request. Never a replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: >
+            Invalid request: a missing key, read_snapshot, author or message;
+            file_ends that is empty, names a table twice, sets both or neither
+            of partitions and all_files, or has tuples that are empty, of
+            different lengths or not as long as the live spec; tuples for a
+            table that has no partition spec ("has no partition spec: end its
+            files with all_files"); a year, month, day, hour or bucket value
+            that is not a base-10 integer (the message names the table, field
+            and value); an appended path the catalog already records as a data
+            file, live or ended (the message names the path); a key reused
+            with another payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and an appended
+            data file is not under `<field>=<value>/` for its identity
+            partition value; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: Commit admission timed out; retry the identical request
+
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -2983,7 +3437,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Publication" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
     post:
       operationId: createPublication
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
@@ -2998,7 +3452,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Publication" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/publications/{publication}:
     get:
@@ -3015,7 +3469,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Publication" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
     delete:
       operationId: dropPublication
       parameters:
@@ -3026,7 +3480,7 @@ paths:
           schema: { type: string }
       responses:
         "204": { description: Removed (its consumer offset is released) }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   # ---- DR / export (SPECIFIED, NOT YET IMPLEMENTED: returns 501) ----
   # The consistent-export half of the DR story (README "PITR + consistent
@@ -3051,7 +3505,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ExportManifest" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /debug/decode-bound:
     post:
@@ -3210,6 +3664,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ConsumerList" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets:
     get:
@@ -3226,6 +3682,8 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
     get:
@@ -3245,6 +3703,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     put:
       operationId: commitConsumerOffset
       summary: >
@@ -3285,6 +3746,8 @@ paths:
               schema: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
 components:
   securitySchemes:
@@ -3293,11 +3756,13 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: >
-        An ES256 compact JWS issued by this instance. Minimum claim
+        An ES256 or RS256 compact JWS from this instance's configured
+        issuer. Minimum claim
         set: `iss` (this instance), `aud`, `sub` (client id or
         service-account subject), `jti`, `exp`, `iat`, `ten`
         (`tenant` | `operator`), and for a tenant `org` plus a `cat`
-        map from catalog name to the scopes held on it. A token NEVER
+        map from catalog name to the scopes held on it (or the same
+        grants as `hoglake:<catalog>:<scope>` values in `scope`). A token NEVER
         carries an object-store credential: S3 access is vended
         separately as short-lived, prefix-confined STS credentials, so
         a leaked control-plane token cannot be replayed against the
@@ -3374,7 +3839,7 @@ components:
         No credential, or one that does not verify. `error` is a closed
         vocabulary (`invalid_request`, `invalid_token`, `token_expired`,
         `not_yet_valid`, `invalid_signature`, `unknown_signing_key`,
-        `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`),
+        `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`, `unknown_backend`),
         and the same value appears in the `WWW-Authenticate` challenge.
       headers:
         WWW-Authenticate:
@@ -3388,6 +3853,29 @@ components:
         The credential verifies and the catalog is the caller's own, but it
         does not hold the scope this route requires. A catalog the caller is
         NOT entitled to is 404, never 403 — a 403 would confirm it exists.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    NotSupportedOnBackend:
+      description: >
+        This backend does not support the operation (501 not_supported_on_backend).
+        Publications and export may instead return not_implemented on PostgreSQL.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Validation:
+      description: >
+        Semantic validation failed (422 validation). Engine result limits may
+        return backend_result_too_large, and query deadlines may return
+        backend_query_timeout. These deterministic refusals have no Retry-After.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    BackendQueryRefused:
+      description: >
+        The engine refused the query. backend_result_too_large requires a smaller
+        result; backend_query_timeout requires a narrower query. Both return 422
+        without Retry-After. Deterministic SQL and request failures return validation.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
@@ -3425,7 +3913,9 @@ components:
         did not answer, and nothing was applied that the server knows of.
         `commit_outcome_unknown`: a commit that the backend may or may not
         have applied. A retry with the same `idempotency_key` is
-        exactly-once. A retry without a key can apply the commit a second
+        exactly-once. PostgreSQL admission failures may return commit_queue_timeout;
+        containment verification may return containment_unverified. Both are retryable.
+        A retry without a key can apply the commit a second
         time, as after a lost COMMIT acknowledgement on PostgreSQL.
       headers:
         Retry-After:
@@ -3436,6 +3926,32 @@ components:
           schema: { $ref: "#/components/schemas/ApiError" }
 
   schemas:
+    RoutingClaim:
+      description: Verified single-catalog placement in the signed rtg claim. Not a request-body parameter.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [b, be, t]
+          properties:
+            b: { type: string, enum: [hoglite] }
+            be:
+              type: string
+              format: uuid
+              pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            t:
+              type: string
+              minLength: 1
+              maxLength: 128
+              pattern: '^(?!\.)(?!.*\.\.)[A-Za-z0-9._-]+$'
+        - type: object
+          additionalProperties: false
+          required: [b, be]
+          properties:
+            b: { type: string, enum: [postgres] }
+            be:
+              type: string
+              format: uuid
+              pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     OperationAuthor:
       type: [string, "null"]
       description: Caller-supplied author recorded on the snapshot and audit actor; not an authenticated identity.
@@ -3488,6 +4004,41 @@ components:
             precondition of the catalog drop, in resolution order. See
             dropCatalog for what each one asks the caller to do.
 
+    MountValue:
+      type: object
+      required: [value]
+      properties:
+        value: { type: integer, format: int64, minimum: 0 }
+        retention_months:
+          type: integer
+          nullable: true
+          description: No source yet; must be null, and responses omit it.
+
+    Mount:
+      type: object
+      required: [name, revision, enabled, values]
+      properties:
+        name: { type: string }
+        revision: { type: integer, format: int64, description: "One more on every write; 0 = never written." }
+        enabled: { type: boolean }
+        values:
+          type: array
+          description: Ascending and distinct.
+          items: { $ref: "#/components/schemas/MountValue" }
+
+    PutMountRequest:
+      type: object
+      required: [revision, enabled]
+      properties:
+        revision: { type: integer, format: int64, minimum: 0, description: "The revision the writer read." }
+        enabled: { type: boolean }
+        values:
+          type: array
+          nullable: true
+          description: Absent or null is empty.
+          maxItems: 10000
+          items: { $ref: "#/components/schemas/MountValue" }
+
     DroppedCatalog:
       type: object
       required: [name, data_path]
@@ -3520,7 +4071,15 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 and mutable-variant-shredding-v1 and atomic-partition-replacement-v1 and org-marked-containment-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
+        read_only:
+          type: boolean
+          description: >
+            true on a mount: a read-only catalog over this instance's
+            source catalog, whose data_path, head_snapshot_id,
+            schema_version and earliest_snapshot_time it carries.
+            No write route serves it, and it carries none of the sampler
+            totals below. Absent on every other catalog.
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -3584,14 +4143,30 @@ components:
 
     Namespace:
       type: object
-      required: [name, namespace_id]
+      required: [name]
       properties:
         name: { type: string }
-        namespace_id: { type: integer, format: int64, description: Stable identity; not reused after namespace deletion. }
+        namespace_id:
+          type: integer
+          format: int64
+          description: >
+            Stable identity; not reused after namespace deletion. Present
+            on every namespace this server holds. Absent exactly when
+            `remote` is true: a remote schema has no id on this server.
         containment:
           description: Present when the namespace is contained (PUT …/containment).
           allOf:
             - { $ref: "#/components/schemas/NamespaceContainment" }
+        remote:
+          type: boolean
+          description: >
+            Present, and true, only for a remote schema: a read-only
+            namespace that another hoglake deployment serves inside this
+            catalog. Its tables are read through the same namespace,
+            table and scan routes; every write to it answers 403
+            `read_only_catalog`, and every other read 501
+            `mount_operation_unavailable`. A listing entry for a remote
+            schema carries `name` and `remote` only.
 
     NamespaceContainment:
       type: object
@@ -3600,6 +4175,15 @@ components:
       properties:
         field: { type: string, pattern: "^[a-z][a-z0-9_]{0,62}$", description: "The predicate field, e.g. team_id." }
         value: { type: integer, format: int64, minimum: 1, description: The value this namespace holds. }
+        org:
+          type: string
+          pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          description: >
+            The org mark, omitted when the namespace has none. Set, it makes the
+            namespace's prefix `<data_path>/org_id=<org>/<field>=<value>/`
+            and may be replaced or cleared only while the namespace has never held a
+            table or view. A canonical lowercase UUID. Capability
+            `org-marked-containment-v1`.
 
     TableCreation:
       type: object
@@ -3698,10 +4282,11 @@ components:
             VARIANT has no whole-column statistics and cannot be a partition or
             sort source. Compaction skips tables containing VARIANT unless
             the server enables it (HOGLAKE_COMPACTION_VARIANT); then it copies
-            each VARIANT in the layout its declaration gives it, and skips
-            any compaction group holding a file in another VARIANT layout or
-            written by DuckDB, so that group's other files stay uncompacted
-            with it.
+            each VARIANT's storage as it is, rewriting a group's files per
+            VARIANT layout — files in the declared layout together, files
+            in any other layout they share together, each output in its
+            inputs' layout — and leaving a file DuckDB wrote uncompacted
+            on its own.
             A top-level VARIANT may declare the shredded layout of the files
             written to it in `type_params.shredding`.
 
@@ -3779,9 +4364,13 @@ components:
             `{"shredding": {"type": "object", "fields": [{"name":
             "$browser", "type": "string"}, {"name": "price", "type":
             "decimal8", "precision": 18, "scale": 2}]}}`.
-            `"shredding": null` declares nothing. A declaration is fixed
-            when its column is defined: no alter op changes it, so a
-            different layout is a new column.
+            `"shredding": null` declares nothing. The alter op
+            `set_variant_shredding` replaces or clears a declaration
+            after the column exists (capability
+            mutable-variant-shredding-v1). A declaration is a target for
+            the writers that honour one and for compaction, never a rule
+            the catalog holds files to: files written under an earlier
+            declaration, or none, keep their layout and keep reading.
 
             Each of these is a 422 naming the column, and inside a
             declaration the path of the node at fault (`$.price`,
@@ -3894,7 +4483,8 @@ components:
             the listed snapshot, whose change row
             names this table (the table-scoped change kinds —
             table_created / table_dropped / table_altered /
-            table_inserted_into / table_deleted_from / table_compacted).
+            table_inserted_into / table_deleted_from / table_compacted /
+            table_replaced).
             It SHRINKS as expiry advances the floor: it is what a reader
             can still time-travel to, not the table's lifetime commit
             count.
@@ -4250,6 +4840,35 @@ components:
         author: { type: string }
         message: { type: string }
 
+    TableFileEnds:
+      type: object
+      required: [namespace, table, expected_table_uuid]
+      description: >
+        The live data files of one table that a replacement ends. Exactly one
+        of `partitions` and `all_files: true`.
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        expected_table_uuid:
+          type: string
+          format: uuid
+          description: Required. A mismatch is 409 `table_recreated`.
+        partitions:
+          type: array
+          minItems: 1
+          description: >
+            Partition tuples whose live files are ended. Each tuple has one
+            value per field of the live partition spec, in the encoding of
+            FileRegistration.partition_values (null is a null value). A tuple
+            that matches no live file ends nothing.
+          items:
+            type: array
+            items: { type: string, nullable: true }
+        all_files:
+          type: boolean
+          default: false
+          description: End every live data file of the table, whatever its spec.
+
     DeleteFileRegistration:
       type: object
       required: [data_file_id, path, delete_count, file_size_bytes]
@@ -4307,6 +4926,14 @@ components:
       properties:
         data_file: { $ref: "#/components/schemas/DataFile" }
         delete_file: { $ref: "#/components/schemas/DeleteFile" }
+        team_id:
+          type: integer
+          format: int64
+          description: >
+            The file's team id — its proven value on a mount's source field.
+            Present ONLY on a mount's (export's) scoped scan, so the Client can
+            vend a per-team S3 credential for each file; absent on every
+            ordinary scan.
 
     PartitionField:
       type: object
@@ -4428,12 +5055,51 @@ components:
         the column (ops apply in order, so a set_partition_spec earlier
         in the same request counts). Setting the field already set
         changes nothing (the request still commits its DDL snapshot, as
-        every alter does); another field is a 422, and there is no
-        unset. While it
+        every alter but an equal set_variant_shredding does); another
+        field is a 422, and there is no unset. While it
         is on, set_partition_spec must keep exactly one identity field
         on it, and drop_column/rename_column of it and rename_table are
         refused. A server without capability object-prefix-layout-v1
         answers 400 unknown alter op.
+
+        `set_variant_shredding` (`name`, a top-level column of type
+        variant; `shredding`, a declaration as ColumnDef.type_params
+        describes one, or null — or absent — to clear) replaces the
+        shredded layout the column declares. The declaration is held to
+        the same rules as at create_table and add_column, and a column
+        of another type or a variant nested in a struct, list or map is
+        refused as it would be there, with the same messages. It is a
+        writer's and compaction's target, not a rule on files: no file
+        is checked against it or rewritten for it, each file's footer
+        carries its own layout and readers use that, so files written
+        under the old declaration stay as they are and keep reading;
+        writers that honour a declaration (pyhoglake, the Trino
+        connector, millrace through pyhoglake) lay out files they write
+        after re-reading the column in the new one, and compaction
+        copies each file's leaves in that file's own layout, grouping
+        inputs by layout with the declared one preferred. Cleared, the
+        column carries no `type_params`. A CHANGED declaration commits
+        like every alter: a DDL snapshot, which a writer holding an
+        older read_snapshot meets as 409 ddl_since_read_snapshot and
+        re-reads for. Re-declaring what the column already declares is
+        a no-op, unlike set_column_comment and set_object_prefix_field:
+        it writes no column row and mints no snapshot, so no writer is
+        refused for it. "Already declares" compares JSON values, not
+        spellings: object key order and number spelling do not matter,
+        and a STORED `type_params` that is absent, `{}` or
+        `{"shredding": null}` declares nothing, so `shredding: null` on
+        such a column is a no-op. The op's own `shredding` has one
+        spelling for "none", null or absent; `{}` and
+        `{"shredding": null}` as the value are declarations, and invalid
+        ones (422, `$ has no type`). A request made only of such ops
+        answers 200 with the table at the unmoved head (`snapshot_id`
+        and `read_snapshot_id` = head) and, as a head GET does, the
+        sampler's totals with `totals_snapshot_id` / `totals_as_of`, or
+        none while the sampler has none — not the exact totals a
+        changing alter's receipt carries; in a request with other ops
+        those commit while the equal declaration writes nothing. A
+        server without capability mutable-variant-shredding-v1 answers
+        400 unknown alter op.
       properties:
         comment: { type: [string, "null"], maxLength: 16384, description: "set_table_comment or set_column_comment; null or absent removes the comment." }
         properties: { $ref: "#/components/schemas/CustomProperties" }
@@ -4442,7 +5108,7 @@ components:
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
                  set_table_comment, set_column_comment, set_properties,
-                 set_object_prefix_field]
+                 set_object_prefix_field, set_variant_shredding]
         column:                       # add_column
           allOf: [{ $ref: "#/components/schemas/ColumnDef" }]
           description: >
@@ -4460,7 +5126,15 @@ components:
             Dotted path of an existing STRUCT to append the new field
             to (new field id, ordinal = max sibling + 1). Absent = a new
             top-level column. Naming a list or a map here is a 422.
-        name: { type: string }        # drop_column, promote_column, set_column_comment, set_object_prefix_field
+        name: { type: string }        # drop_column, promote_column, set_column_comment, set_object_prefix_field, set_variant_shredding
+        shredding:                    # set_variant_shredding
+          type: [object, "null"]
+          description: >
+            The declaration to set on the top-level variant column
+            `name`, in the grammar ColumnDef.type_params gives for
+            `shredding`; null or absent clears it (the column then has
+            no `type_params`). Every rule of the grammar is a 422 naming
+            the column and the path at fault, as at create_table.
         from: { type: string }        # rename_column
         to:
           type: string
@@ -4499,6 +5173,14 @@ components:
       properties:
         snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
+        ended_files:
+          type: integer
+          format: int64
+          description: >
+            Only for POST /commit/replacements/prepared: the data files the
+            commit ended, summed over its tables, also on a replay and on
+            GET /commit/receipts/{operation}. Omitted on every other
+            endpoint and on a receipt written before it was stored.
 
     DataFile:
       type: object
@@ -5390,8 +6072,11 @@ components:
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions). With
             HOGLAKE_COMPACTION_VARIANT on, also groups holding a VARIANT
-            input not in its declared layout or written by DuckDB, which
-            hoglake_compaction_variant_layout_mismatch_total counts apart.
+            input whose field is no VARIANT group at all or holds a
+            REPEATED node outside a LIST or MAP layer, which
+            hoglake_compaction_variant_layout_mismatch_total counts apart
+            (a group whose inputs hold several layouts is rewritten per
+            layout instead, and is not counted here).
         invalid_data:
           type: integer
           format: int64
@@ -5457,11 +6142,10 @@ components:
             HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the replicas
             are not in fact planning the same buckets.
 
-            It spends no object-store IO, so it does NOT consume
-            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN — the same treatment
-            spill_budget_exceeded and merge_budget_exceeded get, and for
-            the same reason: a skip that costs nothing must not be able
-            to starve the sweep.
+            These skips spend no object-store I/O.
+            They do not consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+            Planner or cache refusals for spill or memory budgets use
+            the same rule.
 
             OPTIONAL, and not in `required`, for the same reason
             `offsets_released` is: the maintenance run ledger holds
@@ -5607,29 +6291,40 @@ components:
           type: integer
           format: int64
           description: >
-            Sorted groups refused because their spill would exceed
-            HOGLAKE_COMPACTION_SPILL_BYTES — in metadata at planning, from
-            the registered bytes the spill path would read (no
-            object-store IO), or by the rewrite itself the moment the bytes
-            actually written would cross it (the output is discarded). The
-            bound is in-process because the spill directory is an emptyDir
-            whose overrun EVICTS the pod rather than failing a write.
-            Configuration, not fault: the same groups re-refuse every sweep
-            until the knob, the volume or the target moves. Does not
-            consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Optional.
+            Compaction refuses these sorted groups because their spill
+            needs more than HOGLAKE_COMPACTION_SPILL_BYTES.
+            The planner can refuse a group from registered sizes before
+            object-store I/O.
+            The rewrite stops before it writes beyond the byte limit.
+            The bound protects the pod from eviction when its spill
+            directory fills.
+            Planner or cache refusals do not consume
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+            Runtime refusals after actual I/O consume one slot.
         merge_budget_exceeded:
           type: integer
           format: int64
           description: >
-            Sorted groups refused because their merge cannot fit the sorted
-            heap budget (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / the
-            parallel group count) even with every trusted input spilled:
-            too many spilled runs, each holding a row group while it is
-            read. Predicted in metadata from the registered survivor
-            counts, or raised by the rewrite from the exact spill files.
-            Reachable only by configuration (a heap budget small against
-            HOGLAKE_COMPACTION_TARGET_BYTES). Does not consume
-            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Optional.
+            Compaction refuses these sorted groups because sorting exceeds
+            the memory budget, even after spilling trusted inputs.
+            Each rewrite uses HOGLAKE_COMPACTION_SORTED_HEAP_BYTES divided
+            by the parallel group count.
+            This aggregate includes oversized_row_groups for compatibility.
+            Do not add that subset to this total.
+            Planner or cache refusals do not consume
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+            Runtime refusals after actual I/O consume one slot.
+        oversized_row_groups:
+          type: integer
+          format: int64
+          default: 0
+          description: >
+            Compaction refuses these sorted groups because one row exceeds
+            the memory budget.
+            This counts compaction groups, not rows or Parquet row groups.
+            This counter is a subset of merge_budget_exceeded.
+            Do not add it to skipped totals.
+            An absent field means zero.
         spill_cleanup_failures:
           type: integer
           format: int64
@@ -5753,6 +6448,31 @@ components:
             the API, and the group is refused again on every sweep. Not charged to
             HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
             hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}.
+            Optional, for claimed_elsewhere's reason.
+        layout_probe_only:
+          type: integer
+          format: int64
+          description: >
+            Groups of a VARIANT table (HOGLAKE_COMPACTION_VARIANT) whose
+            layout probe read every input's footer and ran no rewrite:
+            each variant layout among the inputs held too few files for
+            one, every input was written by DuckDB, or every part of a
+            sorted table was refused by the sorted budgets for its
+            layout's shape. The files are left as they are, and the
+            compactor remembers their layouts. A layout short of files is
+            not planned again until files of it arrive; an arrival lent to
+            it that proves to be another layout is counted here too, once,
+            and never lent again. A budget-refused
+            layout is counted here only on that first probe; later sweeps
+            refuse it from metadata as spill_budget_exceeded or
+            merge_budget_exceeded (Prometheus
+            hoglake_compaction_skipped_total{reason="spill_budget"} /
+            {reason="merge_budget"}), which is how to tell the cases apart,
+            and raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or
+            HOGLAKE_COMPACTION_SPILL_BYTES admits the existing files on
+            the next plan with no new arrivals. The footers were read, so this IS charged to
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+            hoglake_compaction_skipped_total{reason="layout_probe_only"}.
             Optional, for claimed_elsewhere's reason.
     RetirementResult:
       type: object
@@ -6809,7 +7529,10 @@ components:
           description: >
             Typed change rows. kind is the closed conflict vocabulary:
             namespace_created/dropped, table_created/dropped/altered,
-            table_inserted_into, table_deleted_from, table_compacted
+            table_inserted_into, table_deleted_from, table_replaced (a
+            replacement that ended data files of the table; recorded beside
+            table_deleted_from, and a changefeed barrier like a truncate),
+            table_compacted
             (a maintenance rewrite — object_id is the table; never a
             conflict for any writer, guarded or not, since it changes
             which files back a table and not which rows are visible in

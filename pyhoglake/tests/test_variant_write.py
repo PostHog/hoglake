@@ -30,6 +30,7 @@ from pyhoglake import (
     VariantEncodingError,
     VariantReport,
     variant,
+    write_part,
 )
 from pyhoglake import writer as writer_module
 from pyhoglake.client import Namespace
@@ -226,6 +227,117 @@ def test_append_writes_pre_encoded_storage_as_given(httpx_mock, store):
         VARIANT_NULL,
     ]
     assert _values(back, "raw") == ["a", 2]
+
+
+def test_write_part_checks_the_structure_of_each_storage_once(monkeypatch):
+    """Storage the Rust codec built was held to structure_fault as the
+    backend accepted it; write_variant_parquet does not check it a second
+    time. Storage the caller hands in, and the Python codec's, is checked
+    there as ever."""
+    from pyhoglake import _variant_backend
+    from pyhoglake import parquet_schema as ps
+
+    checked = []
+    real = ps.structure_fault
+    monkeypatch.setattr(
+        ps, "structure_fault", lambda array: checked.append(len(array)) or real(array)
+    )
+    columns = _columns()
+    rust = _variant_backend.MODE != "python" and _variant_backend.native()[0]
+    write_part(_json_table(), columns, write_options={})
+    assert len(checked) == (0 if rust else 2)
+    checked.clear()
+    storage = columns_to_arrow_schema(columns, variant="storage")
+    encoded = pa.table(
+        {
+            "id": list(range(4)),
+            "name": [f"n{i}" for i in range(4)],
+            "props": variant.encode_json(PROPS, columns[2]).array,
+            "raw": variant.encode_json(RAW, columns[3]).array,
+        },
+        schema=storage,
+    )
+    write_part(encoded, columns, write_options={})
+    assert len(checked) == 2, "the caller's storage is checked"
+    checked.clear()
+    monkeypatch.setattr(_variant_backend, "MODE", "python")
+    write_part(_json_table(), columns, write_options={})
+    assert len(checked) == 2, "the Python codec's output is checked"
+
+
+def test_encoded_by_names_the_codec_of_one_call_and_merge_leaves_it():
+    """encode_python is the reference codec's always, so its report says
+    ``python``; encode_json's says whose output it returned; a report that
+    gathers several calls keeps its own (None, when nothing set it)."""
+    from pyhoglake import _variant_backend
+
+    columns = _columns()
+    by_python = variant.encode_python([{"a": 1}, None], columns[2]).report
+    assert by_python.encoded_by == "python"
+    rust = _variant_backend.MODE != "python" and _variant_backend.native()[0]
+    by_json = variant.encode_json(PROPS, columns[2]).report
+    assert by_json.encoded_by == ("rust" if rust else "python")
+    gathered = VariantReport()
+    gathered.merge(by_python)
+    gathered.merge(by_json)
+    assert gathered.encoded_by is None
+    assert gathered.rows == by_python.rows + by_json.rows
+    # Not compared: two codecs' reports of one input are otherwise equal.
+    assert VariantReport(encoded_by="rust") == VariantReport(encoded_by="python")
+
+
+def _rust_said(monkeypatch, how: str) -> None:
+    """The backend arranged so that Rust's result is not the one returned
+    (``type`` fallback, shadow ``mismatch``, ``auto`` routed to Python for
+    the plan), is returned after the shadow ``agreed``, or is returned as
+    ever (``accepted``)."""
+    from pyhoglake import _variant_backend, variant
+
+    def counted(reason, row, column, report):
+        report.codec_fallbacks[reason] = report.codec_fallbacks.get(reason, 0) + 1
+
+    monkeypatch.setattr(_variant_backend, "_fall_back", counted)
+    if how == "type":
+        monkeypatch.setattr(_variant_backend, "_check", lambda *_: (("type", None), 0))
+    elif how == "mismatch":
+        monkeypatch.setattr(_variant_backend, "SHADOW", 1.0)
+        monkeypatch.setattr(variant, "_storage_slots", lambda array: object())
+    elif how == "agreed":
+        monkeypatch.setattr(_variant_backend, "SHADOW", 1.0)
+    elif how == "routed":
+        monkeypatch.setattr(_variant_backend, "MODE", "auto")
+        monkeypatch.setattr(_variant_backend, "_plan", lambda *_: (None, (), "no"))
+
+
+@pytest.mark.parametrize("how", ["accepted", "agreed", "type", "mismatch", "routed"])
+def test_the_structure_check_is_skipped_only_for_storage_rust_had_checked(
+    monkeypatch, how
+):
+    """``encoded_by`` says whose output a call returned, and the writer
+    skips its structure check on Rust's alone: Rust's result accepted, or
+    agreed with by the shadow, is ``rust`` and unchecked again; a result
+    its check refused (re-encoded in Python), one the shadow found
+    different, or a call ``auto`` routed to Python for the plan, is
+    ``python`` and checked."""
+    from pyhoglake import _variant_backend
+    from pyhoglake import parquet_schema as ps
+
+    if _variant_backend.native()[0] is None or _variant_backend.MODE == "python":
+        pytest.skip("the Rust codec is not in use")
+    _rust_said(monkeypatch, how)
+    rust = how in ("accepted", "agreed")
+    columns = _columns()
+    for column, rows in ((columns[2], PROPS), (columns[3], RAW)):
+        report = variant.encode_json(rows, column).report
+        assert report.encoded_by == ("rust" if rust else "python")
+        assert bool(report.codec_fallbacks) == (how in ("type", "mismatch"))
+    checked = []
+    real = ps.structure_fault
+    monkeypatch.setattr(
+        ps, "structure_fault", lambda array: checked.append(len(array)) or real(array)
+    )
+    write_part(_json_table(), columns, write_options={})
+    assert len(checked) == (0 if rust else 2)
 
 
 def test_append_encodes_each_partition_group_on_its_own(httpx_mock, store, monkeypatch):

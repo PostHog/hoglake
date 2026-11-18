@@ -5,6 +5,7 @@ disposable: catalog ``pyhog-<runid>`` with data under
 ``s3://pyhog-itest/<runid>/``.
 """
 
+import json
 import struct
 import time
 import uuid
@@ -22,12 +23,16 @@ from pyhoglake import (
     DroppedCatalog,
     HoglakeClient,
     NotFoundError,
+    ObjectPrefixViolationError,
     OffsetRegressionError,
     S3Config,
     ops,
+    parquet_write_options,
     variant,
     variant_field,
+    write_part,
 )
+from pyhoglake.client import _upload
 from pyhoglake.parquet_schema import _schema_elements, _top_level
 from pyhoglake.types import columns_to_arrow_schema
 
@@ -646,6 +651,148 @@ def test_variant_append_round_trips_through_pyarrow(catalog, ns, s3config):
     ]
 
 
+def test_set_variant_shredding_relays_out_later_files_only(catalog, ns, s3config):
+    """``ops.set_variant_shredding`` on a declared column: the server stores
+    the new declaration, the file appended before keeps its layout and the
+    file appended after is laid out in the new one (each footer checked
+    against its own declaration with the writer's layout oracle), both read
+    back through ``to_python``; a request prepared under the old
+    declaration is refused at commit, and the re-prepare writes the new
+    layout."""
+    from dataclasses import replace
+
+    from pyhoglake._variant_codec import compile_plan
+    from pyhoglake.errors import DdlSinceReadSnapshotError
+    from pyhoglake.parquet_schema import variant_layout_fault
+
+    if "mutable-variant-shredding-v1" not in catalog.info.capabilities:
+        pytest.skip("the server does not declare mutable-variant-shredding-v1")
+
+    d1 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+        ],
+    }
+    d2 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "$os", "type": "string"},
+            {"name": "tags", "type": "array", "element": {"type": "string"}},
+        ],
+    }
+    table = ns.create_table(
+        "variant_relayout",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", d1),
+            ]
+        ),
+    )
+    rows = [
+        '{"$browser": "Chrome", "$os": "mac", "price": 9.5, "tags": ["a", "b"]}',
+        "null",
+        None,
+    ]
+    want = [
+        {"$browser": "Chrome", "$os": "mac", "price": 9.5, "tags": ["a", "b"]},
+        variant.VARIANT_NULL,
+        None,
+    ]
+
+    def data(ids):
+        return pa.table(
+            {
+                "id": pa.array(ids, pa.int64()),
+                "properties": pa.array(rows, pa.string()).cast(pa.json_()),
+            },
+            schema=columns_to_arrow_schema(table.columns, variant="json"),
+        )
+
+    first = table.append(data([1, 2, 3]), compression="zstd", compression_level=3)
+    (f1,) = table.files(snapshot=first.snapshot_id)
+    # Prepared under d1, published after the alter: refused, and the
+    # uploads of the refused request are never registered.
+    stale = table.prepare_append_tables(
+        [(data([4, 5, 6]), None)],
+        idempotency_key=str(uuid.uuid4()),
+        compression="zstd",
+        compression_level=3,
+    )
+
+    info = table.alter([ops.set_variant_shredding("properties", d2)])
+    column = next(c for c in info.columns if c.name == "properties")
+    assert column.type_params == {"shredding": d2}
+    fresh = ns.table("variant_relayout")
+    assert fresh.columns[1].type_params == {"shredding": d2}
+    assert fresh.columns[1].field_id == column.field_id
+    with pytest.raises(DdlSinceReadSnapshotError):
+        table.commit_prepared(stale)
+    assert table.files(snapshot=info.snapshot_id) == [f1]
+
+    # Re-applying the declaration the column has is a no-op: no snapshot,
+    # and a request prepared before it still commits.
+    prepared = table.prepare_append_tables(
+        [(data([4, 5, 6]), None)],
+        idempotency_key=str(uuid.uuid4()),
+        compression="zstd",
+        compression_level=3,
+    )
+    same = table.alter([ops.set_variant_shredding("properties", dict(d2))])
+    assert same.snapshot_id == info.snapshot_id
+    assert same.read_snapshot_id == info.snapshot_id
+    assert ns.table("variant_relayout").columns[1].type_params == {"shredding": d2}
+    second = table.commit_prepared(prepared)
+    (f2,) = [f for f in table.files(snapshot=second.snapshot_id) if f.path != f1.path]
+    assert f2.path == prepared["appends"][0]["files"][0]["path"]
+
+    fs = s3config.filesystem()
+    under_d1 = replace(column, type_params={"shredding": d1})
+    under_d2 = column
+    for f, declared, other in ((f1, under_d1, under_d2), (f2, under_d2, under_d1)):
+        body = fs.open_input_file(f.path[len("s3://") :]).read()
+        elements = _schema_elements(body)
+        (start,) = [i for e, _, i in _top_level(elements) if e.get(4) == "properties"]
+        plan = compile_plan(declared.type_params["shredding"])
+        assert variant_layout_fault(elements, start, declared, plan) is None, f.path
+        # ...and the check tells the layouts apart.
+        assert (
+            variant_layout_fault(
+                elements, start, other, compile_plan(other.type_params["shredding"])
+            )
+            is not None
+        )
+        back = pq.read_table(pa.BufferReader(body))
+        assert variant.to_python(back.column("properties"), declared) == want
+
+    # Cleared: the next file is unshredded (metadata + value only).
+    cleared = table.alter([ops.set_variant_shredding("properties", None)])
+    assert cleared.columns[1].type_params is None
+    third = table.append(data([7, 8, 9]), compression="zstd", compression_level=3)
+    (f3,) = [
+        f
+        for f in table.files(snapshot=third.snapshot_id)
+        if f.path not in (f1.path, f2.path)
+    ]
+    body = fs.open_input_file(f3.path[len("s3://") :]).read()
+    elements = _schema_elements(body)
+    (start,) = [i for e, _, i in _top_level(elements) if e.get(4) == "properties"]
+    assert (
+        variant_layout_fault(elements, start, cleared.columns[1], compile_plan(None))
+        is None
+    )
+    assert (
+        variant.to_python(
+            pq.read_table(pa.BufferReader(body)).column("properties"),
+            cleared.columns[1],
+        )
+        == want
+    )
+
+
 def test_alter_add_column_then_append(catalog, ns):
     table = ns.create_table(
         "evolving",
@@ -919,6 +1066,267 @@ def test_create_table_with_initial_partition_and_sort_fields(catalog, ns):
         )
 
 
+def _needs_object_prefix(catalog):
+    """Skip, not fail, on a server too old for the layout: the tests below
+    are about pyhoglake's placement against a server that enforces it."""
+    if "object-prefix-layout-v1" not in catalog.info.capabilities:
+        pytest.skip("the server does not declare object-prefix-layout-v1")
+
+
+def _compact_until_quiet(catalog, rounds=5):
+    for _ in range(rounds):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        if result["groups_compacted"] == 0:
+            break
+
+
+def _file_stats(catalog, table, data_file_id, snapshot):
+    """GET .../files/{id}/stats: the server's stored rows, bounds decoded."""
+    return catalog._client._request(
+        "GET",
+        table._path(f"/files/{data_file_id}/stats"),
+        params={"snapshot": snapshot},
+    )
+
+
+def _prefixed_batch(table, rows_per: dict[tuple[int, int], int]) -> pa.Table:
+    """``_part_batch`` with a variant ``props`` column, in the table's write
+    schema (``pa.json_()`` for the variant)."""
+    plain = _part_batch(rows_per)
+    props = [
+        json.dumps({"team": team, "i": i, "tags": ["a", None]})
+        for i, team in enumerate(plain.column("team_id").to_pylist())
+    ]
+    return pa.table(
+        {
+            "team_id": plain.column("team_id"),
+            "ts": plain.column("ts"),
+            "val": plain.column("val"),
+            "props": pa.array(props, pa.string()).cast(pa.json_()),
+        },
+        schema=columns_to_arrow_schema(table.columns, variant="json"),
+    )
+
+
+def test_object_prefix_table_places_files_the_server_accepts(catalog, ns, s3config):
+    """An object-prefix table (``identity(team_id), month(ts)``, then
+    ``set_object_prefix_field``): ``append`` and ``prepare_append_tables`` +
+    ``commit_prepared`` over several teams and months commit, every object
+    sits under ``team_id=<v>/``, a deferred file is ``provided`` at commit
+    (the prefix field's stats alone, not ``pending`` for the hydrator), and
+    a variant column in the same table round-trips."""
+    _needs_object_prefix(catalog)
+    table = ns.create_table(
+        "prefixed_events",
+        pa.schema(
+            [
+                pa.field("team_id", pa.int64(), nullable=False),
+                pa.field("ts", pa.timestamp("us")),
+                pa.field("val", pa.string()),
+                variant_field("props"),
+            ]
+        ),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "month"),
+        ],
+        sort_fields=[ops.NamedSortField("ts")],
+    )
+    info = table.alter([ops.set_object_prefix_field("team_id")])
+    assert info.object_prefix_field == "team_id"
+    assert ns.table("prefixed_events").info().object_prefix_field == "team_id"
+    fid = {c.name: c.field_id for c in table.columns}
+    root = f"s3://{BUCKET}/{RUN_ID}/data/ns1/prefixed_events/"
+
+    def expected(counts):
+        return {(str(team), _month_str(m)): n for (team, m), n in counts.items()}
+
+    # append: full stats, one commit, every file under its team's prefix
+    counts = {(101, 1): 2, (101, 2): 3, (202, 1): 4, (303, 3): 1}
+    res = table.append(
+        _prefixed_batch(table, counts), compression="zstd", compression_level=3
+    )
+    files = table.files(snapshot=res.snapshot_id)
+    assert {f.partition_values: f.record_count for f in files} == expected(counts)
+    for f in files:
+        assert f.path.startswith(f"{root}team_id={f.partition_values[0]}/")
+        assert f.stats_state == "provided"
+
+    # append with deferred stats: provided at commit, not pending
+    deferred = {(101, 3): 2, (404, 1): 1}
+    res = table.append(_prefixed_batch(table, deferred), deferred_stats=True)
+    new = [
+        f
+        for f in table.files(snapshot=res.snapshot_id)
+        if f.begin_snapshot == res.snapshot_id
+    ]
+    assert {f.partition_values: f.record_count for f in new} == expected(deferred)
+    assert all(f.stats_state == "provided" for f in new)
+    assert all(
+        f.path.startswith(f"{root}team_id={f.partition_values[0]}/") for f in new
+    )
+
+    # prepared, deferred: the request carries the prefix field's stats alone,
+    # under <prefix><key>/, and the commit lands them provided
+    prepared = {(202, 2): 3, (303, 1): 2, (505, 2): 1}
+    groups = [
+        (_prefixed_batch(table, {(team, m): n}), (str(team), _month_str(m)))
+        for (team, m), n in prepared.items()
+    ]
+    key = str(uuid.uuid4())
+    request = table.prepare_append_tables(
+        groups,
+        idempotency_key=key,
+        deferred_stats=True,
+        compression="zstd",
+        compression_level=3,
+    )
+    for reg in request["appends"][0]["files"]:
+        assert [s["field_id"] for s in reg["column_stats"]] == [fid["team_id"]]
+        assert reg["path"].startswith(
+            f"{root}team_id={reg['partition_values'][0]}/{key}/"
+        )
+    result = table.commit_prepared(request)
+    new = [
+        f
+        for f in table.files(snapshot=result.snapshot_id)
+        if f.begin_snapshot == result.snapshot_id
+    ]
+    assert {f.partition_values: f.record_count for f in new} == expected(prepared)
+    assert all(f.stats_state == "provided" for f in new)
+    assert {f.path for f in new} == {r["path"] for r in request["appends"][0]["files"]}
+
+    # every live object is under a team prefix, and the variant round-trips
+    fs = s3config.filesystem()
+    by_name = {c.name: c for c in table.columns}
+    for f in table.files(snapshot=result.snapshot_id):
+        team = int(f.partition_values[0])
+        assert f.path.startswith(f"{root}team_id={team}/")
+        back = pq.read_table(
+            pa.BufferReader(fs.open_input_file(f.path[len("s3://") :]).read())
+        )
+        assert set(back.column("team_id").to_pylist()) == {team}
+        for value in variant.to_python(back.column("props"), by_name["props"]):
+            assert value["team"] == team and value["tags"] == ["a", None]
+    total = sum(counts.values()) + sum(deferred.values()) + sum(prepared.values())
+    assert _info_at_head(catalog, table).record_count == total
+
+
+def test_object_prefix_table_refuses_a_file_under_the_table_root(catalog, ns, s3config):
+    """Negative control for the placement: the same file pyhoglake would
+    write, registered by hand under the table root (where every writer
+    put its files before), is refused by the server with 422
+    object_prefix_violation naming the prefix it belongs under. This is
+    the refusal pyhoglake's placement exists to avoid."""
+    _needs_object_prefix(catalog)
+    table = ns.create_table(
+        "prefixed_negative",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "month"),
+        ],
+    )
+    table.alter([ops.set_object_prefix_field("team_id")])
+    info = table.info()
+    rows = _part_batch({(7, 1): 3})
+    # The writer core wants the destination's schema, field ids included.
+    with_ids = pa.Table.from_arrays(
+        [rows.column(c.name) for c in info.columns],
+        schema=columns_to_arrow_schema(info.columns),
+    )
+    part = write_part(
+        with_ids, info.columns, write_options=parquet_write_options(None, None)
+    )
+    root = f"s3://{BUCKET}/{RUN_ID}/data/ns1/prefixed_negative/"
+    uri = f"{root}{uuid.uuid4()}.parquet"
+    registration = part.registration(
+        uri, info.columns, stats=True, partition_values=("7", _month_str(1))
+    )
+    _upload(s3config.filesystem(), uri, part.body)
+    with pytest.raises(ObjectPrefixViolationError) as ei:
+        catalog._commit(
+            {
+                "appends": [
+                    {
+                        "namespace": "ns1",
+                        "table": "prefixed_negative",
+                        "files": [registration],
+                    }
+                ],
+                "read_snapshot": info.read_snapshot_id,
+            },
+            table=table,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.re_prepare and not ei.value.retryable
+    assert "team_id=7/" in (ei.value.detail or "")
+    assert table.files(snapshot=catalog.refresh().head_snapshot_id) == []
+    # The placing writer, same rows, same table: accepted.
+    result = table.append(rows)
+    (placed,) = table.files(snapshot=result.snapshot_id)
+    assert placed.path.startswith(f"{root}team_id=7/")
+
+
+def test_compaction_restores_full_stats_to_prefix_only_files(catalog, ns):
+    """D4's other half: small deferred files on an object-prefix table are
+    registered with the prefix field's stats alone. Compaction (the
+    server's, HOGLAKE_COMPACTION_* as ci/live-python.sh runs it) takes
+    them as inputs, writes its output under the same prefix, registers it
+    provided, and the output carries stats for the other columns — ts
+    bounds included — which the inputs never had."""
+    _needs_object_prefix(catalog)
+    table = ns.create_table(
+        "prefixed_compact",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "month"),
+        ],
+    )
+    table.alter([ops.set_object_prefix_field("team_id")])
+    fid = {c.name: c.field_id for c in table.columns}
+    root = f"s3://{BUCKET}/{RUN_ID}/data/ns1/prefixed_compact/"
+    # Eight files per partition, over HOGLAKE_COMPACTION_MIN_INPUT_FILES=5
+    # (default), each under the 1 MiB threshold: prefix-only stats.
+    inputs: set[str] = set()
+    for _ in range(8):
+        appended = table.append(
+            _part_batch({(7, 1): 3, (8, 1): 2}), deferred_stats=True
+        )
+        inputs |= {f.path for f in appended.files}
+    files = table.files(snapshot=appended.snapshot_id)
+    assert len(files) == 16
+    for f in files:
+        assert f.stats_state == "provided"
+        assert f.path.startswith(f"{root}team_id={f.partition_values[0]}/")
+        stats = _file_stats(catalog, table, f.data_file_id, appended.snapshot_id)
+        assert [c["field_id"] for c in stats["columns"]] == [fid["team_id"]]
+
+    _compact_until_quiet(catalog)
+
+    head = catalog.refresh().head_snapshot_id
+    after = table.files(snapshot=head)
+    assert not inputs & {f.path for f in after}
+    assert len(after) < 16
+    assert sum(f.record_count for f in after) == 8 * 5
+    for f in after:
+        team = f.partition_values[0]
+        assert f.path.startswith(f"{root}team_id={team}/")
+        assert f.stats_state == "provided"
+        stats = _file_stats(catalog, table, f.data_file_id, head)
+        by_id = {c["field_id"]: c for c in stats["columns"]}
+        assert set(by_id) == {fid["team_id"], fid["ts"], fid["val"]}
+        ts = by_id[fid["ts"]]
+        assert ts["lower_bound"] is not None and ts["upper_bound"] is not None
+        assert ts["lower_bound"] <= ts["upper_bound"]
+        prefix = by_id[fid["team_id"]]
+        assert prefix["lower_bound"] == prefix["upper_bound"]
+        assert str(prefix["lower_bound"]) == team
+
+
 def test_partitioned_compaction_groups_within_partition(catalog, ns):
     """Compaction (metadata-planned server-side: same spec + identical
     partition_values and size tier) must merge only within a partition.
@@ -1068,6 +1476,151 @@ def test_compaction_copies_a_declared_variant_table(catalog, ns, s3config):
     assert not inputs & {f.path for f in files}
     assert len(files) < len(inputs)
     assert values() == before
+
+
+def test_compaction_after_set_variant_shredding_compacts_each_layout_apart(
+    catalog, ns, s3config
+):
+    """Writer, alter, writer, compaction: files ``Table.append`` wrote under
+    one declaration (D1), ``ops.set_variant_shredding`` to D2, more files
+    under D2 into the same partition, then the server's sweeps
+    (HOGLAKE_COMPACTION_VARIANT on, as ci/live-python.sh sets it). The
+    sweeps compact D1's files among themselves into D1 and D2's into D2,
+    refuse nothing, and every row reads back as before; an equal
+    re-declaration before the sweeps mints no snapshot."""
+    from dataclasses import replace
+
+    from pyhoglake._variant_codec import compile_plan
+    from pyhoglake.parquet_schema import variant_layout_fault
+
+    if "mutable-variant-shredding-v1" not in catalog.info.capabilities:
+        pytest.skip("the server does not declare mutable-variant-shredding-v1")
+
+    d1 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "$os", "type": "string"},
+        ],
+    }
+    d2 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+            {"name": "tags", "type": "array", "element": {"type": "string"}},
+        ],
+    }
+    table = ns.create_table(
+        "variant_relayout_compact",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", d1),
+            ]
+        ),
+    )
+    rows = [
+        '{"$browser": "Chrome", "$os": "mac", "price": 9.5, "tags": ["a", "b"]}',
+        '{"$browser": 5, "$os": {"v": 1}, "price": "free"}',
+        '{"tags": [1, null], "extra": {"deep": [true]}}',
+        "{}",
+        "null",
+        None,
+        '"text"',
+        "[1, 2]",
+    ]
+    schema = columns_to_arrow_schema(table.columns, variant="json")
+    # Over the server's default HOGLAKE_COMPACTION_MIN_INPUT_FILES=5 for
+    # EACH layout, so both have the files for a rewrite.
+    per_layout = 6
+
+    def append(index: int) -> tuple[str, set[int]]:
+        ids = list(range(index * len(rows), (index + 1) * len(rows)))
+        texts = rows[index % len(rows) :] + rows[: index % len(rows)]
+        data = pa.table(
+            {"id": ids, "properties": pa.array(texts, pa.string()).cast(pa.json_())},
+            schema=schema,
+        )
+        (f,) = table.append(data).files
+        return f.path, set(ids)
+
+    d1_inputs = dict(append(i) for i in range(per_layout))
+    d1_ids = set().union(*d1_inputs.values())
+
+    info = table.alter([ops.set_variant_shredding("properties", d2)])
+    column = next(c for c in info.columns if c.name == "properties")
+    assert column.type_params == {"shredding": d2}
+    d2_inputs = dict(append(i) for i in range(per_layout, 2 * per_layout))
+    d2_ids = set().union(*d2_inputs.values())
+    inputs = {**d1_inputs, **d2_inputs}
+    assert len(inputs) == 2 * per_layout
+
+    # An equal re-declaration, before the sweeps: no snapshot.
+    head = catalog.refresh().head_snapshot_id
+    same = table.alter([ops.set_variant_shredding("properties", dict(d2))])
+    assert same.snapshot_id == head
+    assert catalog.refresh().head_snapshot_id == head
+
+    under = {
+        "d1": (replace(column, type_params={"shredding": d1}), compile_plan(d1)),
+        "d2": (column, compile_plan(d2)),
+    }
+    fs = s3config.filesystem()
+
+    def layout_of(body: bytes) -> str:
+        elements = _schema_elements(body)
+        (start,) = [i for e, _, i in _top_level(elements) if e.get(4) == "properties"]
+        held = [
+            name
+            for name, (col, plan) in under.items()
+            if variant_layout_fault(elements, start, col, plan) is None
+        ]
+        assert len(held) == 1, held
+        return held[0]
+
+    def read_all() -> tuple[dict[int, object], dict[str, tuple[str, set[int]]]]:
+        """Every row's value by id, and each live file's layout and ids."""
+        values: dict[int, object] = {}
+        files: dict[str, tuple[str, set[int]]] = {}
+        for f in table.files(snapshot=catalog.refresh().head_snapshot_id):
+            body = fs.open_input_file(f.path[len("s3://") :]).read()
+            back = pq.read_table(pa.BufferReader(body))
+            ids = back.column("id").to_pylist()
+            # Neither column nor shredding: read whatever layout the file has.
+            props = variant.to_python(back.column("properties"))
+            values.update(zip(ids, props, strict=True))
+            files[f.path] = (layout_of(body), set(ids))
+        return values, files
+
+    before, files_before = read_all()
+    assert len(before) == 2 * per_layout * len(rows)
+    assert {path: ids for path, (_, ids) in files_before.items()} == inputs
+    assert {files_before[p][0] for p in d1_inputs} == {"d1"}
+    assert {files_before[p][0] for p in d2_inputs} == {"d2"}
+
+    compacted = 0
+    for _ in range(5):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        assert result["unconvertible_schema"] == 0, result
+        assert result["failed_groups"] == 0, result
+        if result["groups_compacted"] == 0:
+            break
+        compacted += result["groups_compacted"]
+    assert compacted >= 2
+
+    after, files_after = read_all()
+    assert after == before
+    assert not set(files_after) & set(inputs), "every input was compacted away"
+    assert len(files_after) < len(inputs)
+    by_layout: dict[str, set[int]] = {"d1": set(), "d2": set()}
+    for layout, ids in files_after.values():
+        by_layout[layout] |= ids
+    # D1's files compacted among themselves, into D1; D2's into D2, the
+    # declared layout — no output mixes the two.
+    assert by_layout == {"d1": d1_ids, "d2": d2_ids}
 
 
 def test_drop_table(catalog, ns):

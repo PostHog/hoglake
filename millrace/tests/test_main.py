@@ -14,6 +14,7 @@ import logging
 from collections import Counter
 from typing import Any
 
+import httpx
 import pytest
 from flushkit import make_config, table_wire
 from kafkakit import FakeConsumer
@@ -612,3 +613,171 @@ def test_probe_read_retries_the_gil_race_then_degrades():
         raise RuntimeError("dict changed size during iteration")
 
     assert main._probe_read(always_raced, -1) == -1
+
+
+# -- the credential millrace presents to hoglake (HOGLAKE_AUTH_*) ------------
+
+
+def test_hoglake_auth_is_none_when_nothing_is_set():
+    """No HOGLAKE_AUTH_* means no Authorization header: what an
+    HOGLAKE_AUTH_MODE=off server expects and what millrace always did."""
+    assert main.hoglake_auth({}) is None
+    assert main.hoglake_auth({"HOGLAKE_AUTH_TOKEN": "  "}) is None
+
+
+def test_hoglake_auth_fixed_token_sends_it_as_a_bearer():
+    from pyhoglake.auth import BearerToken
+
+    auth = main.hoglake_auth({"HOGLAKE_AUTH_TOKEN": "eyJ.fixed"})
+    assert isinstance(auth, BearerToken)
+    (req,) = list(auth.auth_flow(httpx.Request("GET", "http://hog.test/v1/catalogs")))
+    assert req.headers["Authorization"] == "Bearer eyJ.fixed"
+
+
+def test_hoglake_auth_token_file_is_read_once_and_trimmed(tmp_path: Any):
+    from pyhoglake.auth import BearerToken
+
+    path = tmp_path / "token"
+    path.write_text("eyJ.from-file\n")
+    auth = main.hoglake_auth({"HOGLAKE_AUTH_TOKEN_FILE": str(path)})
+    assert isinstance(auth, BearerToken)
+    (req,) = list(auth.auth_flow(httpx.Request("GET", "http://hog.test/v1/catalogs")))
+    assert req.headers["Authorization"] == "Bearer eyJ.from-file"
+
+
+def test_hoglake_auth_token_file_problems_are_config_errors(tmp_path: Any):
+    from millrace.config import ConfigError
+
+    with pytest.raises(ConfigError, match="HOGLAKE_AUTH_TOKEN_FILE"):
+        main.hoglake_auth({"HOGLAKE_AUTH_TOKEN_FILE": str(tmp_path / "missing")})
+    empty = tmp_path / "empty"
+    empty.write_text(" \n")
+    with pytest.raises(ConfigError, match="is empty"):
+        main.hoglake_auth({"HOGLAKE_AUTH_TOKEN_FILE": str(empty)})
+
+
+def test_hoglake_auth_client_credentials_mint_against_the_token_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The three variables build pyhoglake's ClientCredentials: one mint at
+    the configured token URL with the client id and secret as HTTP Basic
+    and the audience in the form, then the bearer on every request until
+    it is refreshed — the contract in hoglake's docs/auth.md."""
+    from pyhoglake.auth import ClientCredentials
+
+    mints: list[dict[str, Any]] = []
+
+    def fake_post(url: str, **kwargs: Any) -> httpx.Response:
+        mints.append({"url": url, **kwargs})
+        return httpx.Response(
+            200, json={"access_token": "eyJ.minted", "expires_in": 900}
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    auth = main.hoglake_auth(
+        {
+            "HOGLAKE_AUTH_TOKEN_URL": "http://issuer.test/oauth/token",
+            "HOGLAKE_AUTH_CLIENT_ID": "hlc_abc",
+            "HOGLAKE_AUTH_CLIENT_SECRET": "s3cret",
+        }
+    )
+    assert isinstance(auth, ClientCredentials)
+    flow = auth.auth_flow(httpx.Request("GET", "http://hog.test/v1/catalogs"))
+    req = next(flow)
+    assert req.headers["Authorization"] == "Bearer eyJ.minted"
+    (mint,) = mints
+    assert mint["url"] == "http://issuer.test/oauth/token"
+    assert mint["auth"] == ("hlc_abc", "s3cret")
+    assert mint["data"] == {"grant_type": "client_credentials", "audience": "hoglake"}
+    # Cached: a second request mints nothing.
+    next(auth.auth_flow(httpx.Request("GET", "http://hog.test/v1/catalogs")))
+    assert len(mints) == 1
+
+
+def test_hoglake_auth_audience_is_configurable(monkeypatch: pytest.MonkeyPatch):
+    mints: list[dict[str, Any]] = []
+
+    def fake_post(url: str, **kwargs: Any) -> httpx.Response:
+        mints.append(kwargs)
+        return httpx.Response(200, json={"access_token": "t", "expires_in": 60})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    auth = main.hoglake_auth(
+        {
+            "HOGLAKE_AUTH_TOKEN_URL": "http://issuer.test/oauth/token",
+            "HOGLAKE_AUTH_CLIENT_ID": "id",
+            "HOGLAKE_AUTH_CLIENT_SECRET": "secret",
+            "HOGLAKE_AUTH_AUDIENCE": "hoglake-staging",
+        }
+    )
+    assert auth is not None
+    next(auth.auth_flow(httpx.Request("GET", "http://hog.test/v1/catalogs")))
+    assert mints[0]["data"]["audience"] == "hoglake-staging"
+
+
+def test_hoglake_auth_refuses_partial_client_credentials():
+    from millrace.config import ConfigError
+
+    with pytest.raises(ConfigError, match="missing HOGLAKE_AUTH_CLIENT_SECRET"):
+        main.hoglake_auth(
+            {
+                "HOGLAKE_AUTH_TOKEN_URL": "http://issuer.test/oauth/token",
+                "HOGLAKE_AUTH_CLIENT_ID": "id",
+            }
+        )
+
+
+def test_hoglake_auth_refuses_two_sources():
+    """Two credentials is a mistake to surface, not a precedence to apply:
+    a leftover variable must never silently choose what millrace sends."""
+    from millrace.config import ConfigError
+
+    with pytest.raises(ConfigError, match="exactly one of"):
+        main.hoglake_auth(
+            {"HOGLAKE_AUTH_TOKEN": "t", "HOGLAKE_AUTH_TOKEN_FILE": "/nonexistent"}
+        )
+
+
+def test_main_maps_a_bad_credential_configuration_to_the_config_exit(
+    capsys: pytest.CaptureFixture[str],
+):
+    rc = main._main(
+        _valid_env()
+        | {
+            "HOGLAKE_URL": "http://hog.test",
+            "HOGLAKE_AUTH_TOKEN": "t",
+            "HOGLAKE_AUTH_TOKEN_FILE": "/x",
+        }
+    )
+    assert rc == main.EXIT_CONFIG
+    assert "exactly one of" in capsys.readouterr().err
+
+
+def test_main_hands_the_credential_to_the_hoglake_client(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The credential built from the environment is the one the client
+    sends: _run threads it into HoglakeClient(auth=...)."""
+    import pyhoglake
+
+    seen: dict[str, Any] = {}
+    real = pyhoglake.HoglakeClient
+
+    class Capturing(real):  # type: ignore[misc,valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            seen["auth"] = kwargs.get("auth")
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pyhoglake, "HoglakeClient", Capturing)
+
+    def stop(client: Any, cfg: Any) -> None:
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(main, "ensure_destination", stop)
+    rc = main._main(
+        _valid_env() | {"HOGLAKE_URL": "http://hog.test", "HOGLAKE_AUTH_TOKEN": "eyJ.t"}
+    )
+    assert rc == main.EXIT_ERROR
+    from pyhoglake.auth import BearerToken
+
+    assert isinstance(seen["auth"], BearerToken)

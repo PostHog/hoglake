@@ -29,6 +29,49 @@ object TestTokens {
 
     private val encoder = Base64.getUrlEncoder().withoutPadding()
 
+    /** An RSA key pair of [bits] bits, for RS256 — the default identity-provider algorithm. */
+    fun rsaKeyPair(bits: Int = 2048): KeyPair =
+        KeyPairGenerator.getInstance("RSA").run {
+            initialize(bits)
+            generateKeyPair()
+        }
+
+    /** A compact JWS signed RS256 with [pair]; [header] is sent verbatim. */
+    fun mintRs256(
+        pair: KeyPair,
+        claims: String,
+        header: String = """{"alg":"RS256","kid":"$KID","typ":"JWT"}""",
+    ): String {
+        val h = encoder.encodeToString(header.toByteArray())
+        val p = encoder.encodeToString(claims.toByteArray())
+        val sig =
+            Signature.getInstance("SHA256withRSA").run {
+                initSign(pair.private)
+                update("$h.$p".toByteArray(Charsets.US_ASCII))
+                sign()
+            }
+        return "$h.$p." + encoder.encodeToString(sig)
+    }
+
+    /** One RSA JWK object for [pair]; [extra] is spliced in verbatim (e.g. `,"alg":"RS256"`). */
+    fun rsaJwk(
+        pair: KeyPair,
+        kid: String,
+        extra: String = ""","use":"sig","alg":"RS256"""",
+    ): String {
+        val pub = pair.public as java.security.interfaces.RSAPublicKey
+
+        fun unsigned(v: java.math.BigInteger): String {
+            val raw = v.toByteArray()
+            // BigInteger adds a sign byte; JWK integers are unsigned, minimal.
+            val trimmed = if (raw.size > 1 && raw[0] == 0.toByte()) raw.copyOfRange(1, raw.size) else raw
+            return encoder.encodeToString(trimmed)
+        }
+        return """{"kty":"RSA","kid":"$kid","n":"${unsigned(
+            pub.modulus,
+        )}","e":"${unsigned(pub.publicExponent)}"$extra}"""
+    }
+
     /** A compact JWS signed with [pair], or an unsigned one when the alg is forged. */
     fun mint(
         pair: KeyPair,
@@ -83,12 +126,30 @@ object TestTokens {
         iat: Long = 1_700_000_000L,
         exp: Long = iat + 900,
         extra: String = "",
+        org: String = "11111111-1111-1111-1111-111111111111",
     ): String {
         val prdClaim = prd?.let { ""","prd":$it""" } ?: ""
         return """{"iss":"$ISSUER","aud":"$AUDIENCE","sub":"hlc_team","jti":"jti-s","ten":"scoped",""" +
-            """"org":"11111111-1111-1111-1111-111111111111","cli":"laptop","usr":"user-1",""" +
+            """"org":"$org","cli":"laptop","usr":"user-1",""" +
             """"iat":$iat,"exp":$exp,"cat":$catalogs$prdClaim$extra}"""
     }
+
+    /**
+     * The session profile's claims (docs/auth.md), each with a leading comma:
+     * for [scopedClaims]' `extra`, or spliced in before a tenant claim set's
+     * closing brace. [primaryCatalog] must be the one catalog the token's
+     * `cat` names. [remoteSchemas] is spliced in verbatim (null leaves the
+     * claim out). The credential bundle is fictional and outlives any token.
+     */
+    fun sessionProfile(
+        primaryCatalog: String,
+        remoteSchemas: String?,
+    ): String =
+        ""","profile":"storage-session","version":1,"purpose":"user-session",""" +
+            """"primary_catalog":"$primaryCatalog","aws":{"access_key_id":"FICTIONAL_KEY",""" +
+            """"secret_access_key":"FICTIONAL_SECRET","session_token":"FICTIONAL_TOKEN",""" +
+            """"region":"us-east-1","expires_at":4000000000}""" +
+            (remoteSchemas?.let { ""","remote_schemas":$it""" } ?: "")
 
     fun operatorClaims(
         exp: Long = 4_000_000_000L,
@@ -102,6 +163,12 @@ object TestTokens {
     fun jwks(
         pair: KeyPair,
         kid: String = KID,
+    ): String = """{"keys":[${ecJwk(pair, kid)}]}"""
+
+    /** One EC P-256 JWK object for [pair]. */
+    fun ecJwk(
+        pair: KeyPair,
+        kid: String = KID,
     ): String {
         val pub = pair.public as java.security.interfaces.ECPublicKey
 
@@ -113,7 +180,7 @@ object TestTokens {
             System.arraycopy(raw, from, fixed, 32 - (raw.size - from), raw.size - from)
             return encoder.encodeToString(fixed)
         }
-        return """{"keys":[{"kty":"EC","crv":"P-256","kid":"$kid","use":"sig","alg":"ES256",""" +
-            """"x":"${coord(pub.w.affineX)}","y":"${coord(pub.w.affineY)}"}]}"""
+        return """{"kty":"EC","crv":"P-256","kid":"$kid","use":"sig","alg":"ES256",""" +
+            """"x":"${coord(pub.w.affineX)}","y":"${coord(pub.w.affineY)}"}"""
     }
 }

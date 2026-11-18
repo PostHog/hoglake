@@ -3,12 +3,16 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.guardsRemoteSchemas
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.refuseRemoteSchemas
 import com.posthog.hoglake.auth.requireScopedNamespaces
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
+import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.TableCreationDefinition
-import com.posthog.hoglake.service.TableCreationService
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -62,19 +66,37 @@ private fun TableCreation.toDto() =
         writePath, state, expiresAt, snapshotId, schemaVersion, reason,
     )
 
-fun Application.installTableCreationRoutes(creations: TableCreationService) {
+fun Application.installTableCreationRoutes(
+    creations: TableCreationBackend,
+    selector: CatalogStoreSelector? = null,
+) = installTableCreationRoutes({ creations }, selector)
+
+fun Application.installTableCreationRoutes(
+    creations: () -> TableCreationBackend,
+    selector: CatalogStoreSelector? = null,
+) {
+    fun ApplicationCall.creationBackend(): TableCreationBackend =
+        selector?.tableCreations(this, creationCatalog(), creations) ?: creations()
+
+    // The namespace the creation was prepared for, read from the backend itself, not through the handler's view.
+    fun ApplicationCall.preparedNamespace(): String =
+        selector?.creationNamespace(this, creationCatalog(), creationOperation(), creations)
+            ?: creations().status(creationCatalog(), creationOperation()).definition.namespace
+
     routing {
         route("/v1/catalogs/{catalog}/table-creations/{operation}") {
-            put { call.prepareCreation(creations, partitioned = false) }
-            put("/partitioned") { call.prepareCreation(creations, partitioned = true) }
-            put("/sorted") { call.prepareCreation(creations, partitioned = false, sorted = true) }
-            put("/metadata") { call.prepareCreation(creations, partitioned = false, metadata = true) }
+            put { call.prepareCreation(call.creationBackend(), partitioned = false) }
+            put("/partitioned") { call.prepareCreation(call.creationBackend(), partitioned = true) }
+            put("/sorted") { call.prepareCreation(call.creationBackend(), partitioned = false, sorted = true) }
+            put("/metadata") { call.prepareCreation(call.creationBackend(), partitioned = false, metadata = true) }
             get {
-                call.requireScopedCreation(creations)
+                call.requireScopedCreation { call.preparedNamespace() }
+                val creations = call.creationBackend()
                 call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto())
             }
             post("/commit") {
-                call.requireScopedCreation(creations)
+                call.requireScopedCreation { call.preparedNamespace() }
+                val creations = call.creationBackend()
                 val request = call.receive<PublishTableCreationDto>()
                 call.respond(
                     creations.publish(
@@ -87,7 +109,8 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                 )
             }
             post("/commit/uploads") {
-                call.requireScopedCreation(creations)
+                call.requireScopedCreation { call.preparedNamespace() }
+                val creations = call.creationBackend()
                 val request = call.receive<PublishTableCreationDto>()
                 call.respond(
                     creations.publish(
@@ -98,7 +121,8 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                 )
             }
             post("/abort") {
-                call.requireScopedCreation(creations)
+                call.requireScopedCreation { call.preparedNamespace() }
+                val creations = call.creationBackend()
                 call.respond(creations.abort(call.creationCatalog(), call.creationOperation()).toDto())
             }
         }
@@ -106,7 +130,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
 }
 
 private suspend fun ApplicationCall.prepareCreation(
-    creations: TableCreationService,
+    creations: TableCreationBackend,
     partitioned: Boolean,
     sorted: Boolean = false,
     metadata: Boolean = false,
@@ -152,12 +176,11 @@ private suspend fun ApplicationCall.prepareCreation(
     )
 }
 
-private fun ApplicationCall.creationCatalog(): String =
-    parameters["catalog"] ?: throw BadRequestException("missing catalog")
+private fun ApplicationCall.creationCatalog(): String = pathParam("catalog")
 
 private fun ApplicationCall.creationOperation(): UUID =
     try {
-        UUID.fromString(parameters["operation"])
+        UUID.fromString(pathParam("operation"))
     } catch (_: IllegalArgumentException) {
         throw BadRequestException("invalid operation UUID")
     }
@@ -168,9 +191,24 @@ private fun ApplicationCall.creationOperation(): UUID =
  * publish re-checks against the live namespace's id, so a creation cannot be
  * pointed elsewhere after the check. A creation that does not exist answers
  * 404 as it would for anyone.
+ *
+ * One in a namespace the caller may not use answers the same 404, so neither
+ * its existence nor its namespace shows. [namespace] reads it from the backend
+ * itself, so this decides before the handler's view of the backend does.
+ *
+ * On a server that configures remote schemas the creation is looked up for
+ * every caller: one prepared for a namespace before its name became a remote
+ * schema must not be read, published or aborted afterwards. The request
+ * named an operation and no namespace, so a caller the schema is not for
+ * gets the 404 of an operation that does not exist, in the backends' words.
  */
-private fun ApplicationCall.requireScopedCreation(creations: TableCreationService) {
-    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return
-    val creation = creations.status(creationCatalog(), creationOperation())
-    requireScopedNamespaces(creationCatalog(), listOf(creation.definition.namespace))
+private fun ApplicationCall.requireScopedCreation(namespace: () -> String) {
+    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED && !guardsRemoteSchemas) return
+    val namespaces = listOf(namespace())
+    try {
+        refuseRemoteSchemas(creationCatalog(), namespaces)
+        requireScopedNamespaces(creationCatalog(), namespaces)
+    } catch (_: HoglakeException.NotFound) {
+        throw HoglakeException.NotFound("table creation operation '${creationOperation()}'")
+    }
 }

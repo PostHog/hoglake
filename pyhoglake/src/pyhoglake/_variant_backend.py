@@ -160,7 +160,9 @@ def encode(
             raise RuntimeError(f"{ENV}=native, but {why}")
         if chosen == "auto":
             _count(ROUTED, ("encode", skipped))
-        return python(_json_rows(values) if json_text else values, report=report)
+        out = python(_json_rows(values) if json_text else values, report=report)
+        report.encoded_by = "python"
+        return out
 
     started = time.perf_counter()
     try:
@@ -180,7 +182,9 @@ def encode(
     report.encode_seconds += time.perf_counter() - started
     if fault is not None:
         _fall_back(*fault, column, report)
-        return python(_json_rows(values), report=report)
+        out = python(_json_rows(values), report=report)
+        report.encoded_by = "python"
+        return out
     mine = VariantReport(recursion_bound_rows=bounded)
     for row, reason, path, detail in invalid:
         if on_invalid == "raise" or reason == "sql_null_in_not_null":
@@ -199,6 +203,7 @@ def encode(
     if random.random() < SHADOW:
         return _shadow(out, mine, partial(python, _json_rows(values)), column, report)
     report.merge(mine)
+    report.encoded_by = "rust"
     return out
 
 
@@ -240,11 +245,13 @@ def _shadow(
         SHADOWED["rows"] += mine.rows
     if same:
         report.merge(mine)
+        report.encoded_by = "rust"
         return out
     _fall_back("shadow_mismatch", None, column, report)
     if error is not None:
         raise error
     report.merge(replace(theirs, encode_seconds=0.0))
+    report.encoded_by = "python"
     return expected
 
 

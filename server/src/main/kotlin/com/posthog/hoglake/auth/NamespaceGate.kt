@@ -4,7 +4,10 @@ import com.posthog.hoglake.api.BlockingDispatchPhase
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.store.CatalogBinding
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.request.httpMethod
@@ -47,6 +50,60 @@ fun Application.installNamespaceGate(
     dataPath: (catalog: String) -> String? = { null },
     containment: (catalog: String, namespace: String) -> NamespaceContainment?,
 ) {
+    installCallNamespaceGate(
+        dataPath = { _, catalog -> dataPath(catalog) },
+        containment = { _, catalog, namespace -> containment(catalog, namespace) },
+    )
+}
+
+/** Resolve both scoped lookups through the current request's verified placement. */
+fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
+    installCallNamespaceGate(
+        dataPath = { call, catalog ->
+            // Outside the catch: a refusal by the selector is the request's answer, not a missing catalog.
+            val store = selector.forCatalog(call, catalog)
+            try {
+                store.getCatalog(catalog).dataPath
+            } catch (_: HoglakeException.NotFound) {
+                null
+            }
+        },
+        containment = {
+                call,
+                catalog,
+                namespace,
+            ->
+            selector.forCatalog(call, catalog).liveContainment(catalog, namespace)
+        },
+        containedFor = { call, catalog, field, value ->
+            selector.forCatalog(call, catalog).liveContainedFor(catalog, field, value)
+        },
+        // A mount (export) resolves here as it does on the handler, cached
+        // per request; its isolation is ReadScope in the scan, not
+        // containment, so the gate lets every namespace through (plan row
+        // 1.3h: "calls resolve and skips containment for an export"). A
+        // mount Client's remote binding is the same case one hop early:
+        // the Client holds no namespaces, and the Host scopes the read.
+        // A remote schema is the same case for one namespace of a local
+        // catalog: resolve has checked the token allows it, which is the
+        // whole of this server's check, and no containment exists to read.
+        isExport = { call, catalog -> selector.resolve(call, catalog) !is CatalogBinding.Local },
+        refuseRemoteSchemas = selector::refuseRemoteSchemas.takeIf { selector.hasRemoteSchemas },
+    )
+}
+
+private fun Application.installCallNamespaceGate(
+    dataPath: (ApplicationCall, String) -> String?,
+    containment: (ApplicationCall, String, String) -> NamespaceContainment?,
+    containedFor: (
+        ApplicationCall,
+        String,
+        String,
+        Long,
+    ) -> Pair<String, NamespaceContainment>? = { _, _, _, _ -> null },
+    isExport: (ApplicationCall, String) -> Boolean = { _, _ -> false },
+    refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
+) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
     // Plugins, which is still before routing.
@@ -55,22 +112,54 @@ fun Application.installNamespaceGate(
         NamespaceGatePhase,
     )
     attributes.put(NamespaceGateKey, Unit)
-    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath))
+    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath, containedFor, refuseRemoteSchemas))
     intercept(NamespaceGatePhase) {
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull
         val service = call.application.attributes[AuthServiceKey]
-        val held = containment(pending.catalog, pending.namespace)
+        val held =
+            try {
+                if (isExport(call, pending.catalog)) {
+                    // An export serves every namespace to a verified scoped
+                    // reader; ReadScope, not the gate, bounds what it sees.
+                    Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
+                    return@intercept
+                }
+                containment(call, pending.catalog, pending.namespace)
+            } catch (failure: HoglakeException) {
+                // The lookup answered the request itself; the error mapping
+                // sends the answer, and this counts the request's one auth
+                // outcome. An outage is not an auth outcome. A refusal the
+                // lookup counted itself (the store's, StoreGrant.kt) is not
+                // counted again.
+                if (call.attributes.contains(RefusalCountedKey)) throw failure
+                when (failure) {
+                    // A mount reader on a route the mount does not serve
+                    // (store/Mounts.kt): authorized, as the plugin counts it
+                    // on the scoped routes it allows outright.
+                    is HoglakeException.ReadOnlyCatalog, is HoglakeException.MountOperationUnavailable ->
+                        Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
+                    // A mount placed on hoglite, or a catalog no backend holds.
+                    // One a remote schema refused was counted where it was decided (StoreEntitlement.kt).
+                    is HoglakeException.NotSupported, is HoglakeException.NotFound ->
+                        if (!call.attributes.contains(RefusalCountedKey)) {
+                            val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+                            countRefusal(service, service.clientClass(call), caller, match, failure, enforced = true)
+                        }
+                    else -> Unit
+                }
+                throw failure
+            }
         if (caller != null && held != null &&
-            caller.mayUseContained(pending.catalog, held.field, held.value, pending.required)
+            caller.mayUseContained(pending.catalog, held.field, held.value, held.org, pending.required)
         ) {
-            Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+            Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
             return@intercept
         }
         val refusal =
             HoglakeException.NotFound("namespace '${pending.namespace}' in catalog '${pending.catalog}'")
         val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
-        countRefusal(service, clientClass(call), caller, match, refusal, enforced = true)
+        countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
         call.respondRefusal(refusal)
         finish()
     }

@@ -2,10 +2,10 @@
 
 Not part of run-live-tests.sh: the main suite needs a server with
 HOGLAKE_AUTH_MODE=off, and these cases need one in `enforce` or `warn` that
-trusts hogtower's contract key. Start the server with
+trusts the contract key. Start the server with
 
     HOGLAKE_AUTH_MODE=enforce   (or warn)
-    HOGLAKE_AUTH_ISSUER=https://hogtower.contract.test
+    HOGLAKE_AUTH_ISSUER=https://hoglake.contract.test
     HOGLAKE_AUTH_AUDIENCE=hoglake
     HOGLAKE_AUTH_JWKS_FILE=<a file holding the `jwks` object of contract-vectors.json>
 
@@ -109,7 +109,7 @@ class Signer:
 
     def operator(self):
         return self.mint(
-            {"sub": "hogtower:provisioner", "ten": "operator", "cli": "hogtower"}
+            {"sub": "issuer:provisioner", "ten": "operator", "cli": "provisioner"}
         )
 
 

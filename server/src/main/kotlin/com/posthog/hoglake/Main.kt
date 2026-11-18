@@ -23,16 +23,15 @@ internal fun NettyApplicationEngine.Configuration.configureApiListener(cfg: Conf
     callGroupSize = cfg.nettyCallGroupSize
 }
 
-fun main() {
+fun main(args: Array<String>) {
+    // `hoglake token keygen|mint`: the same binary, no server. Decided on the
+    // first argument alone, before Config.fromEnv(), so a shell that holds
+    // HOGLAKE_AUTH_SIGNING_KEY and nothing else can mint without a database.
+    if (args.firstOrNull() == "token") {
+        kotlin.system.exitProcess(com.posthog.hoglake.auth.TokenCommand.main(args.drop(1)))
+    }
     val cfg = Config.fromEnv()
-    val ds = Database.dataSource(cfg)
-    Database.migrate(ds)
-    val jdbi = Database.jdbi(ds)
-
-    // `ds` is handed over only so the hoglake_db_pool_* saturation
-    // gauges have an MXBean to read (#218); everything else goes
-    // through Jdbi as before.
-    val app = App.build(cfg, jdbi, dataSource = ds)
+    val app = App.build(cfg)
     val background = app.startBackground()
     val server =
         embeddedServer(
