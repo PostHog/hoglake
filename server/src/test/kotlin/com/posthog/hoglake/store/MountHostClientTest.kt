@@ -21,14 +21,9 @@ import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.header
-import io.ktor.client.request.request
-import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
-import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
-import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
-import io.ktor.http.contentType
 import io.ktor.serialization.jackson.jackson
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
@@ -64,18 +59,18 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * A mount Client (plan row 1.3c) through the real auth plugin, namespace gate
- * and catalog routes, against a stub Host that records every request it gets.
- * The Client has no PostgreSQL default, as the customer hoglake has none.
+ * The relay transport of a remote schema's Client (plan row 1.3c,
+ * docs/auth-tenancy.md §6.5b) through the real auth plugin, namespace gate
+ * and routes, against a stub Host that records every request it gets. The
+ * Client holds `lake` and relays its namespace `posthog`.
  */
 class MountHostClientTest {
     @TempDir
     lateinit var dir: Path
     private val pair = TestTokens.keyPair()
-    private val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
-    private val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"
     private val hogliteId = UUID.fromString("5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
-    private val scan = "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2/scan"
+    private val schema = "/v1/catalogs/lake/namespaces/posthog"
+    private val scan = "$schema/tables/events_v2/scan"
 
     /** One request as the stub Host received it. */
     private data class Seen(
@@ -165,18 +160,17 @@ class MountHostClientTest {
     @AfterEach
     fun unbindMetrics() = Metrics.clear()
 
-    private fun scoped(
-        catalogs: String = """{"$mount":["read"]}""",
-        rtg: String = "",
-    ): String =
+    /** The schema's reader: the session profile and its `remote_schemas` claim; [rtg] places `lake`. */
+    private fun scoped(rtg: String = ""): String =
         TestTokens.mint(
             pair,
-            TestTokens.scopedClaims(catalogs = catalogs, extra = if (rtg.isEmpty()) "" else ""","rtg":$rtg"""),
+            TestTokens.scopedClaims(
+                catalogs = """{"lake":["read"]}""",
+                extra =
+                    TestTokens.sessionProfile("lake", """{"posthog":["read"]}""") +
+                        if (rtg.isEmpty()) "" else ""","rtg":$rtg""",
+            ),
         )
-
-    private fun tenant() = TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = mapOf(mount to listOf("admin"))))
-
-    private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
 
     private fun Application.clientModule(
         selector: CatalogStoreSelector,
@@ -193,6 +187,7 @@ class MountHostClientTest {
                     StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
                     predicateFields = setOf("team_id"),
                     backends = cfg.backendKinds,
+                    sessionProfile = true,
                     clock = { 1_700_000_001 },
                 )
             }
@@ -211,7 +206,7 @@ class MountHostClientTest {
         maxResponseBytes: Long = 1 shl 20,
         maxConcurrent: Int = 4,
         prebufferBytes: Int = MountHostClient.PREBUFFER_BYTES,
-        match: MountMatch = MountMatch.Events,
+        match: MountMatch = MountMatch.Namespace("posthog"),
     ) = MountHostClient(
         MountHost(
             id = UUID.randomUUID(),
@@ -222,30 +217,32 @@ class MountHostClientTest {
             timeoutMs = timeoutMs,
             maxResponseBytes = maxResponseBytes,
             maxConcurrent = maxConcurrent,
+            // The stub Hosts speak http, which a remote schema's entry must opt in to.
+            allowInsecureHttp = true,
         ),
         prebufferBytes = prebufferBytes,
     )
 
-    /** The resolver over one reader, by its host's matcher; null is a server with no mount hosts. */
+    /** The resolver over one reader, as its remote schema; null is a server with no mount hosts. */
     private fun resolver(client: MountHostClient?) =
         if (client == null) {
             MountHostResolver.NONE
         } else {
-            MountHostResolver { _, name -> client.takeIf { it.host.match.matches(name) } }
+            MountHostResolver { listOf(RemoteSchemaHost(client.host.match as MountMatch.RemoteSchemaMatch, client)) }
         }
 
     /** A Client of [host] under [mode]; [client] null is a server with no mount hosts. */
     private fun client(
         host: StubHost,
         mode: AuthMode = AuthMode.ENFORCE,
-        default: String = "none",
+        default: String = "postgres",
         client: MountHostClient? = hostClient(host.origin),
         block: suspend ApplicationTestBuilder.(MountHostClient?) -> Unit,
     ) = testApplication {
         val cfg = config(default)
         application {
             clientModule(
-                CatalogStoreSelector(postgres, cfg, MountRegistry.NONE, resolver(client)),
+                CatalogStoreSelector(postgres, cfg, resolver(client)),
                 mode,
                 cfg,
             )
@@ -276,15 +273,7 @@ class MountHostClientTest {
             host.answer = { it.json(200, body) }
             client(host) {
                 val token = scoped()
-                val routes =
-                    listOf(
-                        "/v1/catalogs/$mount",
-                        "/v1/catalogs/$mount/namespaces",
-                        "/v1/catalogs/$mount/namespaces/ingest",
-                        "/v1/catalogs/$mount/namespaces/ingest/tables",
-                        "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2",
-                        scan,
-                    )
+                val routes = listOf(schema, "$schema/tables", "$schema/tables/events_v2", scan)
                 for (route in routes) {
                     val response = get(route, token, requestId = "req-1.3c")
                     assertThat(response.status).describedAs(route).isEqualTo(HttpStatusCode.OK)
@@ -330,9 +319,9 @@ class MountHostClientTest {
                 // Parameter names are matched without regard to case, so each spelling is left out.
                 val query = "Catalog=other&snapshot=5&NAMESPACE=elsewhere&table=other_table&include=column_stats"
                 assertThat(get("$scan?$query", scoped()).status).isEqualTo(HttpStatusCode.OK)
-                assertThat(get("/v1/catalogs/$mount/namespaces?catalog=other", scoped()).status)
+                assertThat(get("$schema/tables?catalog=other", scoped()).status)
                     .isEqualTo(HttpStatusCode.OK)
-                assertThat(host.seen.map { it.rawPath }).containsExactly(scan, "/v1/catalogs/$mount/namespaces")
+                assertThat(host.seen.map { it.rawPath }).containsExactly(scan, "$schema/tables")
                 assertThat(host.seen.map { it.rawQuery }).containsExactly("snapshot=5&include=column_stats", null)
             }
         }
@@ -346,28 +335,22 @@ class MountHostClientTest {
         assertThat(MountHostClient.pathSegment("..%2f")).isEqualTo("..%252f")
         assertThat(MountHostClient.pathSegment("é")).isEqualTo("%C3%A9")
         // The path is built from segments only, so a name can never add one, even unvalidated.
-        assertThat(MountHostClient.path(mount, listOf("namespaces", "a/b", "tables", "c?d#e", "scan")))
-            .isEqualTo("/v1/catalogs/$mount/namespaces/a%2Fb/tables/c%3Fd%23e/scan")
-        assertThat(MountHostClient.path(mount, emptyList())).isEqualTo("/v1/catalogs/$mount")
+        assertThat(MountHostClient.path("lake", listOf("namespaces", "a/b", "tables", "c?d#e", "scan")))
+            .isEqualTo("/v1/catalogs/lake/namespaces/a%2Fb/tables/c%3Fd%23e/scan")
+        assertThat(MountHostClient.path("lake", emptyList())).isEqualTo("/v1/catalogs/lake")
         for (dots in listOf("", ".", "..", "...")) {
             assertThatThrownBy { MountHostClient.pathSegment(dots) }.isInstanceOf(IllegalArgumentException::class.java)
         }
     }
 
     @Test
-    fun `a namespace or table name no catalog could hold is a local 404 and is never sent`() {
+    fun `a table name no catalog could hold is a local 404 and is never sent`() {
         StubHost().use { host ->
             client(host) {
                 val token = scoped()
                 val names = listOf("..", ".", "a%2Fb", "a%2F..%2F..%2Fx", "a%20b", "a%3Fb", "a%23b", "9lives", "%C3%A9")
                 for (name in names) {
-                    for (path in listOf(
-                        "/v1/catalogs/$mount/namespaces/$name",
-                        "/v1/catalogs/$mount/namespaces/$name/tables",
-                        "/v1/catalogs/$mount/namespaces/$name/tables/events_v2",
-                        "/v1/catalogs/$mount/namespaces/ingest/tables/$name",
-                        "/v1/catalogs/$mount/namespaces/ingest/tables/$name/scan",
-                    )) {
+                    for (path in listOf("$schema/tables/$name", "$schema/tables/$name/scan")) {
                         val response = get(path, token)
                         assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.NotFound)
                         assertThat(error(response.bodyAsText())).describedAs(path).isEqualTo("not_found")
@@ -375,157 +358,6 @@ class MountHostClientTest {
                 }
                 assertThat(host.seen).isEmpty()
             }
-        }
-    }
-
-    @Test
-    fun `a caller that is not the mount's scoped reader is refused here and the host is never called`() {
-        StubHost().use { host ->
-            val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
-            val reads =
-                listOf(
-                    "/v1/catalogs/$mount",
-                    "/v1/catalogs/$mount/namespaces",
-                    "/v1/catalogs/$mount/namespaces/ingest",
-                    "/v1/catalogs/$mount/namespaces/ingest/tables",
-                    "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2",
-                    scan,
-                )
-            for (mode in listOf(AuthMode.OFF, AuthMode.WARN, AuthMode.ENFORCE)) {
-                client(host, mode) {
-                    for (path in reads) {
-                        // A scoped token whose `cat` names another catalog, or another mount.
-                        for (cat in listOf("""{"lake":["read"]}""", """{"$other":["read"]}""")) {
-                            val response = get(path, scoped(cat))
-                            assertThat(
-                                response.status,
-                            ).describedAs("%s %s", mode, path).isEqualTo(HttpStatusCode.NotFound)
-                        }
-                        // A tenant and an operator pass the plugin; the binding refuses them.
-                        for (token in listOf(tenant(), operator())) {
-                            val response = get(path, token)
-                            assertThat(
-                                response.status,
-                            ).describedAs("%s %s", mode, path).isEqualTo(HttpStatusCode.NotFound)
-                            assertThat(response.bodyAsText()).contains("catalog '$mount'")
-                        }
-                        // No token: 401 under enforce, the binding's 404 where the plugin lets it through.
-                        val anonymous = get(path)
-                        assertThat(anonymous.status).describedAs("%s %s", mode, path)
-                            .isEqualTo(
-                                if (mode == AuthMode.ENFORCE) HttpStatusCode.Unauthorized else HttpStatusCode.NotFound,
-                            )
-                        if (mode != AuthMode.OFF) {
-                            // A reader whose `rtg` places the mount on hoglite, as the Host answers it.
-                            val placed = get(path, scoped(rtg = routed))
-                            assertThat(
-                                placed.status,
-                            ).describedAs("%s %s", mode, path).isEqualTo(HttpStatusCode.NotImplemented)
-                            assertThat(error(placed.bodyAsText())).isEqualTo("not_supported_on_backend")
-                        }
-                    }
-                }
-            }
-            assertThat(host.seen).isEmpty()
-            assertThat(reached.get()).isZero()
-        }
-    }
-
-    @Test
-    fun `under off even the mount's own reader is served nothing`() {
-        StubHost().use { host ->
-            client(host, AuthMode.OFF) {
-                assertThat(get("/v1/catalogs/$mount", scoped()).status).isEqualTo(HttpStatusCode.NotFound)
-                assertThat(get(scan, scoped()).status).isEqualTo(HttpStatusCode.NotFound)
-            }
-            assertThat(host.seen).isEmpty()
-        }
-    }
-
-    @Test
-    fun `every other route on the mount is refused with the host's codes and the host is never called`() {
-        StubHost().use { host ->
-            for (mode in listOf(AuthMode.WARN, AuthMode.ENFORCE)) {
-                client(host, mode) {
-                    val reader = scoped()
-                    val writer = scoped("""{"$mount":["write"]}""")
-                    // A scoped read route a mount does not serve.
-                    val files = get("/v1/catalogs/$mount/namespaces/ingest/tables/events_v2/files", reader)
-                    assertThat(files.status).isEqualTo(HttpStatusCode.NotImplemented)
-                    assertThat(error(files.bodyAsText())).isEqualTo("mount_operation_unavailable")
-
-                    suspend fun send(
-                        method: HttpMethod,
-                        path: String,
-                        token: String,
-                    ) = client.request(path) {
-                        this.method = method
-                        header(HttpHeaders.Authorization, "Bearer $token")
-                        contentType(ContentType.Application.Json)
-                        setBody("{}")
-                    }
-                    // Writes a scoped token may attempt: the binding refuses them as read-only.
-                    for ((method, path) in listOf(
-                        HttpMethod.Post to "/v1/catalogs/$mount/commit",
-                        HttpMethod.Post to "/v1/catalogs/$mount/namespaces/ingest/tables",
-                        HttpMethod.Delete to "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2",
-                    )) {
-                        val response = send(method, path, writer)
-                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.Forbidden)
-                        assertThat(error(response.bodyAsText())).describedAs(path).isEqualTo("read_only_catalog")
-                    }
-                    // The same writes with a read-only `cat`, and routes outside the scoped set: the plugin's 403.
-                    for ((method, path, token) in listOf(
-                        Triple(HttpMethod.Post, "/v1/catalogs/$mount/commit", reader),
-                        Triple(HttpMethod.Delete, "/v1/catalogs/$mount", writer),
-                        Triple(HttpMethod.Post, "/v1/catalogs/$mount/namespaces", writer),
-                        Triple(HttpMethod.Get, "/v1/catalogs/$mount/storage-usage", reader),
-                    )) {
-                        val response = send(method, path, token)
-                        assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.Forbidden)
-                        assertThat(error(response.bodyAsText())).describedAs(path).isEqualTo("forbidden")
-                    }
-                }
-            }
-            assertThat(host.seen).isEmpty()
-            assertThat(reached.get()).isZero()
-        }
-    }
-
-    @Test
-    fun `a catalog that is not a mount name never involves the host`() {
-        StubHost().use { host ->
-            client(host, default = "postgres") {
-                val response = get("/v1/catalogs/lake", operator())
-                assertThat(response.status).isEqualTo(HttpStatusCode.OK)
-                assertThat(response.bodyAsText()).contains(""""data_path":"s3://bucket/lake"""")
-                // Names that only resemble a mount's are catalogs too.
-                for (name in listOf("${mount}2", mount.uppercase(), "x$mount")) {
-                    assertThat(
-                        get("/v1/catalogs/$name", operator()).status,
-                    ).describedAs(name).isEqualTo(HttpStatusCode.OK)
-                }
-                assertThat(get("/v1/catalogs", operator()).bodyAsText()).contains(""""name":"lake"""")
-            }
-            assertThat(host.seen).isEmpty()
-            assertThat(reached.get()).isEqualTo(5)
-        }
-    }
-
-    @Test
-    fun `with no host configured a mount name is served as before`() {
-        StubHost().use { host ->
-            // PostgreSQL default and no mount record: the reserved name is the catalog it is.
-            client(host, default = "postgres", client = null) {
-                assertThat(get("/v1/catalogs/$mount", scoped()).status).isEqualTo(HttpStatusCode.OK)
-            }
-            assertThat(reached.get()).isEqualTo(1)
-            // No default backend: nothing holds it.
-            client(host, client = null) {
-                assertThat(get("/v1/catalogs/$mount", scoped()).status).isEqualTo(HttpStatusCode.NotFound)
-                assertThat(get("/v1/catalogs", scoped()).status).isEqualTo(HttpStatusCode.NotFound)
-            }
-            assertThat(host.seen).isEmpty()
         }
     }
 
@@ -560,7 +392,7 @@ class MountHostClientTest {
                 assertThat(expired.headers[HttpHeaders.WWWAuthenticate]).isEqualTo("""Bearer error="token_expired"""")
 
                 host.answer = { it.json(500, """{"error":"internal_error","detail":"internal server error"}""") }
-                assertThat(get("/v1/catalogs/$mount", scoped()).status).isEqualTo(HttpStatusCode.InternalServerError)
+                assertThat(get(schema, scoped()).status).isEqualTo(HttpStatusCode.InternalServerError)
             }
         }
     }
@@ -585,20 +417,20 @@ class MountHostClientTest {
                                 it.json(
                                     302,
                                     "",
-                                    headers = mapOf("Location" to "${elsewhere.origin}/v1/catalogs/$mount"),
+                                    headers = mapOf("Location" to "${elsewhere.origin}$schema"),
                                 )
                             },
                             {
                                 it.json(
                                     307,
                                     "",
-                                    headers = mapOf("Location" to "${elsewhere.origin}/v1/catalogs/$mount"),
+                                    headers = mapOf("Location" to "${elsewhere.origin}$schema"),
                                 )
                             },
                         )
                     for ((i, answer) in answers.withIndex()) {
                         host.answer = answer
-                        for (path in listOf("/v1/catalogs/$mount", "/v1/catalogs")) {
+                        for (path in listOf(schema, scan)) {
                             val response = get(path, scoped())
                             val text = response.bodyAsText()
                             assertThat(response.status).describedAs("answer %d %s: %s", i, path, text)
@@ -620,7 +452,7 @@ class MountHostClientTest {
         host.close()
         run {
             client(host, client = hostClient(origin)) {
-                for (path in listOf("/v1/catalogs/$mount", scan, "/v1/catalogs")) {
+                for (path in listOf(schema, scan)) {
                     val response = get(path, scoped())
                     val text = response.bodyAsText()
                     assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.ServiceUnavailable)
@@ -671,7 +503,7 @@ class MountHostClientTest {
             client(host, client = hostClient(host.origin, maxConcurrent = 1)) { proxy ->
                 proxy!!.cap.acquire()
                 try {
-                    for (path in listOf(scan, "/v1/catalogs")) {
+                    for (path in listOf(scan, schema)) {
                         val response = get(path, scoped())
                         assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
                         assertThat(error(response.bodyAsText())).isEqualTo("mount_proxy_busy")
@@ -708,8 +540,8 @@ class MountHostClientTest {
         proxy: MountHostClient,
         block: (port: Int) -> T,
     ): T {
-        val cfg = config("none")
-        val selector = CatalogStoreSelector(postgres, cfg, MountRegistry.NONE, resolver(proxy))
+        val cfg = config("postgres")
+        val selector = CatalogStoreSelector(postgres, cfg, resolver(proxy))
         val server =
             embeddedServer(Netty, port = 0, host = "127.0.0.1") { clientModule(selector, AuthMode.ENFORCE, cfg) }
         try {
@@ -793,157 +625,34 @@ class MountHostClientTest {
     }
 
     @Test
-    fun `the listing asks the host once and shows only the mounts the caller's cat names`() {
-        StubHost().use { host ->
-            val entry =
-                """{"name":"$mount","data_path":"s3://bucket/millrace/millrace-dev","head_snapshot_id":41,""" +
-                    """"schema_version":7,"capabilities":[],"read_only":true,"future_field":1}"""
-            host.answer = {
-                it.json(
-                    200,
-                    // The caller's mount, a catalog of the Host's, a mount the caller's `cat` does not name, and noise.
-                    """[{"name":"millrace-dev","data_path":"s3://bucket/millrace/millrace-dev"},$entry,""" +
-                        """{"name":"$other","data_path":"s3://x","read_only":true},$entry,7,{"name":7}]""",
-                )
-            }
-            client(host) {
-                val listed = get("/v1/catalogs", scoped())
-                assertThat(listed.status).isEqualTo(HttpStatusCode.OK)
-                assertThat(listed.bodyAsText()).isEqualTo("[$entry]")
-                val seen = host.seen.single()
-                assertThat(seen.rawPath).isEqualTo("/v1/catalogs")
-                assertThat(seen.rawQuery).isNull()
-                assertThat(seen.headers["authorization"]!!.single()).startsWith("Bearer ")
-                // A mount the Host does not list is not listed here either.
-                host.answer = { it.json(200, "[]") }
-                assertThat(get("/v1/catalogs", scoped()).bodyAsText()).isEqualTo("[]")
-            }
-            host.seen.clear()
-            // A caller with no mount to see makes no upstream call: its listing does not depend on the Host.
-            client(host, default = "postgres") {
-                assertThat(get("/v1/catalogs", operator()).status).isEqualTo(HttpStatusCode.OK)
-                assertThat(get("/v1/catalogs", scoped("""{"lake":["read"]}""")).bodyAsText()).contains("lake")
-                assertThat(host.seen).isEmpty()
-                // With local catalogs too, the Host's mounts follow them.
-                host.answer = { it.json(200, "[$entry]") }
-                val both = get("/v1/catalogs", scoped("""{"lake":["read"],"$mount":["read"]}""")).bodyAsText()
-                assertThat(both).startsWith("""[{"name":"lake"""").endsWith(",$entry]")
-                assertThat(host.seen).hasSize(1)
-            }
-        }
-    }
-
-    @Test
-    fun `proxied requests are counted and timed per mount, and a refused name adds no series`() {
-        StubHost().use { host ->
-            val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
-            client(host, AuthMode.WARN) {
-                repeat(2) { get(scan, scoped()) }
-                host.answer = { it.json(404, """{"error":"not_found","detail":"x"}""") }
-                get(scan, scoped())
-                // Refused locally, under names the caller chose.
-                for (i in 0..9) get("/v1/catalogs/0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9${"%02d".format(i)}-events")
-                get("/v1/catalogs/$other", operator())
-            }
-            val requests = registry.find("hoglake_mount_proxy_requests_total").counters()
-            assertThat(requests.associate { it.id.getTag("catalog") to it.count() }).isEqualTo(mapOf(mount to 3.0))
-            val timer = registry.find("hoglake_mount_proxy_requests").timers().single()
-            assertThat(timer.id.getTag("catalog")).isEqualTo(mount)
-            assertThat(timer.count()).isEqualTo(3)
-            val errors = registry.find("hoglake_mount_proxy_upstream_errors_total").counters()
-            assertThat(errors.associate { it.id.getTag("reason") to it.count() }).isEqualTo(mapOf("http_404" to 1.0))
-            // Every series is the verified mount's: no label came from a refused request's path.
-            val catalogs = registry.meters.mapNotNull { it.id.getTag("catalog") }.toSet()
-            assertThat(catalogs).containsExactly(mount)
-        }
-    }
-
-    @Test
-    fun `two hosts each get only the names they match, and a name no host matches stays local`() {
-        StubHost().use { first ->
-            StubHost().use { second ->
-                fun entry(name: String) = """{"name":"$name","data_path":"s3://bucket/$name","read_only":true}"""
-                first.answer = { it.json(200, "[${entry(mount)},${entry(other)}]") }
-                second.answer = { it.json(200, "[${entry(other)},${entry(mount)}]") }
-                val firstId = UUID.fromString("11111111-1111-4111-8111-111111111111")
-                val secondId = UUID.fromString("22222222-2222-4222-8222-222222222222")
-
-                fun host(
-                    id: UUID,
-                    name: String,
-                    origin: URI,
-                ) = MountHost(id, MountMatch.Catalog(name), MountHost.Kind.HOGLAKE, origin, MountHost.Auth.FORWARD)
-                val third = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f2-events"
-                StaticMountHosts(listOf(host(firstId, mount, first.origin), host(secondId, other, second.origin))).use {
-                        hosts ->
-                    // By id, as a verified claim could name a host later; an unknown id names nothing.
-                    assertThat(hosts.host(firstId)!!.host.origin).isEqualTo(first.origin)
-                    assertThat(hosts.host(secondId)!!.host.origin).isEqualTo(second.origin)
-                    assertThat(hosts.host(UUID.randomUUID())).isNull()
-                    testApplication {
-                        val cfg = config("none")
-                        application {
-                            clientModule(
-                                CatalogStoreSelector(postgres, cfg, MountRegistry.NONE, hosts),
-                                AuthMode.ENFORCE,
-                                cfg,
-                            )
-                        }
-                        val token = scoped("""{"$mount":["read"],"$other":["read"],"$third":["read"]}""")
-                        assertThat(get("/v1/catalogs/$mount/namespaces", token).status).isEqualTo(HttpStatusCode.OK)
-                        assertThat(first.seen.map { it.rawPath }).containsExactly("/v1/catalogs/$mount/namespaces")
-                        assertThat(second.seen).isEmpty()
-                        assertThat(get("/v1/catalogs/$other/namespaces", token).status).isEqualTo(HttpStatusCode.OK)
-                        assertThat(second.seen.map { it.rawPath }).containsExactly("/v1/catalogs/$other/namespaces")
-                        assertThat(first.seen).hasSize(1)
-                        // A mount name neither host matches is not remote: nothing here holds it.
-                        assertThat(
-                            get("/v1/catalogs/$third/namespaces", token).status,
-                        ).isEqualTo(HttpStatusCode.NotFound)
-                        assertThat(first.seen.size + second.seen.size).isEqualTo(2)
-                        // The listing asks each host once and keeps from each only the names it matches.
-                        val listed = get("/v1/catalogs", token)
-                        assertThat(listed.bodyAsText()).isEqualTo("[${entry(mount)},${entry(other)}]")
-                        assertThat(first.seen.map { it.rawPath }.last()).isEqualTo("/v1/catalogs")
-                        assertThat(second.seen.map { it.rawPath }.last()).isEqualTo("/v1/catalogs")
-                        assertThat(first.seen.size + second.seen.size).isEqualTo(4)
-                        // A caller that names only one mount reaches only its host.
-                        get("/v1/catalogs", scoped("""{"$other":["read"]}"""))
-                        assertThat(first.seen).hasSize(2)
-                        assertThat(second.seen).hasSize(3)
-                    }
-                }
-            }
-        }
-    }
-
-    @Test
-    fun `hosts whose matchers overlap or share an id are refused`() {
+    fun `hosts whose matchers overlap or share an id are refused, and a host is found by its id`() {
         fun host(
             match: MountMatch,
             id: UUID = UUID.randomUUID(),
-        ) = MountHost(id, match, MountHost.Kind.HOGLAKE, URI("http://127.0.0.1:9"), MountHost.Auth.FORWARD)
+        ) = MountHost(id, match, MountHost.Kind.HOGLAKE, URI("https://127.0.0.1:9"), MountHost.Auth.FORWARD)
+        val posthog = MountMatch.Namespace("posthog")
+        val family = MountMatch.NamespaceFamily("team")
         for (overlapping in listOf(
-            listOf(host(MountMatch.Events), host(MountMatch.Events)),
-            listOf(host(MountMatch.Events), host(MountMatch.Catalog(mount))),
-            listOf(host(MountMatch.Catalog(mount)), host(MountMatch.Events)),
-            listOf(host(MountMatch.Catalog(mount)), host(MountMatch.Catalog(other)), host(MountMatch.Catalog(mount))),
+            listOf(host(posthog), host(posthog)),
+            listOf(host(posthog), host(MountMatch.Namespace("PostHog"))),
+            listOf(host(family), host(MountMatch.Namespace("team_5"))),
+            listOf(host(posthog), host(family), host(family)),
         )) {
             assertThatThrownBy { StaticMountHosts(overlapping) }
                 .isInstanceOf(IllegalArgumentException::class.java)
-                .hasMessageContaining("match the same catalog name")
+                .hasMessageContaining("match the same namespace name")
         }
         val id = UUID.randomUUID()
-        assertThatThrownBy {
-            StaticMountHosts(listOf(host(MountMatch.Catalog(mount), id), host(MountMatch.Catalog(other), id)))
-        }
+        assertThatThrownBy { StaticMountHosts(listOf(host(posthog, id), host(family, id))) }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("duplicate mount host id")
-        // A name that is not a mount's cannot be matched: it could be another tenant's catalog.
-        for (name in listOf("lake", "millrace-dev", mount.uppercase(), "${mount}2")) {
-            assertThatThrownBy { MountMatch.Catalog(name) }.isInstanceOf(IllegalArgumentException::class.java)
+        // By id, as a verified claim could name a host later; an unknown id names nothing.
+        val other = UUID.randomUUID()
+        StaticMountHosts(listOf(host(posthog, id), host(family, other))).use { hosts ->
+            assertThat(hosts.host(id)!!.host.match).isEqualTo(posthog)
+            assertThat(hosts.host(other)!!.host.match).isEqualTo(family)
+            assertThat(hosts.host(UUID.randomUUID())).isNull()
         }
-        StaticMountHosts(listOf(host(MountMatch.Catalog(mount)), host(MountMatch.Catalog(other)))).close()
     }
 
     @Test
@@ -996,35 +705,33 @@ class MountHostClientTest {
     }
 
     @Test
-    fun `a listing larger than a listing can be is refused, not parsed`() {
-        StubHost().use { host ->
-            val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
-            host.answer = { it.json(200, "[" + "1,".repeat(200_000) + "1]") }
-            client(host) {
-                val response = get("/v1/catalogs", scoped())
-                assertThat(response.status).isEqualTo(HttpStatusCode.BadGateway)
-                assertThat(error(response.bodyAsText())).isEqualTo("mount_host_invalid_response")
-            }
-            val errors = registry.find("hoglake_mount_proxy_upstream_errors_total").counters()
-            assertThat(errors.map { it.id.getTag("reason") }).containsExactly("response_too_large")
-        }
-    }
-
-    @Test
     fun `the whole application cuts a body that fails mid-stream, and answers its typed errors`() {
-        // The real App and its full pipeline (blocking dispatch, logging, metrics), with no PostgreSQL.
+        // The real App and its full pipeline (blocking dispatch, logging, metrics), with no PostgreSQL:
+        // the token places `lake` on a hoglite engine that answers the one catalog read the schema needs.
         val body = ("[" + (1..60_000).joinToString(",") { """{"data_file_id":$it}""" } + "]").toByteArray()
+        val engine =
+            HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+                createContext("/") { exchange ->
+                    val row = """["lake","s3://bucket/lake",3,2,0,null,null,0]"""
+                    exchange.json(200, """{"cols":[],"rows":[$row],"affected":0}""")
+                }
+                start()
+            }
         StubHost().use { host ->
             val hosts =
                 Files.writeString(
                     dir.resolve("hosts.json"),
-                    """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":{"type":"events"},""" +
-                        """"kind":"hoglake","url":"${host.origin}","auth":"forward","max_response_bytes":400000}]}""",
+                    """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":{"type":"namespace",""" +
+                        """"name":"posthog"},"kind":"hoglake","url":"${host.origin}","auth":"forward",""" +
+                        """"allow_insecure_http":true,"max_response_bytes":400000}]}""",
                 )
             val keys = Files.writeString(dir.resolve("jwks.json"), TestTokens.jwks(pair))
+            val backend = """"id":"$hogliteId","kind":"hoglite","url":"http://127.0.0.1:${engine.address.port}""""
+            val backends = Files.writeString(dir.resolve("engine.json"), """{"backends":[{$backend}]}""")
             val cfg =
                 Config(
                     port = 0,
+                    backendsFile = backends.toString(),
                     defaultBackend = "none",
                     jdbcUrl = "jdbc:no-such-driver:must-not-open",
                     dbUser = "",
@@ -1033,11 +740,15 @@ class MountHostClientTest {
                     authIssuer = TestTokens.ISSUER,
                     authJwksFile = keys.toString(),
                     authPredicateFields = "team_id",
+                    authSessionProfile = "on",
                     mountHostsFile = hosts.toString(),
                 )
             val iat = System.currentTimeMillis() / 1000 - 5
-            val token =
-                TestTokens.mint(pair, TestTokens.scopedClaims(catalogs = """{"$mount":["read"]}""", iat = iat))
+            val profile = TestTokens.sessionProfile("lake", """{"posthog":["read"]}""")
+            val routed = ""","rtg":{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
+            val claims =
+                TestTokens.scopedClaims(catalogs = """{"lake":["read"]}""", iat = iat, extra = profile + routed)
+            val token = TestTokens.mint(pair, claims)
             App.build(cfg).use { app ->
                 val server = embeddedServer(Netty, configure = { configureApiListener(cfg) }) { app.module(this) }
                 try {
@@ -1062,6 +773,7 @@ class MountHostClientTest {
                     ).isEqualTo("""{"error":"not_found","detail":"table 'ingest.nope'"}""")
                 } finally {
                     server.stop(0, 1000)
+                    engine.stop(0)
                 }
             }
         }

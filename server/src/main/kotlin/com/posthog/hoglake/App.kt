@@ -7,7 +7,6 @@ import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
-import com.posthog.hoglake.api.installMountRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
 import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
@@ -52,8 +51,6 @@ import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountHostResolver
 import com.posthog.hoglake.store.MountReadService
-import com.posthog.hoglake.store.MountRegistry
-import com.posthog.hoglake.store.MountStore
 import com.posthog.hoglake.store.PostgresCatalogStore
 import com.posthog.hoglake.store.StaticMountHosts
 import com.zaxxer.hikari.HikariDataSource
@@ -92,8 +89,6 @@ class App private constructor(
      * second connection until something asks.
      */
     val healthProbe: HealthProbe,
-    /** Mount records; null is this instance's `hog_mount` ([mountStore]). Tests inject them. */
-    private val mountRegistry: MountRegistry? = null,
 ) : AutoCloseable {
     /** Access from a PostgreSQL request only; probes must use [postgresReady]. */
     val jdbi: Jdbi get() = jdbiProvider()
@@ -140,8 +135,6 @@ class App private constructor(
         PostgresCatalogStore({ catalogService }, { commitService }, { scanService })
     }
 
-    private val mountStore by lazy { MountStore({ jdbi }, cfg::mountAdmitted) }
-
     /**
      * Client mode (plan row 1.3c): the remote hosts this server proxies
      * mounts to (HOGLAKE_MOUNT_HOSTS_FILE). With none configured nothing is
@@ -153,7 +146,6 @@ class App private constructor(
         CatalogStoreSelector(
             catalogStore,
             cfg,
-            MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry ?: mountStore),
             mountHosts.value ?: MountHostResolver.NONE,
             objectStore = { objectStore },
             removalStore = { removalStore },
@@ -162,14 +154,11 @@ class App private constructor(
         )
     }
 
-    /** The mount (export) read surface (plan row 1.3h): the five scoped read routes over the pinned source table. */
+    /** The stream reads of a served family (docs/auth-tenancy.md §6.5d), under the scan cap, budget and deadline. */
     private val mountReadService by lazy {
         MountReadService(
             jdbi,
             { catalogStore },
-            sourceCatalog = cfg.mountSourceCatalog,
-            sourceTableUuid = cfg.mountSourceTableUuidOrNull,
-            sourceFieldId = cfg.mountSourceFieldIdOrNull,
             fileBudget = cfg.mountScanFileBudget,
             scanDeadlineMs = cfg.mountScanDeadlineMs,
             maxConcurrentScans = cfg.mountScanMaxConcurrent,
@@ -465,9 +454,8 @@ class App private constructor(
             jdbi: Jdbi,
             dataSource: HikariDataSource? = null,
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
-            mountRegistry: MountRegistry? = null,
         ): App =
-            App(cfg, { jdbi }, { true }, mountRegistry = mountRegistry, healthProbe = healthProbe).also {
+            App(cfg, { jdbi }, { true }, healthProbe = healthProbe).also {
                 it.bindMetrics(dataSource)
             }
     }
@@ -612,10 +600,6 @@ class App private constructor(
             instanceTotals = { if (postgresReady()) catalogMetrics.latestTotals else null },
             catalogTotals = { if (postgresReady()) catalogMetrics.latestByCatalog else emptyMap() },
             uiTheme = cfg.uiTheme,
-            // A provider, not the instance: forcing the lazy here would open
-            // PG at wiring time and break the PG-free / lazy-boot paths. It is
-            // built only when a mount actually resolves (PG is the default then).
-            mountRead = { mountReadService },
             reservedNamespaces = cfg.reservedNamespaces,
             operatorTeamNamespaces = cfg.operatorTeamNamespaces,
         )
@@ -628,7 +612,7 @@ class App private constructor(
             selector = catalogSelector,
         )
         app.installAlterRoutes({ alterService }, selector = catalogSelector)
-        app.installScanRoutes(catalogSelector, { mountReadService })
+        app.installScanRoutes(catalogSelector)
         app.installViewRoutes({ viewService }, selector = catalogSelector)
         app.installMaintenanceRoutes(
             { optionsService },
@@ -644,7 +628,6 @@ class App private constructor(
         app.installPartitionListingRoutes({ partitionListingService }, selector = catalogSelector)
         app.installPartitionLookupRoutes({ partitionLookupService }, selector = catalogSelector)
         app.installPublicationRoutes(catalogSelector)
-        app.installMountRoutes({ mountStore }, cfg.mountWriterSubject)
         app.installDebugRoutes()
     }
 

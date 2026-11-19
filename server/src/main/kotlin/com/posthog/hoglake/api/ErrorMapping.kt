@@ -28,7 +28,6 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - NotFound            -> 404
  * - ReadOnlyCatalog     -> 403 `read_only_catalog` (any non-read route on a mount)
  * - MountOperationUnavailable -> 501 `mount_operation_unavailable`
- * - MountRevisionConflict -> 409 `mount_revision_conflict` (a stale mount write)
  * - MountScanTooManyFiles -> 422 `mount_scan_too_many_files` (scoped scan over the file budget)
  * - MountScanTimeout    -> 503 `mount_scan_timeout` + Retry-After (scoped scan past the deadline)
  * - MountScanBusy       -> 503 `mount_scan_busy` + Retry-After (export-scan concurrency cap full)
@@ -99,8 +98,6 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         is HoglakeException.ReadOnlyCatalog -> HttpStatusCode.Forbidden to apiError("read_only_catalog", cause)
         is HoglakeException.MountOperationUnavailable ->
             HttpStatusCode.NotImplemented to apiError("mount_operation_unavailable", cause)
-        is HoglakeException.MountRevisionConflict ->
-            HttpStatusCode.Conflict to apiError("mount_revision_conflict", cause)
         is HoglakeException.MountScanTooManyFiles ->
             HttpStatusCode.UnprocessableEntity to apiError("mount_scan_too_many_files", cause)
         is HoglakeException.MountScanTimeout ->

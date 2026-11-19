@@ -55,7 +55,7 @@ class ServedNamespacesIntegrationTest {
     private val source = "imports"
     private val cust = "cust"
 
-    // An enabled mount record for this name, so only a caller's ignored placement stands between it and the mount.
+    // A retired mount name with an enabled `hog_mount` row and the switch on, both of which nothing reads now.
     private val mount = "0194f2f6-8c5d-7a4e-9b1f-3c2d1e0f9a8b-events"
 
     // The customer's own Hoglite backend: this server's backends file does not list it.
@@ -122,15 +122,14 @@ class ServedNamespacesIntegrationTest {
                 authSessionProfile = "on",
                 servedNamespacesFile = served.toString(),
             )
-        db.jdbi.useHandle<Exception> { it.execute("UPDATE hog_mount_switch SET enabled = true") }
-        app =
-            App.build(
-                cfg, db.jdbi,
-                mountRegistry =
-                    MountRegistry {
-                        if (it == mount) MountRecord(mount, 1, true, listOf(42)) else null
-                    },
+        db.jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "INSERT INTO hog_mount (name, revision, enabled, mount_values) VALUES (?, 1, true, '{42}')",
+                mount,
             )
+            h.execute("UPDATE hog_mount_switch SET enabled = true")
+        }
+        app = App.build(cfg, db.jdbi)
         server = embeddedServer(Netty, configure = { configureApiListener(cfg) }) { app.module(this) }
         server.start(wait = false)
         port = runBlocking { server.engine.resolvedConnectors().first().port }
@@ -439,6 +438,36 @@ class ServedNamespacesIntegrationTest {
             assertThat(response.statusCode()).describedAs(path).isEqualTo(404)
             assertThat(response.body()).describedAs(path).doesNotContain("events\"", "a.parquet", orgA, "imports")
         }
+    }
+
+    @Test
+    fun `a stored mount row with the switch on serves nothing, and the mount API has no route`() {
+        val reader = scoped(catalog = mount)
+        // Predicated like any catalog: the catalog route is not a scoped caller's.
+        val catalog = send("GET", "/v1/catalogs/$mount", reader)
+        assertThat(catalog.statusCode()).describedAs(catalog.body()).isEqualTo(403)
+        assertThat(code(catalog)).isEqualTo("forbidden")
+        for (path in listOf("/namespaces", "/namespaces/ingest/tables", "/namespaces/ingest/tables/events/scan")) {
+            val response = send("GET", "/v1/catalogs/$mount$path", reader)
+            assertThat(response.statusCode()).describedAs("%s: %s", path, response.body()).isEqualTo(404)
+            assertThat(code(response)).describedAs(path).isEqualTo("not_found")
+            assertThat(response.body()).describedAs(path).contains("catalog '$mount'")
+        }
+        assertThat(mapper.readTree(send("GET", "/v1/catalogs", reader).body()).size()).isEqualTo(0)
+        // No route and no rule: under enforce, the deny-by-default 401 for every token, an operator's included.
+        val routes = listOf("GET" to "/v1/mounts", "GET" to "/v1/mounts/$mount", "PUT" to "/v1/mounts/$mount")
+        for ((method, path) in routes) {
+            val response = send(method, path, operator())
+            assertThat(response.statusCode()).describedAs("%s %s", method, path).isEqualTo(401)
+            assertThat(code(response)).isEqualTo("invalid_request")
+        }
+        // The shape stays refused at creation, before placement, and nothing is created; a near miss is a catalog.
+        val made = send("POST", "/v1/catalogs", operator(), """{"name":"$mount","data_path":"s3://b/$mount"}""")
+        assertThat(made.statusCode()).describedAs(made.body()).isEqualTo(422)
+        assertThat(code(made)).isEqualTo("validation")
+        assertThat(catalogs.listCatalogs().map { it.name }).doesNotContain(mount)
+        val near = send("POST", "/v1/catalogs", operator(), """{"name":"${mount}2","data_path":"s3://b/near"}""")
+        assertThat(near.statusCode()).describedAs(near.body()).isEqualTo(201)
     }
 
     @Test

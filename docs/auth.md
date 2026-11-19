@@ -47,8 +47,8 @@ one issuer among possible issuers.
 Under `warn` a request with no token (or one that does not verify) is counted
 once, as `missing` or `invalid`, and then served as under `off`: `GET
 /v1/catalogs` lists every catalog of the default PostgreSQL backend, so the
-web UI keeps working through the burn-in. It lists no hoglite catalogs and no
-mounts (an anonymous caller has no routing claim and no mount visibility), and
+web UI keeps working through the burn-in. It lists no hoglite catalogs (an
+anonymous caller has no routing claim), and
 on a deployment whose default backend is not PostgreSQL it answers 404, as it
 did before. The per-catalog totals (`table_count`, `live_rows`,
 `live_size_bytes`, `oldest_snapshot_time`) are omitted for the anonymous
@@ -56,7 +56,7 @@ caller, as `/v1/info` omits the instance totals. A verified token gets its own
 catalogs as it would under `enforce`, with their totals unless it is scoped.
 
 Some features refuse `off` because they rely on the token: the public listener
-(`HOGLAKE_PUBLIC_PORT`), hoglite backends and mounts.
+(`HOGLAKE_PUBLIC_PORT`), hoglite backends, remote schemas and served namespaces.
 
 Listeners:
 
@@ -285,7 +285,7 @@ A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
 `invalid_predicate`, …).
 
 An `operator` token bypasses per-catalog checks and may create catalogs,
-manage mounts and containment, and read operator-only routes. Operator tokens
+manage containment, and read operator-only routes. Operator tokens
 are therefore only as safe as the keys in the JWKS: whoever can sign with them
 is an operator.
 
@@ -382,7 +382,7 @@ tokens does it on the issuer side: the issuer returns scoped, short-lived
 storage credentials alongside the token, in the same response, and the client
 uses them. That is how PostHog's deployment works. Storage credentials are never
 placed inside the JWT: the JWT travels on every request and is forwarded to
-mount hosts, and a storage secret should not.
+the hosts of remote schemas, and a storage secret should not.
 
 ## Clients
 

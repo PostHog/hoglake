@@ -100,8 +100,6 @@ class ScopedNamespaceConfigTest {
     fun `any remote or served configuration prevents activation`() {
         val cfg = config()
         for (match in listOf(
-            """{"type":"events"}""",
-            """{"type":"catalog","name":"11111111-1111-1111-1111-111111111111-events"}""",
             """{"type":"namespace","name":"reports"}""",
             """{"type":"namespace","name":"elsewhere"}""",
             """{"type":"namespace_family","family":"team"}""",

@@ -23,7 +23,6 @@ import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
-import com.posthog.hoglake.store.MountReadService
 import com.posthog.hoglake.store.remoteSchemaRefusal
 import com.posthog.hoglake.store.servedNamespaceRefusal
 import io.ktor.http.HttpStatusCode
@@ -70,12 +69,6 @@ fun Application.installApiRoutes(
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
-    /**
-     * Serves a mount's five scoped read routes (plan row 1.3h). A provider,
-     * not the instance, so a PG-free boot never forces it (it builds a
-     * PostgreSQL-backed reader); it resolves to null where no mount can serve.
-     */
-    mountRead: () -> MountReadService? = { null },
     /** Names `POST .../namespaces` refuses for every caller (HOGLAKE_RESERVED_NAMESPACES). */
     reservedNamespaces: ReservedNamespaces = ReservedNamespaces.NONE,
     /** Names only an operator creates in the listed catalogs (HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS). */
@@ -161,34 +154,15 @@ fun Application.installApiRoutes(
                         is AuthState.Anonymous -> true
                         is AuthState.Authenticated -> auth.caller.kind == Caller.Kind.SCOPED
                     }
-                // A catalog a mount shadows answers as the mount on every
-                // route, so it is not listed. The caller's own mounts follow,
-                // unsorted: re-sorting could reorder the backend's listing.
                 val listed = catalogs?.listCatalogs(visible).orEmpty()
-                val mounts = selector.mountsAmong(call, listed.map { it.name } + listing.mounts)
-                val local =
-                    listed.filterNot { it.name in mounts }
-                        .map { it.toDto(if (withoutTotals) null else totals[it.name]) }
-                val shown = listing.mounts.filter { it in mounts }
-                // A mount Client asks each host once, with the caller's
-                // token, and shows the entries the host returns for these
-                // names as the host wrote them.
-                val remote = if (shown.isEmpty()) null else selector.remoteCatalogs(call, shown)
-                if (shown.isEmpty()) {
-                    call.respond(local)
-                } else if (remote != null) {
-                    call.respond<List<Any>>(local + remote)
-                } else {
-                    val source = selector.mountSource()
-                    call.respond(local + shown.map { source.toMountDto(it) })
-                }
+                call.respond(listed.map { it.toDto(if (withoutTotals) null else totals[it.name]) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
                 // Before placement picks a backend, so no backend can create
                 // a catalog that shares a name with a mount.
                 if (MountNames.isReserved(req.name)) {
-                    throw HoglakeException.Validation("catalog name '${req.name}' is reserved for mounts")
+                    throw HoglakeException.Validation("catalog name '${req.name}' is reserved (<orgID>-events)")
                 }
                 val catalogs = selector.forCatalog(call, req.name)
                 call.respond(
@@ -199,11 +173,8 @@ fun Application.installApiRoutes(
 
             route("/{catalog}") {
                 get {
-                    // The one route a mount serves so far (AuthPolicy.MOUNT_ROUTES).
                     when (val binding = selector.resolve(call, call.catalog())) {
                         is CatalogBinding.Local -> call.respond(binding.store.getCatalog(call.catalog()).toDto())
-                        is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
-                        is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
                         // Unreachable: this path names no namespace.
                         is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
                         is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
@@ -236,15 +207,6 @@ fun Application.installApiRoutes(
                     get {
                         val catalog = call.catalog()
                         when (val binding = selector.resolve(call, catalog)) {
-                            // A mount lists only the pinned table's namespace (plan row 1.3h).
-                            is CatalogBinding.Mount ->
-                                call.respond(
-                                    checkNotNull(mountRead()).namespaces(
-                                        call.longQuery("snapshot"),
-                                        call.instantQuery("at_timestamp"),
-                                    ).map { it.toDto() },
-                                )
-                            is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
                             // Unreachable: this path names no namespace.
                             is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.label)
                             is CatalogBinding.Served -> throw servedNamespaceRefusal(call, binding.label)
@@ -314,15 +276,6 @@ fun Application.installApiRoutes(
                     }
                     get("/{namespace}") {
                         when (val binding = selector.resolve(call, call.catalog())) {
-                            is CatalogBinding.Mount ->
-                                call.respond(
-                                    checkNotNull(mountRead()).namespace(
-                                        call.namespace(),
-                                        call.longQuery("snapshot"),
-                                        call.instantQuery("at_timestamp"),
-                                    ).toDto(),
-                                )
-                            is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
                             is CatalogBinding.Served ->
                                 call.respond(
@@ -382,18 +335,6 @@ fun Application.installApiRoutes(
                     route("/{namespace}/tables") {
                         get {
                             when (val binding = selector.resolve(call, call.catalog())) {
-                                // The pinned table only, with SCOPED totals (plan row 1.3h).
-                                is CatalogBinding.Mount ->
-                                    call.respond(
-                                        checkNotNull(mountRead()).tables(
-                                            call.hoglakeAuth.callerOrNull,
-                                            binding.mount,
-                                            call.namespace(),
-                                            call.longQuery("snapshot"),
-                                            call.instantQuery("at_timestamp"),
-                                        ).map { it.toDto() },
-                                    )
-                                is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
                                 is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
                                 is CatalogBinding.Served ->
                                     call.respond(
@@ -432,18 +373,6 @@ fun Application.installApiRoutes(
                         route("/{table}") {
                             get {
                                 when (val binding = selector.resolve(call, call.catalog())) {
-                                    // A mount serves the pinned table only, totals omitted (plan row 1.3h).
-                                    is CatalogBinding.Mount ->
-                                        call.respond(
-                                            checkNotNull(mountRead()).table(
-                                                call.namespace(),
-                                                call.table(),
-                                                call.longQuery("snapshot"),
-                                                call.instantQuery("at_timestamp"),
-                                            ).toDto(),
-                                        )
-                                    is CatalogBinding.Remote ->
-                                        binding.host.table(call, binding.name, call.namespace(), call.table())
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
                                     // The one table answer that says remote: its
@@ -897,10 +826,7 @@ private fun ApplicationCall.refuseHiddenTable(
  * stored row-group start offsets. Installed separately so App.kt wires
  * it with its own CatalogStore.
  */
-fun Application.installScanRoutes(
-    selector: CatalogStoreSelector,
-    mountRead: () -> MountReadService? = { null },
-) {
+fun Application.installScanRoutes(selector: CatalogStoreSelector) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
@@ -908,19 +834,15 @@ fun Application.installScanRoutes(
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
-            // A mount Client relays the request as it came (plan row 1.3c):
+            // A remote schema's scan is relayed as it came (plan row 1.3c):
             // the Host parses it, plans the scoped scan and applies its caps.
-            selector.remote(call, call.catalog())?.let { remote ->
-                return@get remote.host.scan(call, remote.name, call.namespace(), call.table())
-            }
-            // A remote schema's scan is relayed the same way.
             selector.remoteSchema(call, call.catalog())?.let { schema ->
                 return@get schema.host.schemaScan(call, schema, call.table())
             }
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
             val files =
                 when (val binding = selector.resolve(call, call.catalog())) {
-                    is CatalogBinding.Remote, is CatalogBinding.RemoteSchema ->
+                    is CatalogBinding.RemoteSchema ->
                         error("a remote binding is relayed before the scan is parsed")
                     is CatalogBinding.Local ->
                         binding.store.planScan(
@@ -934,20 +856,6 @@ fun Application.installScanRoutes(
                         )
                     is CatalogBinding.Served ->
                         binding.reader.scan(
-                            call.table(),
-                            call.longQuery("snapshot"),
-                            call.instantQuery("at_timestamp"),
-                            columnStats = request.columnStats,
-                            splitOffsets = request.splitOffsets,
-                        )
-                    // The export's scoped scan (plan row 1.3h): ReadScope in
-                    // SQL, each file its team id, under the shared cap, the
-                    // file budget and the deadline.
-                    is CatalogBinding.Mount ->
-                        checkNotNull(mountRead()).scan(
-                            call.hoglakeAuth.callerOrNull,
-                            binding.mount,
-                            call.namespace(),
                             call.table(),
                             call.longQuery("snapshot"),
                             call.instantQuery("at_timestamp"),
