@@ -215,6 +215,30 @@ This operation never acquires a tenant or initializes a schema.
 
 ### Session profile with embedded storage credentials
 
+#### Dedicated read verification
+
+A separate read verifier takes an explicit profile identifier from the receiver.
+It does not accept `storage-session`.
+It requires ES256 with mounted keys.
+It requires exactly `trino-session`, `hoglake-session`, and `hoglite-session` in `aud`.
+The ordinary verifier refuses these audiences.
+No server route selects the dedicated verifier yet.
+
+The initial read scope covers one primary catalog with a Hoglite placement.
+It requires one explicit team with read permission.
+The token carries generation `1`, a session identifier, and a finite session deadline.
+Require `nbf <= iat < exp <= aws.expires_at <= session_deadline`.
+Clock skew does not extend AWS expiry.
+
+Each storage grant binds the catalog, target, bucket, region, and `s3:GetObject`.
+It carries either a literal `object_key` or a slash-terminated `prefix`.
+The verifier rejects overlaps and repeated grants.
+The manifest grant names one literal object for the routed tenant.
+Two configured remote targets bind the read-only `team` family.
+The verifier does not retain or log the AWS credentials.
+
+#### Experimental profile
+
 **Status: PROPOSED, experimental, off by default.** A query engine that runs
 one user's work across many processes (a coordinator, its workers, hoglake, a
 backend that verifies the token itself) wants ONE token to carry both the
