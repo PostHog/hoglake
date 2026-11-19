@@ -1,0 +1,142 @@
+package com.posthog.hoglake.auth
+
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.ObjectNode
+import com.posthog.hoglake.store.BackendKind
+import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.UUID
+
+class ReadSessionProfileTest {
+    @TempDir
+    lateinit var directory: Path
+
+    private val mapper = ObjectMapper()
+    private val pair = TestTokens.keyPair()
+    private val backend = UUID.fromString("11111111-1111-4111-8111-111111111111")
+    private val profile = ReadSessionProfile("example.aws-session", setOf("remote:events", "remote:imports"))
+
+    private fun verifier(
+        now: Long = 2_000_000_001L,
+        experimental: Boolean = false,
+        backends: Map<UUID, BackendKind> = mapOf(backend to BackendKind.HOGLITE),
+        ignoreUnknownRouting: Boolean = false,
+    ): JwtVerifier {
+        val jwks = directory.resolve("jwks.json")
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(pair, TestTokens.KID)}]}""")
+        return JwtVerifier(
+            TestTokens.ISSUER,
+            TestTokens.AUDIENCE,
+            JwksSigningKeys.fromFile(jwks),
+            predicateFields = setOf("team_id"),
+            backends = backends,
+            sessionProfile = experimental,
+            ignoreUnknownScopedRouting = ignoreUnknownRouting,
+        ) { now }
+    }
+
+    private fun token(mutation: (ObjectNode) -> Unit = {}): String {
+        val claims =
+            mapper.readTree(
+                """
+                {
+                  "iss": "${TestTokens.ISSUER}",
+                  "aud": ["trino-session", "hoglake-session", "hoglite-session"],
+                  "sub": "example.alice", "usr": "example.alice", "jti": "token-a",
+                  "profile": "example.aws-session", "version": 1, "purpose": "user-session",
+                  "ten": "scoped", "org": "example-org", "primary_catalog": "example-catalog",
+                  "sid": "session-a", "generation": 1, "session_deadline": 2000000120,
+                  "iat": 2000000000, "nbf": 2000000000, "exp": 2000000060,
+                  "cat": {"example-catalog": ["read"]}, "prd": {"team_id": {"42": "read"}},
+                  "rtg": {"b": "hoglite", "be": "$backend", "t": "fixture_3"},
+                  "remote_schemas": {"team": ["read"]},
+                  "aws": {"access_key_id":"fictional-key", "secret_access_key":"fictional-secret",
+                          "session_token":"fictional-session", "region":"us-east-1", "expires_at":2000000060},
+                  "grants": [
+                    {"catalog":"example-catalog","target":"example-catalog","bucket":"example-customer",
+                     "object_key":"tables/data.parquet","region":"us-east-1","actions":["s3:GetObject"]},
+                    {"catalog":"example-catalog","target":"$backend","bucket":"example-owner",
+                     "object_key":"root/2c/t/fixture_3/manifest.json","region":"us-east-1","actions":["s3:GetObject"]},
+                    {"catalog":"example-catalog","target":"remote:events","bucket":"example-remote",
+                     "prefix":"events/team_id=42/","region":"us-east-1","actions":["s3:GetObject"]},
+                    {"catalog":"example-catalog","target":"remote:imports","bucket":"example-remote",
+                     "prefix":"imports/team_id=42/","region":"us-east-1","actions":["s3:GetObject"]}
+                  ]
+                }
+                """.trimIndent(),
+            ) as ObjectNode
+        mutation(claims)
+        return TestTokens.mint(pair, claims.toString())
+    }
+
+    @Test
+    fun `the dedicated verifier accepts literal and prefix grants without exporting credentials`() {
+        val caller = verifier().verifyReadSession(token(), profile)
+        assertThat(caller.subject).isEqualTo("example.alice")
+        assertThat(caller.routing?.backendId).isEqualTo(backend)
+        assertThat(caller.remoteSchemaFamilies).containsExactly("team")
+        assertThat(caller.toString()).doesNotContain("fictional-key", "fictional-secret", "fictional-session")
+        val remote = verifier(backends = emptyMap(), ignoreUnknownRouting = true)
+        assertThat(remote.verifyReadSession(token(), profile).routingIgnored).isTrue()
+        assertThatThrownBy { verifier(backends = emptyMap()).verifyReadSession(token(), profile) }
+            .isInstanceOfSatisfying(JwtViolation::class.java) {
+                assertThat(it.reason).isEqualTo(JwtViolation.UNKNOWN_BACKEND)
+            }
+    }
+
+    @Test
+    fun `legacy and dedicated audiences cannot be mixed`() {
+        val legacy = verifier(experimental = true)
+        val mixed = token { (it["aud"] as ArrayNode).add(TestTokens.AUDIENCE) }
+        for (jwt in listOf(token(), mixed)) {
+            assertThatThrownBy { legacy.verify(jwt) }.isInstanceOfSatisfying(JwtViolation::class.java) {
+                assertThat(it.reason).isEqualTo(JwtViolation.WRONG_AUDIENCE)
+            }
+        }
+        assertThatThrownBy { legacy.verifyReadSession(mixed, profile) }
+            .isInstanceOfSatisfying(JwtViolation::class.java) {
+                assertThat(it.reason).isEqualTo(JwtViolation.WRONG_AUDIENCE)
+            }
+    }
+
+    @Test
+    fun `credential expiry has no skew allowance`() {
+        assertThatThrownBy { verifier(2_000_000_060L).verifyReadSession(token(), profile) }
+            .isInstanceOfSatisfying(JwtViolation::class.java) { assertThat(it.reason).isEqualTo(JwtViolation.EXPIRED) }
+    }
+
+    @Test
+    fun `the dedicated verifier refuses malformed or wider claims`() {
+        val mutations: List<(ObjectNode) -> Unit> =
+            listOf(
+                { it.remove("profile") },
+                { it.put("profile", "storage-session") },
+                { it.put("nbf", "2000000000") },
+                { it.put("generation", 2) },
+                { it.put("sub", "example.other") },
+                { it.put("session_deadline", 2_000_000_059L) },
+                { (it["aws"] as ObjectNode).remove("session_token") },
+                { (it["cat"] as ObjectNode).putArray("other").add("read") },
+                { (it["rtg"] as ObjectNode).put("t", "fixture_03") },
+                { (it["grants"][1] as ObjectNode).put("object_key", "root/2c/t/fixture_2/manifest.json") },
+                { (it["grants"][1] as ObjectNode).put("prefix", "root/2c/t/fixture_3/") },
+                { (it["grants"][2] as ObjectNode).put("prefix", "events/*/") },
+                { (it["grants"][2] as ObjectNode).putArray("actions").add("s3:PutObject") },
+                { (it["grants"][3] as ObjectNode).put("catalog", "other") },
+                { (it["grants"] as ArrayNode).remove(3) },
+            )
+        val verifier = verifier()
+        for (mutation in mutations) {
+            assertThatThrownBy { verifier.verifyReadSession(token(mutation), profile) }
+                .isInstanceOfSatisfying(JwtViolation::class.java) {
+                    assertThat(it.reason).isEqualTo(JwtViolation.MALFORMED)
+                    assertThat(it.message).isEqualTo("read session refused")
+                }
+        }
+    }
+}

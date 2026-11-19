@@ -106,6 +106,7 @@ class JwksSigningKeys internal constructor(
     private val minRefreshIntervalMs: Long = DEFAULT_MIN_REFRESH_INTERVAL_MS,
     private val backends: Map<UUID, BackendKind> = emptyMap(),
     private val clock: () -> Long = System::currentTimeMillis,
+    internal val mountedFile: Boolean = false,
     private val runAsync: (() -> Unit) -> Unit = ::runOnRefreshThread,
 ) : SigningKeys {
     private val log = KotlinLogging.logger {}
@@ -224,6 +225,7 @@ class JwksSigningKeys internal constructor(
                 fetch = { Files.readAllBytes(path) },
                 describe = path.toString(),
                 minRefreshIntervalMs = minRefreshIntervalMs,
+                mountedFile = true,
             ).also { it.load() }
 
         fun fromUrl(
@@ -389,6 +391,48 @@ class JwtVerifier(
         return toCaller(claims)
     }
 
+    /**
+     * Verify the dedicated read profile without the legacy profile parser.
+     * This method uses mounted keys. It never refreshes keys.
+     */
+    internal fun verifyReadSession(
+        token: String,
+        profile: ReadSessionProfile,
+    ): Caller =
+        try {
+            if (keys !is JwksSigningKeys || !keys.mountedFile) {
+                throw JwtViolation(JwtViolation.PROFILE_NOT_ENABLED, "read sessions require mounted keys")
+            }
+            if (token.length > 65_536 || token.indexOf('.') !in 1..10_923) {
+                throw JwtViolation(JwtViolation.MALFORMED, "invalid read session size")
+            }
+            val jws = Jwt.parse(token)
+            if (jws.algorithm != "ES256") {
+                throw JwtViolation(JwtViolation.UNSUPPORTED_ALG, "invalid read session algorithm")
+            }
+            val key =
+                jws.keyId?.let(keys::byKeyId)
+                    ?: throw JwtViolation(JwtViolation.UNKNOWN_KEY, "invalid read session key")
+            Jwt.verifySignature(jws, key)
+            val claims = jws.claims
+            if (Jwt.text(claims, "iss") != issuer) {
+                throw JwtViolation(JwtViolation.WRONG_ISSUER, "invalid read session issuer")
+            }
+            profile.validate(claims, clock(), skewSeconds)
+            val route = routing(claims)
+            scopedCaller(
+                claims,
+                Jwt.text(claims, "sub"),
+                Jwt.text(claims, "jti"),
+                Jwt.textOrNull(claims, "cli"),
+                route,
+                route == null,
+                SessionProfile.Grant(emptySet(), setOf("team")),
+            )
+        } catch (failure: JwtViolation) {
+            throw JwtViolation(failure.reason, "read session refused")
+        }
+
     private fun validateTimes(
         claims: JsonNode,
         now: Long,
@@ -435,6 +479,9 @@ class JwtVerifier(
                     }
                 else -> throw JwtViolation(JwtViolation.MALFORMED, "claim 'aud' is neither a string nor an array")
             }
+        if (audiences.any { it in ReadSessionProfile.AUDIENCES }) {
+            throw JwtViolation(JwtViolation.WRONG_AUDIENCE, "dedicated audiences require the read session verifier")
+        }
         if (audience !in audiences) {
             throw JwtViolation(JwtViolation.WRONG_AUDIENCE, "aud $audiences does not contain '$audience'")
         }
@@ -701,6 +748,7 @@ class JwtVerifier(
         clientName: String?,
         routing: Routing?,
         routingIgnored: Boolean,
+        readSession: SessionProfile.Grant? = null,
     ): Caller {
         if (predicateFields.isEmpty()) {
             throw JwtViolation(JwtViolation.INVALID_PREDICATE, "this instance accepts no scoped tokens")
@@ -734,7 +782,7 @@ class JwtVerifier(
                             "claim 'usr' is not a non-blank string of at most $MAX_USER_LENGTH characters",
                         )
             }
-        val profile = SessionProfile.validate(claims, sessionProfile, "scoped")
+        val profile = readSession ?: SessionProfile.validate(claims, sessionProfile, "scoped")
         return Caller(
             subject = subject,
             orgId = orgId,
