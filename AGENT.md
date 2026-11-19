@@ -29,6 +29,10 @@ of [Scale doctrine](#scale-doctrine-read-before-touching-a-query-a-loop-or-a-loc
 are answered in the PR body, the sixth being what ran on the local
 stack and what it showed.)
 
+(And before any PR that changes server behaviour: the PR body says how
+the change behaves on Hoglite, per [Hoglite considerations](#hoglite-considerations),
+and `just test-hoglite` ran on the exact changes.)
+
 ```bash
 (cd server && flox activate -- ./gradlew :test)       # Docker required
 just lint-all        # ktlint + ruff (check & format) across the three Python trees, mypy on pyhoglake + millrace
@@ -844,6 +848,66 @@ what bounds this per run, what bounds it per transaction, what the
 per-row cost is on production's access pattern, what the plan test's
 fixture size is, what grows per commit and how it is purged, and what
 ran on the local stack and what it showed.
+
+## Hoglite considerations
+
+hoglake has two catalog stores behind one REST contract. PostgreSQL holds
+a few large catalogs in one shared database. Hoglite holds each catalog in
+its own SQLite tenant on [hoglite](https://github.com/PostHog/hoglite),
+for very many small ones (README "Backends: PostgreSQL and Hoglite"). A
+feature that works on PostgreSQL is not done until it works on Hoglite,
+or until the PR says, in its body and in the docs, that it is
+PostgreSQL-only and why. Hoglite is not a port to catch up on later: the
+parity review of 2026-11-19 found 28 gaps (issues #666 to #693, label
+`hoglite`), every one of them a PostgreSQL feature that shipped without
+its Hoglite half.
+
+**Rules.**
+
+- **Design for both stores.** Every change to the catalog model, the
+  commit path, a read, a maintenance task, auth, routing or an error code
+  states its Hoglite behaviour in the PR body: implemented the same way,
+  implemented differently (how, and what differs for a caller), or
+  PostgreSQL-only (why, and what a Hoglite caller sees instead). "Not
+  applicable" needs a reason.
+- **Test parity.** A behaviour tested on PostgreSQL is tested on Hoglite
+  in the same PR. Prefer one test parameterized over both backends (the
+  pattern of `HogliteCommitParityIntegrationTest`,
+  `HogliteScanStatsParityIntegrationTest` and the other `*Parity*`
+  classes) to two tests that drift apart. A Hoglite live class is named
+  `com.posthog.hoglake.hoglite.*IntegrationTest`, so `hoglite-live`
+  runs it. Assert the same status, error code and body on both, not
+  "not a conflict".
+- **Schema changes reach the tenant.** A PostgreSQL migration that adds a
+  table, column, constraint, index, vocabulary value (maintenance task,
+  change kind, removal reason) or foreign key has a Hoglite counterpart in
+  `HogliteSchema.kt` in the same PR. Tenants have no migrations yet
+  (`HogliteSchema.kt` KDoc), so any change to a released tenant shape also
+  needs the tenant-upgrade path the KDoc demands.
+- **Run it.** `just test-hoglite` (a Linux container with the newest
+  tested `hoglited`) is part of the pre-push checklist for any server
+  change. On macOS `just test` skips the hoglite live classes, and a
+  skipped class is not a passing one.
+
+**What review looks for.** Each of these shipped once without its Hoglite
+half. Look for the same shape in new code:
+
+| Missed on Hoglite | Example |
+|---|---|
+| A guard PostgreSQL enforces in SQL, a constraint or a lock | No `data_path` overlap check at catalog create (#666); no foreign keys or cascades in the tenant schema, and 5 CHECKs against PostgreSQL's ~75 |
+| A check that assumes one database sees every catalog | PostgreSQL's overlap and name checks cannot see Hoglite tenants; names are not unique across backends (#689) |
+| Authority that comes from a row the tenant can write | `meta.data_path` and `removals` rows steer hoglake's S3 deletes and writes (#668); `meta.name` never compared with the requested catalog (#670) |
+| Auth rules that differ between hoglake and hoglite | A catalog-bound operator token is fleet-wide in hoglake (#667); tokens hoglake accepts and hoglite refuses (#681); the token re-verified on every hop, so long operations fail midway (#680) |
+| A background loop with no Hoglite driver | Retirement unreachable, so a catalog with a dropped table can never be dropped (#674); no hydration, so pending files never get stats (#675) |
+| Audit, metrics or status emitted only on the PostgreSQL path | Most Hoglite mutations unaudited (#676); Hoglite catalogs absent from per-catalog gauges, fleet status and `hoglake_commits_total` (#677); configured loop intervals reported for loops that never run (#690) |
+| Retries and idempotency | A 503 `commit_outcome_unknown` that may be durable, retried blindly by a client (#669); non-commit writes with a fresh txid per call (#682); a drop that fences and then fails half-way (#683) |
+| Clocks and precision | Snapshot time from the JVM clock at transaction build (#672); millisecond timestamps against PostgreSQL's microseconds (#673); upload expiry on each replica's clock |
+| SQL semantics that differ between SQLite and PostgreSQL | BINARY text ordering and NULLs first (#671); rowid reuse where PostgreSQL has sequences; UTF-16 lengths; no `REGEXP` in CHECKs; `IN` passing NULL |
+| Limits PostgreSQL does not have | hoglited's 64 MiB `/tx` body (#684), 100k rows / 64 MiB / 5 s per query (#686), scan refusals PostgreSQL serves (#685) |
+| A guard scoped to the catalog where PostgreSQL scopes it to the table | A width-changing promote fenced on `meta.next_file_id` fails on any busy catalog (#687) |
+| Error codes and check order | 404/409 on Hoglite where PostgreSQL answers 422, and the read-snapshot check before table resolution (#688) |
+| Shared resources | One unhealthy Hoglite backend failing `/healthz` on every pod (#678); Hoglite calls sharing the request threads and breaker with PostgreSQL (#679) |
+| A test that exists for one backend only | Time travel by timestamp, changefeed semantics, sort order, object-prefix commits, uploads, views and the contract-shape `*SpecParityTest` classes are PostgreSQL-only (#693) |
 
 ## Working conventions
 
