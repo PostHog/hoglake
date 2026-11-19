@@ -54,6 +54,8 @@ export interface CatalogOptions {
 
 export interface Namespace {
   name: string;
+  /** Present, and true, only for a remote schema: read-only, served by another Hoglake. */
+  remote?: boolean;
 }
 
 // The server's closed column-type vocabulary, in the spec's enum order
@@ -386,6 +388,12 @@ export interface Table {
    * `read_snapshot`, so the server's OCC validates the cache.
    */
   read_snapshot_id?: Int64;
+  /**
+   * Present, and true, only on a table of a remote schema. Its
+   * `read_snapshot_id` is then a snapshot of the catalog that holds the
+   * table on the serving host, never of this catalog.
+   */
+  remote?: boolean;
 }
 
 export type StatsState = "provided" | "pending" | "failed";

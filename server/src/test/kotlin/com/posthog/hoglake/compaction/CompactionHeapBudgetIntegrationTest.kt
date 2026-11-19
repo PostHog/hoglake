@@ -431,35 +431,71 @@ class CompactionHeapBudgetIntegrationTest {
         val contents = (0 until 4).map { f -> (0 until 50_000L).map { it * 4 + f }.reversed() }
         val cat = realSortedTableOf("spill-hard-stop", contents)
         val registered = db.jdbi.withHandleUnchecked { h -> registeredBytes(h, cat) }
-        val cfg =
-            CompactionConfig(
-                targetBytes = 256L * 1024 * 1024,
-                minInputFiles = 2,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(100_000),
-                spillBytes = registered,
-                spillDir = dir,
-            )
-        val svc = CompactionService(db.jdbi, store, cfg)
-        assertThat(svc.planTable(cat, "ns", "t", cfg).spillRefusedGroups)
-            .describedAs("the registered bytes fit, so the planner admits it")
-            .isZero()
-        val headBefore = headSnapshot(cat)
-        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-        assertThat(result.spillBudgetExceeded).describedAs("%s", result).isEqualTo(1)
-        assertThat(result.failedGroups).isZero()
-        assertThat(result.groupsCompacted).isZero()
-        // The work the stopped rewrite DID reaches the ledger: it is the
-        // group that spilled the most, and it has no result to report from.
-        assertThat(result.spillBytes).isPositive().isLessThanOrEqualTo(registered)
-        assertThat(result.runsSpilled).isPositive()
-        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
-        assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
-        assertThat(ledger["runs_spilled"].asLong()).isEqualTo(result.runsSpilled)
-        assertThat(headSnapshot(cat)).isEqualTo(headBefore)
-        assertThat(spillEntries(dir)).describedAs("no spill directory survives the stop").isEmpty()
-        val staged = removalRows(cat).single()
-        assertThat(objectExists(staged.path)).describedAs("the partial output was discarded").isFalse()
+        catalogs.createTable(cat, "ns", "z", fixtureColumns)
+        alter.alterTable(cat, "ns", "z", listOf(AlterOp.SetSortOrder(ASC)))
+        val healthyBytes = parquetBytes(listOf(2, 1))
+        val healthyFiles =
+            (0 until 2).map { index ->
+                val path = "s3://$BUCKET/$cat/data/ns/z/healthy-$index.parquet"
+                store.put(path, healthyBytes)
+                FileRegistration(path, 2, healthyBytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "z", healthyFiles))))
+        val heavyReads = AtomicInteger()
+        val observed =
+            object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun getRange(
+                    pathUri: String,
+                    startInclusive: Long,
+                    length: Int,
+                ): ByteArray {
+                    if ("/t/" in pathUri) heavyReads.incrementAndGet()
+                    return super.getRange(pathUri, startInclusive, length)
+                }
+            }
+        observed.use {
+            val cfg =
+                CompactionConfig(
+                    targetBytes = 256L * 1024 * 1024,
+                    minInputFiles = 2,
+                    maxGroupsPerRun = 1,
+                    sortedHeapBytes = heapBytesFor(100_000),
+                    spillBytes = registered,
+                    spillDir = dir,
+                )
+            val svc = CompactionService(db.jdbi, observed, cfg)
+            assertThat(svc.planTable(cat, "ns", "t", cfg).spillRefusedGroups)
+                .describedAs("the registered bytes fit, so the planner admits it")
+                .isZero()
+            val headBefore = headSnapshot(cat)
+            val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(result.spillBudgetExceeded).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.failedGroups).isZero()
+            assertThat(result.groupsCompacted).isZero()
+            // The work the stopped rewrite DID reaches the ledger: it is the
+            // group that spilled the most, and it has no result to report from.
+            assertThat(result.spillBytes).isPositive().isLessThanOrEqualTo(registered)
+            assertThat(result.runsSpilled).isPositive()
+            val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+            assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
+            assertThat(ledger["runs_spilled"].asLong()).isEqualTo(result.runsSpilled)
+            assertThat(headSnapshot(cat)).isEqualTo(headBefore)
+            assertThat(spillEntries(dir)).describedAs("no spill directory survives the stop").isEmpty()
+            val staged = removalRows(cat).single()
+            assertThat(objectExists(staged.path)).describedAs("the partial output was discarded").isFalse()
+            val readsAfterFirst = heavyReads.get()
+            assertThat(readsAfterFirst).isPositive()
+            val replay = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(replay.spillBudgetExceeded).isEqualTo(1)
+            assertThat(replay.groupsCompacted).describedAs("cached refusal leaves the only slot for z").isEqualTo(1)
+            assertThat(replay.failedGroups).isZero()
+            assertThat(heavyReads.get()).describedAs("cached refusal does not reopen inputs").isEqualTo(readsAfterFirst)
+            val raised = cfg.copy(spillBytes = registered * 10)
+            val retry = svc.runOnce(cat, raised, MaintenanceTrigger.LOOP)
+            assertThat(retry.groupsCompacted).isEqualTo(1)
+            assertThat(retry.spillBudgetExceeded).isZero()
+            assertThat(heavyReads.get()).isGreaterThan(readsAfterFirst)
+        }
     }
 
     @Test

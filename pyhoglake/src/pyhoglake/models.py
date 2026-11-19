@@ -442,6 +442,11 @@ class TableInfo:
     #: is refused (:class:`~pyhoglake.ObjectPrefixViolationError`):
     #: ``Table.append`` and ``prepare_append_*`` always are.
     object_prefix_field: str | None = None
+    #: True when the server says this table is in a remote schema, whose
+    #: ``read_snapshot_id`` is a snapshot of the table's own catalog, not
+    #: of this one. None when the answer carries no flag: a local table,
+    #: or a remote one from a Host that predates the flag.
+    remote: bool | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -470,6 +475,7 @@ class TableInfo:
                 totals_as_of=d.get("totals_as_of"),
                 read_snapshot_id=d.get("read_snapshot_id"),
                 object_prefix_field=d.get("object_prefix_field"),
+                remote=d.get("remote"),
             )
 
         return _wire("TableInfo", d, build)

@@ -5,11 +5,11 @@ import com.posthog.hoglake.model.Column
 import java.security.MessageDigest
 import java.util.LinkedHashMap
 
-/** Remembers deterministic memory refusals without retaining inputs or schemas. */
+/** Remembers deterministic resource refusals without retaining inputs or schemas. */
 internal class MemoryRefusalMemory(
     private val capacity: Int = CompactionConfig.DEFAULT_MAX_CANDIDATES,
 ) {
-    enum class Reason { MERGE, OVERSIZED_ROW }
+    enum class Reason { SPILL, MERGE, OVERSIZED_ROW }
 
     data class Identity(val a: Long, val b: Long, val c: Long, val d: Long)
 

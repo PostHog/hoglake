@@ -377,6 +377,10 @@ tr.has-deletes {
   color: var(--warn);
   border-color: var(--warn);
 }
+.badge.remote {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 
 /* -- maintenance page ----------------------------------------------------- */
 

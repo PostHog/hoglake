@@ -1820,26 +1820,27 @@ Actual merge boundaries are checked before each raw copy.
 Groups without potential append candidates do not pay this extra range pass.
 
 Planning, remembered-layout parts, borrowing, and execution use the same
-admission predicate. Metadata predicts ordinary runs, but cannot predict
-arbitrary payloads or decoder allocations. Runtime checks can therefore
-refuse a group that planning admitted. This replaces the former claim
-that execution could only improve metadata admission. No multi-pass
-merge or operator tuning knob is added.
+metadata estimate. Runtime guards check actual spill bytes, decoder
+allocations, and merge heads. The rewrite can refuse an admitted group.
+The refusal cache prevents repeated work for an unchanged group.
+The rewrite uses one merge pass. It adds no operator setting.
+
 Remembered layouts use their actual leaf counts when sizing the same reader reserve.
 
 Byte and row totals saturate instead of wrapping.
 Overflow never fits, even under maximum-valued budgets.
 Negative registered sizes or survivor counts are invalid data, not cacheable memory refusals.
 
-Deterministic memory refusals enter a worker-local cache of 50,000
+Deterministic memory and spill-budget refusals enter a worker-local cache of 50,000
 identities, below 8 MiB with ordinary JVM object alignment. Entries retain a digest and reason, not input
 or schema graphs. The digest covers file and DV identities, survivors,
 schema, layout, sort version, and effective budgets. Changed identities
 retry immediately.
 
-Entries have no TTL. Eviction or restart permits a
-fresh attempt. An unchanged cached refusal performs no object-store IO.
-It consumes no rewrite slot.
+Entries have no TTL. Eviction or restart permits a fresh attempt.
+Other workers do not share these entries. A different group composition
+permits a new attempt. An unchanged cached refusal performs no
+object-store I/O. It consumes no rewrite slot.
 
 Refusal counters retain their existing aggregate meaning:
 
@@ -1855,8 +1856,9 @@ Refusal counters retain their existing aggregate meaning:
   header preflight, or guarded decoding.
 - `oversized_row_groups` is a subset of `merge_budget_exceeded`, not an
   additional skipped group. It identifies an oversized materialized row
-  or binary value. Its metric reason is `oversized_row`. Cached refusals
-  preserve this distinction.
+  or binary value. Cached refusals preserve this distinction.
+  The `merge_budget` metric excludes `oversized_row`. Add both reasons
+  to compare the metric with the ledger's `merge_budget_exceeded` counter.
 
 `heap_budget_exceeded` (`reason="heap_budget"`) is HISTORICAL: nothing
 produces it any more. It stays on the wire and in the ledger, reading 0.
@@ -2028,15 +2030,18 @@ footer retention, and open concurrency remain bounded. Keep the existing
 heap-percentage assertion when changing any term. Do not replace it
 with an inequality that merely fits the entire heap.
 
-For `P` parallel groups and eleven output leaves:
+For `P` parallel groups and `L` output leaves per group:
 
 ```
-reader = targetBytes + 22 MiB
+reader = targetBytes + 2 MiB x L
 merge = SORTED_HEAP_BYTES + P x (144 MiB + 16 MiB)
 chunk = SORTED_HEAP_BYTES + P x (reader + 32 MiB + 5 MiB)
 single = SORTED_HEAP_BYTES + P x (144 MiB + 5 MiB)
 peak = max(merge, chunk, single) + P x 16 MiB + 40 MiB + 256 MiB
 ```
+
+The reader reserve is per group. It is outside `SORTED_HEAP_BYTES`.
+Use the actual leaf count for wide or shredded schemas.
 
 The table retains the earlier compression calibration: approximately
 70 B per zstd row and 119 B per Snappy row. Row counts are advisory

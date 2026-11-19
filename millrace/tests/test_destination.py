@@ -265,6 +265,8 @@ def test_missing_namespace_is_created(
 ):
     script_catalog(httpx_mock)
     script_namespaces(httpx_mock, ["other"])
+    # a name the listing omits is asked of the namespace itself
+    not_found(httpx_mock, "GET", f"{NAMESPACES_URL}/{NAMESPACE}")
     httpx_mock.add_response(
         method="POST", url=NAMESPACES_URL, json={"name": NAMESPACE}, status_code=201
     )
@@ -281,6 +283,7 @@ def test_missing_namespace_is_created(
 def test_namespace_create_race_is_tolerated(client: Any, httpx_mock: Any):
     script_catalog(httpx_mock)
     script_namespaces(httpx_mock, [])
+    not_found(httpx_mock, "GET", f"{NAMESPACES_URL}/{NAMESPACE}")
     conflict(httpx_mock, "POST", NAMESPACES_URL)
     script_table(httpx_mock)
     ensure_destination(client, make_config())

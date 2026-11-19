@@ -162,10 +162,7 @@ internal class OutputWriter(
             val large =
                 writerMemory != null &&
                     writerMemory.encodedBytes(row) > rowGroupBytes / props.maxRowCountForPageSizeCheck
-            if (large && !largePageMode) {
-                flushRowGroup()
-                largePageMode = true
-            }
+            if (large) largePageMode = true
             if (!beforeWrite(row) && recordCount > 0) {
                 flushRowGroup()
                 largePageMode = large
@@ -217,15 +214,13 @@ internal class OutputWriter(
         val factory = writerMemory?.let { GuardedValuesWriterFactory(it::replaceDictionaryReservation) }
         valuesWriterFactory = factory
         val columnProperties =
-            if (largePageMode || factory != null) {
+            if (factory != null) {
+                // A large row can arrive at any point in this group.
+                // Check page size after each row without closing the group.
                 ParquetProperties.copy(props)
-                    .apply {
-                        factory?.let { withValuesWriterFactory(it) }
-                        if (largePageMode) {
-                            withMinRowCountForPageSizeCheck(1)
-                            withMaxRowCountForPageSizeCheck(1)
-                        }
-                    }
+                    .withValuesWriterFactory(factory)
+                    .withMinRowCountForPageSizeCheck(1)
+                    .withMaxRowCountForPageSizeCheck(1)
                     .build()
             } else {
                 props

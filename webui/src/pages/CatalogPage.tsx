@@ -19,7 +19,7 @@ import { ErrorBox } from "../components/ErrorBox";
 import { formatSeconds } from "../components/maintenance";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { SnapshotId } from "../components/SnapshotId";
-import { ChangeBadge } from "../components/badges";
+import { ChangeBadge, RemoteBadge } from "../components/badges";
 import { formatTime } from "../lib/format";
 import { identifierError } from "../lib/names";
 
@@ -187,6 +187,7 @@ function NamespacesPanel({ catalog }: { catalog: string }) {
                     >
                       {ns.name}
                     </Link>
+                    {ns.remote === true && <> <RemoteBadge /></>}
                   </td>
                 </tr>
               ))}

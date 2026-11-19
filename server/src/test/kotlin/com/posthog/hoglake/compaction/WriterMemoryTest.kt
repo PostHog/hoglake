@@ -363,6 +363,73 @@ class WriterMemoryTest {
     }
 
     @Test
+    fun `a late large row does not make an unappendable output group`() {
+        runProbe("mixed", "1g", "MIXED_WRITER_MEMORY_OK")
+    }
+
+    private fun verifyMixedSizeAppendable() {
+        val memory = SortMemory(512L shl 20)
+        val writer =
+            WriterMemory(
+                memory, schema, codec, 144L shl 20, (128L shl 20) / 10_000, 1L shl 20,
+                retainFooter = true,
+                availableExtra = { 0 },
+                reserve = { check(it == 0L) },
+            )
+        val tuning =
+            ParquetRewriter.WriterTuning(
+                128L shl 20,
+                1 shl 20,
+                10_000,
+                writerMemory = writer,
+                tuneChecks = false,
+            )
+        val path = tmp.resolve("mixed-size-appendable.parquet")
+        val random = Random(553)
+        val rows = SimpleGroupFactory(schema)
+        ParquetRewriter.writingTo(LocalOutputFile(path), schema, codec, tuning) { output ->
+            repeat(600_000) { index ->
+                val payload = ByteArray(if (index % 3000 == 2999) 20 * 1024 else 400)
+                random.nextBytes(payload)
+                val group = rows.newGroup()
+                group.add(0, Binary.fromConstantByteArray(payload))
+                group.add(1, index.toLong())
+                output.write(
+                    ParquetRewriter.Row(
+                        group,
+                        index.toLong(),
+                        plan = shape.identityPlan,
+                        memoryBytes = payload.size + 1024L,
+                    ),
+                )
+            }
+        }
+        ParquetFileReader.open(LocalInputFile(path)).use { reader ->
+            val footer = reader.footer
+            assertThat(footer.blocks).allMatch { it.compressedSize >= 32L shl 20 }
+            val input = ParquetRewriter.Input(LocalInputFile(path), path.toString(), 0, explicitRowIds = true)
+            assertThat(ParquetRewriter.appendRefusal(input, footer, schema, 32L shl 20)).isNull()
+            val expected = Random(553)
+            val io = ColumnIOFactory().getColumnIO(schema)
+            var index = 0
+            for (block in footer.blocks.indices) {
+                reader.readRowGroup(block).use { pages ->
+                    val records = io.getRecordReader(pages, GroupRecordConverter(schema))
+                    repeat(Math.toIntExact(pages.rowCount)) {
+                        val payload = ByteArray(if (index % 3000 == 2999) 20 * 1024 else 400)
+                        expected.nextBytes(payload)
+                        val actual = records.read()
+                        assertThat(actual.getLong(1, 0)).isEqualTo(index.toLong())
+                        assertThat(actual.getBinary(0, 0).bytes).isEqualTo(payload)
+                        index++
+                    }
+                }
+            }
+            assertThat(index).isEqualTo(600_000)
+        }
+    }
+
+    @Test
     fun `large values use per-row page checks without forcing one-row output groups`() {
         val memory = SortMemory(512L shl 20)
         var extra = 0L
@@ -399,18 +466,27 @@ class WriterMemoryTest {
     @Test
     fun `large legal values rewrite with room and refuse cleanly without writer room`() {
         // The merge keeps three 24 MiB values live across readers, keys, and writer buffers.
-        // Run this fixture outside the shared 512 MiB worker.
-        val log = tmp.resolve("large-values.log")
+        runProbe("large", "2g", "WRITER_MEMORY_OK")
+    }
+
+    /** Keep large parquet buffers outside the shared 512 MiB test worker. */
+    private fun runProbe(
+        mode: String,
+        heap: String,
+        marker: String,
+    ) {
+        val log = tmp.resolve("$mode-values.log")
         val process =
             ProcessBuilder(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-Xmx2g",
+                "-Xmx$heap",
                 "-XX:+UseG1GC",
                 "-ea",
                 "-cp",
                 System.getProperty("java.class.path"),
                 WriterMemoryTest::class.java.name,
                 tmp.toString(),
+                mode,
             ).redirectErrorStream(true).redirectOutput(log.toFile()).start()
         val finished =
             try {
@@ -425,7 +501,7 @@ class WriterMemoryTest {
         assertThat(finished).describedAs(text).isTrue()
         assertThat(process.exitValue()).describedAs(text).isZero()
         assertThat(text).doesNotContain("OutOfMemoryError")
-        assertThat(text).contains("WRITER_MEMORY_OK")
+        assertThat(text).contains(marker)
     }
 
     private fun verifyLargeValues() {
@@ -495,8 +571,18 @@ class WriterMemoryTest {
     companion object {
         @JvmStatic
         fun main(args: Array<String>) {
-            WriterMemoryTest().apply { tmp = Path.of(args.single()) }.verifyLargeValues()
-            println("WRITER_MEMORY_OK")
+            val fixture = WriterMemoryTest().apply { tmp = Path.of(args[0]) }
+            when (args[1]) {
+                "large" -> {
+                    fixture.verifyLargeValues()
+                    println("WRITER_MEMORY_OK")
+                }
+                "mixed" -> {
+                    fixture.verifyMixedSizeAppendable()
+                    println("MIXED_WRITER_MEMORY_OK")
+                }
+                else -> error("unknown writer memory probe: ${args[1]}")
+            }
         }
     }
 }

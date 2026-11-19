@@ -352,9 +352,9 @@ sorts its files is merged without a spill. The same budget bounds the
 merge's buffered row groups; trusted inputs beyond it are demoted to the
 spill path.
 
-Sorted memory admission uses one predicate across planning, borrowing,
-remembered-layout parts, and execution. Metadata estimates ordinary runs.
-Runtime guards also check payloads, page headers, and decoder allocations.
+Planning, borrowing, remembered-layout parts, and execution use a shared
+metadata estimate. Runtime guards also check payloads, page headers, and
+decoder allocations. These checks can refuse an admitted group.
 The full per-group sorted allowance remains available for retained rows.
 A separate input-reader envelope uses the byte target and output leaf
 count. It does not charge all uncompressed row-group values.
@@ -362,8 +362,8 @@ count. It does not charge all uncompressed row-group values.
 `spill_budget_exceeded` covers `HOGLAKE_COMPACTION_SPILL_BYTES`,
 **4 GiB** per group by default. `merge_budget_exceeded` covers decoded-reader and row-memory
 refusals. Its `oversized_row_groups` subset identifies oversized rows or
-binary values. It is not another skipped group. Deterministic memory
-refusals enter a bounded worker-local cache. Unchanged identities then
+binary values. It is not another skipped group. Deterministic memory and
+spill-budget refusals enter a bounded worker-local cache. Unchanged identities then
 skip without object-store IO or another rewrite attempt.
 
 Input, DV, schema, layout, sort-version, or effective-budget changes permit

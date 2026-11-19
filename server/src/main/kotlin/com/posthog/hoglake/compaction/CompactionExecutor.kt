@@ -479,6 +479,7 @@ internal class CompactionExecutor(
         group: CompactionGroup,
     ): BudgetRefusal? {
         when (if (memoryRefusals.size() == 0) null else memoryRefusals.recall(memoryKey(ctx, group, spill))) {
+            MemoryRefusalMemory.Reason.SPILL -> return BudgetRefusal.SPILL
             MemoryRefusalMemory.Reason.MERGE -> return BudgetRefusal.MERGE
             MemoryRefusalMemory.Reason.OVERSIZED_ROW -> return BudgetRefusal.ROW
             null -> Unit
@@ -1603,8 +1604,8 @@ internal class CompactionExecutor(
             // refused on its own re-admission below — still spent a group's
             // IO: charged as one attempt (`layout_probe_only`) after the
             // loop, so a sweep over a backlog of such groups is bounded by
-            // maxGroupsPerRun like any other. (The budget refusals are not
-            // attempts, as the planner's are not; without this the probe's
+            // maxGroupsPerRun like any other. (Metadata and cached budget
+            // refusals are not attempts; without this the probe's
             // footer reads would repeat every sweep, uncounted.)
             var ran = 0
             // ONE REWRITE PER PART, each resolved on its own: a part that
@@ -1859,6 +1860,9 @@ internal class CompactionExecutor(
             // there is none — and it is folded in here: a hard stop is
             // the group that spilled the most, and leaving it out made
             // `spill_bytes` / `runs_spilled` miss exactly those groups.
+            if (spill != null) {
+                memoryRefusals.remember(memoryKey(ctx, group, spill), MemoryRefusalMemory.Reason.SPILL)
+            }
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} stopped at its spill budget " +

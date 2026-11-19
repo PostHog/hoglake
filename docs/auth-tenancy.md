@@ -1211,8 +1211,9 @@ any deployment. §6.5a and §6.5b are unchanged and still describe the mount.
 - **Configuration.** A third matcher in `HOGLAKE_MOUNT_HOSTS_FILE` (§6.5b):
   `{"type": "namespace", "name": "<schema>"}`. Such an entry matches no
   catalog name. It applies to every catalog this server holds itself (bound
-  local: not a mount and not a mount Client's name, and present in the
-  backend that serves it). The name must be a namespace name. Two entries may not have the same name, or names that are
+  local: not a mount and not a mount Client's name, and held by the
+  backend that serves it: proven by a read on PostgreSQL, by the verified
+  `rtg` on a hoglite placement). The name must be a namespace name. Two entries may not have the same name, or names that are
   equal after folding ASCII case. Every other key, bound and boot check of
   §6.5b applies, so a server with such an entry cannot run with auth `off`.
   It also refuses to boot unless `HOGLAKE_AUTH_SESSION_PROFILE` is `on`: only
@@ -1325,11 +1326,16 @@ any deployment. §6.5a and §6.5b are unchanged and still describe the mount.
   or the 403 or 501 below). Unlike a mount's reader, a token whose `rtg`
   places the catalog on hoglite is served: the catalog is the caller's own.
 - **Only in a catalog this server holds.** Once the token allows the schema,
-  the server checks that the catalog exists in the backend that serves it
-  (one read per relayed or refused request, none for a caller the rule
-  refuses and none for any other request). A catalog that does not exist, or
-  one no backend of this server holds, answers that backend's 404 for the
-  catalog, and nothing is sent to the Host.
+  the proof that the catalog exists depends on the backend. None is asked for
+  a caller the rule refuses, and none for any other request.
+  - **PostgreSQL** (routed or the default backend): one read per relayed or
+    refused request. A catalog that does not exist, or one no backend of this
+    server holds, answers that backend's 404 for the catalog, and nothing is
+    sent to the Host.
+  - **Hoglite placement:** the verified `rtg` is the proof, and no read is
+    made, because hoglite refuses `scoped` tokens on its SQL routes
+    ([auth.md](auth.md)). A placed catalog the engine no longer holds is
+    relayed, and the Host's answer decides.
 - **What is relayed.** Four routes, `GET` only: the namespace, its tables, one
   table, and the scan. The request goes to the Host with the same path
   (`/v1/catalogs/<catalog>/namespaces/<schema>/...`, `<schema>` being the
@@ -1389,6 +1395,9 @@ any deployment. §6.5a and §6.5b are unchanged and still describe the mount.
   `*` lists no team: it grants every team, and the listing names none. What a
   `*` caller should see in the listing is open in the spec. The schemas are
   still readable by name.
+  On a hoglite placement, a scoped caller's `GET .../namespaces` answers 403
+  today, because the local listing is a hoglite SQL read. That is a known gap,
+  separate from the relayed routes.
   The entry has no `namespace_id`, because the namespace has no id on this
   server. The listing is built from configuration and the token. No Host is
   asked, so a Host outage does not fail it.
@@ -1482,7 +1491,10 @@ per-team entry is needed.
   tables, one table, and the scan. The reader is bound to the one namespace
   and reads the store itself, not the caller's grant view, which names a
   catalog the source is not. A head read of the namespace is one lookup; only
-  a pinned read lists namespaces.
+  a pinned read lists namespaces. The table answer carries `remote: true`, as
+  the namespace answer does; the listing's entries and the scan do not. Its
+  `read_snapshot_id` is the snapshot of the catalog that holds the table,
+  which a reader pins per table and sends back as `snapshot`.
 - **Errors.** A refusal from the source is rewritten in the caller's
   catalog's terms: a missing table is 404 `table '<ns>.<t>' in catalog
   '<catalog>'`, a snapshot out of range is 422 and one below the expiry floor
@@ -1542,10 +1554,9 @@ same `team_<id>` then shows the published stream tables beside the imports:
   object-prefix field. It is never the token's other values, so a token
   holding teams 42 and 43 sees only team 42's rows in `team_42`. The token's
   grant must still hold that id, and a file is returned only when its
-  statistics prove the value and it is not quarantined (`ReadScope`). The
-  spec's `org_id = <token org>` predicate waits for an `org_id` in the
-  layout. When it lands, it is a second condition in the same seam, not a
-  replacement for the mark.
+  statistics prove the value and it is not quarantined (`ReadScope`). There
+  is no `org_id` predicate: the stream layout carries only `team_id`
+  (PostHog/hogtower#244), so the mark is the whole team-to-org proof.
 - **Totals and properties.** The listing's counts are the team's own files.
   The table response never carries totals, `totals=true` included, because
   whole-table counts are every team's. It never carries the table's
@@ -1576,9 +1587,9 @@ same `team_<id>` then shows the published stream tables beside the imports:
   block is turned on, audit every `team_<digits>` mark against Hogtower's
   team-to-org records. A mark written while the server ran `off` or `warn`
   stays after a later switch to `enforce`.
-- **Not built.** The `org_id` predicate, `remote: true` on the table
-  response, the remote head snapshot fields of the Client's catalog snapshot
-  (P3), and removing `hog_mount`.
+- **Not built.** Removing `hog_mount`. The per-schema remote head snapshot
+  field of the old P3 will not be built: the per-table pin replaces it,
+  which is `read_snapshot_id` with `remote: true`.
 
 ### 6.6 Client-supplied authority fields must die
 

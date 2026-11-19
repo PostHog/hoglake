@@ -84,4 +84,7 @@ echo "== cross-client partition-wire check =="
 echo "== append preparation and conflict guards =="
 (cd "$PYHOGLAKE_DIR" && uv run python "$HERE/test/fixtures/verify_append_guards.py")
 
+echo "== remote-schema pinning (stub server) =="
+python3 "$HERE/test/fixtures/verify_remote_pin.py"
+
 echo "ALL LIVE TESTS PASSED ($ran_cases test files, $ran_assertions assertions, 0 skipped)"

@@ -170,6 +170,11 @@ export function listNamespaces(catalog: string): Promise<Namespace[]> {
   return request(buildUrl(`/catalogs/${seg(catalog)}/namespaces`));
 }
 
+/** One namespace; a remote schema answers `{name, remote: true}`. */
+export function getNamespace(catalog: string, namespace: string): Promise<Namespace> {
+  return request(buildUrl(`/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}`));
+}
+
 export function createNamespace(
   catalog: string,
   name: string,

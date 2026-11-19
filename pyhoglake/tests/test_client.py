@@ -168,6 +168,12 @@ def test_namespace_lookup(client, httpx_mock):
         url=f"{BASE}/v1/catalogs/cat/namespaces",
         json=[{"name": "ns1"}],
     )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/missing",
+        json={"error": "not_found"},
+        status_code=404,
+    )
     with pytest.raises(NotFoundError):
         cat.namespace("missing")
 

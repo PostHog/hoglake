@@ -98,7 +98,9 @@ public:
 	HoglakeCatalogInfo CreateCatalog(const string &data_path);
 
 	// -- namespaces --------------------------------------------------------
-	vector<string> ListNamespaces();
+	vector<HoglakeNamespaceInfo> ListNamespaces();
+	//! GET /namespaces/{ns} with no travel; nullptr on 404
+	unique_ptr<HoglakeNamespaceInfo> TryGetNamespace(const string &ns);
 	void CreateNamespace(const string &name);
 
 	// -- tables ------------------------------------------------------------

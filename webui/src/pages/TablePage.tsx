@@ -29,7 +29,7 @@ import type {
 } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
-import { StatsStateBadge } from "../components/badges";
+import { RemoteBadge, RemoteLine, StatsStateBadge } from "../components/badges";
 import { ClampedText } from "../components/ClampedText";
 import { CopyButton } from "../components/CopyButton";
 import { SnapshotId } from "../components/SnapshotId";
@@ -48,6 +48,7 @@ import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
 import { PartitionLookupPanel } from "../components/PartitionLookupPanel";
+import { useSchemaKind } from "../lib/remote";
 
 const TABS = ["schema", "files", "scan", "partitions"] as const;
 type Tab = (typeof TABS)[number];
@@ -125,9 +126,12 @@ function TotalsFreshness({
   catalog,
   table,
   timeTravel,
+  remote,
 }: {
   catalog: string;
   table: Table;
+  /** A remote table's ids are the holding catalog's: shown, never looked up here. */
+  remote: boolean;
   /**
    * Whether the page asked for a past snapshot. Just `?snapshot=` today:
    * the page has no `at_timestamp` control, and the server's other
@@ -173,7 +177,12 @@ function TotalsFreshness({
         {table.totals_as_of !== undefined
           ? formatRelativeAge(table.totals_as_of)
           : "an earlier snapshot"}{" "}
-        · snapshot <SnapshotId catalog={catalog} id={table.totals_snapshot_id} />
+        · snapshot{" "}
+        {remote ? (
+          table.totals_snapshot_id
+        ) : (
+          <SnapshotId catalog={catalog} id={table.totals_snapshot_id} />
+        )}
       </dd>
     );
   }
@@ -198,10 +207,12 @@ function StatsHeader({
   catalog,
   table,
   timeTravel,
+  remote,
 }: {
   catalog: string;
   table: Table;
   timeTravel: boolean;
+  remote: boolean;
 }) {
   // One test per cell would ask the same question three times; the server
   // sends the three totals together or not at all.
@@ -234,8 +245,21 @@ function StatsHeader({
           the same glance. */}
       <div>
         <dt>totals</dt>
-        <TotalsFreshness catalog={catalog} table={table} timeTravel={timeTravel} />
+        <TotalsFreshness
+          catalog={catalog}
+          table={table}
+          timeTravel={timeTravel}
+          remote={remote}
+        />
       </div>
+      {remote && (
+        <div>
+          <dt>read_snapshot_id</dt>
+          <dd className="mono" title="the holding catalog's snapshot; the scan is pinned to it">
+            {table.read_snapshot_id ?? "—"}
+          </dd>
+        </div>
+      )}
       <div>
         <dt>table_uuid</dt>
         <dd className="mono">
@@ -1664,28 +1688,44 @@ function PartitionsFooter({
   );
 }
 
+/** A panel whose route a remote schema's host does not serve: never requested. */
+function RemoteUnavailable({ what }: { what: string }) {
+  return <p className="empty">{what}: not available for a remote table.</p>;
+}
+
 export function TablePage() {
   const { catalog, namespace, table } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
 
+  // Nothing below that depends on it is requested before the schema's
+  // class is known (src/lib/remote.ts).
+  const kind = useSchemaKind(catalog, namespace);
+  const known = kind.local || kind.remote;
+
   const tabParam = searchParams.get("tab");
   const tab: Tab = TABS.includes(tabParam as Tab) ? (tabParam as Tab) : "schema";
-  const exactLookup = tab === "partitions" && searchParams.get("lookup") === "1";
+  const exactLookup = kind.local && tab === "partitions" && searchParams.get("lookup") === "1";
   // A non-numeric ?snapshot (typo, mangled link) is ignored — treated as
   // head — rather than becoming NaN on screen and on the wire. Valid ids
   // stay exact decimal strings (int64: no Number round-trip).
   const snapshotParam = searchParams.get("snapshot");
-  const snapshot =
+  const urlSnapshot =
     snapshotParam !== null && snapshotParam !== "" && isInt64String(snapshotParam)
       ? snapshotParam
       : undefined;
+  // This catalog's snapshot ids mean nothing to a remote table, so it is
+  // read at head and the URL's id is ignored.
+  const snapshot = kind.local ? urlSnapshot : undefined;
 
-  const enabled = Boolean(catalog && namespace && table);
+  const enabled = Boolean(catalog && namespace && table) && known;
   const tableQuery = useQuery({
     queryKey: ["table", catalog, namespace, table, snapshot ?? "head", exactLookup ? "metadata" : "totals"],
     queryFn: () => getTable(catalog!, namespace!, table!, snapshot, exactLookup ? { totals: false } : undefined),
     enabled,
   });
+  // A remote table's scan is pinned to its own answer's read_snapshot_id.
+  const scanReady = kind.local || (kind.remote && tableQuery.isSuccess);
+  const scanSnapshot = kind.remote ? tableQuery.data?.read_snapshot_id : snapshot;
   if (!catalog || !namespace || !table) return null;
 
   /**
@@ -1748,13 +1788,22 @@ export function TablePage() {
     <section>
       <h2>
         {table} <span className="subtle">table</span>
+        {kind.remote && <> <RemoteBadge /></>}
         {snapshot !== undefined && (
           <span className="badge time-travel">
             @ snapshot <SnapshotId catalog={catalog!} id={snapshot} />
           </span>
         )}
       </h2>
-      {!exactLookup && (tableQuery.isError ? (
+      {kind.remote && <RemoteLine />}
+      {kind.remote && urlSnapshot !== undefined && (
+        <p className="subtle">
+          Time travel by snapshot id is not available for a remote table: showing head.
+        </p>
+      )}
+      {!known && kind.error ? (
+        <ErrorBox error={kind.error} />
+      ) : !exactLookup && (tableQuery.isError ? (
         <ErrorBox error={tableQuery.error} />
       ) : tableQuery.isPending ? (
         <SkeletonBlock />
@@ -1765,6 +1814,7 @@ export function TablePage() {
           // The REQUEST's own parameter. The page has it; the response
           // cannot be asked (see TotalsFreshness).
           timeTravel={snapshot !== undefined}
+          remote={kind.remote}
         />
       ))}
       <div className="tab-bar">
@@ -1781,14 +1831,15 @@ export function TablePage() {
             </button>
           ))}
         </div>
-        {!exactLookup && <SnapshotSelector
+        {kind.local && !exactLookup && <SnapshotSelector
           snapshot={snapshot}
           onChange={(s) => setParam("snapshot", s)}
         />}
       </div>
       {tab === "schema" &&
         (tableQuery.isSuccess ? <SchemaTab table={tableQuery.data} /> : null)}
-      {tab === "files" && (
+      {tab === "files" && kind.remote && <RemoteUnavailable what="Files" />}
+      {tab === "files" && kind.local && (
         <FilesTab
           catalog={catalog}
           namespace={namespace}
@@ -1820,15 +1871,16 @@ export function TablePage() {
           columns={tableQuery.data?.columns}
         />
       )}
-      {tab === "scan" && (
+      {tab === "scan" && scanReady && (
         <ScanTab
           catalog={catalog}
           namespace={namespace}
           table={table}
-          snapshot={snapshot}
+          snapshot={scanSnapshot}
         />
       )}
-      {tab === "partitions" && !exactLookup && (
+      {tab === "partitions" && kind.remote && <RemoteUnavailable what="Partitions" />}
+      {tab === "partitions" && kind.local && !exactLookup && (
         <PartitionsTab
           catalog={catalog}
           namespace={namespace}

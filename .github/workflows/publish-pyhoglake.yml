@@ -2,7 +2,9 @@ name: Publish pyhoglake
 
 # Publishes pyhoglake to PyPI through OIDC trusted publishing (no API-token
 # secret). Trigger: push a tag named pyhoglake-v<version> that matches the
-# version in pyhoglake/pyproject.toml.
+# version in pyhoglake/pyproject.toml. release.yml pushes it on the release
+# commit, after the codec that commit pins is on PyPI; a hand-pushed tag
+# works the same.
 #
 # PyPI side: the PostHog organization owns the pyhoglake project. Its trusted
 # publisher pins this repo, this workflow file, and the `pypi` environment.

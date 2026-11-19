@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.4.13-dev
+  version: 1.4.12
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
@@ -595,6 +595,12 @@ paths:
         of that size should expect a several-hundred-millisecond
         response and should not hold the body in memory casually.
         Paging is the fix and is not yet implemented.
+
+
+        On a remote schema (Namespace.remote), `snapshot` and
+        `at_timestamp` are resolved on the serving host, against the
+        catalogs that hold its tables, never this catalog: list a remote
+        schema at head or with `at_timestamp`.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -652,6 +658,14 @@ paths:
         the identity read, and the one a writer fetching a table's UUID
         and schema per flush should send. See the Table schema for the
         full contract on absence.
+
+
+        On a remote schema (Namespace.remote), `snapshot` and
+        `at_timestamp` are resolved against the catalog that holds the
+        table on the serving host, never this catalog: send the table's
+        own `read_snapshot_id`. A snapshot id of this catalog is refused
+        (422) when it is above that catalog's head, and otherwise reads
+        an unrelated snapshot.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -885,6 +899,11 @@ paths:
         data file the catalog holds row-group start offsets for carries
         them (DataFile.split_offsets) so an engine can cut byte-range
         splits on row-group boundaries.
+      description: >
+        On a remote schema (Namespace.remote), `snapshot` and
+        `at_timestamp` are resolved against the catalog that holds the
+        table on the serving host, as on getTable: send the table's
+        `read_snapshot_id`, never a snapshot id of this catalog.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -4165,8 +4184,10 @@ components:
             catalog. Its tables are read through the same namespace,
             table and scan routes; every write to it answers 403
             `read_only_catalog`, and every other read 501
-            `mount_operation_unavailable`. A listing entry for a remote
-            schema carries `name` and `remote` only.
+            `mount_operation_unavailable`. A listing entry and the
+            getNamespace answer for a remote schema carry `name` and
+            `remote` only: `{"name": <schema>, "remote": true}`, with no
+            snapshot id. Each of its tables carries its own (Table.remote).
 
     NamespaceContainment:
       type: object
@@ -4583,6 +4604,14 @@ components:
             NOT the same field as `snapshot_id`, which is a DDL receipt
             marker present only on createTable/alterTable responses and
             whose ABSENCE on a read is relied on by released clients.
+
+
+            For a remote table (`remote` true) it is a snapshot of the
+            catalog that holds the table on the serving host, not this
+            catalog's, and two tables of one remote schema can be held by
+            different catalogs. A reader pins it for that table: it sends
+            it back as `snapshot` on later getTable and planScan calls of
+            that table, and never sends this catalog's snapshot id there.
         record_count:
           type: integer
           format: int64
@@ -4681,6 +4710,14 @@ components:
             can pin its post-DDL reads to the snapshot its own DDL made
             instead of racing a separate head read. Absent on reads
             (getTable resolves an arbitrary snapshot).
+        remote:
+          type: boolean
+          description: >
+            Present, and true, only on a table of a remote schema
+            (Namespace.remote): set by the host that serves the schema and
+            relayed unchanged. Its `read_snapshot_id` is then the table's
+            pin. Absent on every other table answer and on the
+            createTable and alterTable receipts.
 
     ColumnStats:
       type: object
