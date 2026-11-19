@@ -7,6 +7,7 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.request.path
+import io.ktor.util.AttributeKey
 import io.ktor.util.pipeline.PipelinePhase
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -190,6 +191,7 @@ fun Application.installBlockingDispatch(
                 admitted = true
                 requests.admitted()
                 admission.admit(System.nanoTime())
+                call.attributes.put(QueueWaitMsKey, admission.queueWaitMs())
                 Metrics.requestQueueWait(admission.queueWaitMs())
                 if (RequestAdmission.queueExhausted(admissionBudgetMs, admission.queueWaitMs())) {
                     Metrics.requestShed()
@@ -209,6 +211,15 @@ fun Application.installBlockingDispatch(
         }
     }
 }
+
+private val QueueWaitMsKey = AttributeKey<Long>("HoglakeQueueWaitMs")
+
+/**
+ * How long this call waited for a request thread, for the access log
+ * (observability/AccessLog.kt). Null when it never queued: a probe, or a
+ * request the auth plugin refused before this seam.
+ */
+internal val ApplicationCall.queueWaitMs: Long? get() = attributes.getOrNull(QueueWaitMsKey)
 
 /**
  * The seam's own pipeline phase, BETWEEN `Plugins` and `Call`.

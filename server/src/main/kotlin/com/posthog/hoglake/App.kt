@@ -23,6 +23,7 @@ import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.observability.AccessLog
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.CatalogMetrics
 import com.posthog.hoglake.observability.Metrics
@@ -485,8 +486,8 @@ class App private constructor(
         // RequestId comes before auth, and the order is load-bearing. Auth
         // refuses by responding from inside its own interceptor, so anything
         // installed after it runs on a call whose response is already built: a
-        // 401 would lose its X-Request-Id (and, with CallLogging below it, its
-        // access-log line) exactly when somebody is trying to correlate a
+        // 401 would lose its X-Request-Id (and its access-log line would lose
+        // its request_id) exactly when somebody is trying to correlate a
         // refusal with a server record. Both are cheap and neither touches the
         // database, so both belong on the outside.
         app.install(RequestId)
@@ -494,7 +495,10 @@ class App private constructor(
             // Coroutine-safe MDC propagation of the request id, so audit
             // lines emitted inside request handling carry request_id.
             mdc(Audit.REQUEST_ID_MDC) { call -> call.requestId }
+            // Kept for the MDC alone: the access log writes the request line.
+            filter { false }
         }
+        app.install(AccessLog)
 
         // THEN, and before anything that does real work: authenticate and
         // authorize, so a refused request never reaches the blocking

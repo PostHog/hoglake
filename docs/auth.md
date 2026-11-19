@@ -134,7 +134,7 @@ The core, which every issuer must emit:
 | claim | required | meaning |
 | --- | --- | --- |
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
-| `jti` | yes, by decision | token id, for correlating an audit line with a token. Required because the audit log and the access log name tokens by it; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
+| `jti` | yes, by decision | token id, for correlating a request with a token. Required because the access log names each request's token by it, and an audit line written while a request is handled reaches the token through its `request_id`; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
 | `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
 | `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |

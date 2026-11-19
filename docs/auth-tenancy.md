@@ -1897,6 +1897,30 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 
 "Who is still anonymous" is `hoglake_auth_requests_total{outcome="missing"}`.
 
+Access log (`observability/AccessLog.kt`): one JSON line per request on the
+`hoglake.access` logger, on both listeners. Refusals are logged too: a 401 from
+the auth plugin, a 503 shed by admission, and a relay error. The probes
+(`/healthz`, `/livez`, `/metrics`) are not logged. Each field is left out when
+it is unknown:
+
+- `request_id`, `listener`, `method`, `status`, `catalog`, `namespace`.
+- `route`: the `AuthPolicy` rule's pattern, or `unmatched`. Never the raw path
+  or the query string.
+- `duration_ms`, and `queue_wait_ms`: the wait for a request thread. It is
+  absent when the request never queued.
+- `auth`: `off`, `anonymous` or `authenticated`.
+- From the caller: `kind`, `org`, `jti`, `usr` and `client` (`cli`).
+- `client_class`: the closed `User-Agent` class above.
+- `team`: taken from a `team_<id>` namespace, or else from the one value of the
+  caller's `team_id` grant.
+- `outcome`: the error code of a non-2xx answer.
+
+The line never carries a token, a header value or a body. Per-tenant load is a
+log and not metric labels on purpose: an org, team or token label is unbounded
+cardinality, which is why the metrics stop at pod, catalog and family (the
+relay and stream-scan series count every team schema as `team_*`). Query the
+log in Loki with `| json`, and group by `org` or `team`.
+
 Audit additions: one new action, `auth_refused`. Not built: a `tenant` field on
 every event, and `token_issue`, `token_denied`, `storage_credentials_vend` (the
 last one is the one you want when a customer asks "who read my data", alongside

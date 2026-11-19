@@ -1,5 +1,5 @@
 <!--
-  Logging assembly. Two streams to stdout:
+  Logging assembly. Three streams to stdout:
    - CONSOLE: the app's human-readable log. Root at INFO (2026-09-12:
      DEBUG-by-default made parquet-java log every cell of a compaction
      rewrite — minutes of log formatting per group); DEBUG stays
@@ -8,6 +8,9 @@
      JSON line per event via LogstashEncoder on the dedicated
      "hoglake.audit" logger, additivity off so audit events never leak
      into the pattern console and vice versa.
+   - ACCESS: one JSON line per request with its caller
+     (observability/AccessLog.kt), on "hoglake.access", built the same
+     way as AUDIT.
 -->
 <configuration>
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
@@ -26,6 +29,17 @@
 
     <logger name="hoglake.audit" level="INFO" additivity="false">
         <appender-ref ref="AUDIT"/>
+    </logger>
+
+    <appender name="ACCESS" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- request_id is a structured argument, as on AUDIT. -->
+            <includeMdc>false</includeMdc>
+        </encoder>
+    </appender>
+
+    <logger name="hoglake.access" level="INFO" additivity="false">
+        <appender-ref ref="ACCESS"/>
     </logger>
 
     <root level="INFO">
