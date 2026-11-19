@@ -60,26 +60,6 @@ data class Config(
     /** Optional allowlist id for this process's PostgreSQL backend. */
     val postgresBackendId: String = env("HOGLAKE_POSTGRES_BACKEND_ID", ""),
     /**
-     * The PostgreSQL catalog every mount reads (one per instance, e.g.
-     * `millrace-dev`); its row is each mount's catalog. Empty (the default):
-     * none, so a mount that resolves answers 500 rather than a catalog.
-     */
-    val mountSourceCatalog: String = env("HOGLAKE_MOUNT_SOURCE_CATALOG", ""),
-    /**
-     * The one table every mount reads, pinned by its `table_uuid` (#291
-     * decision 3; hoglake#557's `hog_mount` stores no source table). Empty
-     * (the default): no table pinned, so a mount's read routes answer 500.
-     * The reader resolves the uuid to its live (namespace, name) per request,
-     * so a drop/recreate of the source needs a new value here.
-     */
-    val mountSourceTableUuid: String = env("HOGLAKE_MOUNT_SOURCE_TABLE_UUID", ""),
-    /**
-     * The field id of the mount's source (partition) field — `team_id` —
-     * that `ReadScope` (1.2) scopes on and that each scanned file carries.
-     * Empty (the default): unset, so a mount's read routes answer 500.
-     */
-    val mountSourceFieldId: String = env("HOGLAKE_MOUNT_SOURCE_FIELD_ID", ""),
-    /**
      * The most files one mount scan's scoped plan may return before it is
      * refused with 422 `mount_scan_too_many_files` (plan row 1.3h / M10):
      * a whale org's cold scan is bounded rather than allowed to build an
@@ -105,12 +85,11 @@ data class Config(
     val mountScanMaxConcurrent: Int = env("HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT", "8").toInt(),
     /**
      * Client mode (plan row 1.3c). Optional JSON file naming the remote
-     * hosts this server proxies mounts to, and which catalog names each one
+     * hosts this server relays remote schemas to, and which namespace names each one
      * serves:
-     * {"hosts": [{"id": UUID, "match": {"type": "events"}, "kind": "hoglake",
-     * "url": HTTP_URL, "auth": "forward"}]}.
-     * `match` is {"type": "events"} (every mount name, `<orgID>-events`),
-     * {"type": "catalog", "name": NAME} (one mount name) or
+     * {"hosts": [{"id": UUID, "match": {"type": "namespace_family", "family": "team"},
+     * "kind": "hoglake", "url": HTTPS_URL, "auth": "forward"}]}.
+     * `match` is
      * {"type": "namespace", "name": NAME} (a remote schema: the namespace
      * NAME of every catalog this server holds itself, read-only, relayed to
      * the host; NAME is then reserved as [reservedNamespaceNames] are) or
@@ -128,8 +107,7 @@ data class Config(
      * namespace entry allow_insecure_http (a boolean, default false). A
      * namespace entry's URL must be https unless that key is true: the token
      * relayed for a remote schema can carry storage credentials, and http
-     * sends it without transport encryption. The key is refused on the
-     * other match types, whose URLs may be http as before. A namespace
+     * sends it without transport encryption. A namespace
      * entry may also set remote_name, the schema's name on the host (default
      * NAME): NAME is what this server shows and reserves, while the relayed
      * path and the token's `remote_schemas` use remote_name. Refused on the other
@@ -139,10 +117,8 @@ data class Config(
      * each URL a bare http(s) origin, and no name may match two entries.
      *
      * Empty (the default), or an empty list: no proxy, today's behaviour.
-     * With hosts, a request for a matched name is checked here as a mount
-     * reader's (a remote schema's needs the token's `remote_schemas` claim)
-     * and then sent to that host and nowhere else. Refused at boot
-     * with [mountAllowlist] (a server is a Host or a Client), under
+     * With hosts, a request for a remote schema is checked here (the token's `remote_schemas` claim)
+     * and then sent to that host and nowhere else. Refused at boot under
      * `HOGLAKE_AUTH_MODE=off`, or without [authPredicateFields] (a mount
      * serves only verified scoped tokens). A `namespace` entry is also
      * refused unless [authSessionProfile] is `on`: only a token carrying
@@ -463,19 +439,6 @@ data class Config(
      * no `toString` of this config prints it.
      */
     val authSigningKey: SecretString = SecretString(env("HOGLAKE_AUTH_SIGNING_KEY", "")),
-    /**
-     * The orgs whose mount may serve, comma-separated: the `<id>` of each
-     * mount `<id>-events`, matching the orgs the mount writer manages. `*` admits every mount. Empty (the default) admits none, and no
-     * mount name is then looked up at all. Writes are not gated by it, so a
-     * mount can always be disabled.
-     */
-    val mountAllowlist: Set<String> = nameList(env("HOGLAKE_MOUNT_ALLOWLIST", "")),
-    /**
-     * The `sub` of the one operator token that may write mounts
-     * (`PUT /v1/mounts/{name}`), verified, so under `off` none may: the
-     * issuer's events mount loop. Empty (the default): no caller may.
-     */
-    val mountWriterSubject: String = env("HOGLAKE_MOUNT_WRITER_SUBJECT", ""),
     /**
      * Namespace names no caller may create in any catalog, comma-separated,
      * matched ignoring ASCII case ([ReservedNamespaces]). Empty (the default)
@@ -1546,16 +1509,6 @@ data class Config(
                 mapOf(canonicalBackendId(postgresBackendId) to BackendKind.POSTGRES)
             }
 
-    /** Whether [HOGLAKE_MOUNT_ALLOWLIST][mountAllowlist] admits the mount [name]. */
-    fun mountAdmitted(name: String): Boolean =
-        MountNames.isReserved(name) && ("*" in mountAllowlist || name.removeSuffix("-events") in mountAllowlist)
-
-    /** The pinned source [table_uuid][mountSourceTableUuid], or null when unset. */
-    val mountSourceTableUuidOrNull: UUID? = mountSourceTableUuid.takeIf { it.isNotBlank() }?.let(UUID::fromString)
-
-    /** The pinned source [field id][mountSourceFieldId], or null when unset. */
-    val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
-
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
 
@@ -1683,26 +1636,12 @@ data class Config(
         require(authScopedMaxLifetimeSeconds > 0) {
             "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be positive, got $authScopedMaxLifetimeSeconds"
         }
-        require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
-            "HOGLAKE_MOUNT_ALLOWLIST takes org ids (canonical lowercase UUIDs) or *, got $mountAllowlist"
-        }
-        // Parsed eagerly so a malformed pin fails at boot, not on the first scan.
-        require(mountSourceTableUuid.isBlank() || mountSourceTableUuidOrNull != null) {
-            "HOGLAKE_MOUNT_SOURCE_TABLE_UUID must be a UUID, got '$mountSourceTableUuid'"
-        }
-        require(mountSourceFieldId.isBlank() || (mountSourceFieldIdOrNull?.let { it >= 0 } == true)) {
-            "HOGLAKE_MOUNT_SOURCE_FIELD_ID must be a non-negative integer, got '$mountSourceFieldId'"
-        }
         require(mountScanFileBudget >= 1) { "HOGLAKE_MOUNT_SCAN_FILE_BUDGET must be >= 1, got $mountScanFileBudget" }
         require(mountScanDeadlineMs >= 0) { "HOGLAKE_MOUNT_SCAN_DEADLINE_MS must be >= 0, got $mountScanDeadlineMs" }
         require(mountScanMaxConcurrent >= 0) {
             "HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT must be >= 0, got $mountScanMaxConcurrent"
         }
         if (mountHosts.isNotEmpty()) {
-            require(mountAllowlist.isEmpty()) {
-                "HOGLAKE_MOUNT_HOSTS_FILE (this server is a mount Client) cannot be set with " +
-                    "HOGLAKE_MOUNT_ALLOWLIST (this server is a mount Host): a server is one or the other"
-            }
             require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
                 "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
                     "a mount serves only verified callers"
@@ -2140,6 +2079,9 @@ data class Config(
         /** The default `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS`, named for the boot refusal's message. */
         const val DEFAULT_REINDEX_PURGE_WAIT_WINDOWS = 3
 
+        private const val MOUNT_REMOVED =
+            "the events mount path was removed with it; team schemas are served through HOGLAKE_SERVED_NAMESPACES_FILE"
+
         /** Env vars that no longer exist, and what replaced them. */
         private val REMOVED_ENV =
             mapOf(
@@ -2148,6 +2090,11 @@ data class Config(
                     "HOGLAKE_COMPACTION_MIN_INPUT_FILES (default 5) and " +
                     "HOGLAKE_COMPACTION_MAX_INPUT_FILES (default 64); the old value of 8 " +
                     "maps to neither.",
+                "HOGLAKE_MOUNT_ALLOWLIST" to MOUNT_REMOVED,
+                "HOGLAKE_MOUNT_WRITER_SUBJECT" to MOUNT_REMOVED,
+                "HOGLAKE_MOUNT_SOURCE_CATALOG" to MOUNT_REMOVED,
+                "HOGLAKE_MOUNT_SOURCE_TABLE_UUID" to MOUNT_REMOVED,
+                "HOGLAKE_MOUNT_SOURCE_FIELD_ID" to MOUNT_REMOVED,
             )
 
         /**
@@ -2467,16 +2414,10 @@ private fun readMountHosts(file: String): List<MountHost> {
         require(matcher != null && matcher.isObject) { "mount host requires a match object" }
         val match =
             when (val type = text(matcher, "type")) {
-                "events" -> {
-                    require(matcher.size() == 1) { "an events match takes no other field" }
-                    MountMatch.Events
-                }
-                "catalog" -> {
-                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "name")) {
-                        "a catalog match takes exactly a name"
-                    }
-                    MountMatch.Catalog(text(matcher, "name"))
-                }
+                "events", "catalog" ->
+                    throw IllegalArgumentException(
+                        "the events and catalog match types were removed with the mount path; delete the entry",
+                    )
                 "namespace" -> {
                     require(matcher.properties().map { it.key }.toSet() == setOf("type", "name")) {
                         "a namespace match takes exactly a name"
@@ -2491,13 +2432,9 @@ private fun readMountHosts(file: String): List<MountHost> {
                 }
                 else ->
                     throw IllegalArgumentException(
-                        "mount host match type must be events, catalog, namespace or namespace_family, got '$type'",
+                        "mount host match type must be namespace or namespace_family, got '$type'",
                     )
             }
-        // Not a general switch: the key itself is refused where it would mean nothing.
-        require(insecure == null || match is MountMatch.RemoteSchemaMatch) {
-            "allow_insecure_http is only for a mount host that matches a namespace"
-        }
         val kindText = text(entry, "kind")
         val kind =
             requireNotNull(MountHost.Kind.entries.firstOrNull { it.wire == kindText }) {

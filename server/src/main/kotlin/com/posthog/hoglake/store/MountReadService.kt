@@ -1,10 +1,8 @@
 package com.posthog.hoglake.store
 
-import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.HoglakeException
-import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
@@ -30,21 +28,13 @@ import java.util.UUID
 import java.util.concurrent.Semaphore
 
 /**
- * The read surface a mount (export) serves to the Client (plan row 1.3h):
- * the five scoped read routes — namespaces, namespace, tables, table and
- * scan — over the ONE source table pinned as instance configuration
- * ([sourceCatalog], [sourceTableUuid], [sourceFieldId]; #291 decision 3,
- * hoglake#557's `hog_mount` stores no source). The catalog route and the
- * listing are 1.1b's; every other route is refused ([mountRefusal]).
+ * The scoped reads of the stream half of a served `team_<id>` (below).
  *
  * Isolation is [ReadScope] (1.2) in the scan's SQL and the tables totals,
- * never anything the Client is trusted to do. The mount exposes EXACTLY
- * the pinned table: a request naming any other (namespace, table) is a 404
- * worded as a missing namespace/table, so the source catalog's other
- * tables are never reachable through the mount.
+ * never anything the Client is trusted to do.
  *
  * The scan also:
- *  - carries each file's team id (its proven value on [sourceFieldId]) so
+ *  - carries each file's team id (its proven value on the team field) so
  *    the Client can vend a per-team credential for it;
  *  - is admitted through ONE shared concurrency cap over every export scan
  *    ([scanCap]), non-blocking, answering 503 `mount_scan_busy` when full
@@ -52,12 +42,12 @@ import java.util.concurrent.Semaphore
  *  - is bounded by a file-count budget (422 `mount_scan_too_many_files`)
  *    and a statement deadline (503 `mount_scan_timeout`), both counted on
  *    `hoglake_mount_refusals_total`; and
- *  - records per-mount served/latency/in-flight metrics.
+ *  - records served/latency/in-flight metrics.
  *
  * THE STREAM HALF of a served `team_<id>` (docs/auth-tenancy.md §6.5d) is
- * read here too, by the `stream*` methods: the same scoped statements, cap,
+ * read here, by the `stream*` methods: these scoped statements, cap,
  * budget and deadline, over the published tables of one configured namespace
- * instead of one pinned table, with the one team the caller rule proved
+ * with the one team the caller rule proved
  * ([StreamHalf.team]) as the only value. A table is found by its name in that
  * namespace of the stream catalog and nowhere else. Its series are labelled
  * by the family's label, never a team id or an org.
@@ -66,9 +56,6 @@ class MountReadService(
     private val jdbi: Jdbi,
     /** The PostgreSQL store, for the table route's full [TableInfo] build. */
     private val source: () -> CatalogStore,
-    private val sourceCatalog: String,
-    private val sourceTableUuid: UUID?,
-    private val sourceFieldId: Long?,
     private val fileBudget: Int,
     private val scanDeadlineMs: Long,
     maxConcurrentScans: Int,
@@ -93,115 +80,6 @@ class MountReadService(
         val table: String,
         val comment: String?,
     )
-
-    // ---- namespaces / namespace -----------------------------------------
-
-    /** The one namespace the pinned table lives in (containment stripped: a mount has none). */
-    fun namespaces(
-        snapshot: Long?,
-        atTimestamp: Instant?,
-    ): List<NamespaceInfo> =
-        jdbi.withHandleUnchecked { h ->
-            val (_, pinned) = resolve(h, snapshot, atTimestamp)
-            listOf(NamespaceInfo(namespaceId = pinned.namespaceId, name = pinned.namespace))
-        }
-
-    /** [namespace] if it is the pinned table's; a 404 worded as a missing namespace otherwise. */
-    fun namespace(
-        namespace: String,
-        snapshot: Long?,
-        atTimestamp: Instant?,
-    ): NamespaceInfo =
-        jdbi.withHandleUnchecked { h ->
-            val (_, pinned) = resolve(h, snapshot, atTimestamp)
-            if (namespace != pinned.namespace) notFoundNamespace(namespace)
-            NamespaceInfo(namespaceId = pinned.namespaceId, name = pinned.namespace)
-        }
-
-    // ---- tables / table --------------------------------------------------
-
-    /**
-     * The pinned table as a [TableSummaryInfo], with SCOPED totals — the
-     * record/file/byte counts over the caller's `ReadScope`, never the
-     * whole table's (a count is isolation-bearing, §3.2). History counts
-     * are catalog-wide, which a read-only mount does not expose, so
-     * snapshotCount is 0 and earliestSnapshotId null (plan row 1.3h:
-     * totals optional for a read-only catalog).
-     */
-    fun tables(
-        caller: Caller?,
-        record: MountRecord,
-        namespace: String,
-        snapshot: Long?,
-        atTimestamp: Instant?,
-    ): List<TableSummaryInfo> =
-        inScanTransaction(record.name) { h ->
-            val (at, pinned) = resolve(h, snapshot, atTimestamp)
-            if (namespace != pinned.namespace) notFoundNamespace(namespace)
-            val scope = loadScope(h, caller, record, pinned, at)
-            val totals = scopedTotals(h, scope, at)
-            listOf(
-                TableSummaryInfo(
-                    tableId = pinned.tableId,
-                    tableUuid = sourceTableUuid!!,
-                    name = pinned.table,
-                    comment = pinned.comment,
-                    recordCount = totals.records,
-                    fileCount = totals.files,
-                    fileSizeBytes = totals.bytes,
-                    snapshotCount = 0,
-                    earliestSnapshotId = null,
-                ),
-            )
-        }
-
-    /**
-     * The pinned table's [TableInfo] WITHOUT totals (plan row 1.3h: "totals
-     * omitted"), delegated to the source store so columns, specs, comment
-     * and properties are the real ones. A request naming any other
-     * (namespace, table) is a 404, so no other table of the source is
-     * reachable through the mount.
-     */
-    fun table(
-        namespace: String,
-        table: String,
-        snapshot: Long?,
-        atTimestamp: Instant?,
-    ): TableInfo {
-        jdbi.withHandleUnchecked { h ->
-            val (_, pinned) = resolve(h, snapshot, atTimestamp)
-            if (namespace != pinned.namespace || table != pinned.table) notFoundTable(namespace, table)
-        }
-        // totals=false: the identity read, no manifest aggregate and no leak.
-        return source().getTable(sourceCatalog, namespace, table, snapshot, atTimestamp, totals = false)
-    }
-
-    // ---- scan ------------------------------------------------------------
-
-    /**
-     * The scoped scan of the pinned table: `ReadScope` in the SQL, each
-     * file paired with its live DV and carrying its team id, under the
-     * shared cap, the file budget and the deadline. `include=column_stats`
-     * is scoped to the returned files and its cap counts only them.
-     */
-    fun scan(
-        caller: Caller?,
-        record: MountRecord,
-        namespace: String,
-        table: String,
-        snapshot: Long?,
-        atTimestamp: Instant?,
-        columnStats: ScanService.ColumnStatsRequest?,
-        splitOffsets: Boolean,
-    ): List<ScanFile> =
-        underCap(record.name) {
-            inScanTransaction(record.name) { h ->
-                val (at, pinned) = resolve(h, snapshot, atTimestamp)
-                if (namespace != pinned.namespace || table != pinned.table) notFoundTable(namespace, table)
-                val scope = loadScope(h, caller, record, pinned, at)
-                scopedScan(h, record.name, pinned, scope, at, columnStats, splitOffsets)
-            }
-        }
 
     /** One scan under the shared cap, counted and timed against [label]: a mount's name or a stream's family label. */
     private fun underCap(
@@ -466,9 +344,9 @@ class MountReadService(
         } else {
             at = snapshot ?: cat.headSnapshotId
             // These messages must not name the source catalog: its name is
-            // hidden from a mount reader (the DTO renames it; mountSource()
+            // hidden from a stream reader (streamAt
             // 500s rather than name it). The head/floor are the export's own
-            // snapshot clock, already on the mount's catalog DTO (1.1b).
+            // snapshot clock.
             if (at < 0 || at > cat.headSnapshotId) {
                 throw HoglakeException.Validation(
                     "snapshot $at out of range [0, ${cat.headSnapshotId}] for this export",
@@ -485,85 +363,6 @@ class MountReadService(
             }
         }
         return cat.catalogId to at
-    }
-
-    private fun resolve(
-        h: Handle,
-        snapshot: Long?,
-        atTimestamp: Instant?,
-    ): Pair<Long, Pinned> {
-        val missing = "a mount resolved, but HOGLAKE_MOUNT_SOURCE_CATALOG names no catalog"
-        val (catalogId, at) = readSnapshot(h, sourceCatalog, snapshot, atTimestamp, missing)
-        val uuid = sourceTableUuid ?: error("a mount resolved, but HOGLAKE_MOUNT_SOURCE_TABLE_UUID is not set")
-        val pinned =
-            h.createQuery(
-                """
-                SELECT t.table_id, tv.namespace_id, tv.name AS table_name, tv.comment AS table_comment,
-                       n.name AS namespace_name
-                  FROM hog_table t
-                  JOIN hog_table_version tv ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
-                  JOIN hog_namespace n ON n.catalog_id = tv.catalog_id AND n.namespace_id = tv.namespace_id
-                 WHERE t.catalog_id = :catalogId AND t.table_uuid = :uuid
-                   AND tv.begin_snapshot <= :at AND (tv.end_snapshot IS NULL OR :at < tv.end_snapshot)
-                   AND (t.dropped_snapshot IS NULL OR :at < t.dropped_snapshot)
-                """,
-            )
-                .bind("catalogId", catalogId)
-                .bind("uuid", uuid)
-                .bind("at", at)
-                .map { rs, _ ->
-                    Pinned(
-                        catalogId = catalogId,
-                        tableId = rs.getLong("table_id"),
-                        tableUuid = uuid,
-                        namespaceId = rs.getLong("namespace_id"),
-                        namespace = rs.getString("namespace_name"),
-                        table = rs.getString("table_name"),
-                        comment = rs.getString("table_comment"),
-                    )
-                }
-                .findOne()
-                .orElse(null)
-                ?: error(
-                    "HOGLAKE_MOUNT_SOURCE_TABLE_UUID $uuid is not a live table of '$sourceCatalog' at snapshot $at",
-                )
-        return at to pinned
-    }
-
-    private fun notFoundNamespace(namespace: String): Nothing =
-        throw HoglakeException.NotFound("namespace '$namespace'")
-
-    private fun notFoundTable(
-        namespace: String,
-        table: String,
-    ): Nothing = throw HoglakeException.NotFound("table '$namespace.$table'")
-
-    /**
-     * The caller's `ReadScope` on the pinned table. The predicate field is
-     * the source column's name (`team_id`), so the grant is
-     * `caller.predicates[name]`; `*` means the mount's values and an
-     * absent grant reads no file (§3.2, #147 D5/D6).
-     */
-    private fun loadScope(
-        h: Handle,
-        caller: Caller?,
-        record: MountRecord,
-        pinned: Pinned,
-        at: Long,
-    ): ReadScope {
-        val fieldId = sourceFieldId ?: error("a mount resolved, but HOGLAKE_MOUNT_SOURCE_FIELD_ID is not set")
-        val fieldName =
-            columnsByFieldId(TableRepo.columnsAt(h, pinned.catalogId, pinned.tableId, at))[fieldId]?.second?.def?.name
-                ?: throw MountIntegrityError("source field $fieldId is not a column of the pinned table")
-        return ReadScope.load(
-            h,
-            pinned.catalogId,
-            pinned.tableId,
-            at,
-            fieldId,
-            record.values,
-            caller?.predicates?.get(fieldName),
-        )
     }
 
     private data class Totals(val records: Long, val files: Long, val bytes: Long)
@@ -736,12 +535,6 @@ class MountReadService(
      * bounds the returned rows. The InitPlan array ReadScope collects is
      * bounded by neither (see [ReadScope]).
      */
-    internal fun <R> inScanTransaction(
-        record: MountRecord,
-        body: (Handle) -> R,
-    ): R = inScanTransaction(record.name, body)
-
-    /** The same, with a refusal counted against [label]: a mount's name or a stream's family label. */
     private fun <R> inScanTransaction(
         label: String,
         body: (Handle) -> R,

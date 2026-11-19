@@ -59,9 +59,9 @@ object HogSchemaColumns {
             // SnapshotRepo.insertChange, CommitService change batch,
             // CommitService.checkConflicts.
             "hog_snapshot_change" to setOf("catalog_id", "snapshot_id", "kind", "object_id"),
-            // V34: MountRegistry.postgresSwitch reads `enabled`.
+            // V34: retired; no reader.
             "hog_mount_switch" to setOf("singleton", "enabled"),
-            // V35: MountStore.
+            // V35: retired; no reader.
             "hog_mount" to setOf("name", "revision", "enabled", "mount_values"),
             // NamespaceRepo.
             // V33/V37: contained_field/contained_value/contained_org, read by NamespaceRepo and

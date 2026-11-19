@@ -41,6 +41,27 @@ class RemovedEnvConfigTest {
         }
     }
 
+    @Test
+    fun `each variable of the removed events mount path refuses boot, naming itself and what serves teams now`() {
+        for (key in listOf(
+            "HOGLAKE_MOUNT_ALLOWLIST",
+            "HOGLAKE_MOUNT_WRITER_SUBJECT",
+            "HOGLAKE_MOUNT_SOURCE_CATALOG",
+            "HOGLAKE_MOUNT_SOURCE_TABLE_UUID",
+            "HOGLAKE_MOUNT_SOURCE_FIELD_ID",
+        )) {
+            assertThatThrownBy { check(key to "") }
+                .describedAs(key)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("$key was removed")
+                .hasMessageContaining("events mount path was removed")
+                .hasMessageContaining("HOGLAKE_SERVED_NAMESPACES_FILE")
+        }
+        // The kept mount variables are not removed ones.
+        assertThatCode { check("HOGLAKE_MOUNT_HOSTS_FILE" to "x", "HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT" to "8") }
+            .doesNotThrowAnyException()
+    }
+
     // ---- tier 2: REMOVED_INTERVAL_ENV — 0 passes, positive is refused -------
 
     @Test

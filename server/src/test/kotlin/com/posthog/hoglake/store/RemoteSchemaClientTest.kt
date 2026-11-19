@@ -95,7 +95,6 @@ class RemoteSchemaClientTest {
     private val mapper = wireObjectMapper()
     private val hogliteId = UUID.fromString("5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
     private val postgresId = UUID.fromString("7b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
-    private val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
     private val schema = "/v1/catalogs/lake/namespaces/posthog"
     private val relayed = listOf(schema, "$schema/tables", "$schema/tables/events", "$schema/tables/events/scan")
 
@@ -390,7 +389,7 @@ class RemoteSchemaClientTest {
                     )
                 },
             )
-        application { clientModule(CatalogStoreSelector(postgres, cfg, MountRegistry.NONE, hosts), mode, cfg) }
+        application { clientModule(CatalogStoreSelector(postgres, cfg, hosts), mode, cfg) }
         try {
             block()
         } finally {
@@ -679,6 +678,29 @@ class RemoteSchemaClientTest {
             assertThat(line).contains("catalog=lake", "namespace 'posthog' in catalog 'lake'", "at=remote_schema")
         }
         assertThat(lines.last()).contains("catalog 'lake' not found").doesNotContain("at=")
+    }
+
+    @Test
+    fun `the gate counts one auth outcome when its lookup answers, and none for an outage`() {
+        StubHost().use { host ->
+            val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
+            val tables = "/v1/catalogs/lake/namespaces/team_7/tables"
+            client(host) {
+                // The lookup answers and the namespace is the reader's: the gate's one `ok`.
+                assertThat(get(tables, scoped()).status).isEqualTo(HttpStatusCode.OK)
+                // MUTATION: count every exception in the gate, and this outage (the routed engine is down) adds one.
+                val down = get(tables, scoped(rtg = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""))
+                assertThat(code(down.bodyAsText())).isEqualTo("backend_unavailable")
+            }
+            // No backend holds the catalog: the lookup's 404 is the refusal, counted once.
+            client(host, defaultBackend = "none") {
+                assertThat(get(tables, scoped()).status).isEqualTo(HttpStatusCode.NotFound)
+            }
+            val outcomes = registry.find("hoglake_auth_requests_total").counters()
+            assertThat(outcomes.groupBy { it.id.getTag("outcome") }.mapValues { (_, c) -> c.sumOf { it.count() } })
+                .isEqualTo(mapOf("ok" to 1.0, "not_entitled" to 1.0))
+            assertThat(host.seen).isEmpty()
+        }
     }
 
     @Test
@@ -1181,37 +1203,19 @@ class RemoteSchemaClientTest {
     @Test
     fun `with no namespace host the name is an ordinary local namespace`() {
         StubHost().use { host ->
-            // No hosts at all, and a hosts file with only the old match types.
-            for (matches in listOf<List<MountMatch>>(emptyList(), listOf(MountMatch.Events))) {
-                calls.clear()
-                client(host, matches = matches) {
-                    assertThat(get(schema, operator()).status).isEqualTo(HttpStatusCode.OK)
-                    assertThat(get(schema, scoped()).status).isEqualTo(HttpStatusCode.OK)
-                    val names =
-                        mapper.readTree(
-                            get("/v1/catalogs/lake/namespaces", operator()).bodyAsText(),
-                        ).map { it["name"].asText() }
-                    assertThat(names).containsExactly("team_7", "posthog", "PostHog", "other")
-                    val report = mapper.readTree(get("/v1/catalogs/lake/stats/partitions", operator()).bodyAsText())
-                    assertThat(report["partitions"]).hasSize(3)
-                }
-                assertThat(calls.filter { it.first == "getNamespace" }).hasSize(2)
+            client(host, matches = emptyList()) {
+                assertThat(get(schema, operator()).status).isEqualTo(HttpStatusCode.OK)
+                assertThat(get(schema, scoped()).status).isEqualTo(HttpStatusCode.OK)
+                val names =
+                    mapper.readTree(
+                        get("/v1/catalogs/lake/namespaces", operator()).bodyAsText(),
+                    ).map { it["name"].asText() }
+                assertThat(names).containsExactly("team_7", "posthog", "PostHog", "other")
+                val report = mapper.readTree(get("/v1/catalogs/lake/stats/partitions", operator()).bodyAsText())
+                assertThat(report["partitions"]).hasSize(3)
             }
+            assertThat(calls.filter { it.first == "getNamespace" }).hasSize(2)
             assertThat(host.seen).isEmpty()
-        }
-    }
-
-    @Test
-    fun `a mount keeps its own namespaces, whatever they are called`() {
-        StubHost().use { host ->
-            client(host, matches = listOf(MountMatch.Events, MountMatch.Namespace("posthog"))) {
-                val reader = TestTokens.mint(pair, TestTokens.scopedClaims(catalogs = """{"$mount":["read"]}"""))
-                val path = "/v1/catalogs/$mount/namespaces/posthog/tables"
-                // A mount reader needs no remote_schemas claim: the mount's host serves the mount's namespaces.
-                assertThat(get(path, reader).status).isEqualTo(HttpStatusCode.OK)
-                assertThat(host.seen.single().rawPath).isEqualTo(path)
-            }
-            assertThat(calls).isEmpty()
         }
     }
 
@@ -1608,7 +1612,7 @@ class RemoteSchemaClientTest {
                 remoteName = alias.getValue("posthog"),
             )
         val hosts = StaticMountHosts(listOf(entry))
-        val selector = CatalogStoreSelector(postgres, cfg, MountRegistry.NONE, hosts)
+        val selector = CatalogStoreSelector(postgres, cfg, hosts)
         val server =
             embeddedServer(Netty, port = 0, host = "127.0.0.1") { clientModule(selector, AuthMode.ENFORCE, cfg) }
         try {
