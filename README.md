@@ -23,12 +23,12 @@ The catalog is a **service** — clients speak a REST contract and never see the
 metadata database.
 
 **Contents:**
-[What](#what) | [Quick start](#quick-start) | [Components](#components) | [How a commit works](#how-a-commit-works) | [Compared to DuckLake and Iceberg](#compared-to-ducklake-and-iceberg) | [Performance](#performance) | [Status](#status) | [Development](#development) | [Docs](#docs)
+[What](#what) | [Quick start](#quick-start) | [Components](#components) | [Backends: PostgreSQL and Hoglite](#backends-postgresql-and-hoglite) | [How a commit works](#how-a-commit-works) | [Compared to DuckLake and Iceberg](#compared-to-ducklake-and-iceberg) | [Performance](#performance) | [Status](#status) | [Development](#development) | [Docs](#docs)
 
 ## What
 
 - **Catalog as a service.** All catalog SQL lives server-side behind a REST API. One implementation, one version, one deployment — not a library that every client embeds.
-- **Postgres as the only backend.** Foreign keys with `ON DELETE CASCADE`, advisory locks, partial indexes and range deletes are load-bearing design material, not portability casualties.
+- **Postgres for big catalogs, Hoglite for many small ones.** On PostgreSQL, foreign keys with `ON DELETE CASCADE`, advisory locks, partial indexes and range deletes are load-bearing design material, not portability casualties. [Hoglite](#backends-postgresql-and-hoglite) is a second backend that holds each catalog in its own small database, for fleets of hundreds of thousands of low-volume catalogs.
 - **Commits scoped to the write set.** One commit is one snapshot, and its cost does not grow with the size of the catalog.
 - **Footer-shipping registration.** Writers upload parquet and send the footer statistics; the server never opens a data file on the commit path. A deferred-stats mode hydrates them asynchronously instead.
 - **Server-assigned row lineage.** Contiguous row-id ranges, never reused, under a `table_uuid` incarnation contract. Compaction preserves row ids across a sorted rewrite.
@@ -107,6 +107,21 @@ changefeed and maintenance calls.
 | [millrace/](millrace/README.md) | Kafka → hoglake ingestion with durable SlateDB staging; at-least-once |
 | [duckdb-client/](duckdb-client/README.md) | DuckDB extension — reads, writes, DML, DDL and time travel over the REST contract |
 | [bench/](bench/README.md) | Benchmark harness behind the numbers below |
+
+## Backends: PostgreSQL and Hoglite
+
+One server, one REST contract, two catalog stores behind it. A request's catalog decides which one serves it; clients never see the difference.
+
+| | PostgreSQL | Hoglite |
+|---|---|---|
+| Built for | A few catalogs that are large and busy: petabytes, high commit rates, many concurrent writers | A very large number of individual catalogs that are each small and quiet: one lakehouse per tenant |
+| Storage | One shared Postgres database for every catalog | One [hoglite](https://github.com/PostHog/hoglite) tenant (a SQLite database, durable in S3) per catalog |
+| Scale | Grows with the catalog's size and commit rate | Grows with the number of catalogs: hoglite's sizing guide puts about 5,000 open tenants on a replica, so 100 replicas give about 500,000 open slots, and more tenants can sit in S3 without staying open |
+| Concurrency | Per-catalog advisory lock; many writers across catalogs | One writer per tenant, serialized by hoglite; no joins across tenants |
+| Maintenance | Background loops: compaction, expiry, cleanup, hydration, retirement | No background loops yet. Expiry, cleanup, compaction and the rehydrate requeue run on demand through `POST /v1/catalogs/{catalog}/maintenance/*`; retirement only through the backend seam |
+| Placement | The default backend (`HOGLAKE_DEFAULT_BACKEND=postgres`) | Named in `HOGLAKE_BACKENDS_FILE`. Never the default: a request reaches it only through the verified `rtg` claim in its token (backend and tenant) |
+
+**What Hoglite is for.** PostgreSQL's design pays off when one catalog is big. It does not shrink to many tiny ones: a catalog per customer on a shared Postgres turns the metadata database into the multi-tenant bottleneck. Hoglite gives each low-volume catalog its own small database that opens on demand, recovers on another replica after a failure, and holds no open slot while idle (its state stays in S3). The REST contract, the commit protocol, row lineage, deletion vectors and time travel are the same on both; `HogliteCatalogStore` re-expresses the PostgreSQL store's statements against hoglite's one-round-trip transactions, and the hoglite conformance classes run the shared suite against a real `hoglited`.
 
 ## How a commit works
 
@@ -293,10 +308,3 @@ implementations together.
 ## License
 
 [MIT](LICENSE)
-
-## Internal Hoglite boundary
-
-Hoglite is a private raw-SQL backend for trusted callers.
-Customer metadata grants can address their own backend tenant directly.
-JWT authentication does not make Hoglite a public SQL API or provide TLS.
-S3 permissions remain unchanged.
