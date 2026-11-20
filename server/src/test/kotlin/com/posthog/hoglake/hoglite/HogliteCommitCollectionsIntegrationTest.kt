@@ -338,7 +338,8 @@ class HogliteCommitCollectionsIntegrationTest {
                 // the write MUST roll back, not be protected by a stale pre-read.
                 val setup = HogliteTx()
                 setup.add(
-                    "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at) VALUES(?,'data',0,?)",
+                    "INSERT INTO removals(path,file_kind,reason,queued_snapshot,queued_at) " +
+                        "VALUES(?,'data','snapshot_expiry',0,?)",
                     sensitive,
                     "2026-11-04T00:00:00Z",
                 )

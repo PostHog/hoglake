@@ -404,6 +404,7 @@ internal class HogliteTableCreations(
                 }
 
                 tx.allocateDdlSnapshot()
+                tx.insertSnapshotRow(definition.author, definition.message)
                 // Only a replacement that found a live target retires one (and
                 // fences the new incarnation's feed): CatalogService.createTable
                 // keys both on replacementTableId, which is null for
@@ -486,7 +487,6 @@ internal class HogliteTableCreations(
                         mapper.writeValueAsString(definition.sortFields),
                     )
                 }
-                tx.insertSnapshotRow(definition.author, definition.message)
 
                 // registerInitialFiles, AT the creation snapshot: file rows with
                 // server-assigned row lineage from the new table's zeroed

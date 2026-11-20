@@ -63,6 +63,11 @@ internal fun HogliteTx.allocateCommitSnapshot() {
  * chronological one, and the LATEST row (id DESC LIMIT 1, the primary
  * key's tail) is both the tightest lower bound and an O(1) read — a
  * MAX(ts) aggregate would walk every retained snapshot per commit.
+ *
+ * Call it right after the allocator bump and BEFORE any `changes` row:
+ * `changes.snapshot_id` REFERENCES `snapshots(id)` immediately, so a
+ * change row inserted first is refused (HogliteSchema, Referential
+ * integrity).
  */
 internal fun HogliteTx.insertSnapshotRow(
     author: String?,

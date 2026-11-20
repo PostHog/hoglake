@@ -71,6 +71,12 @@ class HogliteCatalogStoreTest {
     /** A fence guard whose SQL contains this text counts this many rows (the catalog is not empty). */
     private var nonEmpty: Pair<String, Long>? = null
 
+    /** What the bootstrap's `pragma_foreign_keys` probe reads: 1 on every real hoglite connection. */
+    private var foreignKeys = 1L
+
+    /** When set, the /query probe is refused with this (status, body) instead of answered. */
+    private var probeRefusal: Pair<Int, Map<String, Any?>>? = null
+
     /** The storage-usage read's row: file bytes, DV bytes, undrained removals. */
     private var usage: List<Long> = listOf(0, 0, 0)
 
@@ -131,6 +137,8 @@ class HogliteCatalogStoreTest {
                     val sql = body!!["sql"].asText()
                     if (scanAnswer != null && sql.contains("instr(path, '%') > 0 ORDER BY path")) {
                         scanAnswer!!
+                    } else if (probeRefusal != null && sql == HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL) {
+                        probeRefusal!!
                     } else {
                         200 to query(tenants[tenantId]!!, sql, body["args"])
                     }
@@ -168,6 +176,7 @@ class HogliteCatalogStoreTest {
         args: JsonNode? = null,
     ): Map<String, Any?> =
         when {
+            sql == HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL -> result(listOf(foreignKeys))
             sql.startsWith("SELECT name, data_path,") -> if (t.name == null) result() else result(metaRow(t))
             sql == HogliteCatalogStore.STORAGE_USAGE_SQL -> result(usage)
             sql.startsWith("SELECT id, name, contained_field, contained_value FROM namespaces WHERE name = ?") ->
@@ -220,6 +229,7 @@ class HogliteCatalogStoreTest {
         fun nsArg() = t.byId(args!![0].asLong())
         return when {
             sql.contains("sqlite_master") && sql.contains("'meta'") -> if (t.name == null) 0 else 1
+            sql == HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL -> foreignKeys
             sql.contains("dropping = 0") -> if (t.dropping) 0 else 1
             nonEmpty != null && sql.contains(nonEmpty!!.first) -> nonEmpty!!.second
             sql == "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL" ->
@@ -299,10 +309,72 @@ class HogliteCatalogStoreTest {
         assertThat(info.headSnapshotId).isZero()
         assertThat(tenants.keys).containsExactly("t-wh-1")
         assertThat(requests[0]).isEqualTo("PUT /v1/tenants/t-wh-1")
+        // The enforcement probe reads the new tenant before anything is written to it.
+        assertThat(requests[1]).isEqualTo("POST /v1/t/t-wh-1/query")
         // The duplicate guard is statement 0, before any DDL.
-        assertThat(requests[1]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
+        assertThat(requests[2]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
+        // The enforcement probe is statement 1, still before any DDL.
+        assertThat(txStatements.single()[1]).isEqualTo(HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL)
         // The read-back of the new catalog reuses the operation's binding.
         assertThat(resolved.get()).isEqualTo(1)
+    }
+
+    /**
+     * The schema's FOREIGN KEYs hold only with `PRAGMA foreign_keys` on,
+     * which hoglite sets on every tenant connection. A connection that
+     * reads 0 is a misconfigured engine: the bootstrap refuses (503, so
+     * the caller retries once it is fixed) and lays no schema down.
+     */
+    @Test
+    fun `create refuses a tenant whose connection does not enforce foreign keys`() {
+        foreignKeys = 0
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("does not enforce foreign keys")
+            .hasMessageContaining("t-wh-1")
+        assertThat(tenants["t-wh-1"]!!.name).isNull()
+        assertThat(catchThrowable { store.getCatalog("wh") }).isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    /**
+     * An engine that refuses to report the flag at all (a build denying the
+     * pragma) is the same misconfiguration: 503, not the Validation the
+     * generic refusal mapping would give the caller, and no bootstrap sent.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = [409, 422])
+    fun `create refuses a tenant whose engine will not report foreign-key enforcement`(status: Int) {
+        probeRefusal = status to mapOf("code" to "refused", "error" to "not authorized")
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("refused to report PRAGMA foreign_keys")
+            .hasMessageContaining("not authorized")
+        assertThat(txStatements).isEmpty()
+        assertThat(tenants["t-wh-1"]!!.name).isNull()
+    }
+
+    /**
+     * An engine that cannot answer the probe (503) is unavailable now, not
+     * a refused bootstrap later: the in-transaction guard would map a 409
+     * or 422 there to Validation.
+     */
+    @Test
+    fun `create answers 503 when the engine cannot answer the foreign-key probe`() {
+        probeRefusal = 503 to mapOf("error" to "lease lost")
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("lease lost")
+        assertThat(txStatements).isEmpty()
+        assertThat(tenants["t-wh-1"]!!.name).isNull()
     }
 
     @Test

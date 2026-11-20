@@ -142,6 +142,21 @@ things like "one live table of this name per namespace" and "one live
 deletion vector per data file", CHECK-constrained vocabularies. The
 database rejects states the code shouldn't have to defend against.
 
+### The same model, one tenant per catalog (Hoglite)
+
+`hoglite/HogliteSchema.kt` is `schema.sql` re-expressed for one SQLite
+tenant per catalog, foreign keys, cascades, deferred namespace edges and
+CHECKs included; its KDoc ("Referential integrity") has the edge-by-edge
+mapping, the statement-order rules the store follows, and what SQLite
+cannot express. hoglite enforces the constraints on every tenant
+connection (`PRAGMA foreign_keys = ON`, which no client can change);
+`createCatalog` checks that once, at bootstrap, and refuses a tenant
+without it (503 `backend_unavailable`). A `FOREIGN KEY constraint failed`
+refusal of any later transaction is `HogliteIntegrityViolation`, a 500: a
+store bug, never a client error. Tenants have no migrations, so a schema
+change (this one included) means dropping and recreating every
+development tenant.
+
 ## Feature walkthroughs
 
 ### Commits and concurrency control
