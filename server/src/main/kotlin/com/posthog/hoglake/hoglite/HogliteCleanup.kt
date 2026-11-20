@@ -553,6 +553,15 @@ internal class HogliteCleanup(
             val gone =
                 try {
                     val tx = HogliteTx()
+                    // A tenant bootstrapped before receipt_ended existed has
+                    // no such table until a replacement creates it, so the
+                    // page creates it the way the commit does, then deletes
+                    // the page's ended counts before their receipts. The FK
+                    // would cascade them; the statement says the intent and
+                    // does not lean on the cascade. One transaction per page
+                    // still, so the phase accounting is unchanged.
+                    tx.add(HogliteSchema.RECEIPT_ENDED_DDL)
+                    tx.add(PURGE_RECEIPT_ENDED_SQL, cutoff, receiptPurgePage)
                     tx.add(
                         PURGE_RECEIPTS_SQL,
                         cutoff,
@@ -609,7 +618,7 @@ internal class HogliteCleanup(
                 if (staging) {
                     "reason = 'compaction_staging' AND scheduled_at < ?"
                 } else {
-                    "(reason IS NULL OR reason <> 'compaction_staging')"
+                    "reason <> 'compaction_staging'"
                 }
             return "SELECT id, path, reason FROM removals WHERE drained_at IS NULL AND $reasonClause " +
                 "AND (claimed_at IS NULL OR claimed_at < ?) AND id > ? ORDER BY id LIMIT ?"
@@ -620,6 +629,12 @@ internal class HogliteCleanup(
                 "SELECT id FROM maintenance_runs WHERE started_at < ? ORDER BY started_at, id LIMIT ?)"
         internal const val PURGE_RECEIPTS_SQL =
             "DELETE FROM receipts WHERE idempotency_key IN (" +
+                "SELECT idempotency_key FROM receipts WHERE created_at < ? " +
+                "ORDER BY created_at LIMIT ?)"
+
+        /** The same page's ended counts, deleted before their receipts (the FK would cascade them too). */
+        internal const val PURGE_RECEIPT_ENDED_SQL =
+            "DELETE FROM receipt_ended WHERE idempotency_key IN (" +
                 "SELECT idempotency_key FROM receipts WHERE created_at < ? " +
                 "ORDER BY created_at LIMIT ?)"
         internal const val PURGE_DRAINED_SQL =

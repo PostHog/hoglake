@@ -32,6 +32,28 @@ class HogliteRefusalMappingTest {
         assertThat(error).isNotInstanceOf(HoglakeException.BackendUnavailable::class.java)
     }
 
+    /**
+     * A FOREIGN KEY refusal — an orphan the schema turned from corruption
+     * into a refused transaction — is a store bug: a 500 with its stack,
+     * never a client error. Both channels: /tx's 422 `refused` and
+     * /query's bare 409; immediate and commit-time (deferred) alike.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = [409, 422])
+    fun `a foreign key refusal is an integrity violation, not a client error`(status: Int) {
+        val error =
+            store.mapRejected(
+                "cat",
+                HogliteRejected(status, """{"code":"refused","error":"FOREIGN KEY constraint failed"}"""),
+            )
+        assertThat(error).isExactlyInstanceOf(HogliteIntegrityViolation::class.java)
+        assertThat(error).isNotInstanceOf(HoglakeException::class.java)
+        assertThat(error.message).contains("catalog 'cat'", "store bug", "FOREIGN KEY constraint failed")
+        // A CHECK refusal stays a Validation: the row shape, not a dangling reference.
+        val check = HogliteRejected(status, """{"code":"refused","error":"CHECK constraint failed: files"}""")
+        assertThat(store.mapRejected("cat", check)).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+    }
+
     @ParameterizedTest
     @ValueSource(ints = [400, 409, 422])
     fun `known malformed and SQL refusal statuses stay final without a label`(status: Int) {

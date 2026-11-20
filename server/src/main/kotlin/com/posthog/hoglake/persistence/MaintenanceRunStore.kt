@@ -489,7 +489,8 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
          */
         private val RESULT_JSON: ObjectMapper = wireObjectMapper()
 
-        private fun errorText(e: Throwable): String {
+        /** A failed run's `error`: the root cause's message (or class), capped. The hoglite ledger uses it too. */
+        internal fun errorText(e: Throwable): String {
             val cause = generateSequence(e) { it.cause }.take(16).last()
             return (cause.message ?: cause.javaClass.name).take(MAX_ERROR_LENGTH)
         }

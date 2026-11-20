@@ -459,6 +459,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
                   ,{" "}
                   <span className="th-hint" title={MERGE_BUDGET_TITLE}>
                     merge-budget {formatCount(r.merge_budget_exceeded ?? "0")}
+                    {positive(r.oversized_row_groups) && (
+                      <span className="th-hint" title={OVERSIZED_ROW_TITLE}>
+                        {" "}(includes {formatCount(r.oversized_row_groups ?? "0")} groups with oversized rows)
+                      </span>
+                    )}
                   </span>
                 </>
               )}
@@ -663,13 +668,14 @@ const SPILL_BUDGET_TITLE =
   "lowered.";
 
 const MERGE_BUDGET_TITLE =
-  "Groups of a sorted table that compaction did not rewrite because " +
-  "merging their sorted pieces would need more memory than one rewrite " +
-  "may use (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES, divided by the number " +
-  "of groups compacted at once). Only the configuration causes this: " +
-  "the memory limit is small for the target size. Nothing is lost or " +
-  "wrong; raise the memory limit on a pod with enough memory, or lower " +
-  "the target size.";
+  "Compaction refuses these groups because sorting exceeds the memory budget. " +
+  "Each rewrite uses HOGLAKE_COMPACTION_SORTED_HEAP_BYTES divided by the number of concurrent groups. " +
+  "This total includes groups with oversized rows.";
+
+const OVERSIZED_ROW_TITLE =
+  "Compaction refuses each of these groups because one row exceeds the memory budget. " +
+  "This counts compaction groups, not rows or Parquet row groups. " +
+  "The merge-budget total already includes these groups.";
 
 const SPILL_CLEANUP_TITLE =
   "Sorted rewrites whose temporary files on local disk could not be " +

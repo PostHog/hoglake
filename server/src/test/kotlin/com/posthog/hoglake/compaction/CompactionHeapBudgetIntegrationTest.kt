@@ -29,6 +29,7 @@ import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
@@ -124,7 +125,227 @@ class CompactionHeapBudgetIntegrationTest {
             entries.map { it.fileName.toString() }.filter { it.startsWith(SpillDirectory.PREFIX) }.toList()
         }
 
+    @Test
+    fun `a historical variant runtime refusal uses the remembered reader reserve without repeated IO`() {
+        val cat = "heap-variant-refusal-cache-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("id", ColType.LONG),
+                ColumnDef("v", ColType.VARIANT, mapOf("shredding" to mapOf("type" to "int64"))),
+                ColumnDef("payload", ColType.BINARY),
+            ),
+        )
+        val historical = catalogs.getTable(cat, "ns", "t").columns
+        val outputSchema = ParquetRewriter.outputSchema(historical)
+        val fileSchema = MessageType(outputSchema.name, outputSchema.fields.dropLast(1))
+        val directory = Files.createTempDirectory("hoglake-historical-memory-cache")
+        val path = directory.resolve("source.parquet")
+        val bytes =
+            try {
+                val factory = SimpleGroupFactory(fileSchema)
+                val payload = Binary.fromConstantByteArray(ByteArray(128 * 1024) { 42 })
+                ExampleParquetWriter.builder(LocalOutputFile(path))
+                    .withType(fileSchema)
+                    .withCompressionCodec(CompressionCodecName.SNAPPY)
+                    .build().use { writer ->
+                        repeat(2) { index ->
+                            writer.write(
+                                factory.newGroup().also { row ->
+                                    row.add("id", 1L - index)
+                                    row.addGroup("v").apply {
+                                        add("metadata", Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)))
+                                        add("typed_value", 7L)
+                                    }
+                                    row.add("payload", payload)
+                                },
+                            )
+                        }
+                    }
+                Files.readAllBytes(path)
+            } finally {
+                Files.deleteIfExists(path)
+                Files.deleteIfExists(directory)
+            }
+        val registrations =
+            (0 until 2).map { index ->
+                val uri = "s3://$BUCKET/$cat/data/ns/t/historical-$index.parquet"
+                store.put(uri, bytes)
+                FileRegistration(uri, 2, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", registrations))))
+        alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetSortOrder(ASC), AlterOp.SetVariantShredding("v", null)))
+        val reads = AtomicInteger()
+        val observedStore =
+            object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun getRange(
+                    pathUri: String,
+                    startInclusive: Long,
+                    length: Int,
+                ): ByteArray {
+                    reads.incrementAndGet()
+                    return super.getRange(pathUri, startInclusive, length)
+                }
+            }
+        val config =
+            CompactionConfig(
+                targetBytes = 64L shl 20,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = 64L shl 10,
+                variantCompaction = true,
+                spillDir = spillDir(),
+            )
+        observedStore.use {
+            val service = CompactionService(db.jdbi, it, config)
+            assertThat(service.planTable(cat, "ns", "t", config).groups).hasSize(1)
+            assertThat(reads.get()).isZero()
+            val first = service.runOnce(cat, config, MaintenanceTrigger.LOOP)
+            assertThat(first.oversizedRowGroups).isEqualTo(1)
+            assertThat(first.mergeBudgetExceeded).isEqualTo(1)
+            assertThat(first.failedGroups).isZero()
+            assertThat(first.layoutProbeOnly).isZero()
+            val firstReads = reads.get()
+            assertThat(firstReads).isPositive()
+            val known = service.planTable(cat, "ns", "t", config)
+            assertThat(known.groups).describedAs("the runtime identity is found through remembered shapes").isEmpty()
+            assertThat(known.mergeRefusedGroups).isEqualTo(1)
+            val second = service.runOnce(cat, config, MaintenanceTrigger.LOOP)
+            assertThat(second.oversizedRowGroups).isEqualTo(1)
+            assertThat(second.layoutProbeOnly).isZero()
+            assertThat(second.failedGroups).isZero()
+            assertThat(reads.get()).describedAs("neither a footer nor data was fetched again").isEqualTo(firstReads)
+            assertThat(catalogs.listFiles(cat, "ns", "t").map { file -> file.path })
+                .containsExactlyInAnyOrderElementsOf(registrations.map { file -> file.path })
+            val raised = config.copy(sortedHeapBytes = 64L shl 20)
+            val retry = service.runOnce(cat, raised, MaintenanceTrigger.LOOP)
+            assertThat(retry.groupsCompacted).isEqualTo(1)
+            assertThat(retry.mergeBudgetExceeded).isZero()
+            assertThat(retry.failedGroups).isZero()
+            assertThat(reads.get()).isGreaterThan(firstReads)
+        }
+    }
+
+    @Test
+    fun `an unchanged memory refusal is skipped without IO and a higher budget retries`() {
+        val cat = "heap-refusal-cache-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", fixtureColumns)
+        alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetSortOrder(ASC)))
+        val bytes = parquetBytes(listOf(2, 1), "x".repeat(128 * 1024))
+        val registrations =
+            (0 until 2).map { index ->
+                val path = "s3://$BUCKET/$cat/data/ns/t/cache-$index.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, 2, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", registrations))))
+        val reads = AtomicInteger()
+        val observedStore =
+            object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun getRange(
+                    pathUri: String,
+                    startInclusive: Long,
+                    length: Int,
+                ): ByteArray {
+                    reads.incrementAndGet()
+                    return super.getRange(pathUri, startInclusive, length)
+                }
+            }
+        val cfg =
+            CompactionConfig(
+                targetBytes = 64L shl 20,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = 64L shl 10,
+                spillDir = spillDir(),
+            )
+        observedStore.use {
+            val service = CompactionService(db.jdbi, it, cfg)
+            val first = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(first.groupsCompacted).isZero()
+            assertThat(first.mergeBudgetExceeded).isEqualTo(1)
+            assertThat(first.oversizedRowGroups).isEqualTo(1)
+            assertThat(first.failedGroups).isZero()
+            val firstReads = reads.get()
+            assertThat(firstReads).isPositive()
+            val second = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(second.mergeBudgetExceeded).isEqualTo(1)
+            assertThat(second.oversizedRowGroups).isEqualTo(1)
+            assertThat(second.failedGroups).isZero()
+            assertThat(reads.get()).isEqualTo(firstReads)
+            val raised = cfg.copy(sortedHeapBytes = 64L shl 20)
+            val retry = service.runOnce(cat, raised, MaintenanceTrigger.LOOP)
+            assertThat(retry.groupsCompacted).isEqualTo(1)
+            assertThat(retry.mergeBudgetExceeded).isZero()
+            assertThat(reads.get()).isGreaterThan(firstReads)
+        }
+    }
+
     // ---- the full target, through many chunks ------------------------------
+
+    @Test
+    fun `the first memory probe spends one slot while its cached refusal permits healthy progress`() {
+        val cat = "heap-refusal-progress-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        for (table in listOf("a", "b")) {
+            catalogs.createTable(cat, "ns", table, fixtureColumns)
+            alter.alterTable(cat, "ns", table, listOf(AlterOp.SetSortOrder(ASC)))
+            val bytes = parquetBytes(listOf(2, 1), if (table == "a") "x".repeat(128 * 1024) else null)
+            val files =
+                (0 until 2).map { index ->
+                    val path = "s3://$BUCKET/$cat/data/ns/$table/input-$index.parquet"
+                    store.put(path, bytes)
+                    FileRegistration(path, 2, bytes.size.toLong())
+                }
+            commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", table, files))))
+        }
+        val heavyReads = AtomicInteger()
+        val healthyReads = AtomicInteger()
+        val observed =
+            object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun getRange(
+                    pathUri: String,
+                    startInclusive: Long,
+                    length: Int,
+                ): ByteArray {
+                    if ("/a/" in pathUri) heavyReads.incrementAndGet()
+                    if ("/b/" in pathUri) healthyReads.incrementAndGet()
+                    return super.getRange(pathUri, startInclusive, length)
+                }
+            }
+        observed.use {
+            val cfg =
+                CompactionConfig(
+                    targetBytes = 64L shl 20,
+                    minInputFiles = 2,
+                    maxGroupsPerRun = 1,
+                    sortedHeapBytes = 64L shl 10,
+                    spillDir = spillDir(),
+                )
+            val service = CompactionService(db.jdbi, it, cfg)
+            val first = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(first.groupsCompacted).isZero()
+            assertThat(first.mergeBudgetExceeded).isEqualTo(1)
+            assertThat(first.layoutProbeOnly).isZero()
+            assertThat(heavyReads.get()).isPositive()
+            assertThat(healthyReads.get()).isZero()
+            val before = heavyReads.get()
+            val second = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(second.groupsCompacted).isEqualTo(1)
+            assertThat(second.mergeBudgetExceeded).isEqualTo(1)
+            assertThat(second.layoutProbeOnly).isZero()
+            assertThat(second.failedGroups).isZero()
+            assertThat(heavyReads.get()).isEqualTo(before)
+            assertThat(healthyReads.get()).isPositive()
+        }
+    }
 
     @Test
     fun `a dense sorted table the row ceiling refused compacts to the FULL target in one rewrite`() {
@@ -210,35 +431,71 @@ class CompactionHeapBudgetIntegrationTest {
         val contents = (0 until 4).map { f -> (0 until 50_000L).map { it * 4 + f }.reversed() }
         val cat = realSortedTableOf("spill-hard-stop", contents)
         val registered = db.jdbi.withHandleUnchecked { h -> registeredBytes(h, cat) }
-        val cfg =
-            CompactionConfig(
-                targetBytes = 256L * 1024 * 1024,
-                minInputFiles = 2,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(100_000),
-                spillBytes = registered,
-                spillDir = dir,
-            )
-        val svc = CompactionService(db.jdbi, store, cfg)
-        assertThat(svc.planTable(cat, "ns", "t", cfg).spillRefusedGroups)
-            .describedAs("the registered bytes fit, so the planner admits it")
-            .isZero()
-        val headBefore = headSnapshot(cat)
-        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-        assertThat(result.spillBudgetExceeded).describedAs("%s", result).isEqualTo(1)
-        assertThat(result.failedGroups).isZero()
-        assertThat(result.groupsCompacted).isZero()
-        // The work the stopped rewrite DID reaches the ledger: it is the
-        // group that spilled the most, and it has no result to report from.
-        assertThat(result.spillBytes).isPositive().isLessThanOrEqualTo(registered)
-        assertThat(result.runsSpilled).isPositive()
-        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
-        assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
-        assertThat(ledger["runs_spilled"].asLong()).isEqualTo(result.runsSpilled)
-        assertThat(headSnapshot(cat)).isEqualTo(headBefore)
-        assertThat(spillEntries(dir)).describedAs("no spill directory survives the stop").isEmpty()
-        val staged = removalRows(cat).single()
-        assertThat(objectExists(staged.path)).describedAs("the partial output was discarded").isFalse()
+        catalogs.createTable(cat, "ns", "z", fixtureColumns)
+        alter.alterTable(cat, "ns", "z", listOf(AlterOp.SetSortOrder(ASC)))
+        val healthyBytes = parquetBytes(listOf(2, 1))
+        val healthyFiles =
+            (0 until 2).map { index ->
+                val path = "s3://$BUCKET/$cat/data/ns/z/healthy-$index.parquet"
+                store.put(path, healthyBytes)
+                FileRegistration(path, 2, healthyBytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "z", healthyFiles))))
+        val heavyReads = AtomicInteger()
+        val observed =
+            object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun getRange(
+                    pathUri: String,
+                    startInclusive: Long,
+                    length: Int,
+                ): ByteArray {
+                    if ("/t/" in pathUri) heavyReads.incrementAndGet()
+                    return super.getRange(pathUri, startInclusive, length)
+                }
+            }
+        observed.use {
+            val cfg =
+                CompactionConfig(
+                    targetBytes = 256L * 1024 * 1024,
+                    minInputFiles = 2,
+                    maxGroupsPerRun = 1,
+                    sortedHeapBytes = heapBytesFor(100_000),
+                    spillBytes = registered,
+                    spillDir = dir,
+                )
+            val svc = CompactionService(db.jdbi, observed, cfg)
+            assertThat(svc.planTable(cat, "ns", "t", cfg).spillRefusedGroups)
+                .describedAs("the registered bytes fit, so the planner admits it")
+                .isZero()
+            val headBefore = headSnapshot(cat)
+            val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(result.spillBudgetExceeded).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.failedGroups).isZero()
+            assertThat(result.groupsCompacted).isZero()
+            // The work the stopped rewrite DID reaches the ledger: it is the
+            // group that spilled the most, and it has no result to report from.
+            assertThat(result.spillBytes).isPositive().isLessThanOrEqualTo(registered)
+            assertThat(result.runsSpilled).isPositive()
+            val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+            assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
+            assertThat(ledger["runs_spilled"].asLong()).isEqualTo(result.runsSpilled)
+            assertThat(headSnapshot(cat)).isEqualTo(headBefore)
+            assertThat(spillEntries(dir)).describedAs("no spill directory survives the stop").isEmpty()
+            val staged = removalRows(cat).single()
+            assertThat(objectExists(staged.path)).describedAs("the partial output was discarded").isFalse()
+            val readsAfterFirst = heavyReads.get()
+            assertThat(readsAfterFirst).isPositive()
+            val replay = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(replay.spillBudgetExceeded).isEqualTo(1)
+            assertThat(replay.groupsCompacted).describedAs("cached refusal leaves the only slot for z").isEqualTo(1)
+            assertThat(replay.failedGroups).isZero()
+            assertThat(heavyReads.get()).describedAs("cached refusal does not reopen inputs").isEqualTo(readsAfterFirst)
+            val raised = cfg.copy(spillBytes = registered * 10)
+            val retry = svc.runOnce(cat, raised, MaintenanceTrigger.LOOP)
+            assertThat(retry.groupsCompacted).isEqualTo(1)
+            assertThat(retry.spillBudgetExceeded).isZero()
+            assertThat(heavyReads.get()).isGreaterThan(readsAfterFirst)
+        }
     }
 
     @Test
@@ -1180,7 +1437,10 @@ class CompactionHeapBudgetIntegrationTest {
             .addField(Types.optional(PrimitiveTypeName.DOUBLE).id(3).named("score"))
             .named("t")
 
-    private fun parquetBytes(ids: List<Long>): ByteArray {
+    private fun parquetBytes(
+        ids: List<Long>,
+        payload: String? = null,
+    ): ByteArray {
         val tmp = Files.createTempFile("heap-budget", ".parquet")
         Files.deleteIfExists(tmp)
         val factory = SimpleGroupFactory(fixtureSchema)
@@ -1192,7 +1452,7 @@ class CompactionHeapBudgetIntegrationTest {
                 for (id in ids) {
                     val g = factory.newGroup()
                     g.add("id", id)
-                    g.add("name", "n$id")
+                    g.add("name", payload ?: "n$id")
                     g.add("score", id * 1.5)
                     w.write(g)
                 }
