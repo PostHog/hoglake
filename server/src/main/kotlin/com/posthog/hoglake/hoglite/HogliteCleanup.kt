@@ -618,7 +618,7 @@ internal class HogliteCleanup(
                 if (staging) {
                     "reason = 'compaction_staging' AND scheduled_at < ?"
                 } else {
-                    "(reason IS NULL OR reason <> 'compaction_staging')"
+                    "reason <> 'compaction_staging'"
                 }
             return "SELECT id, path, reason FROM removals WHERE drained_at IS NULL AND $reasonClause " +
                 "AND (claimed_at IS NULL OR claimed_at < ?) AND id > ? ORDER BY id LIMIT ?"

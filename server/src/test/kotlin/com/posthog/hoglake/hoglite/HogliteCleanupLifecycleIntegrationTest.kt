@@ -201,7 +201,7 @@ class HogliteCleanupLifecycleIntegrationTest {
         store: HogliteCatalogStore,
         cat: String,
         path: String,
-        reason: String? = null,
+        reason: String = "snapshot_expiry",
     ) {
         write(
             store,
@@ -297,7 +297,14 @@ class HogliteCleanupLifecycleIntegrationTest {
                     )
                 }
             }
-            paths.forEachIndexed { i, path -> queue(store, cat, path, if (i < 2) null else "compaction_staging") }
+            paths.forEachIndexed { i, path ->
+                queue(
+                    store,
+                    cat,
+                    path,
+                    if (i < 2) "snapshot_expiry" else "compaction_staging",
+                )
+            }
             RemovalStore(engine.config()).use { objects ->
                 val cleanup = HogliteCleanup(engine.config(), store, objects)
                 val first = cleanup.runOnce(cat, 1)
@@ -581,8 +588,8 @@ class HogliteCleanupLifecycleIntegrationTest {
             val (columns, values, purge, index) =
                 if (table == "removals") {
                     listOf(
-                        "path,file_kind,queued_snapshot,queued_at,drained_at,drained_outcome",
-                        "'s3://b/key-'||i,'data',0,'2000-01-01T00:00:00.000Z'," +
+                        "path,file_kind,reason,queued_snapshot,queued_at,drained_at,drained_outcome",
+                        "'s3://b/key-'||i,'data','snapshot_expiry',0,'2000-01-01T00:00:00.000Z'," +
                             "CASE WHEN i%100=0 THEN '2000-01-01T00:00:00.000Z' ELSE '2030-01-01T00:00:00.000Z' END," +
                             "'absent'",
                         HogliteCleanup.PURGE_DRAINED_SQL,
@@ -619,7 +626,7 @@ class HogliteCleanupLifecycleIntegrationTest {
         staging: Boolean,
         withCandidates: Boolean,
     ) = fixture { store, cat, _ ->
-        val oppositeReason = if (staging) "NULL" else "'compaction_staging'"
+        val oppositeReason = if (staging) "'snapshot_expiry'" else "'compaction_staging'"
         write(
             store,
             cat,
@@ -631,7 +638,7 @@ class HogliteCleanupLifecycleIntegrationTest {
         assertThat(rows(store, cat, "SELECT COUNT(*) FROM removals").single()[0].asLong()).isEqualTo(100_000)
         val expected = mutableListOf<Long>()
         if (withCandidates) {
-            queue(store, cat, "s3://b/wanted", if (staging) "compaction_staging" else null)
+            queue(store, cat, "s3://b/wanted", if (staging) "compaction_staging" else "snapshot_expiry")
             expected += 100_001L
             if (!staging) {
                 queue(store, cat, "s3://b/expiry", "snapshot_expiry")
@@ -694,7 +701,7 @@ class HogliteCleanupLifecycleIntegrationTest {
             write(
                 store,
                 cat,
-                "UPDATE removals SET claimed_by = 'other-worker', claimed_at = ? WHERE reason IS NULL",
+                "UPDATE removals SET claimed_by = 'other-worker', claimed_at = ? WHERE reason = 'snapshot_expiry'",
                 HogliteSchema.now(),
             )
             RemovalStore(engine.config()).use { objects ->
@@ -705,7 +712,11 @@ class HogliteCleanupLifecycleIntegrationTest {
                         objects,
                     )
                 assertThat(cleanup.runOnce(cat, 10).objectsRemoved).isZero()
-                write(store, cat, "UPDATE removals SET claimed_at = '2000-01-01T00:00:00.000Z' WHERE reason IS NULL")
+                write(
+                    store,
+                    cat,
+                    "UPDATE removals SET claimed_at = '2000-01-01T00:00:00.000Z' WHERE reason = 'snapshot_expiry'",
+                )
                 val expiredLease = cleanup.runOnce(cat, 10)
                 assertThat(expiredLease.removed).isEqualTo(1)
                 assertThat(expiredLease.missing).isZero()
