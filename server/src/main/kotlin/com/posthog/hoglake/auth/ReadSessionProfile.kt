@@ -103,7 +103,7 @@ internal class ReadSessionProfile(
         var hash = 0x811c9dc5u
         for (character in tenant) hash = (hash xor character.code.toUInt()) * 0x01000193u
         val shard = (hash and 255u).toString(16).padStart(2, '0')
-        val manifestSuffix = "/$shard/t/$tenant/manifest.json"
+        val manifestSuffix = "/$shard/t/$tenant/manifest"
         val seen = HashSet<String>()
         var previousBucket = ""
         var previousKey = ""

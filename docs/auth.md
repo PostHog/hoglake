@@ -197,7 +197,8 @@ The request has no body or query parameters.
 The server sends the original verified bearer to the configured backend.
 The backend operation is `GET /v1/t/{tenant}/metadata/v1/catalogs/{catalog}/namespaces/{namespace}`.
 The backend verifies that bearer independently.
-These routes do not accept embedded storage credentials.
+These routes do not accept embedded storage credentials by default.
+The isolated fixture below is the only exception.
 
 The existing owner reads the catalog identity and live namespace in one read view.
 It requires catalog READ authority and permission for the stored containment field and value.
@@ -222,7 +223,19 @@ It does not accept `storage-session`.
 It requires ES256 with mounted keys.
 It requires exactly `trino-session`, `hoglake-session`, and `hoglite-session` in `aud`.
 The ordinary verifier refuses these audiences.
-No server route selects the dedicated verifier yet.
+
+Only an isolated Hoglite fixture can opt in to this verifier.
+Add `read_session` to the binding in `HOGLAKE_SCOPED_NAMESPACE_FILE`.
+The object contains `profile` and a `remote_targets` array of two distinct target IDs.
+Configure `team_id` as the only predicate field.
+The API listener then requires a dedicated read token for the exact bound namespace GET.
+All other requests keep the ordinary verifier.
+
+Hoglake sends the original token to the configured Hoglite owner.
+It does not retry with another token or use legacy SQL after a refusal.
+The public listener never selects the dedicated verifier.
+PostgreSQL catalogs do not support this fixture.
+The fixture requires a Hoglite owner that independently accepts the dedicated profile on its typed read.
 
 The initial read scope covers one primary catalog with a Hoglite placement.
 It requires one explicit team with read permission.
@@ -234,8 +247,15 @@ Each storage grant binds the catalog, target, bucket, region, and `s3:GetObject`
 It carries either a literal `object_key` or a slash-terminated `prefix`.
 The verifier rejects overlaps and repeated grants.
 The manifest grant names one literal object for the routed tenant.
+Its key ends with `/<shard>/t/<routed-tenant>/manifest`, without an extension.
+The shard is the two-digit lowercase hexadecimal result of FNV-1a 32-bit modulo 256 on the full routed tenant.
 Two configured remote targets bind the read-only `team` family.
 The verifier does not retain or log the AWS credentials.
+
+The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
+give the expected verdict for each verifier.
+Their keys and credentials are fictional.
+Run `just server contract-vectors` to regenerate the file.
 
 #### Experimental profile
 

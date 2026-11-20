@@ -1760,7 +1760,18 @@ half. Look for the same shape in new code:
   tool could also create). The planner's `spill_budget_exceeded`
   / `merge_budget_exceeded` call `ExternalMergeSort.admit` rather than
   restating its arithmetic; keep it that way. `heap_budget_exceeded` is
-  historical (reads 0) and stays on the wire. (4) Every other input of
+  historical (reads 0) and stays on the wire.
+
+  Metadata admission predicts ordinary allocations.
+  Arbitrary payloads can exceed that prediction.
+  Runtime guards can refuse an admitted group.
+  The worker caches deterministic memory and spill-budget refusals by immutable identity.
+
+  Schema, sort, layout, DV, input, or effective-budget changes invalidate that identity.
+  Planning, remembered-layout parts, borrowing, and execution use the shared metadata estimate.
+  Execution also checks actual allocations and spill bytes.
+
+  (4) Every other input of
   at least `HOGLAKE_COMPACTION_VERIFY_MIN_BYTES` (16 MiB) is VERIFIED
   by the sortedness pre-pass (`SortednessCheck`: a projected read of
   its key columns, plus the carrier for an explicit-row-id file, every

@@ -352,15 +352,25 @@ sorts its files is merged without a spill. The same budget bounds the
 merge's buffered row groups; trusted inputs beyond it are demoted to the
 spill path.
 
-What can still refuse a sorted group is configuration, in metadata,
-before any IO: `spill_budget_exceeded` when the bytes it would spill
-exceed `HOGLAKE_COMPACTION_SPILL_BYTES` (default 4 GiB per group — the
-spill volume is an emptyDir whose overrun evicts the pod, so the bound is
-in-process), and `merge_budget_exceeded` when its spilled runs alone
-cannot fit the heap budget. `heap_budget_exceeded`, the in-memory sort's
-refusal, is historical and reads 0. The per-ROW bound is still the node
-budget above. server/README.md §Sort orders and compaction carries the
-arithmetic and the pod table.
+Planning, borrowing, remembered-layout parts, and execution use a shared
+metadata estimate. Runtime guards also check payloads, page headers, and
+decoder allocations. These checks can refuse an admitted group.
+The full per-group sorted allowance remains available for retained rows.
+A separate input-reader envelope uses the byte target and output leaf
+count. It does not charge all uncompressed row-group values.
+
+`spill_budget_exceeded` covers `HOGLAKE_COMPACTION_SPILL_BYTES`,
+**4 GiB** per group by default. `merge_budget_exceeded` covers decoded-reader and row-memory
+refusals. Its `oversized_row_groups` subset identifies oversized rows or
+binary values. It is not another skipped group. Deterministic memory and
+spill-budget refusals enter a bounded worker-local cache. Unchanged identities then
+skip without object-store IO or another rewrite attempt.
+
+Input, DV, schema, layout, sort-version, or effective-budget changes permit
+a new attempt. Eviction or process restart can also retry. Entries have
+no TTL. The historical `heap_budget_exceeded` counter reads zero. The
+separate node budget still applies. server/README.md §Sort orders and
+compaction carries the measured sizing model and pod table.
 
 A group's inputs are opened through a window of
 `HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS` (default 8) concurrent opens.

@@ -203,6 +203,7 @@ class MaintenanceLedgerIntegrationTest {
                 "spill_bytes",
                 "spill_budget_exceeded",
                 "merge_budget_exceeded",
+                "oversized_row_groups",
                 "spill_cleanup_failures",
                 "files_verified",
                 "files_unsorted",

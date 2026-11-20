@@ -2,21 +2,33 @@ package com.posthog.hoglake.store
 
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.auth.ReadSessionProfile
+import com.posthog.hoglake.auth.RouteMatch
 import com.posthog.hoglake.service.Identifiers
+import io.ktor.http.HttpMethod
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
 
 /** One operator attestation of local isolation and typed support across the owners. */
-data class ScopedNamespaceBinding(
+internal data class ScopedNamespaceBinding(
     val catalog: String,
     val backendId: UUID,
     val tenant: String,
     val namespace: String,
+    val readSession: ReadSessionProfile? = null,
 ) {
+    fun matches(
+        method: HttpMethod,
+        route: RouteMatch?,
+    ): Boolean =
+        method == HttpMethod.Get && route?.pattern == "/v1/catalogs/{catalog}/namespaces/{namespace}" &&
+            route.catalog == catalog && route.namespace == namespace
+
     companion object {
-        internal fun read(file: String): ScopedNamespaceBinding? {
+        fun read(file: String): ScopedNamespaceBinding? {
             if (file.isBlank()) return null
             val mapper =
                 jacksonObjectMapper()
@@ -24,7 +36,8 @@ data class ScopedNamespaceBinding(
                     .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             val root = Files.newBufferedReader(Path.of(file)).use { mapper.readTree(it) }
             val keys = setOf("catalog", "backend", "backend_id", "tenant", "namespace")
-            require(root != null && root.isObject && root.properties().map { it.key }.toSet() == keys) {
+            val actualKeys = root?.takeIf(JsonNode::isObject)?.properties()?.map { it.key }?.toSet()
+            require(root != null && actualKeys?.minus("read_session") == keys) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE requires one complete binding"
             }
 
@@ -55,7 +68,20 @@ data class ScopedNamespaceBinding(
             ) {
                 "scoped namespace tenant must be canonical"
             }
-            return ScopedNamespaceBinding(catalog, id, tenant, namespace)
+            val readSession = root.get("read_session")?.let(::readSession)
+            return ScopedNamespaceBinding(catalog, id, tenant, namespace, readSession)
+        }
+
+        private fun readSession(node: JsonNode): ReadSessionProfile {
+            require(node.isObject && node.properties().map { it.key }.toSet() == setOf("profile", "remote_targets")) {
+                "read_session requires profile and remote_targets"
+            }
+            val profile = node["profile"].textValue()
+            val targets = node["remote_targets"]
+            require(profile != null && targets.isArray && targets.size() == 2 && targets.all(JsonNode::isTextual)) {
+                "read_session requires a profile and two distinct remote targets"
+            }
+            return ReadSessionProfile(profile, targets.map(JsonNode::textValue).toSet())
         }
     }
 }

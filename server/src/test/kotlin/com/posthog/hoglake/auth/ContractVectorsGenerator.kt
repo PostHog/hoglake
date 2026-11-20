@@ -8,6 +8,7 @@ import java.nio.file.Path
 /**
  * Regenerates `oauth/contract-vectors.json` from [ContractVectors] and
  * `oauth/session-profile-vectors.json` from [SessionProfileVectors].
+ * The dedicated read examples come from [ReadSessionVectors].
  *
  * Skipped unless `-Dhoglake.updateContractVectors=true`, which
  * `just server contract-vectors` passes (through Gradle's
@@ -25,5 +26,11 @@ class ContractVectorsGenerator {
         Files.writeString(path, ContractVectors.render(ContractVectors.document()))
         // The session profile's vectors live beside the contract's, same shape, own gate.
         Files.writeString(Path.of(SessionProfileVectors.PATH), ContractVectors.render(SessionProfileVectors.document()))
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "hoglake.updateContractVectors", matches = "true")
+    fun `write the dedicated read session vectors`() {
+        Files.writeString(Path.of(ReadSessionVectors.PATH), ContractVectors.render(ReadSessionVectors.document()))
     }
 }
