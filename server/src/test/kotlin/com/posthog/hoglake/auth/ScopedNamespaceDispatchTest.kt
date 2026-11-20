@@ -1,5 +1,7 @@
 package com.posthog.hoglake.auth
 
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping
@@ -11,6 +13,7 @@ import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
+import io.ktor.client.request.head
 import io.ktor.client.request.header
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -32,6 +35,7 @@ import java.lang.reflect.Proxy
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.security.interfaces.ECPublicKey
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -48,6 +52,7 @@ class ScopedNamespaceDispatchTest {
     private val path = "/v1/catalogs/lake/namespaces/reports"
     private val success = """{"namespace_id":17,"name":"reports","containment":{"field":"team_id","value":42}}"""
     private val requests = CopyOnWriteArrayList<Pair<String, String?>>()
+    private val sessionDigests = CopyOnWriteArrayList<String>()
     private val legacy = CopyOnWriteArrayList<String>()
     private var server: HttpServer? = null
 
@@ -63,13 +68,33 @@ class ScopedNamespaceDispatchTest {
         Metrics.clear()
     }
 
-    private fun config(enabled: Boolean = true): Config {
+    private val mapper = ObjectMapper()
+    private val vectors =
+        javaClass.getResourceAsStream("/oauth/read-session-vectors.json").use { mapper.readTree(requireNotNull(it)) }
+    private val readVector = vectors["vectors"].single { it["name"].asText() == "complete read session" }
+    private val readPath = "/v1/catalogs/example-catalog/namespaces/reports"
+    private val readBackend = UUID.fromString(vectors["config"]["backend_id"].asText())
+
+    private fun digest(text: String): String =
+        MessageDigest.getInstance("SHA-256").digest(text.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    private fun config(
+        enabled: Boolean = true,
+        withReadSession: Boolean = false,
+        readFixture: Boolean = withReadSession,
+    ): Config {
         val peer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server = peer
         peer.createContext("/") { exchange ->
             exchange.requestBody.readBytes()
             val request = "${exchange.requestMethod} ${exchange.requestURI}"
-            requests.add(request to exchange.requestHeaders.getFirst("Authorization"))
+            val authorization = exchange.requestHeaders.getFirst("Authorization")
+            if (readFixture) {
+                sessionDigests.add(digest(authorization.orEmpty()))
+                requests.add(request to null)
+            } else {
+                requests.add(request to authorization)
+            }
             exchange.responseHeaders.set("Content-Type", "application/json")
             val bytes = body.toByteArray()
             exchange.sendResponseHeaders(status, bytes.size.toLong())
@@ -77,13 +102,22 @@ class ScopedNamespaceDispatchTest {
         }
         peer.start()
         val backends =
-            listOf(id, otherId).joinToString(",") {
+            listOf(id, otherId, readBackend).joinToString(",") {
                 """{"id":"$it","kind":"hoglite","url":"http://127.0.0.1:${peer.address.port}"}"""
             }
         val backendsFile = Files.writeString(dir.resolve("backends.json"), """{"backends":[$backends]}""")
         val binding =
-            """{"catalog":"lake","backend":"hoglite","backend_id":"$id","tenant":"opaque_1","namespace":"reports"}"""
-        val bindingFile = Files.writeString(dir.resolve("binding.json"), binding)
+            mapper.createObjectNode()
+                .put("catalog", if (readFixture) "example-catalog" else "lake")
+                .put("backend", "hoglite")
+                .put("backend_id", (if (readFixture) readBackend else id).toString())
+                .put("tenant", if (readFixture) "fixture_3" else "opaque_1")
+                .put("namespace", "reports")
+        if (withReadSession) {
+            binding.putObject("read_session").put("profile", vectors["config"]["profile"].asText())
+                .set<ObjectNode>("remote_targets", vectors["config"]["remote_targets"])
+        }
+        val bindingFile = Files.writeString(dir.resolve("binding.json"), binding.toString())
         return Config(
             backendsFile = backendsFile.toString(),
             scopedNamespaceFile = if (enabled) bindingFile.toString() else "",
@@ -98,6 +132,8 @@ class ScopedNamespaceDispatchTest {
         cfg: Config,
         guardLegacy: Boolean = true,
         audience: String = TestTokens.AUDIENCE,
+        readFixture: Boolean = false,
+        publicListener: Boolean = false,
     ) {
         val postgres =
             Proxy.newProxyInstance(
@@ -113,18 +149,27 @@ class ScopedNamespaceDispatchTest {
                 }
             } as CatalogStore
         val selector = CatalogStoreSelector(postgres, cfg)
-        installAuth(
+        val service =
             AuthService(
                 AuthMode.ENFORCE,
                 JwtVerifier(
-                    TestTokens.ISSUER,
+                    if (readFixture) vectors["issuer"].asText() else TestTokens.ISSUER,
                     audience,
-                    StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
+                    if (readFixture) {
+                        val jwks = Files.writeString(dir.resolve("test-jwks.json"), vectors["jwks"].toString())
+                        JwksSigningKeys.fromFile(jwks)
+                    } else {
+                        StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey)
+                    },
                     predicateFields = setOf("team_id"),
                     backends = cfg.backendKinds,
-                ) { 1_700_000_100L },
-            ),
-        )
+                ) { if (readFixture) readVector["verify_at"].asLong() else 1_700_000_100L },
+            )
+        if (publicListener) {
+            installAuth(service.forPublicListener())
+        } else {
+            installAuth(service, cfg.scopedNamespaceBinding)
+        }
         installNamespaceGate(selector)
         install(ContentNegotiation) { jackson { configureHoglakeWire() } }
         install(StatusPages) { installErrorMapping() }
@@ -144,6 +189,146 @@ class ScopedNamespaceDispatchTest {
         )
 
     private fun token(claims: String = claims()): String = TestTokens.mint(pair, claims)
+
+    private fun signedRead(change: (ObjectNode) -> Unit): String {
+        val claims = (readVector["claims"] as ObjectNode).deepCopy().also(change)
+        val header = mapper.createObjectNode().put("alg", "ES256").put("kid", ContractVectors.KID).put("typ", "JWT")
+        return ContractVectors.sign(header, claims)
+    }
+
+    @Test
+    fun `only the opted in namespace GET forwards two exact dedicated tokens`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true) }
+            val first = readVector["token"].asText()
+            val second = signedRead { it.put("usr", "example.bob").put("sub", "example.bob").put("jti", "token-b") }
+            for (jwt in listOf(first, second, first)) {
+                val response = client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+                assertThat(response.bodyAsText()).contains("\"namespace_id\":17")
+            }
+            val peer = "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports"
+            assertThat(requests).containsExactly(peer to null, peer to null, peer to null)
+            assertThat(sessionDigests).containsExactly(
+                digest("Bearer $first"),
+                digest("Bearer $second"),
+                digest("Bearer $first"),
+            )
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the dedicated credential cannot reach other routes or use a different placement`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            for (target in listOf(
+                readPath.replace("reports", "other"),
+                readPath.replace("example-catalog", "other-catalog"),
+                "$readPath/tables",
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).isEqualTo(HttpStatusCode.Unauthorized)
+            }
+            assertThat(client.head(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            val wrongTenant =
+                signedRead {
+                    (it["rtg"] as ObjectNode).put("t", "fixture_2")
+                    (it["grants"][1] as ObjectNode).put("object_key", "root/bf/t/fixture_2/manifest")
+                }
+            assertThat(client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }.status)
+                .isEqualTo(HttpStatusCode.NotFound)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the opted in namespace refuses legacy credentials and noncanonical requests`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            val readFields =
+                listOf("profile", "version", "purpose", "primary_catalog", "remote_schemas", "aws", "grants")
+            val metadata =
+                signedRead {
+                    it.putArray("aud").add("hoglake").add("hoglite")
+                    it.remove(readFields)
+                }
+            assertThat(client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $metadata") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            for (target in listOf("$readPath?snapshot=1", readPath.replace("reports", "%72eports"))) {
+                assertThat(client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                    .isEqualTo(HttpStatusCode.BadRequest)
+            }
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `an expired session and repeated bearer headers never reach the backend`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true) }
+            val now = readVector["verify_at"].asLong()
+            val jwt =
+                signedRead {
+                    it.put("exp", now)
+                    (it["aws"] as ObjectNode).put("expires_at", now)
+                }
+            assertThat(client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            val valid = readVector["token"].asText()
+            val repeated =
+                client.get(readPath) {
+                    header(HttpHeaders.Authorization, "Bearer $valid")
+                    header(HttpHeaders.Authorization, "Bearer $valid")
+                }
+            assertThat(repeated.status).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `an owner refusal never triggers a second request`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            status = 503
+            body = """{"code":"unavailable"}"""
+            val response = client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+            assertThat(requests).hasSize(1)
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the metadata configuration refuses the dedicated credential`() =
+        testApplication {
+            val cfg = config(readFixture = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            assertThat(client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the public listener refuses the dedicated credential even when the API listener opts in`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true, publicListener = true) }
+            val jwt = readVector["token"].asText()
+            assertThat(client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
 
     @Test
     fun `the exact route forwards the exact verified JWT without legacy reads`() =

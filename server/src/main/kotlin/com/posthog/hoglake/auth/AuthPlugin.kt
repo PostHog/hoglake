@@ -5,6 +5,7 @@ import com.posthog.hoglake.api.errorBody
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.store.ScopedNamespaceBinding
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
@@ -184,6 +185,7 @@ class AuthService(
 }
 
 private val AuthStateKey = AttributeKey<AuthState>("HoglakeAuthState")
+private val ReadSessionBindingKey = AttributeKey<ScopedNamespaceBinding>("HoglakeReadSessionBinding")
 
 /**
  * What the auth plugin concluded about this request.
@@ -237,12 +239,18 @@ val ApplicationCall.hoglakeAuth: AuthState
     get() = attributes.getOrNull(AuthStateKey) ?: AuthState.Off
 
 /** Only the auth plugin constructs this request-local, redacted credential holder. */
-class VerifiedBackendAuthority internal constructor(internal val token: String) {
+class VerifiedBackendAuthority internal constructor(
+    internal val token: String,
+    internal val readSessionBinding: ScopedNamespaceBinding? = null,
+) {
     override fun toString(): String = "VerifiedBackendAuthority(redacted)"
 }
 
+internal val ApplicationCall.verifiedBackendAuthority: VerifiedBackendAuthority?
+    get() = (hoglakeAuth as? AuthState.Authenticated)?.backendAuthority
+
 internal val ApplicationCall.verifiedBackendToken: String?
-    get() = (hoglakeAuth as? AuthState.Authenticated)?.backendAuthority?.token
+    get() = verifiedBackendAuthority?.takeIf { it.readSessionBinding == null }?.token
 
 /**
  * The audit `actor` for a request, or a refusal.
@@ -335,14 +343,27 @@ val HoglakeAuth =
             val match = AuthPolicy.match(method, path)
             // Kept for the store's check (StoreEntitlement.kt), which asks for what this route demands.
             match?.let { call.attributes.put(RouteMatchKey, it) }
-            val token = bearerToken(call)
+            val readBinding =
+                call.application.attributes.getOrNull(ReadSessionBindingKey)?.takeIf {
+                    it.matches(method, match)
+                }
+            val readProfile = readBinding?.readSession
+            val token =
+                bearerToken(call)?.takeIf {
+                    readProfile == null || call.request.headers.getAll(HttpHeaders.Authorization)?.size == 1
+                }
 
             var caller: Caller? = null
             var failure: HoglakeException? = null
 
             if (token != null) {
                 try {
-                    caller = service.verifier!!.verify(token)
+                    caller =
+                        if (readProfile == null) {
+                            service.verifier!!.verify(token)
+                        } else {
+                            service.verifier!!.verifyReadSession(token, readProfile)
+                        }
                 } catch (v: JwtViolation) {
                     // Detail to the log, reason to the client; see JwtViolation.
                     AuthLog.debug(v) { "token refused for ${call.request.path()}" }
@@ -363,7 +384,7 @@ val HoglakeAuth =
             call.attributes.put(
                 AuthStateKey,
                 caller?.let {
-                    AuthState.Authenticated(it, token?.let(::VerifiedBackendAuthority))
+                    AuthState.Authenticated(it, token?.let { jwt -> VerifiedBackendAuthority(jwt, readBinding) })
                 } ?: AuthState.Anonymous,
             )
 
@@ -374,6 +395,14 @@ val HoglakeAuth =
             // liveness probe behind a session cookie or an expired console token
             // fetching /v1/info must not start 401-ing.
             val decision = AuthPolicy.authorize(caller, match)
+            if (readProfile != null &&
+                (decision is AuthDecision.Allow || decision is AuthDecision.ByBody)
+            ) {
+                val refusal = HoglakeException.NotFound("namespace")
+                countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
+                call.respondRefusal(refusal)
+                return@onCall
+            }
             if (decision is AuthDecision.Allow) {
                 // The token was still parsed, so a valid one still yields its
                 // caller and its per-tenant totals.
@@ -636,7 +665,18 @@ internal val AuthServiceKey = AttributeKey<AuthService>("HoglakeAuthService")
  * so the plugin stays a `val` — a single object, installed the same way twice,
  * holding no per-application state that a second test application could inherit.
  */
-fun Application.installAuth(service: AuthService) {
+fun Application.installAuth(service: AuthService) = installAuth(service, null)
+
+internal fun Application.installAuth(
+    service: AuthService,
+    namespaceBinding: ScopedNamespaceBinding?,
+) {
+    if (namespaceBinding?.readSession != null) {
+        require(service.mode == AuthMode.ENFORCE && !service.tenantOnly) {
+            "read_session requires the enforcing API listener"
+        }
+        attributes.put(ReadSessionBindingKey, namespaceBinding)
+    }
     attributes.put(AuthServiceKey, service)
     install(HoglakeAuth)
 }

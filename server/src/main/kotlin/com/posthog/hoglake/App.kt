@@ -512,7 +512,7 @@ class App private constructor(
         // resolves no callers, which is precisely today's behaviour. A mis-set
         // `enforce` (no issuer, no key source) fails here, at boot, naming the
         // variable — not with a fleet-wide 401 (see [auth]).
-        app.installAuth(auth)
+        app.installAuth(auth, cfg.scopedNamespaceBinding?.takeUnless { auth.tenantOnly })
 
         // Then, and once: every handler installed below this line runs
         // its blocking database/object-store work on requestDispatcher

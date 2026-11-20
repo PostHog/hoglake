@@ -1526,7 +1526,7 @@ data class Config(
             teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
         )
 
-    val scopedNamespaceBinding: ScopedNamespaceBinding? = ScopedNamespaceBinding.read(scopedNamespaceFile)
+    internal val scopedNamespaceBinding: ScopedNamespaceBinding? = ScopedNamespaceBinding.read(scopedNamespaceFile)
 
     /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
     val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
@@ -1573,6 +1573,12 @@ data class Config(
             }
             require(authPredicateFields.split(',').any { it.isNotBlank() }) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS"
+            }
+            if (binding.readSession != null) {
+                val fields = authPredicateFields.split(',').map(String::trim).filter(String::isNotEmpty).toSet()
+                require(fields == setOf("team_id")) {
+                    "read_session requires only the team_id predicate field"
+                }
             }
             require(backendKinds[binding.backendId] == BackendKind.HOGLITE) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE requires a configured hoglite backend"
