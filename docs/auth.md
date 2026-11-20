@@ -234,6 +234,8 @@ Each storage grant binds the catalog, target, bucket, region, and `s3:GetObject`
 It carries either a literal `object_key` or a slash-terminated `prefix`.
 The verifier rejects overlaps and repeated grants.
 The manifest grant names one literal object for the routed tenant.
+Its key ends with `/<shard>/t/<routed-tenant>/manifest`, without an extension.
+The shard is the two-digit lowercase hexadecimal result of FNV-1a 32-bit modulo 256 on the full routed tenant.
 Two configured remote targets bind the read-only `team` family.
 The verifier does not retain or log the AWS credentials.
 
