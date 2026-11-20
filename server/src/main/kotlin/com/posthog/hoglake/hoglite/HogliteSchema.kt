@@ -31,11 +31,126 @@ import java.time.format.DateTimeFormatter
  * idempotent, and hoglite's (client, txid) dedup makes a replayed
  * bootstrap a no-op read.
  *
+ * ## Referential integrity
+ *
+ * The schema declares what `server/schema.sql` declares, re-keyed for
+ * one tenant: every child-of-table row (`table_versions`, `columns`,
+ * `partition_specs`, `sort_specs`, `table_layouts`, `table_totals`,
+ * `files`, `dvs`) REFERENCES `tables(id)` ON DELETE CASCADE; `dvs`
+ * also REFERENCES `files(id)` ON DELETE CASCADE (hog_delete_file ->
+ * hog_data_file); `changes` REFERENCES `snapshots(id)` ON DELETE
+ * CASCADE (hog_snapshot_change -> hog_snapshot); `table_versions`,
+ * `views` and the denormalized `tables.namespace_id` REFERENCE
+ * `namespaces(id)` DEFERRABLE INITIALLY DEFERRED with no action, as
+ * hog_table_version and hog_view do (a namespace row with versioned
+ * history under it cannot be deleted; deferred so a transaction's
+ * statement order does not matter). `receipt_ended` REFERENCES
+ * `receipts` ON DELETE CASCADE, because on Postgres the ended count is
+ * a column of the receipt row and dies with it. Postgres's thirteen
+ * `catalog_id REFERENCES hog_catalog ON DELETE CASCADE` edges have no
+ * counterpart: the tenant IS the catalog, and dropping it deletes the
+ * tenant. The per-file child tables (hog_file_column_stats,
+ * hog_file_partition_value, hog_partition_field, hog_sort_field) are
+ * JSON columns here and carry no FK of their own.
+ *
+ * The CHECK constraints are Postgres's, except the four `~` regexes,
+ * which SQLite cannot run: the identifier policy (catalog, namespace,
+ * table, column and view names, containment field) is spelled as the
+ * exact GLOB + length() equivalent instead ([identifier],
+ * [CATALOG_NAME_CHECK], [CONTAINMENT_CHECK]). Vocabularies (change
+ * kinds, column types, removal reasons, maintenance tasks, upload and
+ * creation states) are the literal lists of schema.sql, not the Kotlin
+ * enums, so a new member needs the same two-sided change it needs there.
+ * They sit on LEAF tables only. An FK parent (`tables`, `files`,
+ * `snapshots`, `namespaces`, `receipts`) carries no vocabulary CHECK:
+ * SQLite changes a CHECK only by rebuilding the table, and rebuilding a
+ * parent under enforcement cascades (DROP TABLE deletes every child row,
+ * RENAME rewrites the children's references) while hoglite refuses the
+ * PRAGMA that would switch enforcement off for the rebuild. So
+ * hog_data_file's `file_format` and `stats_state` lists are not here;
+ * the store writes those two columns from closed Kotlin sets.
+ *
+ * hoglite runs every tenant connection with `PRAGMA foreign_keys = ON`
+ * and lets no client turn it off, so the constraints hold on every
+ * write: a violating statement is refused (422 `refused`, "FOREIGN KEY
+ * constraint failed"), a deferred violation fails its transaction at
+ * commit, and ON DELETE CASCADE runs. The store checks that once, at
+ * bootstrap: it reads `pragma_foreign_keys` on a new tenant and again as
+ * a guard of the bootstrap transaction, and refuses a tenant whose
+ * connection does not report 1 ([HogliteCatalogStore.createCatalog]),
+ * and a FOREIGN KEY refusal of any later transaction is a store bug,
+ * not a client error ([HogliteIntegrityViolation]). Statement order
+ * inside a transaction therefore matters: a parent row goes in before
+ * its children (the snapshot row before its change rows, the receipt
+ * before its `receipt_ended` row, the table before its files), and the
+ * maintenance deletes (expiry, retirement) still delete and queue each
+ * child explicitly before its parent, so what they queue for removal
+ * never depends on a cascade.
+ *
  * There are no tenant migrations. [DDL] is the first released schema.
  * The first schema change after release must also upgrade the tenants
- * that exist, before any operation reads the new shape.
+ * that exist, before any operation reads the new shape. Until then, a
+ * schema change (this one included) means: drop and recreate every
+ * development tenant, because `CREATE TABLE IF NOT EXISTS` leaves an
+ * existing table as it was, constraints included. After release, adding
+ * a vocabulary member (a maintenance task, a change kind, a removal
+ * reason, a column type, an upload or creation state) is such a change:
+ * the leaf table that holds the CHECK must be rebuilt on every tenant
+ * before a server that writes the new member deploys, exactly as
+ * Postgres needs its migration first. FK-parent tables must never gain a
+ * vocabulary CHECK, for the reason above.
  */
 internal object HogliteSchema {
+    /**
+     * Identifiers.PATTERN (`^[A-Za-z_][A-Za-z0-9_-]{0,127}$`) as a CHECK
+     * expression: first character a letter or underscore, every character
+     * in `[A-Za-z0-9_-]`, at most 128 of them. GLOB is case-sensitive and
+     * `-` last in a class is literal, so the three terms are the regex for
+     * any text SQLite stores as a string. The one gap: GLOB reads a value
+     * only up to an embedded NUL while length() counts past it, so a name
+     * with a NUL after a valid prefix passes here where Postgres (which
+     * stores no NUL in text at all) refuses it. The store's Kotlin
+     * validation ([com.posthog.hoglake.service.Identifiers]) runs first and
+     * refuses it, on both backends.
+     */
+    internal fun identifier(column: String): String =
+        "($column GLOB '[A-Za-z_]*' AND NOT $column GLOB '*[^A-Za-z0-9_-]*' AND length($column) <= 128)"
+
+    /** Identifiers.CATALOG_NAME_PATTERN (`^[a-z0-9][a-z0-9_-]{0,62}$`), the same way. */
+    const val CATALOG_NAME_CHECK =
+        "(name GLOB '[a-z0-9]*' AND NOT name GLOB '*[^a-z0-9_-]*' AND length(name) <= 63)"
+
+    /**
+     * hog_namespace_containment_shape: both or neither, a positive value,
+     * and the field's `^[a-z][a-z0-9_]{0,62}$` spelled as GLOB + length.
+     */
+    const val CONTAINMENT_CHECK =
+        "((contained_field IS NULL AND contained_value IS NULL) " +
+            "OR (contained_field IS NOT NULL AND contained_value IS NOT NULL AND contained_value > 0 " +
+            "AND contained_field GLOB '[a-z]*' AND NOT contained_field GLOB '*[^a-z0-9_]*' " +
+            "AND length(contained_field) <= 63))"
+
+    /** A versioned row's window: `[begin_snapshot, end_snapshot)` is never empty. */
+    const val WINDOW_CHECK = "CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)"
+
+    /** hog_column.col_type's closed set, in schema.sql's order. */
+    const val COLUMN_TYPES =
+        "'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16', 'uint32', 'uint64', 'float', 'double', " +
+            "'decimal', 'date', 'time', 'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns', 'timestamptz', " +
+            "'string', 'json', 'uuid', 'binary', 'variant', 'list', 'struct', 'map'"
+
+    /** hog_snapshot_change.kind's closed vocabulary. */
+    const val CHANGE_KINDS =
+        "'namespace_created', 'namespace_dropped', 'table_created', 'table_dropped', 'table_altered', " +
+            "'table_inserted_into', 'table_deleted_from', 'table_compacted', 'table_replaced', " +
+            "'view_created', 'view_dropped'"
+
+    /** hog_file_removal.reason's vocabulary. */
+    const val REMOVAL_REASONS = "'snapshot_expiry', 'table_drop_gc', 'compaction_staging', 'trino_upload'"
+
+    /** hog_maintenance_run.task's vocabulary. */
+    const val MAINTENANCE_TASKS = "'hydrator', 'expiry', 'cleanup', 'compaction', 'verify', 'retirement', 'reindex'"
+
     /** The `meta` row's fixed id — one catalog, one row. */
     const val META_ID = 1L
 
@@ -56,7 +171,7 @@ internal object HogliteSchema {
      */
     const val RECEIPT_ENDED_DDL =
         """CREATE TABLE IF NOT EXISTS receipt_ended(
-                idempotency_key TEXT PRIMARY KEY,
+                idempotency_key TEXT PRIMARY KEY REFERENCES receipts(idempotency_key) ON DELETE CASCADE,
                 ended_files INTEGER NOT NULL
             )"""
 
@@ -70,11 +185,12 @@ internal object HogliteSchema {
      */
     const val TABLE_LAYOUTS_DDL =
         """CREATE TABLE IF NOT EXISTS table_layouts(
-                table_id INTEGER NOT NULL,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
                 object_prefix_field_id INTEGER NOT NULL,
-                PRIMARY KEY(table_id, begin_snapshot)
+                PRIMARY KEY(table_id, begin_snapshot),
+                $WINDOW_CHECK
             )"""
 
     const val TABLE_LAYOUTS_LIVE_DDL =
@@ -115,7 +231,7 @@ internal object HogliteSchema {
         listOf(
             """CREATE TABLE IF NOT EXISTS meta(
                 id INTEGER PRIMARY KEY CHECK(id = 1),
-                name TEXT NOT NULL,
+                name TEXT NOT NULL CHECK $CATALOG_NAME_CHECK,
                 data_path TEXT NOT NULL,
                 next_snapshot INTEGER NOT NULL DEFAULT 1,
                 next_table_id INTEGER NOT NULL DEFAULT 1,
@@ -125,7 +241,8 @@ internal object HogliteSchema {
                 schema_version INTEGER NOT NULL DEFAULT 0,
                 earliest_snapshot_id INTEGER NOT NULL DEFAULT 0,
                 earliest_snapshot_time TEXT,
-                snapshot_retention_seconds INTEGER,
+                snapshot_retention_seconds INTEGER
+                    CHECK (snapshot_retention_seconds IS NULL OR snapshot_retention_seconds > 0),
                 consumer_floor INTEGER NOT NULL DEFAULT 1,
                 /* Set by dropCatalog's fencing transaction: every
                  * mutating tenant tx guards on it, so no write can land
@@ -137,19 +254,19 @@ internal object HogliteSchema {
              * contained_field/contained_value: namespace containment, as
              * Postgres V33 adds it to hog_namespace. Not versioned: a read
              * at a past snapshot gets the current containment, as on
-             * Postgres. The CHECK has the V33 shape without the field-name
-             * regex, because SQLite has no `~`. The store validates the
-             * field in Kotlin before every write.
+             * Postgres. The CHECK is V33's hog_namespace_containment_shape
+             * with the field-name regex as GLOB ([CONTAINMENT_CHECK]); the
+             * store still validates the field in Kotlin first, for the
+             * message. V37's contained_org has no column here.
              */
             """CREATE TABLE IF NOT EXISTS namespaces(
                 id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
+                name TEXT NOT NULL CHECK ${identifier("name")},
                 created_snapshot INTEGER NOT NULL,
                 dropped_snapshot INTEGER,
                 contained_field TEXT,
                 contained_value INTEGER,
-                CHECK ((contained_field IS NULL AND contained_value IS NULL)
-                    OR (contained_field IS NOT NULL AND contained_value IS NOT NULL AND contained_value > 0))
+                CHECK $CONTAINMENT_CHECK
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live
                 ON namespaces(name) WHERE dropped_snapshot IS NULL""",
@@ -159,18 +276,27 @@ internal object HogliteSchema {
             """CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live_containment
                 ON namespaces(contained_field, contained_value)
                 WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL""",
+            /*
+             * Identity (hog_table) plus a denormalized copy of the live
+             * version's namespace and name, and hog_table_stats's row-id
+             * allocator. namespace_id is the deferred no-action edge
+             * hog_table_version carries; replaced_table_id is deliberately
+             * not a FK (the referenced row is retired, never deleted, and
+             * a cascade is the one thing it must not do), so the self-edge
+             * CHECK is its only structural defence.
+             */
             """CREATE TABLE IF NOT EXISTS tables(
                 id INTEGER PRIMARY KEY,
-                namespace_id INTEGER NOT NULL,
-                namespace TEXT NOT NULL,
-                name TEXT NOT NULL,
+                namespace_id INTEGER NOT NULL REFERENCES namespaces(id) DEFERRABLE INITIALLY DEFERRED,
+                namespace TEXT NOT NULL CHECK ${identifier("namespace")},
+                name TEXT NOT NULL CHECK ${identifier("name")},
                 table_uuid TEXT NOT NULL UNIQUE,
                 comment TEXT,
                 properties_json TEXT NOT NULL DEFAULT '{}',
-                next_row_id INTEGER NOT NULL DEFAULT 0,
+                next_row_id INTEGER NOT NULL DEFAULT 0 CHECK (next_row_id >= 0),
                 next_field_id INTEGER NOT NULL DEFAULT 1,
                 schema_version INTEGER NOT NULL DEFAULT 0,
-                replaced_table_id INTEGER,
+                replaced_table_id INTEGER CHECK (replaced_table_id <> id),
                 created_snapshot INTEGER NOT NULL,
                 dropped_snapshot INTEGER
             )""",
@@ -185,15 +311,16 @@ internal object HogliteSchema {
              * stays on the tables row.
              */
             """CREATE TABLE IF NOT EXISTS table_versions(
-                table_id INTEGER NOT NULL,
-                namespace_id INTEGER NOT NULL,
-                namespace TEXT NOT NULL,
-                name TEXT NOT NULL,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+                namespace_id INTEGER NOT NULL REFERENCES namespaces(id) DEFERRABLE INITIALLY DEFERRED,
+                namespace TEXT NOT NULL CHECK ${identifier("namespace")},
+                name TEXT NOT NULL CHECK ${identifier("name")},
                 comment TEXT,
                 properties_json TEXT NOT NULL DEFAULT '{}',
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
-                PRIMARY KEY(table_id, begin_snapshot)
+                PRIMARY KEY(table_id, begin_snapshot),
+                $WINDOW_CHECK
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS table_versions_live
                 ON table_versions(namespace, name) WHERE end_snapshot IS NULL""",
@@ -215,35 +342,40 @@ internal object HogliteSchema {
              * the stats of files written under the old shape.
              */
             """CREATE TABLE IF NOT EXISTS columns(
-                table_id INTEGER NOT NULL,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
                 field_id INTEGER NOT NULL,
                 parent_field_id INTEGER,
-                ordinal INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                name TEXT NOT NULL CHECK ${identifier("name")},
+                type TEXT NOT NULL CHECK (type IN ($COLUMN_TYPES)),
                 type_params_json TEXT,
                 nullable INTEGER NOT NULL,
                 comment TEXT,
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
-                PRIMARY KEY(table_id, field_id, begin_snapshot)
+                PRIMARY KEY(table_id, field_id, begin_snapshot),
+                $WINDOW_CHECK,
+                CONSTRAINT columns_parent_not_self CHECK (parent_field_id IS NULL OR parent_field_id <> field_id),
+                CONSTRAINT columns_parent_precedes_child CHECK (parent_field_id IS NULL OR parent_field_id < field_id)
             )""",
             "CREATE INDEX IF NOT EXISTS columns_table ON columns(table_id, end_snapshot)",
             """CREATE TABLE IF NOT EXISTS partition_specs(
-                table_id INTEGER NOT NULL,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
                 spec_id INTEGER NOT NULL,
                 fields_json TEXT NOT NULL,
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
-                PRIMARY KEY(table_id, spec_id)
+                PRIMARY KEY(table_id, spec_id),
+                $WINDOW_CHECK
             )""",
             """CREATE TABLE IF NOT EXISTS sort_specs(
-                table_id INTEGER NOT NULL,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
                 spec_id INTEGER NOT NULL,
                 fields_json TEXT NOT NULL,
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
-                PRIMARY KEY(table_id, spec_id)
+                PRIMARY KEY(table_id, spec_id),
+                $WINDOW_CHECK
             )""",
             /*
              * The object-prefix layout (`set_object_prefix_field`), Postgres
@@ -256,10 +388,10 @@ internal object HogliteSchema {
             TABLE_LAYOUTS_DDL,
             TABLE_LAYOUTS_LIVE_DDL,
             """CREATE TABLE IF NOT EXISTS table_totals(
-                table_id INTEGER PRIMARY KEY,
+                table_id INTEGER PRIMARY KEY REFERENCES tables(id) ON DELETE CASCADE,
                 record_count INTEGER NOT NULL DEFAULT 0,
                 file_count INTEGER NOT NULL DEFAULT 0,
-                file_size_bytes INTEGER NOT NULL DEFAULT 0
+                file_size_bytes INTEGER NOT NULL DEFAULT 0 CHECK (file_size_bytes >= 0)
             )""",
             """CREATE TABLE IF NOT EXISTS snapshots(
                 id INTEGER PRIMARY KEY,
@@ -268,9 +400,13 @@ internal object HogliteSchema {
                 message TEXT,
                 schema_version INTEGER NOT NULL
             )""",
+            // hog_snapshot_change: the typed vocabulary is closed, every
+            // row names its object, and a row never outlives its snapshot.
+            // Immediate, so each DDL and commit transaction inserts its
+            // snapshot row before its change rows.
             """CREATE TABLE IF NOT EXISTS changes(
-                snapshot_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN ($CHANGE_KINDS)),
                 object_id INTEGER NOT NULL
             )""",
             "CREATE INDEX IF NOT EXISTS changes_obj ON changes(object_id, snapshot_id)",
@@ -291,11 +427,11 @@ internal object HogliteSchema {
              */
             """CREATE TABLE IF NOT EXISTS files(
                 id INTEGER PRIMARY KEY,
-                table_id INTEGER NOT NULL,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
-                record_count INTEGER NOT NULL,
-                file_size_bytes INTEGER NOT NULL,
+                record_count INTEGER NOT NULL CHECK (record_count >= 0),
+                file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes >= 0),
                 footer_size INTEGER,
                 row_id_start INTEGER NOT NULL,
                 explicit_row_ids INTEGER NOT NULL DEFAULT 0,
@@ -307,20 +443,25 @@ internal object HogliteSchema {
                 path TEXT NOT NULL,
                 partition_values_json TEXT,
                 stats_json TEXT,
-                split_offsets_json TEXT
+                split_offsets_json TEXT,
+                $WINDOW_CHECK
             )""",
             "CREATE INDEX IF NOT EXISTS files_table ON files(table_id, begin_snapshot)",
+            // hog_delete_file: a vector rides its data file (and its table)
+            // and goes with it; no file_format column, every row is a
+            // puffin deletion vector.
             """CREATE TABLE IF NOT EXISTS dvs(
-                data_file_id INTEGER NOT NULL,
-                table_id INTEGER NOT NULL,
+                data_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
                 delete_file_id INTEGER NOT NULL,
                 path TEXT NOT NULL,
-                delete_count INTEGER NOT NULL,
-                file_size_bytes INTEGER NOT NULL,
+                delete_count INTEGER NOT NULL CHECK (delete_count > 0),
+                file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes >= 0),
                 begin_snapshot INTEGER NOT NULL,
                 end_snapshot INTEGER,
                 epoch INTEGER NOT NULL,
-                PRIMARY KEY(data_file_id, epoch)
+                PRIMARY KEY(data_file_id, epoch),
+                $WINDOW_CHECK
             )""",
             DVS_ONE_LIVE_DDL,
             "CREATE INDEX IF NOT EXISTS dvs_table ON dvs(table_id, begin_snapshot)",
@@ -335,7 +476,7 @@ internal object HogliteSchema {
             // First-release DDL. Drop and recreate development tenants instead of adding migration code.
             "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
             """CREATE TABLE IF NOT EXISTS offsets(
-                consumer_id TEXT NOT NULL,
+                consumer_id TEXT NOT NULL CHECK (length(consumer_id) BETWEEN 1 AND 128),
                 table_uuid TEXT NOT NULL,
                 committed_snapshot INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -351,9 +492,9 @@ internal object HogliteSchema {
                 upload_id TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
                 prefix TEXT NOT NULL,
-                file_kind TEXT NOT NULL,
+                file_kind TEXT NOT NULL CHECK (file_kind IN ('data', 'delete')),
                 path TEXT NOT NULL,
-                state TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('active', 'registered', 'abandoned')),
                 claimed_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 scheduled_at TEXT
@@ -371,13 +512,14 @@ internal object HogliteSchema {
                 definition_json TEXT NOT NULL,
                 table_uuid TEXT NOT NULL,
                 write_path TEXT NOT NULL,
-                state TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('prepared', 'committed', 'rejected', 'aborted')),
                 expires_at TEXT NOT NULL,
                 files_json TEXT,
                 snapshot_id INTEGER,
                 schema_version INTEGER,
                 reason TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                CHECK ((state = 'committed') = (snapshot_id IS NOT NULL AND schema_version IS NOT NULL))
             )""",
             /*
              * The removal queue (Postgres's hog_file_removal minus
@@ -389,8 +531,8 @@ internal object HogliteSchema {
             """CREATE TABLE IF NOT EXISTS removals(
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL,
-                file_kind TEXT NOT NULL,
-                reason TEXT,
+                file_kind TEXT NOT NULL CHECK (file_kind IN ('data', 'delete')),
+                reason TEXT CHECK (reason IN ($REMOVAL_REASONS)),
                 queued_snapshot INTEGER NOT NULL,
                 queued_at TEXT NOT NULL,
                 scheduled_at TEXT,
@@ -399,7 +541,8 @@ internal object HogliteSchema {
                 claimed_at TEXT,
                 claimed_by TEXT,
                 drained_at TEXT,
-                drained_outcome TEXT
+                drained_outcome TEXT CHECK (drained_outcome IN ('deleted', 'absent', 'registered')),
+                CHECK ((drained_at IS NULL) = (drained_outcome IS NULL))
             )""",
             "CREATE INDEX IF NOT EXISTS removals_unclaimed ON removals(claimed_at)",
             // Each ordered claim walk ignores the opposite arm's backlog.
@@ -410,14 +553,15 @@ internal object HogliteSchema {
             "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
             """CREATE TABLE IF NOT EXISTS views(
                 id INTEGER PRIMARY KEY,
-                namespace_id INTEGER NOT NULL,
-                namespace TEXT NOT NULL,
-                name TEXT NOT NULL,
+                namespace_id INTEGER NOT NULL REFERENCES namespaces(id) DEFERRABLE INITIALLY DEFERRED,
+                namespace TEXT NOT NULL CHECK ${identifier("namespace")},
+                name TEXT NOT NULL CHECK ${identifier("name")},
                 view_uuid TEXT NOT NULL UNIQUE,
                 dialect TEXT NOT NULL,
                 sql_text TEXT NOT NULL,
                 created_snapshot INTEGER NOT NULL,
-                dropped_snapshot INTEGER
+                dropped_snapshot INTEGER,
+                CHECK (dropped_snapshot IS NULL OR dropped_snapshot > created_snapshot)
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS views_live
                 ON views(namespace, name) WHERE dropped_snapshot IS NULL""",
@@ -445,13 +589,15 @@ internal object HogliteSchema {
              */
             """CREATE TABLE IF NOT EXISTS maintenance_runs(
                 id INTEGER PRIMARY KEY,
-                task TEXT NOT NULL,
-                run_trigger TEXT NOT NULL,
+                task TEXT NOT NULL CHECK (task IN ($MAINTENANCE_TASKS)),
+                run_trigger TEXT NOT NULL CHECK (run_trigger IN ('loop', 'manual')),
                 started_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL,
-                status TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('ok', 'failed')),
                 error TEXT,
-                result_json TEXT
+                result_json TEXT,
+                CHECK (finished_at >= started_at),
+                CHECK ((status = 'failed') = (error IS NOT NULL))
             )""",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_task ON maintenance_runs(task, id)",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",

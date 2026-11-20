@@ -7,9 +7,12 @@ import com.posthog.hoglake.auth.AuthService
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.PatchField
 import com.posthog.hoglake.service.RemovalStore
 import com.sun.net.httpserver.HttpServer
@@ -138,6 +141,15 @@ class HogliteCleanupLifecycleIntegrationTest {
             store.queryCatalog(cat, sql, *args).rows
         }
 
+    /** A table for a raw file row to reference (files.table_id REFERENCES tables); its id. */
+    private fun fileTable(
+        store: HogliteCatalogStore,
+        cat: String,
+    ): Long {
+        store.createNamespace(cat, "ns")
+        return store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG))).tableId
+    }
+
     private fun seed(
         store: HogliteCatalogStore,
         cat: String,
@@ -154,11 +166,13 @@ class HogliteCleanupLifecycleIntegrationTest {
         )
         for ((key, time) in listOf("old" to old, "keep" to now)) {
             write(store, cat, "INSERT INTO receipts VALUES (?, 'fp', 0, 0, ?)", key, time)
+            // The receipt's ended count goes with it (receipt_ended REFERENCES receipts ON DELETE CASCADE).
+            write(store, cat, "INSERT INTO receipt_ended VALUES (?, 1)", key)
             write(
                 store,
                 cat,
                 "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at,drained_at,drained_outcome) " +
-                    "VALUES (?, 'data',0,?,?, 'missing')",
+                    "VALUES (?, 'data',0,?,?, 'absent')",
                 key,
                 time,
                 time,
@@ -363,24 +377,39 @@ class HogliteCleanupLifecycleIntegrationTest {
                         HogliteSchema.now(),
                         HogliteSchema.now(),
                     )
-                "live-file", "ended-file" ->
+                "live-file", "ended-file" -> {
+                    val table = fileTable(store, cat)
                     write(
                         store,
                         cat,
                         "INSERT INTO files(table_id,begin_snapshot,end_snapshot,record_count,file_size_bytes," +
-                            "row_id_start,stats_state,path) VALUES (1,0,?,1,4,0,'pending',?)",
+                            "row_id_start,stats_state,path) VALUES (?,0,?,1,4,0,'pending',?)",
+                        table,
                         if (kind == "ended-file") 1 else null,
                         path,
                     )
-                else ->
+                }
+                else -> {
+                    // A vector rides a data file (dvs.data_file_id REFERENCES files), so one goes in first.
+                    val table = fileTable(store, cat)
+                    write(
+                        store,
+                        cat,
+                        "INSERT INTO files(id,table_id,begin_snapshot,record_count,file_size_bytes," +
+                            "row_id_start,stats_state,path) VALUES (1,?,0,1,4,0,'pending',?)",
+                        table,
+                        "s3://hoglake-it/$cat/data-under-vector",
+                    )
                     write(
                         store,
                         cat,
                         "INSERT INTO dvs(data_file_id,table_id,delete_file_id,path,delete_count,file_size_bytes," +
-                            "begin_snapshot,end_snapshot,epoch) VALUES (1,1,2,?,1,4,0,?,1)",
+                            "begin_snapshot,end_snapshot,epoch) VALUES (1,?,2,?,1,4,0,?,1)",
+                        table,
                         path,
                         if (kind == "ended-dv") 1 else null,
                     )
+                }
             }
             queue(store, cat, path)
             val result = cleanup(store, cat)
@@ -552,9 +581,10 @@ class HogliteCleanupLifecycleIntegrationTest {
             val (columns, values, purge, index) =
                 if (table == "removals") {
                     listOf(
-                        "path,file_kind,queued_snapshot,queued_at,drained_at",
+                        "path,file_kind,queued_snapshot,queued_at,drained_at,drained_outcome",
                         "'s3://b/key-'||i,'data',0,'2000-01-01T00:00:00.000Z'," +
-                            "CASE WHEN i%100=0 THEN '2000-01-01T00:00:00.000Z' ELSE '2030-01-01T00:00:00.000Z' END",
+                            "CASE WHEN i%100=0 THEN '2000-01-01T00:00:00.000Z' ELSE '2030-01-01T00:00:00.000Z' END," +
+                            "'absent'",
                         HogliteCleanup.PURGE_DRAINED_SQL,
                         "removals_drained_at",
                     )
@@ -604,7 +634,7 @@ class HogliteCleanupLifecycleIntegrationTest {
             queue(store, cat, "s3://b/wanted", if (staging) "compaction_staging" else null)
             expected += 100_001L
             if (!staging) {
-                queue(store, cat, "s3://b/expiry", "expiry")
+                queue(store, cat, "s3://b/expiry", "snapshot_expiry")
                 expected += 100_002L
             }
         }
@@ -641,7 +671,7 @@ class HogliteCleanupLifecycleIntegrationTest {
                 cat,
                 numbers +
                     "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at,drained_at,drained_outcome) " +
-                    "SELECT 'old-'||i,'data',0,?,?,'missing' FROM n",
+                    "SELECT 'old-'||i,'data',0,?,?,'absent' FROM n",
                 old,
                 old,
             )
@@ -688,23 +718,20 @@ class HogliteCleanupLifecycleIntegrationTest {
     fun `ordinary maintenance purge failure still attempts receipts and drained ledger then fails original`() =
         fixture { store, cat, _ ->
             seed(store, cat)
-            write(
-                store,
-                cat,
-                "CREATE TABLE hold_ledger(run_id INTEGER REFERENCES maintenance_runs(id) ON DELETE RESTRICT)",
-            )
-            write(store, cat, "INSERT INTO hold_ledger SELECT id FROM maintenance_runs")
+            holdLedger(store, cat)
             attempts.clear()
             val failure = catchThrowable { cleanup(store, cat) }
-            assertThat(
-                failure,
-            ).isInstanceOf(
-                HoglakeException.Validation::class.java,
-            ).hasMessageContaining("FOREIGN KEY constraint failed")
+            // The hold is a FOREIGN KEY, which the store reads as a store bug (HogliteIntegrityViolation),
+            // so the ledger failure comes back wrapped with the run's partial result.
+            assertThat(failure)
+                .isInstanceOf(PartialResult::class.java)
+                .hasMessageContaining("FOREIGN KEY constraint failed")
+                .hasCauseInstanceOf(HogliteIntegrityViolation::class.java)
             assertThat(phaseNames()).containsExactly("cleanup-ledger", "cleanup-receipts", "cleanup-drained")
             assertThat(
                 rows(store, cat, "SELECT idempotency_key FROM receipts ORDER BY idempotency_key").flatten(),
             ).containsExactly("keep")
+            assertThat(rows(store, cat, "SELECT idempotency_key FROM receipt_ended").flatten()).containsExactly("keep")
             assertThat(rows(store, cat, "SELECT path FROM removals ORDER BY path").flatten()).containsExactly("keep")
             assertThat(
                 rows(store, cat, "SELECT status, error FROM maintenance_runs ORDER BY id DESC LIMIT 1").single(),
@@ -745,12 +772,7 @@ class HogliteCleanupLifecycleIntegrationTest {
             )
             write(store, cat, "INSERT INTO hold_drained SELECT id FROM removals WHERE path = 'old'")
             if (failLedger) {
-                write(
-                    store,
-                    cat,
-                    "CREATE TABLE hold_ledger(run_id INTEGER REFERENCES maintenance_runs(id) ON DELETE RESTRICT)",
-                )
-                write(store, cat, "INSERT INTO hold_ledger SELECT id FROM maintenance_runs")
+                holdLedger(store, cat)
             }
             attempts.clear()
             val failure =
@@ -760,15 +782,15 @@ class HogliteCleanupLifecycleIntegrationTest {
                     assertThat(result.receiptsPurgeFailures).isZero()
                 }
             if (failLedger) {
+                assertThat(failure)
+                    .hasMessageContaining("FOREIGN KEY constraint failed")
+                    .hasCauseInstanceOf(HogliteIntegrityViolation::class.java)
+                // The drained failure rides the ledger failure (the wrapper's cause), not the wrapper.
+                val ledgerFailure = failure.cause!!
+                assertThat(ledgerFailure.suppressed).hasSize(1)
                 assertThat(
-                    failure,
-                ).isInstanceOf(
-                    HoglakeException.Validation::class.java,
-                ).hasMessageContaining("FOREIGN KEY constraint failed")
-                assertThat(failure.suppressed).hasSize(1)
-                assertThat(
-                    failure.suppressed.single(),
-                ).isNotSameAs(failure).isInstanceOf(HoglakeException.Validation::class.java)
+                    ledgerFailure.suppressed.single(),
+                ).isNotSameAs(ledgerFailure).isInstanceOf(HogliteIntegrityViolation::class.java)
             } else {
                 assertThat(failure).isNull()
             }
@@ -957,5 +979,18 @@ class HogliteCleanupLifecycleIntegrationTest {
                 assertThat(store.getCatalog(cat).name).isEqualTo(cat)
             }
         }
+    }
+
+    /** Holds every ledger row with a RESTRICT edge, so the ledger purge's DELETE is refused. */
+    private fun holdLedger(
+        store: HogliteCatalogStore,
+        cat: String,
+    ) {
+        write(
+            store,
+            cat,
+            "CREATE TABLE hold_ledger(run_id INTEGER REFERENCES maintenance_runs(id) ON DELETE RESTRICT)",
+        )
+        write(store, cat, "INSERT INTO hold_ledger SELECT id FROM maintenance_runs")
     }
 }

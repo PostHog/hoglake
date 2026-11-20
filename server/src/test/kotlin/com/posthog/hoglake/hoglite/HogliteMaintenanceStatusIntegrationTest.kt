@@ -1,5 +1,7 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceBacklog
 import com.posthog.hoglake.model.MaintenanceRunStatus
@@ -38,6 +40,13 @@ class HogliteMaintenanceStatusIntegrationTest {
     private fun catalog(): String =
         HogliteConformanceEngine.uniqueName("status").also {
             store.createCatalog(it, "s3://hoglake-it/$it")
+        }
+
+    /** A catalog with one table, id 1, for the raw file rows to reference (files.table_id REFERENCES tables). */
+    private fun catalogWithTable(): String =
+        catalog().also {
+            store.createNamespace(it, "ns")
+            assertThat(store.createTable(it, "ns", "t", listOf(ColumnDef("id", ColType.LONG))).tableId).isEqualTo(1)
         }
 
     private fun write(
@@ -93,22 +102,23 @@ class HogliteMaintenanceStatusIntegrationTest {
 
     @Test
     fun `status reports live backlogs and successful failed and partial run records`() {
-        val cat = catalog()
+        val cat = catalogWithTable()
         write(
             cat,
             "INSERT INTO files(id, table_id, begin_snapshot, end_snapshot, record_count, file_size_bytes, " +
                 "row_id_start, stats_state, path) VALUES " +
                 "(1, 1, 0, NULL, 1, 100, 0, 'pending', 'pending'), " +
                 "(2, 1, 0, NULL, 1, 200, 1, 'failed', 'failed'), " +
-                "(3, 1, 0, NULL, 1, 1000, 2, 'ready', 'large'), " +
+                "(3, 1, 0, NULL, 1, 1000, 2, 'provided', 'large'), " +
                 "(4, 1, 0, 1, 1, 100, 3, 'pending', 'ended')",
         )
         val old = Instant.now().minusSeconds(120)
         write(
             cat,
-            "INSERT INTO removals(path, file_kind, queued_snapshot, queued_at, claimed_by, drained_at) VALUES " +
-                "('queued', 'data', 0, ?, NULL, NULL), ('claimed', 'data', 0, ?, 'worker', NULL), " +
-                "('drained', 'data', 0, ?, NULL, ?)",
+            "INSERT INTO removals(path, file_kind, queued_snapshot, queued_at, claimed_by, drained_at, " +
+                "drained_outcome) VALUES " +
+                "('queued', 'data', 0, ?, NULL, NULL, NULL), ('claimed', 'data', 0, ?, 'worker', NULL, NULL), " +
+                "('drained', 'data', 0, ?, NULL, ?, 'absent')",
             HogliteSchema.fmt(old),
             HogliteSchema.fmt(old.plusSeconds(60)),
             HogliteSchema.fmt(old.minusSeconds(60)),
@@ -152,13 +162,13 @@ class HogliteMaintenanceStatusIntegrationTest {
                 meta.headSnapshotId,
             ),
         )
-        write(cat, "UPDATE files SET stats_state = 'ready' WHERE id = 1")
+        write(cat, "UPDATE files SET stats_state = 'provided' WHERE id = 1")
         assertThat(backend().status(cat).tasks[0].backlog).isEqualTo(MaintenanceBacklog.HydratorBacklog(0, 1))
         assertThat(backend().runs(catalog(), null, null, 50).runs).isEmpty()
     }
 
     @Test
-    fun `run history uses exclusive ids with task filters and preserves unknown task names`() {
+    fun `run history uses exclusive ids with task filters and reports tasks the status view does not list`() {
         val cat = catalog()
         val now = HogliteSchema.fmt(Instant.now())
         write(
@@ -169,11 +179,13 @@ class HogliteMaintenanceStatusIntegrationTest {
             now,
             now,
         )
-        run(cat, "future_task", "manual", Instant.now())
+        // The ledger's task vocabulary is closed (schema.sql's CHECK, here too), so a name outside it
+        // cannot be written; the two the status view does not loop on still come back by name.
+        run(cat, "reindex", "manual", Instant.now())
         run(cat, "verify", "manual", Instant.now())
         val first = backend().runs(cat, null, null, 2)
         assertThat(first.hasMore).isTrue()
-        assertThat(first.runs.map { it.taskName }).containsExactly("verify", "future_task")
+        assertThat(first.runs.map { it.taskName }).containsExactly("verify", "reindex")
         val next = backend().runs(cat, null, first.runs.last().runId, 2)
         assertThat(next.runs.map { it.runId }).containsExactly(505, 504)
         assertThat(backend().runs(cat, MaintenanceTask.EXPIRY, 504, 2).runs.map { it.runId }).containsExactly(502, 500)
@@ -254,13 +266,13 @@ class HogliteMaintenanceStatusIntegrationTest {
 
     @Test
     fun `production status and history statements use indexed ranges on a large tenant`() {
-        val cat = catalog()
+        val cat = catalogWithTable()
         write(
             cat,
             "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10000) " +
                 "INSERT INTO files(id, table_id, begin_snapshot, end_snapshot, record_count, file_size_bytes, " +
                 "row_id_start, stats_state, path) SELECT i, 1, 0, CASE WHEN i < 9990 THEN 1 END, " +
-                "1, 2000, i, 'ready', 'file-' || i FROM n",
+                "1, 2000, i, 'provided', 'file-' || i FROM n",
         )
         val now = HogliteSchema.fmt(Instant.now())
         write(
@@ -274,8 +286,9 @@ class HogliteMaintenanceStatusIntegrationTest {
         write(
             cat,
             "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10000) " +
-                "INSERT INTO removals(path, file_kind, queued_snapshot, queued_at, drained_at) " +
-                "SELECT 'object-' || i, 'data', 0, ?, CASE WHEN i < 9990 THEN ? END FROM n",
+                "INSERT INTO removals(path, file_kind, queued_snapshot, queued_at, drained_at, drained_outcome) " +
+                "SELECT 'object-' || i, 'data', 0, ?, CASE WHEN i < 9990 THEN ? END, " +
+                "CASE WHEN i < 9990 THEN 'absent' END FROM n",
             now,
             now,
         )

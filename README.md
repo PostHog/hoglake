@@ -118,6 +118,7 @@ One server, one REST contract, two catalog stores behind it. A request's catalog
 | Storage | One shared Postgres database for every catalog | One [hoglite](https://github.com/PostHog/hoglite) tenant (a SQLite database, durable in S3) per catalog |
 | Scale | Grows with the catalog's size and commit rate | Grows with the number of catalogs: hoglite's sizing guide puts about 5,000 open tenants on a replica, so 100 replicas give about 500,000 open slots, and more tenants can sit in S3 without staying open |
 | Concurrency | Per-catalog advisory lock; many writers across catalogs | One writer per tenant, serialized by hoglite; no joins across tenants |
+| Integrity | Foreign keys with `ON DELETE CASCADE`, deferred namespace edges, CHECK-constrained vocabularies (`server/schema.sql`) | The same constraints, declared per tenant (`hoglite/HogliteSchema.kt`, whose KDoc has the mapping) and enforced by hoglite's `PRAGMA foreign_keys`, which the catalog bootstrap checks |
 | Maintenance | Background loops: compaction, expiry, cleanup, hydration, retirement | No background loops yet. Expiry, cleanup, compaction and the rehydrate requeue run on demand through `POST /v1/catalogs/{catalog}/maintenance/*`; retirement only through the backend seam |
 | Placement | The default backend (`HOGLAKE_DEFAULT_BACKEND=postgres`) | Named in `HOGLAKE_BACKENDS_FILE`. Never the default: a request reaches it only through the verified `rtg` claim in its token (backend and tenant) |
 

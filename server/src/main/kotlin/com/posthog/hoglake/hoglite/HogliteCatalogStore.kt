@@ -239,11 +239,25 @@ class HogliteCatalogStore(
             CatalogService.validateDataPath(dataPath)
             val tenantId = boundTenant(name)
             backendCall(name) { client.createTenant(tenantId) }
+            probeForeignKeys(name, tenantId)
             val boot = HogliteTx()
             // The schema is bootstrapped in ONE transaction, so the meta
             // table exists exactly when an earlier create committed.
             boot.expectZero("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'") {
                 HoglakeException.AlreadyExists("catalog '$name' already exists")
+            }
+            // The schema's FOREIGN KEYs and cascades hold only on a
+            // connection with PRAGMA foreign_keys on, which hoglite sets for
+            // every tenant connection and lets no client change. The guard
+            // reads the flag on the very connection that lays the schema
+            // down ([probeForeignKeys] read it on a reader a moment ago) and
+            // refuses to bootstrap a tenant without it: a catalog whose
+            // integrity rested on nothing would be a misconfigured backend,
+            // not a catalog. 503, so a caller retries once the engine is
+            // fixed; the tenant stays empty and a retry re-runs this
+            // transaction (HogliteSchema, Referential integrity).
+            boot.expectScalar(1, FOREIGN_KEYS_PROBE_SQL) {
+                HoglakeException.BackendUnavailable(foreignKeysOff(tenantId))
             }
             HogliteSchema.DDL.forEach { boot.add(it) }
             boot.add(
@@ -589,6 +603,7 @@ class HogliteCatalogStore(
                 name,
             ) { HoglakeException.AlreadyExists("namespace '$name' already exists") }
             tx.allocateDdlSnapshot()
+            tx.insertSnapshotRow(author, message)
             tx.affectOne(
                 "UPDATE meta SET next_namespace_id = next_namespace_id + 1 WHERE id = 1",
             ) { HoglakeException.NotFound("catalog '$catalog'") }
@@ -602,7 +617,6 @@ class HogliteCatalogStore(
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'namespace_created', " +
                     "(SELECT next_namespace_id - 1 FROM meta WHERE id = 1))",
             )
-            tx.insertSnapshotRow(author, message)
             val readback = tx.add(HogliteSql.READBACK_DDL)
             val results = runTx(catalog, freshTxid("create-ns"), null, tx)
             val row = results[readback].firstRow()!!
@@ -705,6 +719,7 @@ class HogliteCatalogStore(
                 ns.namespaceId,
             ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
             tx.allocateDdlSnapshot()
+            tx.insertSnapshotRow(author, message)
             tx.affectOne(
                 "UPDATE namespaces SET dropped_snapshot = ${HogliteSchema.HEAD_SQL} WHERE id = ?",
                 ns.namespaceId,
@@ -714,7 +729,6 @@ class HogliteCatalogStore(
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'namespace_dropped', ?)",
                 ns.namespaceId,
             )
-            tx.insertSnapshotRow(author, message)
             val readback = tx.add(HogliteSql.READBACK_DDL)
             val results = runTx(catalog, freshTxid("drop-ns"), null, tx)
             val row = results[readback].firstRow()!!
@@ -1143,6 +1157,7 @@ class HogliteCatalogStore(
                 name,
             ) { HoglakeException.AlreadyExists("table '$namespace.$name' already exists in catalog '$catalog'") }
             tx.allocateDdlSnapshot()
+            tx.insertSnapshotRow(author, message)
             tx.affectOne(
                 "UPDATE meta SET next_table_id = next_table_id + 1 WHERE id = 1",
             ) { HoglakeException.NotFound("catalog '$catalog'") }
@@ -1172,7 +1187,6 @@ class HogliteCatalogStore(
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'table_created', " +
                     "(SELECT next_table_id - 1 FROM meta WHERE id = 1))",
             )
-            tx.insertSnapshotRow(author, message)
             val readback = tx.add(HogliteSql.READBACK_DDL)
             val results = runTx(catalog, freshTxid("create-table"), null, tx)
             val row = results[readback].firstRow()!!
@@ -1546,6 +1560,7 @@ class HogliteCatalogStore(
                 t.tableId,
             ) { HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'") }
             tx.allocateDdlSnapshot()
+            tx.insertSnapshotRow(author, message)
             tx.affectOne(
                 "UPDATE tables SET dropped_snapshot = ${HogliteSchema.HEAD_SQL} WHERE id = ?",
                 t.tableId,
@@ -1565,7 +1580,6 @@ class HogliteCatalogStore(
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'table_dropped', ?)",
                 t.tableId,
             )
-            tx.insertSnapshotRow(author, message)
             val readback = tx.add(HogliteSql.READBACK_DDL)
             val results = runTx(catalog, freshTxid("drop-table"), null, tx)
             val row = results[readback].firstRow()!!
@@ -1606,6 +1620,7 @@ class HogliteCatalogStore(
                 )
             }
             tx.allocateDdlSnapshot()
+            tx.insertSnapshotRow(author, message)
             // End every live file and DV at the new snapshot and zero the
             // totals. The OBJECTS are not queued for removal here — a
             // retained pre-truncate snapshot still references them; the
@@ -1639,7 +1654,6 @@ class HogliteCatalogStore(
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'table_deleted_from', ?)",
                 t.tableId,
             )
-            tx.insertSnapshotRow(author, message)
             val readback = tx.add(HogliteSql.READBACK_DDL)
             val results = runTx(catalog, freshTxid("truncate"), null, tx)
             val row = results[readback].firstRow()!!
@@ -2933,7 +2947,9 @@ class HogliteCatalogStore(
                     startedAt,
                     java.time.Instant.now(),
                     com.posthog.hoglake.model.MaintenanceRunStatus.FAILED,
-                    e.message,
+                    // Never null (the ledger's CHECK ties `error` to a failed
+                    // status), capped, from the root cause: MaintenanceRunStore's rule.
+                    com.posthog.hoglake.persistence.MaintenanceRunStore.errorText(e),
                     (e as? com.posthog.hoglake.persistence.PartialResult)?.partial,
                 )
                 throw e
@@ -3179,10 +3195,57 @@ class HogliteCatalogStore(
             throw r
         }
 
+    /**
+     * The bootstrap's first look at a new tenant: `PRAGMA foreign_keys`,
+     * read through [FOREIGN_KEYS_PROBE_SQL] on one of its connections. An
+     * engine that refuses the statement (a build that denies the pragma)
+     * or reads 0 is misconfigured for this schema: 503, never the
+     * Validation the bootstrap transaction's generic refusal mapping would
+     * make of a refused probe. Authority and tenant answers keep their
+     * meaning; a read-guard answer (result too large, query timeout) says
+     * nothing about the flag and is left to the bootstrap transaction,
+     * which repeats the read on the writer connection as its own guard.
+     */
+    private fun probeForeignKeys(
+        catalog: String,
+        tenantId: String,
+    ) {
+        val row =
+            try {
+                client.query(tenantId, FOREIGN_KEYS_PROBE_SQL).firstRow()
+            } catch (r: HogliteRejected) {
+                when (val mapped = mapRejected(catalog, r)) {
+                    is HoglakeException.Validation ->
+                        throw HoglakeException.BackendUnavailable(
+                            "hoglite refused to report PRAGMA foreign_keys for tenant '$tenantId' " +
+                                "(${r.status}: ${r.body}); the catalog schema relies on it, " +
+                                "so the engine is misconfigured",
+                        )
+                    is HoglakeException.Unauthenticated, is HoglakeException.Forbidden, is HoglakeException.NotFound ->
+                        throw mapped
+                    else -> return
+                }
+            }
+        if (row?.get(0).asLongOrNull() != 1L) throw HoglakeException.BackendUnavailable(foreignKeysOff(tenantId))
+    }
+
+    private fun foreignKeysOff(tenantId: String): String =
+        "hoglite tenant '$tenantId' does not enforce foreign keys (PRAGMA foreign_keys is off); " +
+            "the catalog schema relies on them, so the engine is misconfigured"
+
+    /**
+     * The typed exception a deterministic hoglite refusal means. A
+     * [HoglakeException] (a client-visible status) for everything the
+     * caller could have caused or can act on; a [HogliteIntegrityViolation]
+     * (500, logged with its stack) for a FOREIGN KEY refusal, which the
+     * schema's constraints turn from silent corruption into a refused
+     * transaction and which only a store bug can produce — every statement
+     * the store sends resolves its parents under guards first.
+     */
     internal fun mapRejected(
         catalog: String,
         r: HogliteRejected,
-    ): HoglakeException {
+    ): RuntimeException {
         val body = runCatching { json.readTree(r.body) }.getOrNull()
         val code = body?.get("code")?.asText()
         val detail = body?.get("error")?.asText() ?: r.body
@@ -3198,6 +3261,8 @@ class HogliteCatalogStore(
                 HoglakeException.BackendQueryTimeout(
                     "hoglite query exceeded the engine deadline; narrow the request: $detail",
                 )
+            FOREIGN_KEY_REFUSAL in detail && (code == "refused" || r.status in setOf(409, 422)) ->
+                HogliteIntegrityViolation(catalog, detail)
             // /query's bare 409 is SQL refusal; readTx also normalizes refused 422 to 409.
             code in setOf("refused", "out_of_memory") || r.status in setOf(400, 409, 422) ->
                 HoglakeException.Validation("hoglite refused the statement: $detail")
@@ -3305,6 +3370,17 @@ class HogliteCatalogStore(
 
         /** Concurrent single reads when the engine has no `/v1/query-batch`. */
         const val LIST_FALLBACK_PARALLELISM = 16
+
+        /**
+         * The bootstrap's enforcement probe: `PRAGMA foreign_keys` on the
+         * connection running the transaction, read through its table-valued
+         * form because hoglite refuses `PRAGMA` statements through `/tx`
+         * and `/query` and lets the flag only be read. 1 = enforced.
+         */
+        internal const val FOREIGN_KEYS_PROBE_SQL = "SELECT foreign_keys FROM pragma_foreign_keys"
+
+        /** SQLite's message for a refused FOREIGN KEY, immediate or at commit (deferred). */
+        internal const val FOREIGN_KEY_REFUSAL = "FOREIGN KEY constraint failed"
 
         internal fun freshTxid(prefix: String): String = "$prefix:${UUID.randomUUID()}"
     }

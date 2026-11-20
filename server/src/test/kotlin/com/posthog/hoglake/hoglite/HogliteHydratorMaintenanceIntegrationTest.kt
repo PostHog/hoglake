@@ -62,7 +62,7 @@ class HogliteHydratorMaintenanceIntegrationTest {
             )
         }
         write(c, "UPDATE files SET stats_state = 'failed'")
-        write(c, "UPDATE files SET end_snapshot = begin_snapshot WHERE id = 2")
+        write(c, "UPDATE files SET end_snapshot = begin_snapshot + 1 WHERE id = 2")
         write(c, "UPDATE files SET stats_state = 'provided' WHERE id = 3")
         val dropped = store.getTable(c, "ns", "dropped")
         store.dropTable(c, "ns", "dropped", dropped.tableUuid, "test", "drop")
