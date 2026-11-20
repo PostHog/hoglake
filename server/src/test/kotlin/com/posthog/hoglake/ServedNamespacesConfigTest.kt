@@ -172,8 +172,8 @@ class ServedNamespacesConfigTest {
         val hosts =
             Files.writeString(
                 dir.resolve("hosts.json"),
-                """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":{"type":"events"},""" +
-                    """"kind":"hoglake","url":"http://h:1","auth":"forward"}]}""",
+                """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":{"type":"namespace","name":"x"},""" +
+                    """"kind":"hoglake","url":"https://h:1","auth":"forward"}]}""",
             )
         refused("a server is one or the other") { config(mountHostsFile = hosts.toString()) }
         for (mode in listOf("warn", "enforce")) {

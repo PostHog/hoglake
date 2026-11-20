@@ -69,7 +69,7 @@ object Metrics {
         fun mountScan(catalog: String): Timer =
             mountScan.computeIfAbsent(catalog) { name ->
                 Timer.builder("hoglake_mount_scans")
-                    .description("Per-mount scoped scan latency, grant of the shared cap to the served plan")
+                    .description("Scoped scan latency, grant of the shared cap to the served plan")
                     .tag("catalog", name)
                     .publishPercentileHistogram()
                     // A whale org's cold scan is minutes, which the default 30 s ceiling would fold into +Inf.
@@ -82,7 +82,7 @@ object Metrics {
         fun mountProxy(catalog: String): Timer =
             mountProxy.computeIfAbsent(catalog) { name ->
                 Timer.builder("hoglake_mount_proxy_requests")
-                    .description("Per-mount proxied request latency on a mount Client, send to the Host's last byte")
+                    .description("Proxied request latency on a mount Client, send to the Host's last byte")
                     .tag("catalog", name)
                     .publishPercentileHistogram()
                     // The Host's scan deadline is a minute; the default 30 s ceiling would fold it into +Inf.
@@ -94,7 +94,7 @@ object Metrics {
             mountScanInFlight.computeIfAbsent(catalog) { name ->
                 AtomicInteger().also { n ->
                     Gauge.builder("hoglake_mount_scans_in_flight", n) { it.get().toDouble() }
-                        .description("Scoped scans of this mount in flight on this process right now")
+                        .description("Scoped scans in flight on this process right now")
                         .tag("catalog", name)
                         .strongReference(true)
                         .register(registry)

@@ -126,42 +126,6 @@ class MountHostClient(
     /** Requests in flight right now; a test holds the cap through [permits]. */
     internal val cap: Semaphore get() = permits
 
-    suspend fun catalog(
-        call: ApplicationCall,
-        mount: String,
-    ) = relay(call, mount)
-
-    suspend fun namespaces(
-        call: ApplicationCall,
-        mount: String,
-    ) = relay(call, mount, "namespaces")
-
-    suspend fun namespace(
-        call: ApplicationCall,
-        mount: String,
-        namespace: String,
-    ) = relay(call, mount, "namespaces", namespaceName(namespace))
-
-    suspend fun tables(
-        call: ApplicationCall,
-        mount: String,
-        namespace: String,
-    ) = relay(call, mount, "namespaces", namespaceName(namespace), "tables")
-
-    suspend fun table(
-        call: ApplicationCall,
-        mount: String,
-        namespace: String,
-        table: String,
-    ) = relay(call, mount, "namespaces", namespaceName(namespace), "tables", tableName(namespace, table))
-
-    suspend fun scan(
-        call: ApplicationCall,
-        mount: String,
-        namespace: String,
-        table: String,
-    ) = relay(call, mount, "namespaces", namespaceName(namespace), "tables", tableName(namespace, table), "scan")
-
     /**
      * The four routes of a remote schema ([CatalogBinding.RemoteSchema]):
      * the caller's request for the namespace `schema.schema` of its own
@@ -192,34 +156,6 @@ class MountHostClient(
         schema: CatalogBinding.RemoteSchema,
         table: String,
     ) = relaySchema(call, schema, null, "tables", tableName(schema.schema, table), "scan")
-
-    /**
-     * The Host's catalog entries for [mounts], as the Host sent them: one
-     * upstream listing whatever [mounts] holds, and only entries it names
-     * are kept. The Host decides which of them serve; one it leaves out is
-     * not listed here either.
-     */
-    suspend fun catalogs(
-        call: ApplicationCall,
-        mounts: Set<String>,
-    ): List<JsonNode> {
-        if (mounts.isEmpty()) return emptyList()
-        return exchange(call, mountSubject(mounts), URI.create("$base/v1/catalogs")) { body, deadline ->
-            val bytes = read(body, LISTING_BYTES, mounts, deadline)
-            if (bytes.size > LISTING_BYTES) throw tooLarge(mounts)
-            val root = runCatching { json.readTree(bytes) }.getOrNull()
-            if (root == null || !root.isArray) throw invalid(mounts, "a catalog listing that is not a JSON array")
-            root.filter { it.isObject && it.get("name")?.takeIf(JsonNode::isTextual)?.asText() in mounts }
-                .distinctBy { it.get("name").asText() }
-        }
-    }
-
-    /** Forward the caller's GET for `/v1/catalogs/{mount}[/tail...]` and relay the answer to [call]. */
-    private suspend fun relay(
-        call: ApplicationCall,
-        mount: String,
-        vararg tail: String,
-    ) = relay(call, mountSubject(setOf(mount)), path(mount, tail.asList()))
 
     /**
      * Forward the caller's GET for `/v1/catalogs/{catalog}/namespaces/{schema}[/tail...]`,
@@ -253,20 +189,13 @@ class MountHostClient(
     /**
      * What one exchange is for: the names it is counted against in metrics
      * ([labels]) and the wording of the 404 a request with no credential
-     * gets ([missing]). Built only by [mountSubject] and [relaySchema], which
-     * check the names first, so no label is raw request input.
+     * gets ([missing]). Built only by [relaySchema], which checks the names
+     * first, so no label is raw request input.
      */
     private class Subject(
         val labels: Set<String>,
         val missing: String,
     )
-
-    /** The subject for mount [names]: each must have the reserved shape, and this host must serve mounts. */
-    private fun mountSubject(names: Set<String>): Subject {
-        check(names.isNotEmpty() && names.all(MountNames::isReserved)) { "not a mount name" }
-        check(host.match !is MountMatch.RemoteSchemaMatch) { "a remote schema's host serves no mount" }
-        return Subject(names, "catalog '${names.first()}'")
-    }
 
     private suspend fun relay(
         call: ApplicationCall,
@@ -581,7 +510,6 @@ class MountHostClient(
         const val PREBUFFER_BYTES = 64 * 1024
         private const val COPY_BUFFER_BYTES = 64 * 1024
         private const val ERROR_BODY_BYTES = 64 * 1024
-        private const val LISTING_BYTES = 256 * 1024
 
         /** Past the host's deadline, how long a caller may still take to receive the body. */
         private const val CALLER_GRACE_MS = 10_000L

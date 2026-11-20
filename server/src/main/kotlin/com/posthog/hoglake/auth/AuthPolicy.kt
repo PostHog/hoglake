@@ -1,6 +1,5 @@
 package com.posthog.hoglake.auth
 
-import com.posthog.hoglake.store.MountNames
 import io.ktor.http.HttpMethod
 import io.ktor.http.decodeURLPart
 
@@ -150,12 +149,6 @@ object AuthPolicy {
             // and need no filtering at all.
             Entry(HttpMethod.Get, "/v1/maintenance/status", Requirement.OPERATOR),
             Entry(HttpMethod.Get, "/v1/maintenance/runs", Requirement.OPERATOR),
-            // ---- mounts (docs/auth-tenancy.md §6.5a) ----------------------
-            // A write also needs the one configured subject, which its
-            // handler checks in every mode (store/Mounts.kt requireMountWriter).
-            Entry(HttpMethod.Get, "/v1/mounts", Requirement.OPERATOR),
-            Entry(HttpMethod.Get, "/v1/mounts/{mount}", Requirement.OPERATOR),
-            Entry(HttpMethod.Put, "/v1/mounts/{mount}", Requirement.OPERATOR),
             // ---- one catalog ---------------------------------------------
             Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG", Requirement.READ),
             Entry(HttpMethod.Delete, "/v1/catalogs/$CATALOG", Requirement.ADMIN),
@@ -507,7 +500,6 @@ object AuthPolicy {
      *   ([BODY_SCOPED_ROUTES]).
      *
      * Routes that name their namespaces in the body are [BODY_SCOPED_ROUTES].
-     * On a mount's name, the [MOUNT_ROUTES] are open by `cat` alone.
      */
     internal val SCOPED_ROUTES: Set<Pair<HttpMethod, String>> =
         setOf(
@@ -561,17 +553,6 @@ object AuthPolicy {
             HttpMethod.Put to "/v1/catalogs/$CATALOG/uploads/{upload}",
         )
 
-    /**
-     * The mount column (#291 §5): the routes a mount serves its scoped
-     * reader. Every route not listed is UNAVAILABLE on a mount, and binding
-     * dispatch refuses it there (`mountRefusal`) in every auth mode; this
-     * table only lets the reader reach the binding. On a reserved-shape name
-     * a listed route is open by `cat` alone, so a route narrowed per
-     * namespace or per body must not be listed (AuthPolicyTest pins it).
-     */
-    internal val MOUNT_ROUTES: Set<Pair<HttpMethod, String>> =
-        setOf(HttpMethod.Get to "/v1/catalogs/$CATALOG")
-
     private fun authorizeScoped(
         caller: Caller,
         catalog: String,
@@ -580,17 +561,6 @@ object AuthPolicy {
         val required = match.requirement.scopeOrNull()
         val method = match.method
         val route = method?.let { it to match.pattern }
-        // A mount's route on a mount-shaped name: the shape is all this table
-        // can see, so it checks `cat`, and binding dispatch serves the mount.
-        // A reserved name that is no mount is served as the catalog it is,
-        // which shows the caller only what its catalog listing does.
-        if (required != null && route in MOUNT_ROUTES && MountNames.isReserved(catalog)) {
-            return if (caller.catalogClaimAllows(catalog, required)) {
-                AuthDecision.Allow
-            } else {
-                AuthDecision.InsufficientScope(catalog, required)
-            }
-        }
         if (required == null || route == null || (route !in SCOPED_ROUTES && route !in BODY_SCOPED_ROUTES)) {
             return AuthDecision.NotPredicated(catalog, match.pattern)
         }

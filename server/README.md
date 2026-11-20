@@ -527,8 +527,8 @@ gauged live as `hoglake_object_prefix_quarantined_files{catalog}` off
 the V31 partial index). A reader that serves one value's files of such a
 table includes only `stats_state = 'provided' AND NOT
 prefix_quarantined`: pending, failed and quarantined files stay out.
-No endpoint is such a reader yet (a mount's `ReadScope` compiles the
-predicate, docs/auth-tenancy.md §6.5a, but no route serves it): nothing
+The served stream scan is such a reader (its `ReadScope` compiles the
+predicate, docs/auth-tenancy.md §6.5d). Nothing
 clears the flag, it is on no response, and GET /scan returns a quarantined
 file as `provided`. The DDL keeps the layout true: the option is set only on an EMPTY table whose
 spec has exactly one identity field on the column, once (the same field
@@ -538,7 +538,7 @@ keep that identity field, the column cannot be dropped or renamed, the
 table cannot be renamed, and an atomic replacement of it is refused at
 prepare. GET reports `object_prefix_field` as of the snapshot read.
 Compaction keeps the layout (2.1d): it takes as inputs only
-`stats_state = 'provided' AND NOT prefix_quarantined` files (the mount
+`stats_state = 'provided' AND NOT prefix_quarantined` files (the `ReadScope`
 predicate, added to the candidate read for such tables only), writes each
 group's output under the group's value's prefix (groups never span a
 partition), proves the output's footer stats for the field before it

@@ -88,13 +88,7 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         containedFor = { call, catalog, field, value ->
             selector.forCatalog(call, catalog).liveContainedFor(catalog, field, value)
         },
-        // A mount (export) resolves here as it does on the handler, cached
-        // per request; its isolation is ReadScope in the scan, not
-        // containment, so the gate lets every namespace through (plan row
-        // 1.3h: "calls resolve and skips containment for an export"). A
-        // mount Client's remote binding is the same case one hop early:
-        // the Client holds no namespaces, and the Host scopes the read.
-        // A remote schema is the same case for one namespace of a local
+        // A remote schema, one namespace of a local
         // catalog: resolve has checked the token allows it, which is the
         // whole of this server's check, and no containment exists to read.
         isExport = { call, catalog -> selector.resolve(call, catalog) !is CatalogBinding.Local },
@@ -103,9 +97,8 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
             if (call.request.httpMethod != HttpMethod.Get) {
                 null
             } else {
-                val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
                 selector.scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeIf {
-                    match?.pattern == "/v1/catalogs/{catalog}/namespaces/{namespace}"
+                    it.matches(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
                 }?.let { binding ->
                     ScopedNamespaceRead {
                         val expected = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}"
@@ -159,6 +152,20 @@ private fun Application.installCallNamespaceGate(
         // This selection precedes isExport: resolve can issue legacy SQL.
         // A selected read always finishes here, including every refusal.
         val selected = scopedNamespace(call, pending)
+        if (selected == null && call.verifiedBackendAuthority?.readSessionBinding != null) {
+            val refusal = HoglakeException.NotFound("namespace")
+            countRefusal(
+                service,
+                service.clientClass(call),
+                caller,
+                call.attributes.getOrNull(RouteMatchKey),
+                refusal,
+                enforced = true,
+            )
+            call.respondRefusal(refusal)
+            finish()
+            return@intercept
+        }
         if (selected != null) {
             val result =
                 try {

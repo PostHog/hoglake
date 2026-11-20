@@ -1,6 +1,5 @@
 package com.posthog.hoglake.store
 
-import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.TeamNamespaces
@@ -9,41 +8,12 @@ import java.net.URI
 import java.util.UUID
 
 /**
- * Which names one mount host serves: catalog names ([Events], [Catalog]) or
+ * Which names one mount host serves:
  * namespace names in every local catalog ([Namespace], [NamespaceFamily]). A
  * name matches at most one configured host ([MountHost.requireDisjoint],
  * checked at boot).
  */
 sealed interface MountMatch {
-    fun matches(catalog: String): Boolean
-
-    /** Every mount name, `<orgID>-events` ([MountNames]). Wire: `{"type": "events"}`. */
-    data object Events : MountMatch {
-        override fun matches(catalog: String): Boolean = MountNames.isReserved(catalog)
-    }
-
-    /**
-     * One catalog, by its exact name. Wire: `{"type": "catalog", "name": "..."}`.
-     *
-     * Only a mount-shaped name is accepted today. Everything that keeps a
-     * mount apart from a catalog is keyed on that shape: `POST /v1/catalogs`
-     * refuses it, the issuer's `cat` grammar keeps it off hoglite,
-     * `AuthPolicy.MOUNT_ROUTES` opens by it, and the listing shows by it. A
-     * name outside it could be another tenant's catalog on a token-routed
-     * backend, which this binding would then shadow.
-     */
-    data class Catalog(
-        val name: String,
-    ) : MountMatch {
-        init {
-            require(MountNames.isReserved(name)) {
-                "a mount host can match a catalog by name only when the name is a mount's (<orgID>-events), got '$name'"
-            }
-        }
-
-        override fun matches(catalog: String): Boolean = catalog == name
-    }
-
     /**
      * What a match that serves namespaces, not catalogs, answers: the names
      * it keeps off this server's own catalogs ([covers]), the ones it relays
@@ -88,8 +58,6 @@ sealed interface MountMatch {
             }
         }
 
-        override fun matches(catalog: String): Boolean = false
-
         override val label: String get() = name
 
         /** Whether [namespace] is this remote schema's name or a case variant of it. */
@@ -117,8 +85,6 @@ sealed interface MountMatch {
                 "the only namespace family is '${TeamNamespaces.FAMILY}', got '$family'"
             }
         }
-
-        override fun matches(catalog: String): Boolean = false
 
         override val label: String get() = TeamNamespaces.LABEL
 
@@ -194,11 +160,8 @@ data class MountHost(
         require(origin.scheme in setOf("http", "https") && !origin.host.isNullOrEmpty()) {
             "a mount host must be an http(s) origin"
         }
-        require(!allowInsecureHttp || match is MountMatch.RemoteSchemaMatch) {
-            "allow_insecure_http is only for a mount host that matches a namespace"
-        }
-        require(match !is MountMatch.RemoteSchemaMatch || origin.scheme == "https" || allowInsecureHttp) {
-            "a mount host that matches a namespace must be an https origin: the token it is sent can carry " +
+        require(origin.scheme == "https" || allowInsecureHttp) {
+            "a mount host must be an https origin: the token it is sent can carry " +
                 "storage credentials. Set \"allow_insecure_http\": true on the entry to send it over http"
         }
         require(match !is MountMatch.Namespace || TeamNamespaces.FAMILY !in listOfNotNull(match.name, remoteName)) {
@@ -291,9 +254,6 @@ data class MountHost(
             b: MountMatch,
         ): Boolean =
             when (a) {
-                is MountMatch.Events -> b is MountMatch.Events || (b is MountMatch.Catalog && a.matches(b.name))
-                is MountMatch.Catalog -> b.matches(a.name)
-                // A namespace name and a catalog name never meet.
                 is MountMatch.RemoteSchemaMatch -> b is MountMatch.RemoteSchemaMatch && overlapping(a, b)
             }
 
@@ -311,43 +271,24 @@ data class MountHost(
 
         private fun describe(match: MountMatch): String =
             when (match) {
-                is MountMatch.Events -> "events"
-                is MountMatch.Catalog -> "catalog '${match.name}'"
                 is MountMatch.Namespace -> "namespace '${match.name}'"
                 is MountMatch.NamespaceFamily -> "namespace family '${match.family}'"
             }
     }
 }
 
-/**
- * Where a catalog name is mounted from: the one seam between "this name is
- * remote" and the proxy. `resolve` answers the reader for the host that
- * serves [catalog] to [caller], or null when no host does and the name is
- * this server's own business. The proxy knows only what it is handed here:
- * a host's kind, origin and auth mode, never a process-wide address.
- *
- * [caller] is the request's verified caller (null when there is none). The
- * static resolver does not read it; it is in the signature so that a later
- * one can take the host from a verified claim, by id ([StaticMountHosts.host]),
- * before falling back to the configured matchers, with no call site changed.
- */
 fun interface MountHostResolver {
-    fun resolve(
-        caller: Caller?,
-        catalog: String,
-    ): MountHostClient?
-
     /**
      * The remote schemas this server configures: empty unless a host matches
      * a namespace or a namespace family ([MountMatch.RemoteSchemaMatch]). Static configuration, the same
      * for every caller and catalog; who may read one is the token's to say
      * (auth/StoreEntitlement.kt).
      */
-    fun remoteSchemas(): List<RemoteSchemaHost> = emptyList()
+    fun remoteSchemas(): List<RemoteSchemaHost>
 
     companion object {
         /** No hosts: every name is local, which is a server that is not a mount Client. */
-        val NONE = MountHostResolver { _, _ -> null }
+        val NONE = MountHostResolver { emptyList() }
     }
 }
 
@@ -394,11 +335,6 @@ class StaticMountHosts(
 
     /** The reader for the configured host [id], or null: an id outside the configuration names nothing. */
     fun host(id: UUID): MountHostClient? = readers.firstOrNull { it.host.id == id }
-
-    override fun resolve(
-        caller: Caller?,
-        catalog: String,
-    ): MountHostClient? = readers.firstOrNull { it.host.match.matches(catalog) }
 
     override fun remoteSchemas(): List<RemoteSchemaHost> = schemas
 

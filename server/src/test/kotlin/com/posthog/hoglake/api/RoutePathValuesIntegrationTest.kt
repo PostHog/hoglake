@@ -98,8 +98,6 @@ class RoutePathValuesIntegrationTest {
         return TestTokens.mint(pair, claims)
     }
 
-    private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
-
     private fun send(
         port: Int,
         method: String,
@@ -179,17 +177,6 @@ class RoutePathValuesIntegrationTest {
             assertThat(made.statusCode()).describedAs(made.body()).isEqualTo(201)
             assertThat(catalogs.listTables("alpha", "team_9").map { it.name }).containsExactly("of_team_9")
             assertThat(catalogs.listTables("alpha", "team_7").map { it.name }).contains("made_here")
-        }
-    }
-
-    @Test
-    fun `a mount query parameter does not change the mount of the path`() {
-        withServer { port ->
-            val asked = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
-            val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"
-            val mount = send(port, "GET", "/v1/mounts/$asked?mount=$other", operator())
-            assertThat(mount.statusCode()).describedAs(mount.body()).isEqualTo(200)
-            assertThat(mapper.readTree(mount.body())["name"].asText()).isEqualTo(asked)
         }
     }
 }

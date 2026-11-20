@@ -46,6 +46,28 @@ class ScopedNamespaceConfigTest {
         assertThat(found.backendId).isEqualTo(UUID.fromString(id))
         assertThat(found.tenant).isEqualTo("opaque_1")
         assertThat(found.namespace).isEqualTo("reports")
+        assertThat(found.readSession).isNull()
+    }
+
+    @Test
+    fun `read session requires an explicit complete configuration and exactly the team predicate`() {
+        val settings = """{"profile":"example.aws-session","remote_targets":["remote:events","remote:imports"]}"""
+
+        fun withSession(value: String) = binding.dropLast(1) + ""","read_session":$value}"""
+        val cfg = config(withSession(settings))
+        assertThat(cfg.scopedNamespaceBinding?.readSession).isNotNull()
+        assertThatThrownBy { cfg.copy(authPredicateFields = "team_id,project_id") }
+            .hasMessageContaining("only the team_id predicate")
+        for (invalid in listOf(
+            "null",
+            "{}",
+            settings.replace("example.aws-session", "storage-session"),
+            settings.replace("remote:imports", "remote:events"),
+            settings.replace("\"remote:events\"", "1"),
+            settings.dropLast(1) + ""","extra":true}""",
+        )) {
+            assertThatThrownBy { config(withSession(invalid)) }.isInstanceOf(IllegalArgumentException::class.java)
+        }
     }
 
     @Test
@@ -100,8 +122,6 @@ class ScopedNamespaceConfigTest {
     fun `any remote or served configuration prevents activation`() {
         val cfg = config()
         for (match in listOf(
-            """{"type":"events"}""",
-            """{"type":"catalog","name":"11111111-1111-1111-1111-111111111111-events"}""",
             """{"type":"namespace","name":"reports"}""",
             """{"type":"namespace","name":"elsewhere"}""",
             """{"type":"namespace_family","family":"team"}""",

@@ -65,8 +65,8 @@ class StoreEntitlementRoutesTest {
     /**
      * Every public selector function that takes a call and a catalog name,
      * found by reflection so that a function added later is driven too.
-     * `remote` is one of them: with no mount host it answers null for a name
-     * the token allows, which counts here as an answer.
+     * `remoteSchema` is one of them: with no remote schema it answers null for
+     * a name the token allows, which counts here as an answer.
      */
     private val perCatalog: List<Method> =
         CatalogStoreSelector::class.java.methods.filter { m ->
@@ -190,7 +190,7 @@ class StoreEntitlementRoutesTest {
                     } else {
                         // MUTATION: remove the check from `resolve` and every route a
                         // tenant or a scoped caller reaches hands out `beta`; remove
-                        // it from `remote` and that one function answers for `beta`.
+                        // it from `remoteSchema` and that one function answers for `beta`.
                         if (handed.isNotEmpty()) wrong += "$what as $kind was handed $handed"
                         if (reaches) {
                             refusedAtTheStore++
@@ -207,7 +207,7 @@ class StoreEntitlementRoutesTest {
             // Not vacuous: the routes, the functions, and the refusals that came from the store.
             assertThat(routes()).hasSizeGreaterThan(60)
             assertThat(everyFunction)
-                .contains("forCatalog", "resolve", "remote", "requirePostgres", "uploads", "compaction")
+                .contains("forCatalog", "resolve", "remoteSchema", "requirePostgres", "uploads", "compaction")
                 .hasSizeGreaterThan(25)
             // Under `warn` only the scoped caller is refused.
             assertThat(refusedAtTheStore).isGreaterThan(if (mode.isEnforcing) routes().size else 30)

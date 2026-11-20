@@ -2635,9 +2635,6 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     /** A read route a mount does not serve -> 501 `mount_operation_unavailable`. */
     class MountOperationUnavailable(detail: String) : HoglakeException(detail)
 
-    /** A mount write at a revision the mount is not at -> 409 `mount_revision_conflict`. */
-    class MountRevisionConflict(detail: String) : HoglakeException(detail)
-
     /**
      * A mount scan whose scoped plan would return more files than the
      * instance's file-count budget -> 422 `mount_scan_too_many_files`. The

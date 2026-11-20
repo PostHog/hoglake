@@ -68,8 +68,6 @@ class ServedStreamIntegrationTest {
     private val cust = "cust"
     private val published = listOf("events", "persons", "sessions", "gone", "by_day", "no_layout", "broken")
 
-    /** The legacy `<orgID>-events` mount, over the same `events` table. */
-    private val mount = "$orgA-events"
     private val ns = "/v1/catalogs/$cust/namespaces/team_42"
     private val four = listOf(ns, "$ns/tables", "$ns/tables/events", "$ns/tables/events/scan")
     private val importFile = "s3://bucket/$imports/org_id=$orgA/team_id=42/pageviews/a.parquet"
@@ -226,7 +224,6 @@ class ServedStreamIntegrationTest {
                 catId,
                 events.tableId,
             )
-            h.execute("UPDATE hog_mount_switch SET enabled = true")
         }
         // A history of team 42's files in a namespace of its own, served by a Host whose stream block names it:
         // file 20 is live throughout; 22 is removed and 21 added at a later snapshot; 23 is team 43's.
@@ -422,32 +419,11 @@ class ServedStreamIntegrationTest {
                 authPredicateFields = "team_id",
                 authSessionProfile = "on",
                 servedNamespacesFile = served.toString(),
-                // The legacy mount, beside it, over the same events table.
-                mountSourceCatalog = streamCatalog,
-                mountSourceTableUuid = events.tableUuid.toString(),
-                mountSourceFieldId = teamFieldId.toString(),
                 mountScanFileBudget = fileBudget,
                 mountScanDeadlineMs = deadlineMs,
                 mountScanMaxConcurrent = maxConcurrent,
             )
-        val app =
-            App.build(
-                cfg,
-                db.jdbi,
-                mountRegistry =
-                    MountRegistry {
-                        if (it == mount) {
-                            MountRecord(
-                                mount,
-                                1,
-                                true,
-                                listOf(42, 43),
-                            )
-                        } else {
-                            null
-                        }
-                    },
-            )
+        val app = App.build(cfg, db.jdbi)
         val server = embeddedServer(Netty, configure = { configureApiListener(cfg) }) { app.module(this) }
         server.start(wait = false)
         return RunningHost(
@@ -1230,31 +1206,6 @@ class ServedStreamIntegrationTest {
                 get(port, path("team_43", "/tables/events/scan"), scoped(prd = """{"team_id":{"43":"read"}}"""))
             assertThat(imported.body()).contains(shadowedFile)
             assertThat(unchanged.map { get(port, it, token).body() }).isEqualTo(withStream)
-        }
-    }
-
-    @Test
-    fun `the legacy mount reads as before on a server with the stream block`() {
-        val reader =
-            TestTokens.mint(
-                pair,
-                TestTokens.scopedClaims(
-                    prd = """{"team_id":{"42":"read","43":"read"}}""",
-                    catalogs = """{"$mount":["read"]}""",
-                    iat = System.currentTimeMillis() / 1000 - 5,
-                    org = orgA,
-                ),
-            )
-        withHost { port, _ ->
-            val base = "/v1/catalogs/$mount/namespaces/$streamNamespace/tables"
-            val tables = json(get(port, base, reader))
-            assertThat(names(tables)).containsExactly("events")
-            assertThat(tables.single()["file_count"].asLong()).isEqualTo(3)
-            val scan = json(get(port, "$base/events/scan?include=column_stats", reader))
-            assertThat(ids(scan)).containsExactly(1L, 2L, 3L)
-            assertThat(teams(scan)).containsExactly(42L, 43L)
-            assertThat(scan.map { it["data_file"]["column_stats"].size() }).containsExactly(1, 1, 1)
-            assertThat(get(port, "$base/events_raw", reader).statusCode()).isEqualTo(404)
         }
     }
 

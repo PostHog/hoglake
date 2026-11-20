@@ -47,8 +47,8 @@ one issuer among possible issuers.
 Under `warn` a request with no token (or one that does not verify) is counted
 once, as `missing` or `invalid`, and then served as under `off`: `GET
 /v1/catalogs` lists every catalog of the default PostgreSQL backend, so the
-web UI keeps working through the burn-in. It lists no hoglite catalogs and no
-mounts (an anonymous caller has no routing claim and no mount visibility), and
+web UI keeps working through the burn-in. It lists no hoglite catalogs (an
+anonymous caller has no routing claim), and
 on a deployment whose default backend is not PostgreSQL it answers 404, as it
 did before. The per-catalog totals (`table_count`, `live_rows`,
 `live_size_bytes`, `oldest_snapshot_time`) are omitted for the anonymous
@@ -56,7 +56,7 @@ caller, as `/v1/info` omits the instance totals. A verified token gets its own
 catalogs as it would under `enforce`, with their totals unless it is scoped.
 
 Some features refuse `off` because they rely on the token: the public listener
-(`HOGLAKE_PUBLIC_PORT`), hoglite backends and mounts.
+(`HOGLAKE_PUBLIC_PORT`), hoglite backends, remote schemas and served namespaces.
 
 Listeners:
 
@@ -134,7 +134,7 @@ The core, which every issuer must emit:
 | claim | required | meaning |
 | --- | --- | --- |
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
-| `jti` | yes, by decision | token id, for correlating an audit line with a token. Required because the audit log and the access log name tokens by it; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
+| `jti` | yes, by decision | token id, for correlating a request with a token. Required because the access log names each request's token by it, and an audit line written while a request is handled reaches the token through its `request_id`; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
 | `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
 | `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
@@ -197,7 +197,8 @@ The request has no body or query parameters.
 The server sends the original verified bearer to the configured backend.
 The backend operation is `GET /v1/t/{tenant}/metadata/v1/catalogs/{catalog}/namespaces/{namespace}`.
 The backend verifies that bearer independently.
-These routes do not accept embedded storage credentials.
+These routes do not accept embedded storage credentials by default.
+The isolated fixture below is the only exception.
 
 The existing owner reads the catalog identity and live namespace in one read view.
 It requires catalog READ authority and permission for the stored containment field and value.
@@ -214,6 +215,49 @@ An unsupported backend response does not trigger an SQL fallback.
 This operation never acquires a tenant or initializes a schema.
 
 ### Session profile with embedded storage credentials
+
+#### Dedicated read verification
+
+A separate read verifier takes an explicit profile identifier from the receiver.
+It does not accept `storage-session`.
+It requires ES256 with mounted keys.
+It requires exactly `trino-session`, `hoglake-session`, and `hoglite-session` in `aud`.
+The ordinary verifier refuses these audiences.
+
+Only an isolated Hoglite fixture can opt in to this verifier.
+Add `read_session` to the binding in `HOGLAKE_SCOPED_NAMESPACE_FILE`.
+The object contains `profile` and a `remote_targets` array of two distinct target IDs.
+Configure `team_id` as the only predicate field.
+The API listener then requires a dedicated read token for the exact bound namespace GET.
+All other requests keep the ordinary verifier.
+
+Hoglake sends the original token to the configured Hoglite owner.
+It does not retry with another token or use legacy SQL after a refusal.
+The public listener never selects the dedicated verifier.
+PostgreSQL catalogs do not support this fixture.
+The fixture requires a Hoglite owner that independently accepts the dedicated profile on its typed read.
+
+The initial read scope covers one primary catalog with a Hoglite placement.
+It requires one explicit team with read permission.
+The token carries generation `1`, a session identifier, and a finite session deadline.
+Require `nbf <= iat < exp <= aws.expires_at <= session_deadline`.
+Clock skew does not extend AWS expiry.
+
+Each storage grant binds the catalog, target, bucket, region, and `s3:GetObject`.
+It carries either a literal `object_key` or a slash-terminated `prefix`.
+The verifier rejects overlaps and repeated grants.
+The manifest grant names one literal object for the routed tenant.
+Its key ends with `/<shard>/t/<routed-tenant>/manifest`, without an extension.
+The shard is the two-digit lowercase hexadecimal result of FNV-1a 32-bit modulo 256 on the full routed tenant.
+Two configured remote targets bind the read-only `team` family.
+The verifier does not retain or log the AWS credentials.
+
+The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
+give the expected verdict for each verifier.
+Their keys and credentials are fictional.
+Run `just server contract-vectors` to regenerate the file.
+
+#### Experimental profile
 
 **Status: PROPOSED, experimental, off by default.** A query engine that runs
 one user's work across many processes (a coordinator, its workers, hoglake, a
@@ -285,7 +329,7 @@ A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
 `invalid_predicate`, …).
 
 An `operator` token bypasses per-catalog checks and may create catalogs,
-manage mounts and containment, and read operator-only routes. Operator tokens
+manage containment, and read operator-only routes. Operator tokens
 are therefore only as safe as the keys in the JWKS: whoever can sign with them
 is an operator.
 
@@ -382,7 +426,7 @@ tokens does it on the issuer side: the issuer returns scoped, short-lived
 storage credentials alongside the token, in the same response, and the client
 uses them. That is how PostHog's deployment works. Storage credentials are never
 placed inside the JWT: the JWT travels on every request and is forwarded to
-mount hosts, and a storage secret should not.
+the hosts of remote schemas, and a storage secret should not.
 
 ## Clients
 

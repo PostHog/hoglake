@@ -173,7 +173,6 @@ object Audit {
             is HoglakeException.TableRecreated -> "table_recreated"
             is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
-            is HoglakeException.MountRevisionConflict -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"

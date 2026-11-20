@@ -11,8 +11,6 @@ import com.posthog.hoglake.auth.installNamespaceGate
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
-import com.posthog.hoglake.store.MountHostResolver
-import com.posthog.hoglake.store.MountRegistry
 import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
@@ -85,9 +83,6 @@ class RoutePathValuesTest {
     /** Every argument a store or backend received, as text. */
     private val received = CopyOnWriteArrayList<String>()
 
-    /** Every catalog name a handler asked the selector to resolve. */
-    private val resolved = CopyOnWriteArrayList<String>()
-
     /** A backend that records its arguments and then fails: what it was asked is all this test reads. */
     private inline fun <reified T : Any> recording(): T =
         Proxy.newProxyInstance(T::class.java.classLoader, arrayOf(T::class.java)) { _, method, args ->
@@ -111,16 +106,7 @@ class RoutePathValuesTest {
     @Test
     fun `a query parameter named like a path segment never reaches a store or a backend as the route's value`() {
         testApplication {
-            val selector =
-                CatalogStoreSelector(
-                    recording<CatalogStore>(),
-                    null,
-                    MountRegistry.NONE,
-                    MountHostResolver { _, catalog ->
-                        resolved += catalog
-                        null
-                    },
-                )
+            val selector = CatalogStoreSelector(recording<CatalogStore>())
             application {
                 val verifier =
                     JwtVerifier(
@@ -156,9 +142,8 @@ class RoutePathValuesTest {
             }
             val wrong = mutableListOf<String>()
             for (rule in routes()) {
-                for ((isOperator, token) in listOf(true to operator(), false to tenant())) {
+                for (token in listOf(operator(), tenant())) {
                     received.clear()
-                    resolved.clear()
                     client.request(url(rule)) {
                         method = rule.method
                         header(HttpHeaders.Authorization, "Bearer $token")
@@ -168,10 +153,6 @@ class RoutePathValuesTest {
                         }
                     }
                     val what = "${rule.method.value} ${rule.pattern}"
-                    // An operator reaches every handler; each resolves the catalog of the path, and only that one.
-                    if ((isOperator || resolved.isNotEmpty()) && resolved.toSet() != setOf("alpha")) {
-                        wrong += "$what resolved ${resolved.toSet()}"
-                    }
                     val fromQuery = received.filter { it in query.values }
                     if (fromQuery.isNotEmpty()) wrong += "$what was handed $fromQuery"
                 }
