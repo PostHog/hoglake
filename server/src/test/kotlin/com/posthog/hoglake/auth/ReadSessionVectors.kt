@@ -31,7 +31,7 @@ internal object ReadSessionVectors {
                 {"catalog":"example-catalog","target":"example-catalog","bucket":"example-customer",
                  "object_key":"tables/data.parquet","region":"us-east-1","actions":["s3:GetObject"]},
                 {"catalog":"example-catalog","target":"$BACKEND","bucket":"example-owner",
-                 "object_key":"root/2c/t/fixture_3/manifest.json","region":"us-east-1","actions":["s3:GetObject"]},
+                 "object_key":"root/2c/t/fixture_3/manifest","region":"us-east-1","actions":["s3:GetObject"]},
                 {"catalog":"example-catalog","target":"remote:events","bucket":"example-remote",
                  "prefix":"events/team_id=42/","region":"us-east-1","actions":["s3:GetObject"]},
                 {"catalog":"example-catalog","target":"remote:imports","bucket":"example-remote",
@@ -84,6 +84,9 @@ internal object ReadSessionVectors {
         add("experimental profile marker") { it.put("profile", SessionProfile.ID) }
         add("missing session token") { (it["aws"] as ObjectNode).remove("session_token") }
         add("noncanonical incarnation") { (it["rtg"] as ObjectNode).put("t", "fixture_03") }
+        add("wrong manifest suffix") {
+            (it["grants"][1] as ObjectNode).put("object_key", "root/2c/t/fixture_3/manifest.json")
+        }
         add("manifest prefix") {
             (it["grants"][1] as ObjectNode).apply {
                 remove("object_key")
