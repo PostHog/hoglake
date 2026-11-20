@@ -115,10 +115,11 @@ class HogliteMaintenanceStatusIntegrationTest {
         val old = Instant.now().minusSeconds(120)
         write(
             cat,
-            "INSERT INTO removals(path, file_kind, queued_snapshot, queued_at, claimed_by, drained_at, " +
+            "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at, claimed_by, drained_at, " +
                 "drained_outcome) VALUES " +
-                "('queued', 'data', 0, ?, NULL, NULL, NULL), ('claimed', 'data', 0, ?, 'worker', NULL, NULL), " +
-                "('drained', 'data', 0, ?, NULL, ?, 'absent')",
+                "('queued', 'data', 'snapshot_expiry', 0, ?, NULL, NULL, NULL), " +
+                "('claimed', 'data', 'snapshot_expiry', 0, ?, 'worker', NULL, NULL), " +
+                "('drained', 'data', 'snapshot_expiry', 0, ?, NULL, ?, 'absent')",
             HogliteSchema.fmt(old),
             HogliteSchema.fmt(old.plusSeconds(60)),
             HogliteSchema.fmt(old.minusSeconds(60)),
@@ -286,8 +287,9 @@ class HogliteMaintenanceStatusIntegrationTest {
         write(
             cat,
             "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10000) " +
-                "INSERT INTO removals(path, file_kind, queued_snapshot, queued_at, drained_at, drained_outcome) " +
-                "SELECT 'object-' || i, 'data', 0, ?, CASE WHEN i < 9990 THEN ? END, " +
+                "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at, drained_at, " +
+                "drained_outcome) SELECT 'object-' || i, 'data', 'snapshot_expiry', 0, ?, " +
+                "CASE WHEN i < 9990 THEN ? END, " +
                 "CASE WHEN i < 9990 THEN 'absent' END FROM n",
             now,
             now,

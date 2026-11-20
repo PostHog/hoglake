@@ -359,6 +359,24 @@ class HogliteCatalogStoreTest {
         assertThat(tenants["t-wh-1"]!!.name).isNull()
     }
 
+    /**
+     * An engine that cannot answer the probe (503) is unavailable now, not
+     * a refused bootstrap later: the in-transaction guard would map a 409
+     * or 422 there to Validation.
+     */
+    @Test
+    fun `create answers 503 when the engine cannot answer the foreign-key probe`() {
+        probeRefusal = 503 to mapOf("error" to "lease lost")
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("lease lost")
+        assertThat(txStatements).isEmpty()
+        assertThat(tenants["t-wh-1"]!!.name).isNull()
+    }
+
     @Test
     fun `a create on a tenant that already holds a catalog is AlreadyExists and changes nothing`() {
         seed("t-wh-1", "wh", "s3://bucket/old")

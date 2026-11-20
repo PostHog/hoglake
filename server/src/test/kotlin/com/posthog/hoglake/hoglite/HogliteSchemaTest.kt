@@ -296,7 +296,8 @@ class HogliteSchemaTest {
         )
         assertThat(table("removals")).contains(
             "file_kind TEXT NOT NULL CHECK (file_kind IN ('data', 'delete'))",
-            "reason TEXT CHECK (reason IN ('snapshot_expiry', 'table_drop_gc', 'compaction_staging', 'trino_upload'))",
+            "reason TEXT NOT NULL CHECK (reason IN ('snapshot_expiry', 'table_drop_gc', " +
+                "'compaction_staging', 'trino_upload'))",
             "drained_outcome TEXT CHECK (drained_outcome IN ('deleted', 'absent', 'registered'))",
             "CHECK ((drained_at IS NULL) = (drained_outcome IS NULL))",
         )

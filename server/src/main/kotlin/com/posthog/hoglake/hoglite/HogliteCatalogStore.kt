@@ -2980,7 +2980,9 @@ class HogliteCatalogStore(
                     task.wire,
                     trigger.wire,
                     HogliteSchema.fmt(startedAt),
-                    HogliteSchema.fmt(finishedAt),
+                    // The pod clock can step back during a run; CHECK (finished_at >=
+                    // started_at) would refuse the row and this warn-only path lose it.
+                    HogliteSchema.fmt(maxOf(startedAt, finishedAt)),
                     status.wire,
                     error,
                     result?.let { ledgerJson.writeValueAsString(it) },
@@ -3202,9 +3204,11 @@ class HogliteCatalogStore(
      * or reads 0 is misconfigured for this schema: 503, never the
      * Validation the bootstrap transaction's generic refusal mapping would
      * make of a refused probe. Authority and tenant answers keep their
-     * meaning; a read-guard answer (result too large, query timeout) says
-     * nothing about the flag and is left to the bootstrap transaction,
-     * which repeats the read on the writer connection as its own guard.
+     * meaning, and an engine that cannot answer is 503 here rather than a
+     * refused bootstrap later. Only a read-guard answer (result too large,
+     * query timeout) says nothing about the flag; it is left to the
+     * bootstrap transaction, which repeats the read on the writer
+     * connection as its own guard.
      */
     private fun probeForeignKeys(
         catalog: String,
@@ -3221,9 +3225,8 @@ class HogliteCatalogStore(
                                 "(${r.status}: ${r.body}); the catalog schema relies on it, " +
                                 "so the engine is misconfigured",
                         )
-                    is HoglakeException.Unauthenticated, is HoglakeException.Forbidden, is HoglakeException.NotFound ->
-                        throw mapped
-                    else -> return
+                    is HoglakeException.BackendResultTooLarge, is HoglakeException.BackendQueryTimeout -> return
+                    else -> throw mapped
                 }
             }
         if (row?.get(0).asLongOrNull() != 1L) throw HoglakeException.BackendUnavailable(foreignKeysOff(tenantId))

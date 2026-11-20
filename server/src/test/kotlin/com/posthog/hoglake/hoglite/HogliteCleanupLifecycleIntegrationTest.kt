@@ -171,8 +171,8 @@ class HogliteCleanupLifecycleIntegrationTest {
             write(
                 store,
                 cat,
-                "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at,drained_at,drained_outcome) " +
-                    "VALUES (?, 'data',0,?,?, 'absent')",
+                "INSERT INTO removals(path,file_kind,reason,queued_snapshot,queued_at,drained_at,drained_outcome) " +
+                    "VALUES (?, 'data','snapshot_expiry',0,?,?, 'absent')",
                 key,
                 time,
                 time,
@@ -670,8 +670,8 @@ class HogliteCleanupLifecycleIntegrationTest {
                 store,
                 cat,
                 numbers +
-                    "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at,drained_at,drained_outcome) " +
-                    "SELECT 'old-'||i,'data',0,?,?,'absent' FROM n",
+                    "INSERT INTO removals(path,file_kind,reason,queued_snapshot,queued_at,drained_at," +
+                    "drained_outcome) SELECT 'old-'||i,'data','snapshot_expiry',0,?,?,'absent' FROM n",
                 old,
                 old,
             )
@@ -869,7 +869,8 @@ class HogliteCleanupLifecycleIntegrationTest {
             write(
                 store,
                 cat,
-                "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at) VALUES (?, 'data',0,?)",
+                "INSERT INTO removals(path,file_kind,reason,queued_snapshot,queued_at) " +
+                    "VALUES (?, 'data','snapshot_expiry',0,?)",
                 path,
                 HogliteSchema.now(),
             )

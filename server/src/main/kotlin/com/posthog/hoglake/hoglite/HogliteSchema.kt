@@ -532,7 +532,7 @@ internal object HogliteSchema {
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL,
                 file_kind TEXT NOT NULL CHECK (file_kind IN ('data', 'delete')),
-                reason TEXT CHECK (reason IN ($REMOVAL_REASONS)),
+                reason TEXT NOT NULL CHECK (reason IN ($REMOVAL_REASONS)),
                 queued_snapshot INTEGER NOT NULL,
                 queued_at TEXT NOT NULL,
                 scheduled_at TEXT,
