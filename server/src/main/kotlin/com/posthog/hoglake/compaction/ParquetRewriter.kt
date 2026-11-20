@@ -9,9 +9,8 @@ import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import com.posthog.hoglake.service.Identifiers
-import org.apache.parquet.column.Dictionary
+import org.apache.parquet.column.page.PageReadStore
 import org.apache.parquet.example.data.Group
-import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.metadata.BlockMetaData
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData
@@ -22,11 +21,7 @@ import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.OutputFile
 import org.apache.parquet.io.api.Binary
-import org.apache.parquet.io.api.Converter
-import org.apache.parquet.io.api.GroupConverter
-import org.apache.parquet.io.api.PrimitiveConverter
 import org.apache.parquet.io.api.RecordConsumer
-import org.apache.parquet.io.api.RecordMaterializer
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
@@ -231,19 +226,14 @@ class InvalidDataException(message: String) : IllegalArgumentException(message)
  * all data columns are written OPTIONAL; catalog nullability is
  * metadata, not parquet repetition.
  *
- * **Nested columns rewrite, they are not copied around.** The record
- * pipeline above is already the parquet-java Group API, and a `Group`
- * is a tree: `GroupRecordConverter` materializes the whole nested
- * record and `getGroup` reaches into it. So list, struct and map extend
- * the SAME plan-and-write shape one level at a time — the plan becomes a
- * tree of [Step]s instead of a flat array — rather than needing a
- * copy-only escape hatch. That matters: making nested tables
- * `unconvertible_schema` would have meant a table with one `map` column
- * could never be compacted, which is a permanent debt leak, not a
- * deferral. The cost is per-ROW heap proportional to the nested payload
- * (the unsorted path still holds exactly one Group at a time) and a
- * recursive walk per row. The walk writes the OUTPUT record straight from
- * the decoded source row ([RowPlan]); there is no output-shaped copy.
+ * Nested columns use the same rewrite path.
+ * [OwnedGroupMaterializer] materializes the nested source tree.
+ * [RowPlan] traverses that tree without an output-shaped copy.
+ * List, struct, and map columns extend the recursive plan.
+ *
+ * Materialized-row memory follows the nested payload.
+ * The unsorted path holds one source Group at a time.
+ * Each row needs one recursive emission walk.
  *
  * Nested structure is spec-shaped on both sides: the 3-level LIST
  * encoding (`optional group x (LIST) { repeated group list { optional
@@ -626,6 +616,7 @@ object ParquetRewriter {
          * the file as parquet-java does.
          */
         val footer: ParquetMetadata? = null,
+        override val byteAppend: Boolean = false,
     ) : RunCandidate
 
     /**
@@ -697,17 +688,19 @@ object ParquetRewriter {
     )
 
     /**
-     * How a writer's row groups are bounded, when the default (128 MiB
-     * row groups, default pages, parquet-java's size-check cadence) is
-     * not the bound wanted. Only spill files ask: reading one back holds a
-     * whole row group, so the block must actually bound it, which
-     * parquet-java's check cadence does not ensure on its own (see
-     * [ExternalMergeSort.SPILL_MAX_ROWS_PER_SIZE_CHECK]).
+     * Writer block, page, and size-check settings.
+     * Spills use smaller blocks and pages.
+     * Sorted writers also install [writerMemory] without changing ordinary output settings.
+     * Large rows temporarily require checks after every row.
      */
     internal class WriterTuning(
         val rowGroupBytes: Long,
         val pageBytes: Int,
         val maxRowsPerSizeCheck: Int,
+        val measureRows: SortMemory? = null,
+        val keyDecimalWidths: IntArray = intArrayOf(),
+        val writerMemory: WriterMemory? = null,
+        val tuneChecks: Boolean = true,
     )
 
     /**
@@ -727,7 +720,11 @@ object ParquetRewriter {
         val rowId: Long,
         val key: Array<Any?> = NO_KEY,
         val plan: RowPlan? = null,
-    )
+        val memoryBytes: Long = 0,
+    ) {
+        /** Positive means measured. Negative means a conservative static encoding bound. */
+        var writerBytes: Long = 0
+    }
 
     private val NO_KEY = emptyArray<Any?>()
 
@@ -784,11 +781,12 @@ object ParquetRewriter {
      * chunk phase measured 97 MB against the copy's 82 MB at 50,000 rows,
      * and the copy was no slower (`SortedRewriteCpuMeasurement`).
      */
-    private fun unpinned(value: Binary): Binary = Binary.fromConstantByteArray(value.bytes)
+    internal fun unpinned(value: Binary): Binary = Binary.fromConstantByteArray(value.bytes)
 
     /**
-     * [GroupRecordConverter] with [budget] spent as the row is built, and
-     * every binary value [unpinned].
+     * Materialize owned SimpleGroup rows.
+     * Spend [budget] before allocations.
+     * Detach binary payloads with [unpinned].
      *
      * Parquet hands a `RecordMaterializer` a tree of converters and
      * drives it from the column pages: every `start()` on a group
@@ -804,86 +802,8 @@ object ParquetRewriter {
     internal fun budgetedMaterializer(
         schema: MessageType,
         budget: NodeBudget,
-    ): RecordMaterializer<Group> {
-        val delegate = GroupRecordConverter(schema)
-        val root = CountingGroupConverter(delegate.rootConverter, budget, isRoot = true)
-        return object : RecordMaterializer<Group>() {
-            override fun getCurrentRecord(): Group = delegate.currentRecord
-
-            override fun getRootConverter(): GroupConverter = root
-
-            override fun skipCurrentRecord() = delegate.skipCurrentRecord()
-        }
-    }
-
-    private class CountingGroupConverter(
-        private val delegate: GroupConverter,
-        private val budget: NodeBudget,
-        private val isRoot: Boolean = false,
-    ) : GroupConverter() {
-        private val children = HashMap<Int, Converter>()
-
-        override fun getConverter(fieldIndex: Int): Converter =
-            children.getOrPut(fieldIndex) {
-                when (val c = delegate.getConverter(fieldIndex)) {
-                    is PrimitiveConverter -> CountingPrimitiveConverter(c, budget)
-                    else -> CountingGroupConverter(c.asGroupConverter(), budget)
-                }
-            }
-
-        override fun start() {
-            // The root's start is the row boundary: the allowance is per
-            // ROW and per PHASE, so the decode's renews here.
-            if (isRoot) budget.reset() else budget.spend()
-            delegate.start()
-        }
-
-        override fun end() = delegate.end()
-    }
-
-    private class CountingPrimitiveConverter(
-        private val delegate: PrimitiveConverter,
-        private val budget: NodeBudget,
-    ) : PrimitiveConverter() {
-        override fun hasDictionarySupport(): Boolean = delegate.hasDictionarySupport()
-
-        override fun setDictionary(dictionary: Dictionary) = delegate.setDictionary(dictionary)
-
-        override fun addValueFromDictionary(dictionaryId: Int) {
-            budget.spend()
-            delegate.addValueFromDictionary(dictionaryId)
-        }
-
-        override fun addBinary(value: Binary) {
-            budget.spend()
-            delegate.addBinary(unpinned(value))
-        }
-
-        override fun addBoolean(value: Boolean) {
-            budget.spend()
-            delegate.addBoolean(value)
-        }
-
-        override fun addDouble(value: Double) {
-            budget.spend()
-            delegate.addDouble(value)
-        }
-
-        override fun addFloat(value: Float) {
-            budget.spend()
-            delegate.addFloat(value)
-        }
-
-        override fun addInt(value: Int) {
-            budget.spend()
-            delegate.addInt(value)
-        }
-
-        override fun addLong(value: Long) {
-            budget.spend()
-            delegate.addLong(value)
-        }
-    }
+        memory: SortMemory.RowBudget? = null,
+    ): OwnedGroupMaterializer = OwnedGroupMaterializer(schema, budget, memory)
 
     /**
      * How one matched input column lands in the output.
@@ -1136,6 +1056,7 @@ object ParquetRewriter {
             !input.explicitRowIds -> "its row ids are positional"
             footer.fileMetaData.schema != outputSchema -> "its schema is not the output schema"
             footer.blocks.isEmpty() -> "it has no row groups"
+            footer.blocks.any { it.rowCount < 0 } -> "a row group has a negative count"
             footer.blocks.any { it.compressedSize < floorBytes } ->
                 "a row group is smaller than the append floor of $floorBytes B"
             footer.blocks.any { rowIdStatistics(it) == null } -> "a row group has no row-id statistics"
@@ -1351,7 +1272,13 @@ object ParquetRewriter {
         private val shape: OutputShape,
         /** The sorted path's keys, extracted per row; null on the unsorted path. */
         private val keys: SortKeys? = null,
-    ) : Iterator<Row> {
+        private val memory: SortMemory.RowBudget? = null,
+        readerAllowanceBytes: Long = memory?.limit ?: Long.MAX_VALUE,
+        readerProfile: SortedReaderMemory.Profile? = null,
+        private val decodeStats: SortMemory.DecodeStats? = null,
+        readerClosed: Boolean = false,
+        reserveReader: (Long) -> Unit = {},
+    ) : Iterator<Row>, AutoCloseable {
         // From the reader the caller already opened, not a second open of
         // its own. This used to be `readSchema(input.source)` followed by
         // `readRows(input.source, ...)`, which opened — and so re-read and
@@ -1360,6 +1287,9 @@ object ParquetRewriter {
 
         init {
             refuseDuplicateNames(fileSchema, emptyList())
+            if (reader.footer.blocks.any { it.rowCount < 0 }) {
+                throw InvalidDataException("${input.label} has a negative row-group count")
+            }
         }
 
         // The plan and the carrier are resolved against the FILE's schema
@@ -1372,9 +1302,7 @@ object ParquetRewriter {
                 // row-id column; positional ids would be wrong for it.
                 // Resolved FIRST: its refusals (a duplicated reserved id is
                 // invalid_data) take precedence over the plan's.
-                val carrier = rowIdCarrier(fileSchema, input)
-                val variants = VariantPolicy.Expect(shape.variantLayouts, reader.footer.fileMetaData.createdBy)
-                projectRead(fileSchema, columnPlan(fileSchema, shape.liveColumns, input.label, variants), carrier)
+                projectedRead(input, reader.footer, shape)
             }
 
         /** What this reader decodes: the file schema pruned to the plan. */
@@ -1383,9 +1311,24 @@ object ParquetRewriter {
         private val srcRowIdIndex = projected.carrier
         private val plan = projected.steps
 
-        init {
-            reader.setRequestedSchema(schema)
-        }
+        private val guarded =
+            if (memory == null) {
+                reader.setRequestedSchema(schema)
+                null
+            } else {
+                try {
+                    val profile =
+                        readerProfile ?: readerProfile(input, reader.footer, schema, readerAllowanceBytes, memory.limit)
+                    val footer = reader.footer
+                    if (!readerClosed) reader.close()
+                    reserveReader(profile.chargeBytes)
+                    profile.open(input.source, footer, dataStream(input.source)).also {
+                        if (decodeStats != null) decodeStats.readers++
+                    }
+                } catch (error: SortedReaderMemoryException) {
+                    throw SortMemory.readerFailure(error)
+                }
+            }
 
         // One allowance per row, spent by the DECODE: the root converter
         // renews it at each row boundary. There is no second phase to
@@ -1405,6 +1348,16 @@ object ParquetRewriter {
         private var ordinal = 0L
         private var applied = 0L
         private var pending: Row? = null
+        private var rowGroupIndex = 0
+        private var pages: PageReadStore? = null
+
+        override fun close() {
+            records = null
+            pending = null
+            pages?.close()
+            pages = null
+            guarded?.close()
+        }
 
         override fun hasNext(): Boolean {
             if (pending == null) pending = advance()
@@ -1419,27 +1372,58 @@ object ParquetRewriter {
         private fun advance(): Row? {
             while (true) {
                 while (leftInRowGroup == 0L) {
-                    val pages = reader.readNextRowGroup()
-                    if (pages == null) {
+                    records = null
+                    pages?.close()
+                    pages = null
+                    while (rowGroupIndex < reader.footer.blocks.size &&
+                        reader.footer.blocks[rowGroupIndex].rowCount == 0L
+                    ) {
+                        rowGroupIndex++
+                    }
+                    if (rowGroupIndex >= reader.footer.blocks.size) {
                         val expected = input.deletes?.cardinality ?: 0L
                         check(applied == expected) {
                             "deletion vector for ${input.label} claims $expected positions but only " +
                                 "$applied fell inside the file — refusing a lossy compaction"
                         }
+                        close()
                         return null
                     }
-                    records = columnIO.getRecordReader(pages, budgetedMaterializer(schema, budget))
-                    leftInRowGroup = pages.rowCount
+                    val index = rowGroupIndex++
+                    val next =
+                        try {
+                            guarded?.readRowGroup(index) ?: reader.readRowGroup(index)
+                        } catch (error: SortedReaderMemoryException) {
+                            throw SortMemory.readerFailure(error)
+                        }
+                    pages = next
+                    try {
+                        records = columnIO.getRecordReader(next, budgetedMaterializer(schema, budget, memory))
+                    } catch (error: SortedReaderMemoryException) {
+                        throw SortMemory.readerFailure(error)
+                    }
+                    leftInRowGroup = next.rowCount
                 }
-                val src = records!!.read()
                 leftInRowGroup--
                 val position = ordinal++
-                if (input.deletes?.contains(position) == true) {
-                    applied++
-                    continue
-                }
-                return row(src, position)
+                readPhysicalRow(position)?.let { return it }
             }
+        }
+
+        /** A deleted row must leave this frame before the next materialization. */
+        private fun readPhysicalRow(position: Long): Row? {
+            val src =
+                try {
+                    records!!.read()
+                } catch (error: SortedReaderMemoryException) {
+                    throw SortMemory.readerFailure(error)
+                }
+            if (decodeStats != null) decodeStats.rows++
+            if (input.deletes?.contains(position) == true) {
+                applied++
+                return null
+            }
+            return row(src, position)
         }
 
         private fun row(
@@ -1467,10 +1451,50 @@ object ParquetRewriter {
                 } else {
                     input.rowIdStart + position
                 }
-            val key = boundKeys?.extract(src, input.label) ?: NO_KEY
-            return Row(src, rowId, key, rowPlan)
+            val key = boundKeys?.extract(src, input.label, memory) ?: NO_KEY
+            return Row(src, rowId, key, rowPlan, memory?.spent ?: 0)
         }
     }
+
+    internal fun projectedRead(
+        input: Input,
+        footer: ParquetMetadata,
+        shape: OutputShape,
+    ): ProjectedRead {
+        val schema = footer.fileMetaData.schema
+        val carrier = rowIdCarrier(schema, input)
+        val variants = VariantPolicy.Expect(shape.variantLayouts, footer.fileMetaData.createdBy)
+        return projectRead(schema, columnPlan(schema, shape.liveColumns, input.label, variants), carrier)
+    }
+
+    internal fun dataStream(source: InputFile): org.apache.parquet.io.SeekableInputStream =
+        when (source) {
+            is S3InputFile -> source.newDataStream()
+            is ByteCountingInputFile -> source.newDataStream()
+            else -> source.newStream()
+        }
+
+    internal fun readerProfile(
+        input: Input,
+        footer: ParquetMetadata,
+        schema: MessageType,
+        allowance: Long,
+        maxBinaryBytes: Long,
+    ): SortedReaderMemory.Profile =
+        SortedReaderMemory.profile(
+            input.source,
+            footer,
+            schema,
+            allowance,
+            maxBinaryBytes,
+            sourceReadaheadBytes =
+                when (val source = input.source) {
+                    is S3InputFile -> source.readaheadBytes.toLong()
+                    is ByteCountingInputFile -> source.readaheadBytes
+                    else -> 0
+                },
+            streamFactory = { dataStream(input.source) },
+        )
 
     /** A projected read: the requested schema, the plan re-indexed into it, the carrier's index in it. */
     internal class ProjectedRead(val schema: MessageType, val steps: List<Step?>, val carrier: Int?)
@@ -1761,6 +1785,28 @@ object ParquetRewriter {
         liveColumns: List<Column>,
         variantLayouts: Map<Long, GroupType> = emptyMap(),
     ): Int = outputSchema(liveColumns, variantLayouts).columns.size
+
+    /** Count the same output from remembered deviations, without retaining their layout trees. */
+    internal fun outputLeafCountOfShapes(
+        liveColumns: List<Column>,
+        shapes: Map<Long, VariantLayoutMemory.Shape>,
+    ): Int {
+        var leaves = outputLeafCount(liveColumns)
+        for (column in liveColumns.allNodes().filter { it.def.type == ColType.VARIANT }) {
+            val shape = shapes[column.fieldId] ?: continue
+            val declared = VariantLayout.groupType(column, Type.Repetition.OPTIONAL)
+            val replacement =
+                SortMemory.add(
+                    Math.subtractExact(leaves, VariantLayout.leaves(declared)).toLong(),
+                    shape.leaves.toLong(),
+                )
+            if (shape.leaves < 1 || replacement > Int.MAX_VALUE) {
+                throw InvalidDataException("remembered output leaf count is invalid or unrepresentable")
+            }
+            leaves = replacement.toInt()
+        }
+        return leaves
+    }
 
     /**
      * The output schema is the LIVE schema: every live column in
@@ -2655,6 +2701,34 @@ object ParquetRewriter {
     ) {
         private val fields = shape.dataFields
         private val rowIdIndex = shape.rowIdIndex
+        private val outputSchema = shape.schema
+        private var memoryExpansion = 0L
+
+        /** A schema-only bound decides whether a rare dry emission is necessary. */
+        fun emittedMemoryBound(
+            row: Row,
+            memory: SortMemory,
+        ): Long {
+            if (memoryExpansion == 0L) {
+                fun groups(
+                    type: GroupType,
+                    visit: (GroupType) -> Unit,
+                ) {
+                    visit(type)
+                    for (field in type.fields) if (!field.isPrimitive) groups(field.asGroupType(), visit)
+                }
+                var smallestSource = Long.MAX_VALUE
+                var largestOutput = 0L
+                groups(row.group.type) { smallestSource = minOf(smallestSource, memory.groupBytes(it.fieldCount)) }
+                groups(outputSchema) { largestOutput = maxOf(largestOutput, memory.groupBytes(it.fieldCount)) }
+                memoryExpansion = maxOf(1, (largestOutput + smallestSource - 1) / smallestSource)
+            }
+            return SortMemory.add(
+                SortMemory.multiply(row.memoryBytes, memoryExpansion),
+                memory.groupBytes(outputSchema.fieldCount),
+                memory.valueBytes(),
+            )
+        }
 
         /** For [SortKeys.bind]: the top-level steps, in output order. */
         internal val topSteps: List<Step?> get() = steps
@@ -2950,7 +3024,19 @@ object ParquetRewriter {
 
         /** The spec these keys were resolved from, in order. */
         val fields: List<SortFieldDef> = sortFields
+
         private val kinds = keys.map { kindOf(it.primitive) }.toTypedArray()
+        internal val memoryDecimalWidths =
+            IntArray(keys.size) { index ->
+                val primitive = keys[index].primitive
+                if (kinds[index] == KeyKind.DECIMAL &&
+                    primitive.primitiveTypeName == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
+                ) {
+                    primitive.typeLength
+                } else {
+                    0
+                }
+            }
         private val descending = BooleanArray(keys.size) { keys[it].field.direction == SortDirection.DESC }
         private val nullsFirst =
             BooleanArray(keys.size) { keys[it].field.nullOrder == com.posthog.hoglake.model.NullOrder.NULLS_FIRST }
@@ -2959,15 +3045,19 @@ object ParquetRewriter {
         fun extract(
             group: Group,
             source: String,
+            memory: SortMemory.RowBudget? = null,
         ): Array<Any?> =
-            Array(keys.size) { i ->
-                val key = keys[i]
-                val holder = navigate(group, key.path)
-                val idx = key.path.last()
-                if (holder == null || holder.getFieldRepetitionCount(idx) == 0) {
-                    null
-                } else {
-                    valueOf(kinds[i], key, holder, idx, source)
+            run {
+                memory?.keys(keys.size)
+                Array(keys.size) { i ->
+                    val key = keys[i]
+                    val holder = navigate(group, key.path)
+                    val idx = key.path.last()
+                    if (holder == null || holder.getFieldRepetitionCount(idx) == 0) {
+                        null
+                    } else {
+                        valueOf(kinds[i], key, holder, idx, source, memory)
+                    }
                 }
             }
 
@@ -2978,6 +3068,7 @@ object ParquetRewriter {
             holder: Group,
             idx: Int,
             source: String,
+            memory: SortMemory.RowBudget? = null,
         ): Any =
             when (kind) {
                 KeyKind.BOOLEAN -> if (holder.getBoolean(idx, 0)) 1L else 0L
@@ -2987,8 +3078,16 @@ object ParquetRewriter {
                 KeyKind.UINT64 -> holder.getLong(idx, 0) xor Long.MIN_VALUE
                 KeyKind.FLOAT -> holder.getFloat(idx, 0).toDouble()
                 KeyKind.DOUBLE -> holder.getDouble(idx, 0)
-                KeyKind.DECIMAL -> decimalOf(key.primitive, holder.getBinary(idx, 0).bytes, source)
-                KeyKind.BYTES -> holder.getBinary(idx, 0).bytes
+                KeyKind.DECIMAL -> {
+                    val binary = holder.getBinary(idx, 0)
+                    memory?.keyPayload(binary.length().toLong())
+                    decimalOf(key.primitive, binary.bytes, source)
+                }
+                KeyKind.BYTES -> {
+                    val binary = holder.getBinary(idx, 0)
+                    memory?.keyPayload(binary.length().toLong())
+                    binary.bytes
+                }
             }
 
         /**
@@ -3034,29 +3133,44 @@ object ParquetRewriter {
             fun extract(
                 src: Group,
                 source: String,
+                memory: SortMemory.RowBudget? = null,
             ): Array<Any?> =
-                Array(keys.size) { i ->
-                    val chain = paths[i]
-                    val leaf = leaves[i]
-                    if (chain == null || leaf == null) return@Array null
-                    var holder: Group = src
-                    for (d in 0 until chain.size - 1) {
-                        if (holder.getFieldRepetitionCount(chain[d]) == 0) return@Array null
-                        holder = holder.getGroup(chain[d], 0)
-                    }
-                    val idx = chain[chain.size - 1]
-                    if (holder.getFieldRepetitionCount(idx) == 0) return@Array null
-                    when (leaf.mode) {
-                        CopyMode.INT_TO_LONG -> holder.getInteger(idx, 0).toLong()
-                        CopyMode.UINT32_TO_LONG -> holder.getInteger(idx, 0).toLong() and 0xFFFF_FFFFL
-                        CopyMode.FLOAT_TO_DOUBLE -> holder.getFloat(idx, 0).toDouble()
-                        CopyMode.DECIMAL_INT32 -> BigInteger.valueOf(holder.getInteger(idx, 0).toLong())
-                        CopyMode.DECIMAL_INT64 -> BigInteger.valueOf(holder.getLong(idx, 0))
-                        CopyMode.DECIMAL_BINARY ->
-                            decimalOf(keys[i].primitive, holder.getBinary(idx, 0).bytes, source)
-                        CopyMode.IDENTITY -> valueOf(kinds[i], keys[i], holder, idx, source)
+                run {
+                    memory?.keys(keys.size)
+                    Array(keys.size) { i ->
+                        val chain = paths[i]
+                        val leaf = leaves[i]
+                        if (chain == null || leaf == null) return@Array null
+                        var holder: Group = src
+                        for (d in 0 until chain.size - 1) {
+                            if (holder.getFieldRepetitionCount(chain[d]) == 0) return@Array null
+                            holder = holder.getGroup(chain[d], 0)
+                        }
+                        val idx = chain[chain.size - 1]
+                        if (holder.getFieldRepetitionCount(idx) == 0) return@Array null
+                        when (leaf.mode) {
+                            CopyMode.INT_TO_LONG -> holder.getInteger(idx, 0).toLong()
+                            CopyMode.UINT32_TO_LONG -> holder.getInteger(idx, 0).toLong() and 0xFFFF_FFFFL
+                            CopyMode.FLOAT_TO_DOUBLE -> holder.getFloat(idx, 0).toDouble()
+                            CopyMode.DECIMAL_INT32 -> decimalKey(holder.getInteger(idx, 0).toLong(), memory)
+                            CopyMode.DECIMAL_INT64 -> decimalKey(holder.getLong(idx, 0), memory)
+                            CopyMode.DECIMAL_BINARY -> {
+                                val binary = holder.getBinary(idx, 0)
+                                memory?.keyPayload(binary.length().toLong())
+                                decimalOf(keys[i].primitive, binary.bytes, source)
+                            }
+                            CopyMode.IDENTITY -> valueOf(kinds[i], keys[i], holder, idx, source, memory)
+                        }
                     }
                 }
+        }
+
+        private fun decimalKey(
+            value: Long,
+            memory: SortMemory.RowBudget?,
+        ): BigInteger {
+            memory?.keyPayload(8)
+            return BigInteger.valueOf(value)
         }
 
         /** Sort keys, then row id. */

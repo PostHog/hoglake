@@ -39,6 +39,7 @@ internal class CompactionExecutor(
     private val store: ObjectStore,
     /** Request-scoped adapters can retain the bounded layout cache between calls. */
     internal val variantLayouts: VariantLayoutMemory = VariantLayoutMemory(),
+    internal val memoryRefusals: MemoryRefusalMemory = MemoryRefusalMemory(),
 ) {
     private val log = KotlinLogging.logger(CompactionService::class.java.name)
 
@@ -354,6 +355,7 @@ internal class CompactionExecutor(
                 groups = free.groups,
                 spillRefusedGroups = packed.spillRefused,
                 mergeRefusedGroups = packed.mergeRefused,
+                oversizedRowGroups = packed.oversizedRows,
                 objectPrefixUnresolvableGroups = packed.prefixUnresolvable,
                 claimedGroups = free.claimed,
                 candidatesFetched = fetched.candidatesFetched,
@@ -442,6 +444,7 @@ internal class CompactionExecutor(
         val spillRefused: Long,
         val mergeRefused: Long,
         val prefixUnresolvable: Long = 0,
+        val oversizedRows: Long = 0,
     )
 
     /** A candidate as sorted-rewrite admission sees it: catalog facts only. */
@@ -452,31 +455,22 @@ internal class CompactionExecutor(
     ) : RunCandidate
 
     /** Why the planner refused a sorted group; see [budgetRefusal]. */
-    private enum class BudgetRefusal { SPILL, MERGE }
+    private enum class BudgetRefusal { SPILL, MERGE, ROW }
 
     /**
-     * Whether a SORTED group would be refused by the rewrite's own
-     * budgets, decided from registered sizes and survivor counts before
-     * any IO: [BudgetRefusal.SPILL] when the bytes its spill path would
-     * read exceed [SortSpill.spillBudgetBytes], [BudgetRefusal.MERGE]
-     * when its spilled runs alone exceed [SortSpill.mergeBudgetBytes].
-     * Null = attempt it.
+     * Apply shared metadata admission and remembered memory refusals.
+     * [ExternalMergeSort.admit] estimates spill bytes and merge memory from registered inputs.
+     * [BudgetRefusal.ROW] identifies a cached oversized-row refusal.
+     * Null permits a runtime attempt.
      *
-     * THE REWRITER'S ARITHMETIC, NOT A COPY OF IT: this calls
-     * [ExternalMergeSort.admit] with the same trust predicate, sizes and
-     * survivors [compactGroup] hands the rewrite, so the planner cannot
-     * refuse a group the rewrite would take or wave through one it would
-     * refuse in the same way. The rewrite still checks for itself — from
-     * the footers it opens and the bytes it actually writes — and those
-     * hard stops reach [executeGroup]'s arms as the same two exceptions.
+     * At the same shape and budgets, planner, parts, and borrowing use shared admission.
+     * Metadata-trusted files are run candidates.
+     * Other files initially enter the spill estimate.
+     * The sortedness pre-pass can verify additional runs.
      *
-     * WORST CASE about sortedness: only metadata-trusted files count as
-     * runs here; every other file is assumed to spill. The rewrite's
-     * pre-pass may VERIFY some of them as already sorted and read them in
-     * place, and the planner cannot know which without reading them. So
-     * this refuses only groups that would need more spill (or more
-     * spilled runs) than the budgets allow even if nothing verified; a
-     * group it admits can only do better at execution, never worse.
+     * Metadata cannot predict arbitrary payloads or decoder allocations.
+     * Runtime guards can refuse an admitted group.
+     * The worker caches deterministic refusals by immutable identity.
      */
     private fun budgetRefusal(
         ctx: TableContext,
@@ -484,6 +478,12 @@ internal class CompactionExecutor(
         leaves: Int,
         group: CompactionGroup,
     ): BudgetRefusal? {
+        when (if (memoryRefusals.size() == 0) null else memoryRefusals.recall(memoryKey(ctx, group, spill))) {
+            MemoryRefusalMemory.Reason.SPILL -> return BudgetRefusal.SPILL
+            MemoryRefusalMemory.Reason.MERGE -> return BudgetRefusal.MERGE
+            MemoryRefusalMemory.Reason.OVERSIZED_ROW -> return BudgetRefusal.ROW
+            null -> Unit
+        }
         val runs = group.files.map { PlannedRun(trustedSorted(ctx, it), it.fileSizeBytes, it.survivingRecords) }
         val admission =
             try {
@@ -491,8 +491,14 @@ internal class CompactionExecutor(
             } catch (_: SpillBudgetExceededException) {
                 return BudgetRefusal.SPILL
             }
-        return if (admission.projectedBytes > spill.mergeBudgetBytes) BudgetRefusal.MERGE else null
+        return if (!SortMemory.fits(admission.projectedBytes, spill.mergeBudgetBytes)) BudgetRefusal.MERGE else null
     }
+
+    private fun memoryKey(
+        ctx: TableContext,
+        group: CompactionGroup,
+        spill: SortSpill,
+    ): MemoryRefusalMemory.Identity = MemoryRefusalMemory.key(ctx, group, spill, variantLayouts, appendFloorBytes)
 
     /**
      * A group's files in ROW-ID order, which is not cosmetic.
@@ -562,6 +568,7 @@ internal class CompactionExecutor(
         val spill = ctx.sortSpill
         val spillRefused = mutableListOf<CompactionGroup>()
         val mergeRefused = mutableListOf<CompactionGroup>()
+        val rowRefused = mutableListOf<CompactionGroup>()
         // Groups admitted against their KNOWN shape: that verdict is the
         // whole admission, so the declared-estimate filter below passes them
         // through. Judged against the declared estimate as well, a group of
@@ -570,16 +577,6 @@ internal class CompactionExecutor(
         // does not hold.
         val judgedByShape = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<CompactionGroup, Boolean>())
         val declaredLeaves by lazy { runCatching { ParquetRewriter.outputLeafCount(ctx.columns) }.getOrNull() }
-        val declaredVariantLeaves by lazy {
-            ctx.columns.allNodes().filter { it.def.type == ColType.VARIANT }.associate { column ->
-                column.fieldId to
-                    runCatching {
-                        VariantLayout.leaves(
-                            VariantLayout.groupType(column, org.apache.parquet.schema.Type.Repetition.OPTIONAL),
-                        )
-                    }.getOrDefault(0)
-            }
-        }
 
         // The budgets' verdict on a group in a known layout: null admits.
         // Pure, so that a loan the planner only CONSIDERS (borrow, below)
@@ -589,9 +586,8 @@ internal class CompactionExecutor(
             shapes: Map<Long, VariantLayoutMemory.Shape>,
         ): BudgetRefusal? {
             if (spill == null) return null
-            val leaves = declaredLeaves ?: return null
             val partLeaves =
-                leaves - shapes.keys.sumOf { declaredVariantLeaves[it] ?: 0 } + shapes.values.sumOf { it.leaves }
+                runCatching { ParquetRewriter.outputLeafCountOfShapes(ctx.columns, shapes) }.getOrNull() ?: return null
             return budgetRefusal(ctx, cfg.sortSpillOfShapes(ctx.columns, shapes), partLeaves, group)
         }
 
@@ -604,6 +600,11 @@ internal class CompactionExecutor(
             return when (refusalOfKnown(group, shapes)) {
                 BudgetRefusal.SPILL -> false.also { spillRefused += group }
                 BudgetRefusal.MERGE -> false.also { mergeRefused += group }
+                BudgetRefusal.ROW ->
+                    false.also {
+                        mergeRefused += group
+                        rowRefused += group
+                    }
                 null -> true
             }
         }
@@ -692,6 +693,11 @@ internal class CompactionExecutor(
                         when (budgetRefusal(ctx, spill, leaves, group)) {
                             BudgetRefusal.SPILL -> false.also { spillRefused += group }
                             BudgetRefusal.MERGE -> false.also { mergeRefused += group }
+                            BudgetRefusal.ROW ->
+                                false.also {
+                                    mergeRefused += group
+                                    rowRefused += group
+                                }
                             null -> true
                         }
                 }
@@ -706,6 +712,7 @@ internal class CompactionExecutor(
             spillRefused.size.toLong(),
             mergeRefused.size.toLong(),
             unresolvable.size.toLong(),
+            rowRefused.size.toLong(),
         )
     }
 
@@ -834,7 +841,8 @@ internal class CompactionExecutor(
             // `heap_budget` is HISTORICAL: nothing produces it since the
             // external merge sort (hoglake#134). Its successors:
             Metrics.compactionSkipped(catalog, "spill_budget", result.spillBudgetExceeded)
-            Metrics.compactionSkipped(catalog, "merge_budget", result.mergeBudgetExceeded)
+            Metrics.compactionSkipped(catalog, "merge_budget", result.mergeBudgetExceeded - result.oversizedRowGroups)
+            Metrics.compactionSkipped(catalog, "oversized_row", result.oversizedRowGroups)
             Metrics.compactionSpillBytes(catalog, result.spillBytes)
             Metrics.compactionAppendedBytes(catalog, result.bytesAppended)
             Metrics.compactionAppendSkipped(catalog, "unknown_range", result.filesUnranged)
@@ -959,44 +967,26 @@ internal class CompactionExecutor(
         val bucketsSkippedClaimed: Long = 0,
         /** Planning failures spend no object-store attempt. */
         val planningFailures: Long = 0,
+        /** A subset of [mergeBudgetExceeded] with a separate metric reason. */
+        val oversizedRowGroups: Long = 0,
         /** Workers return terminal failures after all outcomes in their wave settle. */
         val terminalFailure: Throwable? = null,
+        /** Only runtime budget guards consume attempts. */
+        val runtimeBudgetRefusals: Long = 0,
     ) {
         /**
          * What this tally has spent of `maxGroupsPerRun`.
          *
-         * The budget is a bound on OBJECT-STORE WORK, so it counts every
-         * outcome that spent a group's IO and, with one exception, no
-         * outcome that did not. Not charged:
-         *
-         *  - [spillBudgetExceeded] and [mergeBudgetExceeded], the sorted
-         *    rewrite's budgets, which the planner decides in metadata
-         *    before a byte is fetched;
-         *  - [claimedElsewhere], which is a group another maintainer is
-         *    already rewriting — refused by the planner's claim read or
-         *    by the claim insert, both of which run before the fetch.
-         *
-         * Charging either would let one un-compactable table, or one
-         * busy sibling replica, consume the whole sweep's budget and
-         * starve every other table forever. The counters' own KDoc and
-         * the OpenAPI both state this; `attempts` is where it is
-         * actually true.
-         *
-         * The exception: the same two budget refusals raised by the
-         * REWRITE mid-run (an exact footer or the bytes actually spilled
-         * broke a budget the registered metadata fit) did spend IO, and
-         * they are still not charged — they arrive through the same
-         * counters, and splitting them would put one condition under two
-         * names. They are bounded anyway: the planner admits only groups
-         * whose registered metadata fits, so a hard stop needs metadata
-         * that under-predicts the bytes, and a sweep still executes at
-         * most the groups its plans claimed.
+         * Metadata refusals, cached refusals, and [claimedElsewhere] spend no attempt.
+         * They do not fetch group data.
+         * [runtimeBudgetRefusals] charges each attempt that reaches a runtime budget guard.
+         * Public refusal counters retain both refusal types.
          */
         val attempts: Int
             get() =
                 (
                     groupsCompacted + groupsRetired + skippedConflicts + dvSuperseded +
-                        unconvertibleSchema + invalidData + failedGroups + layoutProbeOnly
+                        unconvertibleSchema + invalidData + failedGroups + layoutProbeOnly + runtimeBudgetRefusals
                 ).toInt()
 
         operator fun plus(other: GroupTally) =
@@ -1034,7 +1024,9 @@ internal class CompactionExecutor(
                 planMs + other.planMs,
                 bucketsSkippedClaimed + other.bucketsSkippedClaimed,
                 planningFailures + other.planningFailures,
+                oversizedRowGroups + other.oversizedRowGroups,
                 terminalFailure ?: other.terminalFailure,
+                runtimeBudgetRefusals + other.runtimeBudgetRefusals,
             )
 
         companion object {
@@ -1181,6 +1173,7 @@ internal class CompactionExecutor(
                     GroupTally(
                         spillBudgetExceeded = plan.spillRefusedGroups,
                         mergeBudgetExceeded = plan.mergeRefusedGroups,
+                        oversizedRowGroups = plan.oversizedRowGroups,
                         objectPrefixUnresolvable = plan.objectPrefixUnresolvableGroups,
                         claimedElsewhere = plan.claimedGroups,
                         // The plan measures, summed over every table the
@@ -1294,6 +1287,7 @@ internal class CompactionExecutor(
             spillBytes = spillBytes,
             spillBudgetExceeded = spillBudgetExceeded,
             mergeBudgetExceeded = mergeBudgetExceeded,
+            oversizedRowGroups = oversizedRowGroups,
             spillCleanupFailures = spillCleanupFailures,
             filesVerified = filesVerified,
             filesUnsorted = filesUnsorted,
@@ -1610,8 +1604,8 @@ internal class CompactionExecutor(
             // refused on its own re-admission below — still spent a group's
             // IO: charged as one attempt (`layout_probe_only`) after the
             // loop, so a sweep over a backlog of such groups is bounded by
-            // maxGroupsPerRun like any other. (The budget refusals are not
-            // attempts, as the planner's are not; without this the probe's
+            // maxGroupsPerRun like any other. (Metadata and cached budget
+            // refusals are not attempts; without this the probe's
             // footer reads would repeat every sweep, uncounted.)
             var ran = 0
             // ONE REWRITE PER PART, each resolved on its own: a part that
@@ -1649,7 +1643,7 @@ internal class CompactionExecutor(
                             )
                         }
                     }
-                if (partSpill != null && part.layouts.isNotEmpty()) {
+                if (partSpill != null) {
                     // The leaf count is the part's output schema's. That schema
                     // cannot fail to build for a planned part: every layout in
                     // it is one the probe's walk accepted, and the live
@@ -1676,6 +1670,7 @@ internal class CompactionExecutor(
                             when (refusal) {
                                 BudgetRefusal.SPILL -> GroupTally(spillBudgetExceeded = 1)
                                 BudgetRefusal.MERGE -> GroupTally(mergeBudgetExceeded = 1)
+                                BudgetRefusal.ROW -> GroupTally(mergeBudgetExceeded = 1, oversizedRowGroups = 1)
                             }
                         part.dropFooters()
                         continue
@@ -1855,19 +1850,19 @@ internal class CompactionExecutor(
             }
             return GroupTally(invalidData = 1)
         } catch (e: SpillBudgetExceededException) {
-            // The rewrite's own HARD STOP: the bytes actually spilled (or
-            // the exact footers) broke a budget the registered metadata
-            // fit — the planner refuses the predictable cases before any
-            // IO. Its own arm, ahead of `Throwable`, because it is a
-            // configuration signal and not a failure: counted with the
-            // planner's refusals and, like them, not charged. The output
-            // upload was discarded and the spill directory removed by the
-            // rewriter on the way out.
+            // The rewrite hits its spill allowance.
+            // Metadata admission already catches predictable cases.
+            // This typed configuration refusal is not an execution failure.
+            // It still consumes one runtime attempt.
+            // The rewriter handles output and spill cleanup.
             //
             // The WORK it spent is on the exception, not on a result —
             // there is none — and it is folded in here: a hard stop is
             // the group that spilled the most, and leaving it out made
             // `spill_bytes` / `runs_spilled` miss exactly those groups.
+            if (spill != null) {
+                memoryRefusals.remember(memoryKey(ctx, group, spill), MemoryRefusalMemory.Reason.SPILL)
+            }
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} stopped at its spill budget " +
@@ -1883,8 +1878,14 @@ internal class CompactionExecutor(
                     e.filesUnsorted,
                     e.filesUnchecked,
                 ) +
-                GroupTally(spillBudgetExceeded = 1)
+                GroupTally(spillBudgetExceeded = 1, runtimeBudgetRefusals = 1)
         } catch (e: MergeBudgetExceededException) {
+            if (spill != null) {
+                memoryRefusals.remember(
+                    memoryKey(ctx, group, spill),
+                    if (e.oversizedRow) MemoryRefusalMemory.Reason.OVERSIZED_ROW else MemoryRefusalMemory.Reason.MERGE,
+                )
+            }
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} cannot be merged inside its heap budget " +
@@ -1900,7 +1901,11 @@ internal class CompactionExecutor(
                     e.filesUnsorted,
                     e.filesUnchecked,
                 ) +
-                GroupTally(mergeBudgetExceeded = 1)
+                GroupTally(
+                    mergeBudgetExceeded = 1,
+                    oversizedRowGroups = if (e.oversizedRow) 1 else 0,
+                    runtimeBudgetRefusals = 1,
+                )
         } catch (e: OutOfMemoryError) {
             // The backstop, and it should be unreachable: a sorted
             // rewrite's chunk is sized by the measured per-node cost and

@@ -6024,11 +6024,10 @@ components:
             HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the replicas
             are not in fact planning the same buckets.
 
-            It spends no object-store IO, so it does NOT consume
-            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN — the same treatment
-            spill_budget_exceeded and merge_budget_exceeded get, and for
-            the same reason: a skip that costs nothing must not be able
-            to starve the sweep.
+            These skips spend no object-store I/O.
+            They do not consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+            Planner or cache refusals for spill or memory budgets use
+            the same rule.
 
             OPTIONAL, and not in `required`, for the same reason
             `offsets_released` is: the maintenance run ledger holds
@@ -6174,29 +6173,40 @@ components:
           type: integer
           format: int64
           description: >
-            Sorted groups refused because their spill would exceed
-            HOGLAKE_COMPACTION_SPILL_BYTES — in metadata at planning, from
-            the registered bytes the spill path would read (no
-            object-store IO), or by the rewrite itself the moment the bytes
-            actually written would cross it (the output is discarded). The
-            bound is in-process because the spill directory is an emptyDir
-            whose overrun EVICTS the pod rather than failing a write.
-            Configuration, not fault: the same groups re-refuse every sweep
-            until the knob, the volume or the target moves. Does not
-            consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Optional.
+            Compaction refuses these sorted groups because their spill
+            needs more than HOGLAKE_COMPACTION_SPILL_BYTES.
+            The planner can refuse a group from registered sizes before
+            object-store I/O.
+            The rewrite stops before it writes beyond the byte limit.
+            The bound protects the pod from eviction when its spill
+            directory fills.
+            Planner or cache refusals do not consume
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+            Runtime refusals after actual I/O consume one slot.
         merge_budget_exceeded:
           type: integer
           format: int64
           description: >
-            Sorted groups refused because their merge cannot fit the sorted
-            heap budget (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / the
-            parallel group count) even with every trusted input spilled:
-            too many spilled runs, each holding a row group while it is
-            read. Predicted in metadata from the registered survivor
-            counts, or raised by the rewrite from the exact spill files.
-            Reachable only by configuration (a heap budget small against
-            HOGLAKE_COMPACTION_TARGET_BYTES). Does not consume
-            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Optional.
+            Compaction refuses these sorted groups because sorting exceeds
+            the memory budget, even after spilling trusted inputs.
+            Each rewrite uses HOGLAKE_COMPACTION_SORTED_HEAP_BYTES divided
+            by the parallel group count.
+            This aggregate includes oversized_row_groups for compatibility.
+            Do not add that subset to this total.
+            Planner or cache refusals do not consume
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+            Runtime refusals after actual I/O consume one slot.
+        oversized_row_groups:
+          type: integer
+          format: int64
+          default: 0
+          description: >
+            Compaction refuses these sorted groups because one row exceeds
+            the memory budget.
+            This counts compaction groups, not rows or Parquet row groups.
+            This counter is a subset of merge_budget_exceeded.
+            Do not add it to skipped totals.
+            An absent field means zero.
         spill_cleanup_failures:
           type: integer
           format: int64

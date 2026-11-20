@@ -14,6 +14,7 @@ import com.posthog.hoglake.compaction.CompactionWork.PlannedWork
 import com.posthog.hoglake.compaction.CompactionWork.TableContext
 import com.posthog.hoglake.compaction.CompactionWork.WorkItem
 import com.posthog.hoglake.compaction.LiveDv
+import com.posthog.hoglake.compaction.MemoryRefusalMemory
 import com.posthog.hoglake.compaction.VariantLayoutMemory
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.ColumnStats
@@ -53,7 +54,7 @@ internal class HogliteCompaction(
 ) : CompactionBackend {
     private val log = KotlinLogging.logger {}
     private val storage = HogliteStorage()
-    private val executor = CompactionExecutor(storage, objectStore, cursors.variantLayouts)
+    private val executor = CompactionExecutor(storage, objectStore, cursors.variantLayouts, cursors.memoryRefusals)
 
     override fun runOnce(
         catalog: String,
@@ -866,6 +867,7 @@ internal class HogliteCompactionCursors {
     data class Position(val specId: Long, val valuesJson: String, val bytes: Long, val fileId: Long)
 
     val variantLayouts = VariantLayoutMemory()
+    val memoryRefusals = MemoryRefusalMemory()
     private val nextCatalogId = AtomicLong()
     private val catalogIds =
         object : LinkedHashMap<String, Long>(16, 0.75f, true) {

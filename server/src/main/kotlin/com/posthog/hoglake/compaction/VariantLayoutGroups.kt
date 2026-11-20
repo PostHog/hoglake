@@ -449,7 +449,9 @@ internal object VariantLayoutGroups {
     ): Long {
         val dataEnd =
             footer.blocks.maxOfOrNull { block ->
-                block.columns.maxOfOrNull { it.startingPos + it.totalSize } ?: block.startingPos
+                // Empty blocks have no data span.
+                // They can omit column metadata.
+                block.columns.maxOfOrNull { it.startingPos + it.totalSize } ?: 0L
             } ?: 0L
         return (fileSizeBytes - dataEnd - 8).coerceAtLeast(0)
     }

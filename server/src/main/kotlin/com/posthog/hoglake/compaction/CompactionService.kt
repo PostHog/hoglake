@@ -746,30 +746,10 @@ data class CompactionConfig(
         get() = maxOf(1L, sortedHeapBytes / parallelGroups)
 
     /**
-     * How many ROWS of [columns] one CHUNK of the sorted rewrite holds —
-     * the chunk phase's heap bound ([sortedHeapBytesPerGroup]) in the unit
-     * the heap actually holds. Only the arithmetic of the former sorted
-     * row ceiling survives here: it used to bound a whole GROUP, and now
-     * bounds one chunk (hoglake#134).
-     *
-     * A materialized row is not its bytes; it is a `SimpleGroup`, a
-     * `List<Object>[]` field array, and then an `ArrayList` plus that
-     * list's backing `Object[]` plus one boxed value for every populated
-     * field. Measured at **151.6 bytes per node** for the flat event
-     * shape this catalog holds (`SortedHeapMeasurement`, steady-state
-     * retained heap over 200k rows);
-     * [SORTED_HEAP_BYTES_PER_NODE] rounds that up, because erring large
-     * costs smaller chunks and erring small costs an OOM in a background
-     * loop — the same asymmetry [nestedSortExpansion] is calibrated on.
-     *
-     * Nodes are counted off the LIVE schema (every node of the forest,
-     * plus one for the `_hog_row_id` carrier every output writes), which
-     * is exact for flat tables and a floor for nested ones — hence the
-     * [nestedSortExpansion] division, which is the only thing standing in
-     * for list lengths the catalog cannot know. A VARIANT is one catalog
-     * node but a Parquet group of up to thousands ([VariantLayout.shape]),
-     * so it counts as its layout's nodes, and as nested when that layout
-     * holds a list.
+     * Advisory row ceiling for one sorted chunk.
+     * Runtime byte charges can flush earlier without reducing the configured group allowance.
+     * The legacy 192-byte node estimate preserves ordinary flat-table chunk sizes.
+     * Nested schemas retain their configured row-count derate.
      *
      * [variantLayouts], by field id, is the subtree a rewrite actually
      * writes a variant column in where that is not the declared one — the
@@ -813,7 +793,17 @@ data class CompactionConfig(
     internal fun sortSpillOfShapes(
         columns: List<Column>,
         shapes: Map<Long, VariantLayoutMemory.Shape>,
-    ): SortSpill = sortSpill(columns).copy(chunkRows = spillChunkRowsOfShapes(columns, shapes))
+    ): SortSpill =
+        sortSpill(columns).copy(
+            chunkRows = spillChunkRowsOfShapes(columns, shapes),
+            readerBudgetBytes = readerReserveBytes(ParquetRewriter.outputLeafCountOfShapes(columns, shapes)),
+        )
+
+    private fun readerReserveBytes(leaves: Int): Long =
+        SortMemory.add(
+            targetBytes,
+            SortMemory.multiply(leaves.toLong(), ExternalMergeSort.TRUSTED_PAGE_BYTES_PER_LEAF),
+        )
 
     /**
      * The bounds a sorted rewrite of a table shaped [columns] runs under:
@@ -834,6 +824,7 @@ data class CompactionConfig(
             spillBudgetBytes = spillBytes,
             spillDir = spillDir,
             verifyMinBytes = verifyMinBytes,
+            readerBudgetBytes = readerReserveBytes(ParquetRewriter.outputLeafCount(columns, variantLayouts)),
         )
 
     companion object {
@@ -844,25 +835,22 @@ data class CompactionConfig(
         const val DEFAULT_NESTED_SORT_EXPANSION = 64
 
         /**
-         * Heap cost of one materialized parquet-java node, for
-         * [spillChunkRows].
+         * Advisory schema-node cost for [spillChunkRows].
          *
          * Measured 151.6 B/node (`SortedHeapMeasurement`: 200k flat
-         * 11-field event rows retained 333.5 MB, 1667 B/row); 192 rounds
-         * up by a quarter to cover the less-settled samples, allocator
-         * variance and the reference array `sortedWith` copies. A node is
-         * one populated field: its `ArrayList`, that list's backing array
-         * and one boxed value.
+         * 11-field event rows retained 333.5 MB, 1667 B/row).
+         * The 192 B estimate sets an advisory row ceiling.
+         * [SortMemory] separately guards groups, field slots, present values, and payloads.
+         * Null fields receive no present-value charge.
          */
         const val SORTED_HEAP_BYTES_PER_NODE = 192L
 
         /**
-         * See [sortedHeapBytes]. 1 GiB: worst-case process peak ~1614 MiB
-         * (the larger of the chunk phase with a target-sized input row
-         * group and the merge with the flat ~140 MiB output writer, plus
-         * the hydrator's whole-object ceiling), 56% of the 4 GiB
-         * maintenance pod's ~2.8 GiB heap. server/README.md has the pod
-         * table.
+         * See [sortedHeapBytes]. The default flat-schema charged envelope is 1907 MiB.
+         * This is 67% of the maintenance pod's 2867 MiB heap.
+         * It includes the reader reserve, writer, sorter, metadata, caches, and hydrator.
+         * Sampled total heap occupancy also includes uncollected allocations.
+         * server/README.md records the sizing model and measurements.
          */
         const val DEFAULT_SORTED_HEAP_BYTES = 1024L * 1024 * 1024
 
@@ -1112,6 +1100,8 @@ data class CompactionPlan(
      * plan had become slow before every sweep started dying.
      */
     val planMs: Long = 0,
+    /** Cached oversized-row refusals, included in [mergeRefusedGroups]. */
+    val oversizedRowGroups: Long = 0,
 )
 
 /**

@@ -97,9 +97,8 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
             if (call.request.httpMethod != HttpMethod.Get) {
                 null
             } else {
-                val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
                 selector.scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeIf {
-                    match?.pattern == "/v1/catalogs/{catalog}/namespaces/{namespace}"
+                    it.matches(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
                 }?.let { binding ->
                     ScopedNamespaceRead {
                         val expected = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}"
@@ -153,6 +152,20 @@ private fun Application.installCallNamespaceGate(
         // This selection precedes isExport: resolve can issue legacy SQL.
         // A selected read always finishes here, including every refusal.
         val selected = scopedNamespace(call, pending)
+        if (selected == null && call.verifiedBackendAuthority?.readSessionBinding != null) {
+            val refusal = HoglakeException.NotFound("namespace")
+            countRefusal(
+                service,
+                service.clientClass(call),
+                caller,
+                call.attributes.getOrNull(RouteMatchKey),
+                refusal,
+                enforced = true,
+            )
+            call.respondRefusal(refusal)
+            finish()
+            return@intercept
+        }
         if (selected != null) {
             val result =
                 try {

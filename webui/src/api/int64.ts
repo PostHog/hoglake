@@ -184,6 +184,7 @@ const INT64_FIELDS = new Set([
   "spill_bytes",
   "spill_budget_exceeded",
   "merge_budget_exceeded",
+  "oversized_row_groups",
   "spill_cleanup_failures",
   // The sortedness pre-pass's verdicts (CompactionResult, hoglake#134).
   "files_verified",
