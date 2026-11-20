@@ -1765,21 +1765,23 @@ data class CompactionResult(
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val spillBytes: Long = 0,
     /**
-     * Sorted groups refused because their spill would exceed
-     * HOGLAKE_COMPACTION_SPILL_BYTES: in metadata at planning from the
-     * registered input bytes (no IO), or stopped by the rewrite the moment
-     * the bytes actually written would cross it (output discarded). A
-     * spill directory is an emptyDir whose overrun EVICTS the pod, which
-     * is why the bound is in-process. Configuration, not fault; not
-     * charged to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+     * Count sorted groups that exceed HOGLAKE_COMPACTION_SPILL_BYTES.
+     * Metadata admission checks registered input sizes without IO.
+     * Runtime guards stop before another write exceeds this allowance.
+     * The rewrite discards aborted output.
+     *
+     * A spill-volume overrun can evict the pod.
+     * Metadata-only refusals spend no attempt.
+     * A runtime refusal spends one HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN slot.
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val spillBudgetExceeded: Long = 0,
     /**
      * Sorted groups refused because their merge cannot fit the sorted
      * heap budget (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / parallel
-     * groups) even with every trusted input spilled. Reachable only by
-     * configuration; not charged, like [spillBudgetExceeded].
+     * groups) even with every trusted input spilled. Metadata-only refusals spend no attempt.
+     * Runtime guards consume an attempt.
+     * The worker caches deterministic memory refusals.
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val mergeBudgetExceeded: Long = 0,
@@ -1900,6 +1902,9 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val layoutProbeOnly: Long = 0,
+    /** Groups with a row above the byte allowance, included in [mergeBudgetExceeded]. */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val oversizedRowGroups: Long = 0,
 )
 
 /**

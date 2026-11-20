@@ -481,7 +481,11 @@ class HogliteCompactionIntegrationTest {
             compaction { c, _ ->
                 when (mutation) {
                     "claimed" -> rawWrite(c, "UPDATE removals SET claimed_at = '2026-01-01T00:00:00.000Z'")
-                    "drained" -> rawWrite(c, "UPDATE removals SET drained_at = '2026-01-01T00:00:00.000Z'")
+                    "drained" ->
+                        rawWrite(
+                            c,
+                            "UPDATE removals SET drained_at = '2026-01-01T00:00:00.000Z', drained_outcome = 'absent'",
+                        )
                     "attempted" -> rawWrite(c, "UPDATE removals SET attempts = 1")
                     "table" -> rawWrite(c, "UPDATE tables SET dropped_snapshot = 999 WHERE name = 'events'")
                     "input" -> rawWrite(c, "UPDATE files SET end_snapshot = 999 WHERE path = '$a'")

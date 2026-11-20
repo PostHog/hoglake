@@ -84,7 +84,12 @@ internal object CompactionWork {
          * roots the output paths under its prefix ([ObjectPrefix.dataFilePath]).
          */
         val containment: NamespaceContainment? = null,
-    )
+    ) {
+        /** A plan reuses this schema fingerprint across all groups and borrow checks. */
+        val memoryRefusalIdentity: MemoryRefusalMemory.Identity by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            MemoryRefusalMemory.contextKey(this)
+        }
+    }
 
     data class PlanWithContext(
         val ctx: TableContext,

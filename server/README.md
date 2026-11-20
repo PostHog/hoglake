@@ -142,6 +142,21 @@ things like "one live table of this name per namespace" and "one live
 deletion vector per data file", CHECK-constrained vocabularies. The
 database rejects states the code shouldn't have to defend against.
 
+### The same model, one tenant per catalog (Hoglite)
+
+`hoglite/HogliteSchema.kt` is `schema.sql` re-expressed for one SQLite
+tenant per catalog, foreign keys, cascades, deferred namespace edges and
+CHECKs included; its KDoc ("Referential integrity") has the edge-by-edge
+mapping, the statement-order rules the store follows, and what SQLite
+cannot express. hoglite enforces the constraints on every tenant
+connection (`PRAGMA foreign_keys = ON`, which no client can change);
+`createCatalog` checks that once, at bootstrap, and refuses a tenant
+without it (503 `backend_unavailable`). A `FOREIGN KEY constraint failed`
+refusal of any later transaction is `HogliteIntegrityViolation`, a 500: a
+store bug, never a client error. Tenants have no migrations, so a schema
+change (this one included) means dropping and recreating every
+development tenant.
+
 ## Feature walkthroughs
 
 ### Commits and concurrency control
@@ -1700,73 +1715,165 @@ A file with columns lacking field ids is not checked (they bind by name,
 which the check does not follow), and a sort column a file lacks is
 null in every row — sorted.
 
-What it costs, per checked file: `1 + keys x row groups` ranged GETs —
-the footer, then one per sort-key column chunk per row group, because
-the key chunks are not adjacent and each becomes its own request
-(`hoglake_compaction_sort_check_bytes_total`; a debug log line per file
-names its reads and bytes) — through a separate stream with a 256 KiB
-readahead, since the merge's 8 MiB readahead would pad every key chunk
-into the columns between them; plus a second footer read at the reopen
-for each file that becomes a run. A writer with many small row groups
-multiplies the first term: DuckDB's 122,880-row default is 40+ row
-groups in a 500 MB file, so 40+ GETs per key column. It runs through the open window (`HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS`
-files at once); each slot holds a footer, one row group's projected
-key chunks and the readahead, before admission and outside the merge
-budget. The SIZE FLOOR is why small files are not checked: two opens
-(the projected pre-pass, then the reopen for the merge) against one
-chunk-phase read plus one local spill write and read. At 16 MiB the
-local round trip costs about what the extra open does; below it the
-chunk path wins outright, and at millions of small files a day it also
-keeps the merge's fan-in at a few spilled runs rather than thousands of
-one-file runs. `0` checks every input of known size (a file of unknown
-size is never checked). The planner's metadata refusals
-stay WORST CASE: they assume nothing verifies, so they refuse only groups
-that would not fit even if every non-trusted file spilled.
+The guarded pre-pass profiles one row group at a time.
+It checks key-page headers before decoding projected chunks.
+A sort violation stops both decoding and later row-group profiling.
+Memory refusals leave the file unverified, rather than marking it unsorted.
+
+A checked file can require `1 + 2 x keys x row groups` ranged GETs.
+This covers its footer, key-page header scans, and projected chunk reads.
+Adjacent reads and the 256 KiB key-stream readahead can reduce that count.
+The 8 MiB merge readahead would unnecessarily fetch intervening columns.
+A verified file also needs a footer reopen for its ordinary input pipeline.
+`hoglake_compaction_sort_check_bytes_total` records delivered bytes, including header scans.
+
+The open window bounds simultaneous footer opens with
+`HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS`.
+Only the caller decodes a projected row group at a time.
+The same reader and allocation guards protect this pass before admission.
+The two projected key rows share the configured row allowance.
+
+The **16 MiB** size floor keeps tiny inputs on the chunk path.
+Below that floor, another remote read usually costs more than local spilling.
+It also prevents millions of tiny verified inputs from becoming merge heads.
+`0` checks every known-size input; unknown-size inputs remain unchecked.
+Metadata admission assumes no input verifies and still uses runtime feedback
+for payloads it cannot predict.
 
 Key order is exact whenever every trusted run is key-sorted. Ties break
 by row id when every trusted input was itself written that way — true of
 every output this rewriter writes — and otherwise deterministically but
 unspecified (outputs written before #134 broke ties in input order).
 
-`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default **1 GiB**, divided by
-`HOGLAKE_COMPACTION_PARALLEL_GROUPS`) bounds BOTH phases of one group.
-The chunk is that budget in rows: the live schema's node count at
-~192 B per materialized node (measured 151.6, rounded up), divided again
-by `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64) for a table
-with nested columns, whose object graph measured 30-70x its compressed
-bytes. That is the old row ceiling's arithmetic; it now sizes a chunk,
-never a group. The merge is that budget in buffered bytes: parquet-java's
-`readNextRowGroup()` holds a reader's whole compressed row group, so a
-run costs its largest row group plus a page per leaf plus its stream
-buffer — a trusted run up to the 128 MiB output block (exact from its
-footer, which is read before any data), a spilled run ~16 MiB plus
-128 KiB per leaf. Trusted inputs are ADMITTED largest first while the
-projected cost of every run fits; the rest are DEMOTED to the spill path,
-which changes work and never correctness.
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` defaults to **1 GiB**. Parallel
+groups divide this allowance. Each group can use its full allowance for
+retained chunk rows or decoded merge runs. The existing 192-byte node
+estimate remains an advisory row ceiling. Nested schemas retain their
+64-fold row-count derate. Neither estimate replaces runtime byte checks.
 
-Two refusals remain, both typed, counted, decided by the planner in
-METADATA with the rewriter's own arithmetic (`ExternalMergeSort.admit`)
-and re-checked by the rewrite itself, and neither charged to the run's
-group budget:
+The row charge includes group headers, empty field lists, present values,
+binary payloads, sort keys, row wrappers, and reference-array growth.
+Absent values cost field slots, not imaginary value objects. Guards run
+before group, value, and key allocations. Byte pressure spills the
+existing chunk before an incoming allocation. The row ceiling flushes
+only when another surviving row arrives. A deleted tail therefore does
+not force a boundary spill.
 
-- `spill_budget_exceeded` /
-  `hoglake_compaction_skipped_total{reason="spill_budget"}`: the
-  registered bytes a group's spill path would read exceed
-  `HOGLAKE_COMPACTION_SPILL_BYTES` (default **4 GiB**, per group). The
-  rewrite also meters every byte it writes and stops, discarding its
-  output, the moment the next would cross the budget. The bound is
-  in-process because the spill directory is an emptyDir: an overrun of
-  its `sizeLimit` is a kubelet EVICTION of the pod, not an IOException,
-  and `FileStore.usableSpace` reports the node's disk, not the limit.
-  Size the volume as `parallelGroups x spillBytes` with margin. A 512 MiB
-  group of zstd client inputs spills under ~0.9 GiB (snappy spill of
-  zstd input runs ~1.6x its bytes).
-- `merge_budget_exceeded` /
-  `hoglake_compaction_skipped_total{reason="merge_budget"}`: the
-  group's spilled runs ALONE exceed the merge budget. Only configuration
-  reaches it — a heap budget small against the byte target — and there
-  is deliberately no multi-pass merge to absorb it (twice the spill disk,
-  and a second code path, for a misconfiguration).
+Input decoding has a structural reserve: the byte target plus
+2 MiB per output leaf. A header profile charges projected compressed
+chunks, actual pages, decoder state, dictionaries, and source buffers.
+It does not charge every row-group value or all uncompressed bytes.
+Positive reader excess uses the retained-row allowance.
+Existing rows spill before a larger reader loads pages.
+Reader plus retained memory remains below the budget plus structural reserve.
+
+Indexed row-group reads release the previous store before reading another.
+Codec and value guards check allocation controls before decompression or
+materialization. The sortedness pre-pass uses these guards too.
+Memory refusals leave a file unverified for the ordinary chunk path.
+
+A decoded merge run costs its reader profile plus twice its largest
+charged row. The second row covers replacement overlap. Spill writers
+measure the emitted representation, including carrier fields and keys,
+without building another row graph. Trusted reader profiles and head
+caps are installed before spilling. A shared ledger checks observed
+trusted-row maxima before allocating larger heads. Spill profiles and
+measured row maxima replace their metadata estimates.
+
+The spill estimate includes packed scratch for the producer's 20,000-row
+pages and fixed column/page objects. An eleven-leaf run now estimates
+19,216,564 bytes. Four runs reserve 76,866,256 bytes, compared with
+76,385,594 observed bytes. This remains an estimate, not a universal
+page-count or dictionary bound.
+
+Owned converters release completed nested groups.
+They transfer root ownership when records return.
+Absent fields cannot pin earlier rows through converter
+state. Deleted rows leave their decode frame before another row starts.
+
+Writer-only allocations remain separate from emitted-row maxima.
+Slab capacities, compression output, checksum copies, and retained extrema
+share the fixed writer reserve. Overflow competes with retained rows or
+merge heads. Large rows enable per-row page checks within their row
+group. The 128 MiB output target and 1 MiB pages remain unchanged.
+Ordinary rows keep their existing check cadence.
+
+Dictionary hash arrays, encoded-ID lists, and fallback scratch share the ledger.
+A per-row-group values factory guards actual growth before allocation.
+Page resets keep dictionary capacity charges until their references are released.
+Binary dictionary keys include retained payloads.
+The ledger gives no source ownership credit.
+
+A whole-row forecast can flush a pending group before writing.
+Forecasts alone never refuse a row.
+
+Ordinary forecasts add next-row growth to current capacities.
+They do not multiply already-buffered pages.
+Rare large-row forecasts remain separate.
+
+A schema bound avoids another graph walk for ordinary flat rows.
+Potentially large emissions receive a dry consumer walk before writing.
+This walk counts bytes without constructing an output row graph.
+Closed footer metadata follows serialized statistics semantics, rather
+than retaining omitted full binary bounds.
+Completed row groups keep only bounded extrema metadata.
+Aggregate bounding preserves serialized statistics and page indexes.
+
+Native codec buffers remain outside the heap ledger.
+Container sizing must retain headroom for those buffers and codec contexts.
+
+Byte-appended runs do not open decoded readers or reserve decoded heads.
+A potential byte append triggers a bounded, footer-only range pass.
+The range pass reuses supplied footers.
+It closes transport streams promptly.
+Unknown, truncated, or non-order-preserving bounds cannot prove an append.
+Final spill ranges are checked again before copying row groups.
+
+A mixed spill can span an empty gap between disjoint source ranges.
+The original source proof remains valid across that gap.
+Actual merge boundaries are checked before each raw copy.
+Groups without potential append candidates do not pay this extra range pass.
+
+Planning, remembered-layout parts, borrowing, and execution use the same
+metadata estimate. Runtime guards check actual spill bytes, decoder
+allocations, and merge heads. The rewrite can refuse an admitted group.
+The refusal cache prevents repeated work for an unchanged group.
+The rewrite uses one merge pass. It adds no operator setting.
+
+Remembered layouts use their actual leaf counts when sizing the same reader reserve.
+
+Byte and row totals saturate instead of wrapping.
+Overflow never fits, even under maximum-valued budgets.
+Negative registered sizes or survivor counts are invalid data, not cacheable memory refusals.
+
+Deterministic memory and spill-budget refusals enter a worker-local cache of 50,000
+identities, below 8 MiB with ordinary JVM object alignment. Entries retain a digest and reason, not input
+or schema graphs. The digest covers file and DV identities, survivors,
+schema, layout, sort version, and effective budgets. Changed identities
+retry immediately.
+
+Entries have no TTL. Eviction or restart permits a fresh attempt.
+Other workers do not share these entries. A different group composition
+permits a new attempt. An unchanged cached refusal performs no
+object-store I/O. It consumes no rewrite slot.
+
+Refusal counters retain their existing aggregate meaning:
+
+- `spill_budget_exceeded` and metric reason `spill_budget` cover the
+  per-group disk allowance, **4 GiB** by default. Registered spill bytes
+  are checked before IO. The writer also meters every emitted byte.
+  Crossing the allowance discards the output. Size the spill volume as
+  `parallelGroups x spillBytes`, with margin, because emptyDir overruns
+  can evict the pod.
+- `merge_budget_exceeded` covers decoded readers, merge heads, and rows
+  that cannot fit their allowances. Ordinary merge refusals use metric
+  reason `merge_budget`. They can occur during metadata admission,
+  header preflight, or guarded decoding.
+- `oversized_row_groups` is a subset of `merge_budget_exceeded`, not an
+  additional skipped group. It identifies an oversized materialized row
+  or binary value. Cached refusals preserve this distinction.
+  The `merge_budget` metric excludes `oversized_row`. Add both reasons
+  to compare the metric with the ledger's `merge_budget_exceeded` counter.
 
 `heap_budget_exceeded` (`reason="heap_budget"`) is HISTORICAL: nothing
 produces it any more. It stays on the wire and in the ledger, reading 0.
@@ -1876,10 +1983,15 @@ chunks, retained heap at a full GC):
 | 8,000,000 | 160 | 147 MB | 82 MB | 1,206 MB |
 
 The chunk phase is FLAT in group size. The merge held ~6.6 MB per
-spilled run (above the writer) against the ~17.4 MiB each is charged.
-The OUTPUT writer is FLAT too: parquet-java keeps the row group it is
-building in memory until the row group closes, which is a constant —
-about 1.1x the 128 MiB output row group plus buffer slack, ~140 MiB.
+spilled run (above the writer) against the current ~18.3 MiB estimate.
+The output writer also stays flat.
+It buffers one output row group until close.
+The historical buffered cost is about 140 MiB for a 128 MiB target.
+
+These measurements use ordinary binary extrema. Large extrema require
+explicit writer accounting, even when footer serialization omits them.
+Writer guards include those lifetimes.
+Emitted spill-head charges do not.
 
 It used to grow, by ~40 MB per million rows with no plateau (310 MB at
 3.2M rows, 519 MB at 6.4M, 643 MB at 8M), and the cause was not the
@@ -1894,56 +2006,76 @@ can pin a page. Measured with `SortedRewriteHeapMeasurement` before and
 after; the class histogram at the old peak was ~500 MB of `byte[]` under
 ~80k live `ByteBufferBackedBinary`.
 
-The CHUNK phase holds, besides the chunk itself: the current input's
-whole compressed row group (a client file's own block size, bounded only
-by the file's size, which is under the target), the spill writer's
-16 MiB block (up to ~2x that in buffer slabs), the sort's temporary
-reference array (at most half the chunk's references, ~1 MiB per 500,000
-rows), and the admitted trusted readers' parsed footers (KiB each). The
-chunk is charged at 192 B a node and measured at 151.6 (0.79x,
-`SortedHeapMeasurement`), so those terms ride in the remaining 0.21x of
-the budget (215 MiB at 1 GiB) unless an input's row group is larger than
-~175 MiB. With a target-sized single-row-group input the chunk phase is
-at most 809 + 512 + 32 + ~5 MiB = ~1,360 MiB at the default, which is now
-MORE than the merge phase's 1,024 + 156 MiB, so the peak is the larger
-of the two. The one path that holds a chunk AND the output writer, the
-single-chunk in-memory sort, holds no spill writer and no input row
-group, so it is at most 0.79x the budget plus the writer.
+The earlier measurements above remain the baseline for the row-only
+model. They do not justify discounting the new retained-row allowance.
+The current deployment envelope charges the full configured budget.
+For the default flat event schema, eleven output leaves give a
+`512 + 11 x 2 = 534 MiB` structural reader reserve. A large uncompressed
+row group is not necessarily a large reader: compressed chunks and
+live pages determine the profile. Conversely, compressed candidate files
+must remain below the byte target.
 
-So the honest worst-case process peak is
+For one parallel group, the chunk envelope includes the 1,024 MiB row
+budget, 534 MiB reader, 32 MiB spill writer, and 5 MiB sorter.
+The sizing reserve adds 16 MiB for ordinary flat-schema footer metadata,
+40 MiB for both worker caches, and 256 MiB for the hydrator.
+The resulting **1,907 MiB** is below 70% of the deployment's 2,867 MiB
+heap. The merge envelope instead adds the output writer and multipart
+buffer to the full merge allowance. A single-chunk output has no live
+input reader or spill writer beside its output writer.
+
+The bounded-child calibration verifies two million event rows from eight
+inputs totaling 83,110,081 bytes. It keeps the 1 GiB budget and exactly
+four spills. The integrated writer calibration sampled 1,459,723,936 heap bytes.
+Earlier intermediate snapshots sampled up to 2,241,339,624 bytes, above 70% of the fixture heap.
+These samples include uncollected allocations, unlike full-GC retained measurements.
+The 1,907 MiB sizing assertion remains the charged-envelope gate, not a sampled-occupancy guarantee.
+
+Separate cases verify 400,000 rows in one input row group and a 151-column sparse schema with 200,000 rows.
+The sparse case uses six spills.
+A 507,579,537-byte near-target source consumes 24,037,751 bytes of coordinated reader excess.
+After five spills, two million output rows pass payload verification.
+Its sampled heap peak is 2,614,492,832 bytes, or 87% of the child heap.
+That measurement underscores the difference between live charges and total occupancy.
+
+This is a flat-schema charged-allocation envelope, not a universal
+bound for arbitrary footer graphs. Retained variant footers and unusually
+large metadata require their own measured reserve. Header parsing,
+footer retention, and open concurrency remain bounded. Keep the existing
+heap-percentage assertion when changing any term. Do not replace it
+with an inequality that merely fits the entire heap.
+
+For `P` parallel groups and `L` output leaves per group:
 
 ```
-max( SORTED_HEAP_BYTES + parallelGroups x (140 MiB + 16 MiB),   (merge: admitted runs at their charge; output writer, flat; S3 part buffer)
-     0.79 x SORTED_HEAP_BYTES + 512 MiB + 37 MiB )             (chunk: chunk graph; a target-sized input row group; spill writer + sort array)
-+ 256 MiB                                                       (the hydrator's whole-object ceiling, same tick)
+reader = targetBytes + 2 MiB x L
+merge = SORTED_HEAP_BYTES + P x (144 MiB + 16 MiB)
+chunk = SORTED_HEAP_BYTES + P x (reader + 32 MiB + 5 MiB)
+single = SORTED_HEAP_BYTES + P x (144 MiB + 5 MiB)
+peak = max(merge, chunk, single) + P x 16 MiB + 40 MiB + 256 MiB
 ```
 
-against a heap that is 70% of the pod (`MaxRAMPercentage=70`). The table
-below is for `parallelGroups = 1` and a ten-column flat event table
-(11 nodes a row with the row-id carrier, so 2,112 B per chunk row); the
-spill-file counts are for a full 512 MiB group of zstd (~70 B/row) and of
-snappy (~119 B/row) client input, and the merge charge is the zstd case's
-spilled runs at 17.4 MiB each:
+The reader reserve is per group. It is outside `SORTED_HEAP_BYTES`.
+Use the actual leaf count for wide or shredded schemas.
 
-| pod | heap | `SORTED_HEAP_BYTES` | peak | chunk rows | spill files zstd / snappy | merge charge (zstd) |
+The table retains the earlier compression calibration: approximately
+70 B per zstd row and 119 B per Snappy row. Row counts are advisory
+ceilings. Larger actual rows can spill earlier. The merge column uses
+metadata estimates, while runtime uses actual profiles and emitted-row
+maxima. The full target and default output settings remain unchanged.
+
+| pod | heap | `SORTED_HEAP_BYTES` | peak | chunk rows | spill files zstd / snappy | merge estimate (zstd) |
 |---|---|---|---|---|---|---|
-| 4 GiB (today) | 2.8 GiB | **1 GiB** (default) | 1614 MiB, 56% | 508,400 | 16 / 9 | 278 MiB |
-| 8 GiB | 5.6 GiB | 2 GiB | 2460 MiB, 43% | 1,016,800 | 8 / 5 | 139 MiB |
-| 16 GiB | 11.2 GiB | 4 GiB | 4508 MiB, 39% | 2,033,601 | 4 / 3 | 70 MiB |
-| 32 GiB | 22.4 GiB | 8 GiB | 8604 MiB, 38% | 4,067,203 | 2 / 2 | 35 MiB |
-| 64 GiB | 44.8 GiB | 16 GiB | 16796 MiB, 37% | 8,134,407 | 1 / 1 (no spill) | 0 |
+| 4 GiB | 2.8 GiB | **1 GiB** | 1907 MiB, 67% | 508,400 | 16 / 9 | 293 MiB |
+| 8 GiB | 5.6 GiB | 2 GiB | 2931 MiB, 51% | 1,016,800 | 8 / 5 | 147 MiB |
+| 16 GiB | 11.2 GiB | 4 GiB | 4979 MiB, 43% | 2,033,601 | 4 / 3 | 73 MiB |
+| 32 GiB | 22.4 GiB | 8 GiB | 9075 MiB, 40% | 4,067,203 | 2 / 2 | 37 MiB |
+| 64 GiB | 44.8 GiB | 16 GiB | 17267 MiB, 38% | 8,134,407 | 1 / 1, no spill | 0 |
 
-Every row reaches the full 512 MiB target; the knob buys fewer, larger
-spill files and room to read more trusted runs in place, not bigger
-groups. **The default fits today's 4 GiB pod**: 56% of the heap in the
-worst case, before the rest of the server. That bound assumes a
-target-sized single-row-group input during the chunk phase (or, in the
-merge, the full charge — ~2.6x what a spilled run measured), plus the
-hydrator's ceiling; a realistic zstd group at the default merges 16
-spilled runs (~106 MB measured, 278 MiB charged). Raising the knob
-without the pod is how the OOM comes back; at 512 MiB the bound is 42%.
-Gigahog runs the last row with `parallelGroups` above 1, which adds
-156 MiB per extra group to the merge term (6 groups: 17576 MiB, 38%).
+Every row retains the 512 MiB target. More heap buys fewer spills and
+more decoded trusted runs, not larger groups. At six parallel groups,
+the last row becomes approximately 20,200 MiB, or 44% of its heap.
+Raise the pod before raising the sorted allowance.
 
 ### The multipart upload needs a lifecycle rule
 

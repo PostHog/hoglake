@@ -8,6 +8,7 @@ import com.posthog.hoglake.api.AbandonUploadsDto
 import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.ClaimUploadDto
 import com.posthog.hoglake.api.CommitRequestDto
+import com.posthog.hoglake.api.CompactionResultDto
 import com.posthog.hoglake.api.CreateCatalogRequestDto
 import com.posthog.hoglake.api.CreateNamespaceRequestDto
 import com.posthog.hoglake.api.CreateTableRequestDto
@@ -38,6 +39,7 @@ import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationDefinitionCodec
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.plugins.BadRequestException
+import org.junit.jupiter.api.Test
 
 /**
  * Fuzz target (docs/fuzzing.md layer 4, target f): the wire parse path for
@@ -194,6 +196,27 @@ class WireDtoParseFuzzTest {
             check(mapper.readValue<StorageUsageDto>(mapper.writeValueAsBytes(dto)) == dto)
             val body = mapper.readTree(mapper.writeValueAsBytes(dto))
             check(body["tracked_bytes"].isTextual && body["pending_delete_files"].isTextual)
+        }
+
+        // Compaction counters retain exact integer tokens through the production mapper.
+        parseOrNull { mapper.readValue<CompactionResultDto>(data) }?.let { dto ->
+            val encoded = mapper.writeValueAsBytes(dto)
+            check(mapper.readValue<CompactionResultDto>(encoded) == dto)
+            val original = mapper.readTree(data)
+            val body = mapper.readTree(encoded)
+            val counters =
+                listOf(
+                    "oversized_row_groups" to dto.oversizedRowGroups,
+                    "merge_budget_exceeded" to dto.mergeBudgetExceeded,
+                )
+            for ((name, value) in counters) {
+                val token = body[name]
+                check(token.isIntegralNumber)
+                check(token.bigIntegerValue() == value.toBigInteger())
+                original[name]?.takeIf { it.isIntegralNumber }?.let { expected ->
+                    check(token.bigIntegerValue() == expected.bigIntegerValue())
+                }
+            }
         }
 
         parseOrNull { mapper.readValue<CreateNamespaceRequestDto>(data) }?.let { dto ->
@@ -371,6 +394,23 @@ class WireDtoParseFuzzTest {
             } catch (e: Exception) {
                 checkAllowed("AlterTableRequestDto", e)
             }
+        }
+    }
+
+    @Test
+    fun `compaction corpus seeds reach the exact counter oracle`() {
+        val seeds =
+            mapOf(
+                "compaction-result-int64.json" to (Long.MAX_VALUE to 9_007_199_254_740_993L),
+                "commit_empty" to (0L to 0L),
+            )
+        for ((name, counters) in seeds) {
+            val resource = "WireDtoParseFuzzTestInputs/wireParseFailsOnlyWithMappedExceptions/$name"
+            val data = requireNotNull(javaClass.getResourceAsStream(resource)).use { it.readBytes() }
+            val parsed = mapper.readValue<CompactionResultDto>(data)
+            check(parsed.mergeBudgetExceeded == counters.first)
+            check(parsed.oversizedRowGroups == counters.second)
+            wireParseFailsOnlyWithMappedExceptions(data)
         }
     }
 

@@ -946,9 +946,11 @@ internal object HogliteCommit {
             }
         }
 
-        // 4. Allocate: the snapshot, then the file ids this commit needs
-        // (data files first, then DVs — the shared allocator's order).
+        // 4. Allocate: the snapshot (and its row, which the change rows of
+        // step 8 reference), then the file ids this commit needs (data
+        // files first, then DVs — the shared allocator's order).
         tx.allocateCommitSnapshot()
+        tx.insertSnapshotRow(request.author, request.message)
         val totalFiles = plannedAppends.size + plannedDeletes.size
         if (totalFiles > 0) {
             tx.affectOne(
@@ -1108,7 +1110,8 @@ internal object HogliteCommit {
             }
         }
 
-        // 8. Typed change rows, the snapshot row, the receipt, readback.
+        // 8. Typed change rows (their snapshot row went in at step 4), the
+        // receipt, then its ended count (which references it), readback.
         for (t in order.values) {
             val table = resolved.getValue("${t.namespace}.${t.table}")
             if (t.appends) {
@@ -1136,15 +1139,6 @@ internal object HogliteCommit {
                 )
             }
         }
-        tx.insertSnapshotRow(request.author, request.message)
-        if (request.idempotencyKey != null && ends.isNotEmpty()) {
-            tx.add(HogliteSchema.RECEIPT_ENDED_DDL)
-            tx.add(
-                "INSERT INTO receipt_ended(idempotency_key, ended_files) VALUES " +
-                    "(?, (SELECT COUNT(*) FROM files WHERE end_snapshot = ${HogliteSchema.HEAD_SQL}))",
-                request.idempotencyKey.toString(),
-            )
-        }
         if (request.idempotencyKey != null) {
             tx.add(
                 "INSERT INTO receipts(idempotency_key, fingerprint, snapshot_id, schema_version, created_at) " +
@@ -1152,6 +1146,14 @@ internal object HogliteCommit {
                 request.idempotencyKey.toString(),
                 fingerprint,
                 HogliteSchema.now(),
+            )
+        }
+        if (request.idempotencyKey != null && ends.isNotEmpty()) {
+            tx.add(HogliteSchema.RECEIPT_ENDED_DDL)
+            tx.add(
+                "INSERT INTO receipt_ended(idempotency_key, ended_files) VALUES " +
+                    "(?, (SELECT COUNT(*) FROM files WHERE end_snapshot = ${HogliteSchema.HEAD_SQL}))",
+                request.idempotencyKey.toString(),
             )
         }
         val readback = tx.add(HogliteSql.READBACK_COMMIT)

@@ -316,10 +316,13 @@ class HogliteRetirementIntegrationTest {
     fun `foreign vectors prevent any deletion or removal queue entry`() {
         val cat = catalog()
         droppedFiles(cat, 1)
+        // The vector's table must exist (dvs.table_id REFERENCES tables); a live one with no files.
+        val other = store.createTable(cat, "ns", "other", listOf(ColumnDef("id", ColType.LONG))).tableId
         write(
             cat,
             "INSERT INTO dvs(delete_file_id, table_id, data_file_id, path, " +
-                "delete_count, file_size_bytes, begin_snapshot, epoch) VALUES (1, 999, 1, ?, 1, 20, 1, 1)",
+                "delete_count, file_size_bytes, begin_snapshot, epoch) VALUES (1, ?, 1, ?, 1, 20, 1, 1)",
+            other,
             "s3://hoglake-it/$cat/foreign",
         )
         val result = HogliteRetirement(store).runOnce(cat)
@@ -347,7 +350,7 @@ class HogliteRetirementIntegrationTest {
                     write(
                         raced,
                         "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at) " +
-                            "VALUES (?, 'data', 'test', 1, ?)",
+                            "VALUES (?, 'data', 'snapshot_expiry', 1, ?)",
                         "s3://hoglake-it/$raced/already",
                         HogliteSchema.now(),
                     )
@@ -369,7 +372,7 @@ class HogliteRetirementIntegrationTest {
         HogliteInterposer(engine.url()).use { proxy ->
             val hook =
                 proxy.hook({ m, p, b -> HogliteInterposer.isWriteTx(m, p, b) && "INSERT INTO removals" in b }) {
-                    write(cat, "UPDATE files SET end_snapshot = begin_snapshot WHERE id = 1")
+                    write(cat, "UPDATE files SET end_snapshot = begin_snapshot + 1 WHERE id = 1")
                 }
             val result = HogliteRetirement(proxy.store, batchSize = 1).runOnce(cat)
             assertThat(hook.fired).isTrue()

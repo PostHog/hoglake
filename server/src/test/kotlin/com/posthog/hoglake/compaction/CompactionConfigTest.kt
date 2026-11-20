@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.schema.Type
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -500,31 +501,22 @@ class CompactionConfigTest {
 
     @Test
     fun `the default is sized for the pod the maintenance deployment actually has`() {
-        // The knob is only honest if its default is safe on the pod that
-        // exists. 4 GiB at MaxRAMPercentage=70 is ~2.8 GiB of heap. The
-        // worst-case process peak since the external merge sort
-        // (hoglake#134) is the LARGER of its two phases, plus the
-        // hydrator's 256 MiB whole-object ceiling firing in the same tick:
-        // the MERGE — the admitted runs charged up to the budget, the
-        // OUTPUT writer's buffered row group (measured flat at ~147 MB,
-        // SortedRewriteHeapMeasurement, since the materializer stopped its
-        // statistics pinning input pages) and the 16 MiB S3 part buffer —
-        // and the CHUNK phase — the chunk at ~0.79x the budget, a
-        // target-sized 512 MiB input row group, the spill writer's slabs
-        // and the sort's reference array (~37 MiB).
-        //
-        // Pinned as an inequality against the REAL heap rather than as
-        // an equality on the constant: the failure this guards is
-        // someone raising the default (or a term growing) without the
-        // charts change that makes it survivable. The honest formula puts
-        // the default at 56%, stated in server/README.md.
+        // Charge the full row allowance, not the former 0.79 measured fraction.
+        // Preserve the deployment's 70%-of-heap inequality.
+        // This envelope covers the calibrated flat event schema and ordinary metadata.
         val mib = 1024.0 * 1024
         val heap = 4.0 * 1024 * mib * 0.70
         val budget = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
         val outputWriter = 147_502.0 * 1024
         val merge = budget + outputWriter + 16 * mib
-        val chunk = 0.79 * budget + 512 * mib + 37 * mib
-        val peak = maxOf(merge, chunk) + 256 * mib
+        val eventColumns = (1L..10L).map { Column(it, (it - 1).toInt(), ColumnDef("field$it", ColType.LONG)) }
+        val reader = defaulted().sortSpill(eventColumns).readerBudgetBytes.toDouble()
+        assertThat(reader).isEqualTo(534 * mib)
+        val chunk = budget + reader + 37 * mib
+        val single = budget + outputWriter + 5 * mib
+        val metadataAndCaches = (16 + 40) * mib
+        val peak = maxOf(merge, chunk, single) + metadataAndCaches + 256 * mib
+        assertThat(peak / mib).isEqualTo(1907.0)
         assertThat(peak / heap)
             .describedAs(
                 "worst-case peak %.0f MiB against a %.0f MiB heap — raise the pod before the knob",
@@ -1137,6 +1129,39 @@ class CompactionConfigTest {
         assertThat(app)
             .containsPattern("""variantCompaction\s*=\s*cfg\.compactionVariant\b""")
             .containsPattern("""variantCompactionCatalogs\s*=\s*cfg\.compactionVariantCatalogs""")
+    }
+
+    @Test
+    fun `remembered historical shapes use exactly the runtime reader reserve`() {
+        val bare = Column(2, 1, ColumnDef("v", ColType.VARIANT))
+        val typed =
+            bare.copy(
+                def = bare.def.copy(typeParams = mapOf("shredding" to mapOf("type" to "int64"))),
+            )
+        val config = defaulted()
+        for ((declared, historical) in listOf(bare to typed, typed to bare)) {
+            val live = flatColumns + declared
+            val layout = VariantLayout.groupType(historical, Type.Repetition.OPTIONAL)
+            val (nodes, nested) = VariantLayout.shape(layout)
+            val shapes = mapOf(2L to VariantLayoutMemory.Shape(nodes, nested, VariantLayout.leaves(layout)))
+            val runtime = config.sortSpill(live, mapOf(2L to layout))
+            val remembered = config.sortSpillOfShapes(live, shapes)
+            assertThat(remembered).isEqualTo(runtime)
+            assertThat(remembered.readerBudgetBytes).isNotEqualTo(config.sortSpill(live).readerBudgetBytes)
+            assertThat(
+                config.sortSpillOfShapes(live, shapes + (999L to VariantLayoutMemory.Shape(9, true, 4))),
+            ).describedAs("layouts of absent columns do not change the output").isEqualTo(runtime)
+        }
+    }
+
+    @Test
+    fun `remembered shape leaf counts cannot wrap into an affordable reader reserve`() {
+        val live = flatColumns + Column(2, 1, ColumnDef("v", ColType.VARIANT))
+        for (leaves in listOf(-1, 0, Int.MAX_VALUE)) {
+            assertThatThrownBy {
+                defaulted().sortSpillOfShapes(live, mapOf(2L to VariantLayoutMemory.Shape(4, false, leaves)))
+            }.isInstanceOf(InvalidDataException::class.java)
+        }
     }
 
     @Test
