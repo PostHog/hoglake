@@ -938,15 +938,18 @@ export interface CompactionResult {
   runs_demoted?: Int64;
   spill_bytes?: Int64;
   /**
-   * Sorted groups refused because their spill would exceed
-   * HOGLAKE_COMPACTION_SPILL_BYTES (decided from registered sizes before
-   * any IO, or stopped by the rewrite at the bytes actually written), and
-   * because their spilled runs alone cannot fit the sorted heap budget.
-   * Configuration, not fault: the same groups re-refuse every sweep until
-   * a knob moves.
+   * Groups that compaction refuses because sorting exceeds HOGLAKE_COMPACTION_SPILL_BYTES.
    */
   spill_budget_exceeded?: Int64;
+  /** Groups that compaction refuses because sorting exceeds the memory budget. This includes oversized_row_groups. */
   merge_budget_exceeded?: Int64;
+  /**
+   * Groups that compaction refuses because one row exceeds the memory budget.
+   * This counts compaction groups, not rows or Parquet row groups.
+   * This subset of merge_budget_exceeded adds no skipped groups.
+   * An absent field means zero.
+   */
+  oversized_row_groups?: Int64;
   /** Spill directories a rewrite could not remove: disk the spill volume still counts. */
   spill_cleanup_failures?: Int64;
   /**
