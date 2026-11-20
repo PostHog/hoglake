@@ -237,6 +237,11 @@ The manifest grant names one literal object for the routed tenant.
 Two configured remote targets bind the read-only `team` family.
 The verifier does not retain or log the AWS credentials.
 
+The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
+give the expected verdict for each verifier.
+Their keys and credentials are fictional.
+Run `just server contract-vectors` to regenerate the file.
+
 #### Experimental profile
 
 **Status: PROPOSED, experimental, off by default.** A query engine that runs
