@@ -116,12 +116,19 @@ its answer, deliberately above the server's 30 s commit-lock wait so a
 queued commit's clean 503 `commit_queue_timeout` is heard rather than
 timed out into an unknown outcome; every other request keeps the 30 s
 read timeout. The whole loop — attempts and backoff — is bounded by
-`hoglake_commit_deadline_ms` (default 300 s): without it retried read
+`hoglake_commit_deadline_ms` (default 300 s, capped at 30 min: half the
+server's one-hour floor on `HOGLAKE_RECEIPT_RETENTION_SECONDS`, so a
+retry under the key never outlives its receipt and publishes the files
+again): without it retried read
 timeouts could hold COMMIT for max retries × 120 s (~22 min) against a
 hung server. No attempt waits past the deadline (its read timeout is
 clamped to the time left) and no attempt starts that could not end
 before it; the commit then stops, with the unknown-outcome advice when
-an attempt timed out. Retries: commit-loop only, default
+an attempt timed out. Only `commit_queue_timeout` and
+`backend_unavailable` are definite 503s; any other 503 (a proxy's
+untyped one included) is an unknown outcome, retried only under a key.
+An attempt that throws before the server answers (a failed token
+re-mint) after an earlier unknown outcome still ends with the advice. Retries: commit-loop only, default
 max 10 / 100 ms / backoff 1.5, no jitter (DuckLake's numbers), settings
 `hoglake_max_retry_count` / `hoglake_retry_wait_ms` /
 `hoglake_retry_backoff`.

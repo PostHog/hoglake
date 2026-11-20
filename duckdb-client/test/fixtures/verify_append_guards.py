@@ -645,6 +645,29 @@ class AppendGuards(unittest.TestCase):
                 )
                 self.assertEqual(len(self.files(table)), 1)
 
+    def test_untyped_503_is_an_unknown_outcome(self):
+        # A proxy's 503 with a non-API body can follow a commit it forwarded
+        # and lost the answer to. Only commit_queue_timeout and
+        # backend_unavailable are definite; this one retries only under the
+        # key, and without the capability it stops with the advice.
+        self.proxy.injected = [(503, "<html>upstream connect error</html>")]
+        before = len(self.proxy.commits)
+        self.run_sql(f"INSERT INTO {self.prefix}x VALUES (11, 22)")
+        self.assertEqual(len(self.proxy.commits), before + 2)
+        self.assertEqual(self.proxy.commits[before], self.proxy.commits[before + 1])
+        self.assertIn("idempotency_key", self.proxy.commits[before])
+        self.assertEqual(len(self.files("x")), 1)
+        self.proxy.withheld_capabilities = {"idempotent-append-v1"}
+        self.proxy.injected = [(503, "<html>upstream connect error</html>")]
+        before = len(self.proxy.commits)
+        result = self.run_sql(
+            f"INSERT INTO {self.prefix}y VALUES (11, 22)", succeeds=False
+        )
+        self.assertEqual(len(self.proxy.commits), before + 1)
+        self.assertIn("MAY be durable", result.stderr)
+        self.assertIn("idempotent-append-v1", result.stderr)
+        self.assertNotIn("retries exhausted", result.stderr)
+
     def assert_unknown_outcome_advice(self, stderr, key):
         # The terminal error for a commit the server may have published:
         # names the key and the receipt route, says what a 404 there
@@ -719,8 +742,10 @@ class AppendGuards(unittest.TestCase):
                 "y",
                 (409, {"error": "ddl_since_read_snapshot", "detail": "changed"}),
                 " (start a new transaction and re-run the statement)",
-                "this refusal needs a new transaction and ended the retries; "
-                "after 2 attempt(s) the commit MAY be durable",
+                (
+                    "this refusal needs a new transaction and ended the retries; "
+                    "after 2 attempt(s) the commit MAY be durable"
+                ),
             ),
         )
         for table, definite, definite_suffix, lead in cases:
@@ -804,9 +829,7 @@ class AppendGuards(unittest.TestCase):
         )
         # 6 without the deadline; 3 with it (0-1 s, 1-2 s, 2-2.5 s)
         self.assertIn(len(self.proxy.commits), (2, 3), self.proxy.commit_times)
-        self.assertLess(
-            self.proxy.commit_times[-1] - self.proxy.commit_times[0], 2.5
-        )
+        self.assertLess(self.proxy.commit_times[-1] - self.proxy.commit_times[0], 2.5)
         self.assertEqual(len(set(map(json.dumps, self.proxy.commits))), 1)
         self.assertIn("no_response", result.stderr)
         self.assertIn(

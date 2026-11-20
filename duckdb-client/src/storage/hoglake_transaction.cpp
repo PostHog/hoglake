@@ -1,6 +1,7 @@
 #include "storage/hoglake_transaction.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/catalog_exception.hpp"
@@ -436,9 +437,13 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 	// hold COMMIT for max_retries × commit_timeout_ms (~22 min at the
 	// defaults) against a hung server. No attempt waits past it, and no
 	// attempt starts that could not end before it.
+	// It is also the window in which a keyed retry is exactly-once, so it
+	// stays under the server's minimum receipt retention
+	// (MAX_COMMIT_DEADLINE_MS).
 	auto deadline_ms = MaxValue<uint64_t>(
-	    MinValue<uint64_t>(
-	        GetSettingOrDefault<uint64_t>(context, "hoglake_commit_deadline_ms", DEFAULT_COMMIT_DEADLINE_MS), 86400000),
+	    MinValue<uint64_t>(GetSettingOrDefault<uint64_t>(context, "hoglake_commit_deadline_ms",
+	                                                     DEFAULT_COMMIT_DEADLINE_MS),
+	                       MAX_COMMIT_DEADLINE_MS),
 	    1000);
 	auto started = std::chrono::steady_clock::now();
 	auto elapsed_ms = [&started]() {
@@ -457,7 +462,23 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 	for (idx_t attempt = 0;; attempt++) {
 		// the check before each sleep leaves time on the clock here
 		auto remaining_ms = deadline_ms - MinValue<uint64_t>(elapsed_ms(), deadline_ms - 1);
-		auto outcome = Api().TryCommit(request, MinValue<uint64_t>(commit_timeout_ms, remaining_ms));
+		HoglakeCommitOutcome outcome;
+		try {
+			outcome = Api().TryCommit(request, MinValue<uint64_t>(commit_timeout_ms, remaining_ms));
+		} catch (std::exception &e) {
+			// an attempt that throws before the server answers (a token
+			// re-mint that fails) settles nothing; after an earlier unknown
+			// outcome the error must still carry the advice and the key
+			if (!outcome_unknown) {
+				throw;
+			}
+			ErrorData error(e);
+			throw TransactionException(
+			    "hoglake: commit failed: %s%s", error.RawMessage(),
+			    UnknownOutcomeAdvice(Api(), attempt + 1,
+			                         StringUtil::Format("attempt %llu failed before the server answered", attempt + 1),
+			                         false, request.idempotency_key));
+		}
 		if (outcome.success) {
 			return;
 		}
@@ -486,16 +507,19 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 				retryable = true;
 			}
 		} else if (outcome.status == 503) {
-			// backpressure (commit_queue_timeout) and a backend that did
-			// not answer (backend_unavailable) applied nothing and retry
-			// as they are. commit_outcome_unknown may have published, so
-			// it retries only under a key the server honors (see above).
-			// Honor Retry-After.
-			if (outcome.error == "commit_outcome_unknown") {
+			// Only the server's own backpressure (commit_queue_timeout) and
+			// a backend that did not answer (backend_unavailable) applied
+			// nothing and retry as they are. Every other 503 may have
+			// published: commit_outcome_unknown, and a proxy's untyped 503
+			// (its body is not the API's JSON, so error reads "HTTP 503")
+			// sent after it forwarded the commit and lost the answer. Those
+			// retry only under a key the server honors (see above). Honor
+			// Retry-After.
+			if (outcome.error == "commit_queue_timeout" || outcome.error == "backend_unavailable") {
+				retryable = true;
+			} else {
 				outcome_unknown = true;
 				retryable = keyed;
-			} else {
-				retryable = true;
 			}
 			if (outcome.retry_after_seconds > 0) {
 				sleep_ms = MinValue<idx_t>(outcome.retry_after_seconds, 600) * 1000;

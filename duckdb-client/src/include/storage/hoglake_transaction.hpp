@@ -102,6 +102,12 @@ public:
 	//! COMMIT for max_retries × timeout, ~22 min at the defaults, against
 	//! a hung server.
 	static constexpr idx_t DEFAULT_COMMIT_DEADLINE_MS = 300000;
+	//! Ceiling on hoglake_commit_deadline_ms: half the server's floor on
+	//! HOGLAKE_RECEIPT_RETENTION_SECONDS (one hour, Config's
+	//! MIN_RECEIPT_RETENTION_SECONDS). A retry under the key replays the
+	//! receipt only while the receipt exists; one sent after cleanup
+	//! purged it publishes the same files again and reports success.
+	static constexpr idx_t MAX_COMMIT_DEADLINE_MS = 1800000;
 
 	// -- catalog entry cache ----------------------------------------------
 	//! A name the listing does not hold is asked of the server once per

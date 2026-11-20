@@ -38,7 +38,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("hoglake_commit_deadline_ms",
 	                          "Wall-time budget for one hoglake commit across all of its retry attempts and backoff; "
 	                          "once passed the commit stops and, if any attempt got no definite answer, reports that "
-	                          "the commit may be durable",
+	                          "the commit may be durable. Capped at 30 minutes, half the server's minimum receipt "
+	                          "retention, so a retry under the idempotency key always finds its receipt",
 	                          LogicalType::UBIGINT, Value::UBIGINT(HoglakeTransaction::DEFAULT_COMMIT_DEADLINE_MS),
 	                          nullptr, SetScope::GLOBAL);
 
