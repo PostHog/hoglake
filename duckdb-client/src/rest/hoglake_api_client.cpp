@@ -145,6 +145,16 @@ HoglakeCatalogInfo ParseCatalogInfo(yyjson_val *obj) {
 	info.head_snapshot_id = GetBoundedInt(obj, "head_snapshot_id", 0, 9223372036854775807LL);
 	info.schema_version = GetBoundedInt(obj, "schema_version", 0, 9223372036854775807LL);
 	info.earliest_snapshot_time = GetString(obj, "earliest_snapshot_time");
+	auto capabilities = yyjson_obj_get(obj, "capabilities");
+	if (capabilities && yyjson_is_arr(capabilities)) {
+		size_t idx, max;
+		yyjson_val *capability;
+		yyjson_arr_foreach(capabilities, idx, max, capability) {
+			if (yyjson_is_str(capability)) {
+				info.capabilities.emplace_back(yyjson_get_str(capability));
+			}
+		}
+	}
 	return info;
 }
 
@@ -434,15 +444,24 @@ string HoglakeApiClient::TravelQuery(const HoglakeTravel &travel) {
 //! writes too: hoglake decides authentication before any handler runs, so a
 //! 401 means the request did nothing. A fixed TOKEN cannot be refreshed, so
 //! its 401 is final.
-HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const string &path,
-                                                     const string &json_body) {
+HoglakeApiClient::Response HoglakeApiClient::TryRequest(const string &method, const string &path,
+                                                        const string &json_body, idx_t read_timeout_ms) {
 	auto token = CurrentToken();
-	auto response = SendOnce(method, path, json_body, token);
+	auto response = SendOnce(method, path, json_body, token, read_timeout_ms);
 	if (response.status != 401 || !auth.UsesClientCredentials()) {
 		return response;
 	}
 	InvalidateToken(token);
-	return SendOnce(method, path, json_body, CurrentToken());
+	return SendOnce(method, path, json_body, CurrentToken(), read_timeout_ms);
+}
+
+HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const string &path,
+                                                     const string &json_body) {
+	auto response = TryRequest(method, path, json_body);
+	if (response.status == 0) {
+		throw IOException("hoglake: %s %s%s failed: %s", method, endpoint, path, response.transport_error);
+	}
+	return response;
 }
 
 string HoglakeApiClient::CurrentToken() {
@@ -504,10 +523,11 @@ void HoglakeApiClient::MintToken() {
 }
 
 HoglakeApiClient::Response HoglakeApiClient::SendOnce(const string &method, const string &path, const string &json_body,
-                                                      const string &token) {
+                                                      const string &token, idx_t read_timeout_ms) {
 	duckdb_httplib::Client client(endpoint);
 	client.set_connection_timeout(10, 0);
-	client.set_read_timeout(30, 0);
+	client.set_read_timeout(NumericCast<time_t>(read_timeout_ms / 1000),
+	                        NumericCast<time_t>((read_timeout_ms % 1000) * 1000));
 	client.set_write_timeout(30, 0);
 	duckdb_httplib::Headers headers {{"User-Agent", USER_AGENT}};
 	if (!token.empty()) {
@@ -528,11 +548,13 @@ HoglakeApiClient::Response HoglakeApiClient::SendOnce(const string &method, cons
 	} else {
 		throw InternalException("hoglake: unknown HTTP method %s", method);
 	}
-	if (!result) {
-		throw IOException("hoglake: %s %s%s failed: %s", method, endpoint, path,
-		                  duckdb_httplib::to_string(result.error()));
-	}
 	Response response;
+	if (!result) {
+		// no status arrived: refused/reset connection, or the read
+		// timeout. Request() throws for this; TryRequest() hands it on
+		response.transport_error = duckdb_httplib::to_string(result.error());
+		return response;
+	}
 	response.status = result->status;
 	response.body = result->body;
 	if (result->has_header("Retry-After")) {
@@ -872,10 +894,13 @@ vector<HoglakeScanFile> HoglakeApiClient::PlanScan(const string &ns, const strin
 // Commits
 //===--------------------------------------------------------------------===//
 
-HoglakeCommitOutcome HoglakeApiClient::TryCommit(const HoglakeCommitRequest &request) {
+HoglakeCommitOutcome HoglakeApiClient::TryCommit(const HoglakeCommitRequest &request, idx_t read_timeout_ms) {
 	JsonMutDoc body;
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
+	if (!request.idempotency_key.empty()) {
+		yyjson_mut_obj_add_strcpy(body.doc, root, "idempotency_key", request.idempotency_key.c_str());
+	}
 	if (request.read_snapshot.IsValid()) {
 		yyjson_mut_obj_add_int(body.doc, root, "read_snapshot",
 		                       NumericCast<int64_t>(request.read_snapshot.GetIndex()));
@@ -938,10 +963,18 @@ HoglakeCommitOutcome HoglakeApiClient::TryCommit(const HoglakeCommitRequest &req
 		yyjson_mut_obj_add_strcpy(body.doc, root, "message", request.message.c_str());
 	}
 
-	auto response = Request("POST", CatalogPath("/commit"), body.Write());
+	auto path = CatalogPath("/commit");
+	auto response = TryRequest("POST", path, body.Write(), read_timeout_ms);
 	HoglakeCommitOutcome outcome;
 	outcome.status = response.status;
 	outcome.retry_after_seconds = response.retry_after_seconds;
+	if (response.status == 0) {
+		// the request may have reached the server (a lost
+		// acknowledgement in transport); the caller decides
+		outcome.error = "no_response";
+		outcome.detail = StringUtil::Format("POST %s%s: %s", endpoint, path, response.transport_error);
+		return outcome;
+	}
 	if (response.status == 200) {
 		outcome.success = true;
 		JsonDoc doc(response.body);

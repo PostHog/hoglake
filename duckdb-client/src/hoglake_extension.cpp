@@ -5,7 +5,9 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/storage_extension.hpp"
+#include "rest/hoglake_api_client.hpp"
 #include "storage/hoglake_storage.hpp"
+#include "storage/hoglake_transaction.hpp"
 #include "functions/hoglake_metadata_functions.hpp"
 
 namespace duckdb {
@@ -27,6 +29,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("hoglake_retry_backoff",
 	                          "Backoff factor for exponentially increasing commit retry wait time",
 	                          LogicalType::DOUBLE, Value::DOUBLE(1.5), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("hoglake_commit_timeout_ms",
+	                          "How long one hoglake commit attempt waits for the server's answer; keep it above the "
+	                          "server's HOGLAKE_COMMIT_LOCK_TIMEOUT_MS (30 s by default) so a queued commit's 503 is "
+	                          "heard instead of timing out into an unknown outcome",
+	                          LogicalType::UBIGINT, Value::UBIGINT(HoglakeApiClient::DEFAULT_COMMIT_TIMEOUT_MS), nullptr,
+	                          SetScope::GLOBAL);
+	config.AddExtensionOption("hoglake_commit_deadline_ms",
+	                          "Wall-time budget for one hoglake commit across all of its retry attempts and backoff; "
+	                          "once passed the commit stops and, if any attempt got no definite answer, reports that "
+	                          "the commit may be durable",
+	                          LogicalType::UBIGINT, Value::UBIGINT(HoglakeTransaction::DEFAULT_COMMIT_DEADLINE_MS),
+	                          nullptr, SetScope::GLOBAL);
 
 	HoglakeMetadataFunctions::Register(loader);
 }

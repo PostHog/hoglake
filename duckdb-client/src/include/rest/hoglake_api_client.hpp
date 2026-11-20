@@ -137,7 +137,23 @@ public:
 	// -- commits -----------------------------------------------------------
 	//! One commit attempt; never throws for commit-taxonomy failures
 	//! (409/422/503) — the caller's retry loop classifies the outcome.
-	HoglakeCommitOutcome TryCommit(const HoglakeCommitRequest &request);
+	//! A request that got no answer (connection refused or reset, read
+	//! timeout) is an outcome too, status 0: the server may have
+	//! published it, so the caller retries under the same
+	//! idempotency_key instead of surfacing an IOException.
+	//! read_timeout_ms bounds the wait for the answer; it must exceed the
+	//! server's commit-lock wait (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, 30 s by
+	//! default) or a clean 503 commit_queue_timeout under contention
+	//! arrives after the client gave up and reads as a lost answer.
+	HoglakeCommitOutcome TryCommit(const HoglakeCommitRequest &request,
+	                               idx_t read_timeout_ms = DEFAULT_COMMIT_TIMEOUT_MS);
+
+	//! Read timeout for every request but /commit
+	static constexpr idx_t DEFAULT_READ_TIMEOUT_MS = 30000;
+	//! Default for the hoglake_commit_timeout_ms setting: four times the
+	//! server's default commit-lock wait, so a queued commit's 503 is
+	//! heard rather than timed out
+	static constexpr idx_t DEFAULT_COMMIT_TIMEOUT_MS = 120000;
 
 public:
 	//! Percent-encode one URL path segment (identifiers are user data).
@@ -145,13 +161,22 @@ public:
 
 private:
 	struct Response {
+		//! 0 = no answer: the transport failed before a status arrived
+		//! (transport_error names the failure)
 		int status = 0;
 		string body;
 		//! Retry-After header in seconds (0 when absent)
 		idx_t retry_after_seconds = 0;
+		string transport_error;
 	};
 
+	//! Sends the request; a transport failure throws IOException.
 	Response Request(const string &method, const string &path, const string &json_body);
+	//! Request, except a transport failure comes back as status 0 for
+	//! callers that must decide for themselves whether the request may
+	//! have been applied (the commit loop).
+	Response TryRequest(const string &method, const string &path, const string &json_body,
+	                    idx_t read_timeout_ms = DEFAULT_READ_TIMEOUT_MS);
 	//! Throws the mapped duckdb exception for a non-2xx response.
 	//! travel_scoped: this request carried a snapshot/at_timestamp
 	//! selector, so a refusal of that selector applies to EVERY object
@@ -163,7 +188,8 @@ private:
 	static string TravelQuery(const HoglakeTravel &travel);
 
 private:
-	Response SendOnce(const string &method, const string &path, const string &json_body, const string &token);
+	Response SendOnce(const string &method, const string &path, const string &json_body, const string &token,
+	                  idx_t read_timeout_ms);
 	//! The bearer token to send, minting one if none is cached or it is
 	//! near expiry. Empty when no credential is configured.
 	string CurrentToken();
