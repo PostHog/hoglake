@@ -17,6 +17,7 @@ import com.posthog.hoglake.auth.remoteTeamSchemas
 import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
 import com.posthog.hoglake.auth.requireServedNamespaceEntitlement
+import com.posthog.hoglake.auth.verifiedBackendAuthority
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -96,17 +97,24 @@ class CatalogStoreSelector(
         ) {
             throw HoglakeException.NotFound("namespace")
         }
-        val token = call.verifiedBackendToken ?: throw HoglakeException.NotFound("namespace")
+        val authority = call.verifiedBackendAuthority ?: throw HoglakeException.NotFound("namespace")
+        val token = authority.token
         if (token.length > 64 * 1024) throw HoglakeException.NotFound("namespace")
-        // Never forward a credential-bearing profile on the typed metadata path.
-        val claims =
-            try {
-                Jwt.parse(token).claims
-            } catch (_: JwtViolation) {
+        if (authority.readSessionBinding != null) {
+            if (authority.readSessionBinding !== binding) {
                 throw HoglakeException.NotFound("namespace")
             }
-        if (SessionProfile.carried(claims) || claims.has("storage")) {
-            throw HoglakeException.NotFound("namespace")
+        } else {
+            // The ordinary namespace read does not forward embedded credentials.
+            val claims =
+                try {
+                    Jwt.parse(token).claims
+                } catch (_: JwtViolation) {
+                    throw HoglakeException.NotFound("namespace")
+                }
+            if (SessionProfile.carried(claims) || claims.has("storage")) {
+                throw HoglakeException.NotFound("namespace")
+            }
         }
         val result =
             client(binding.backendId).forRequest(token)
