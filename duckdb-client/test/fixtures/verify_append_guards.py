@@ -35,7 +35,24 @@ class CommitProxy:
         self.resolution_overrides = []
         self.on_resolve = lambda: None
         self.on_commit = lambda: None
+        # (status, body) answers the proxy gives the next /commit attempts
+        # itself, in order; a None entry forwards that attempt to the
+        # server unchanged, so a later attempt can be the injected one
         self.injected = []
+        # Catalog.capabilities the proxy hides from GET /v1/catalogs/{name}
+        # (what an older server, or one without the feature, advertises)
+        self.withheld_capabilities = set()
+        # forwarded /commit answers as (status, body); a lost ack records
+        # the server's real answer here and tells the client 503
+        self.commit_results = []
+        self.lost_acks = 0
+        # the same loss in TRANSPORT: the server published and the
+        # connection closes before any status reaches the client
+        self.dropped_acks = 0
+        # a hung server: every /commit is held (never forwarded) for this
+        # many seconds, or until close(), then dropped without a status
+        self.commit_hang_s = 0
+        self.released = threading.Event()
         self.failure = None
         self.poison_metadata = False
         self.wait_for_hydration = False
@@ -69,14 +86,27 @@ class CommitProxy:
                         owner.commit_times.append(time.monotonic())
                         if len(owner.commits) == 1:
                             owner.on_commit()
-                        if owner.injected:
-                            status, body = owner.injected.pop(0)
+                        if owner.commit_hang_s:
+                            owner.released.wait(owner.commit_hang_s)
+                            self.close_connection = True
+                            return
+                        injected = owner.injected.pop(0) if owner.injected else None
+                        if injected is not None:
+                            status, body = injected
+                            # a str body is a proxy's own answer (502/504
+                            # HTML), not the API's JSON
+                            raw = isinstance(body, str)
                             self.send_response(status)
-                            self.send_header("Content-Type", "application/json")
+                            self.send_header(
+                                "Content-Type",
+                                "text/html" if raw else "application/json",
+                            )
                             if status == 503:
                                 self.send_header("Retry-After", "1")
                             self.end_headers()
-                            self.wfile.write(json.dumps(body).encode())
+                            self.wfile.write(
+                                (body if raw else json.dumps(body)).encode()
+                            )
                             return
                     with httpx.Client(trust_env=False, timeout=60) as client:
                         if (
@@ -107,6 +137,17 @@ class CommitProxy:
                         )
                     body = response.json()
                     if response.is_success:
+                        if (
+                            owner.withheld_capabilities
+                            and self.command == "GET"
+                            and path.path.startswith("/v1/catalogs/")
+                            and path.path.count("/") == 3
+                        ):
+                            body["capabilities"] = [
+                                capability
+                                for capability in body.get("capabilities", [])
+                                if capability not in owner.withheld_capabilities
+                            ]
                         if self.command == "GET" and path.path.endswith(
                             "/snapshots/resolve"
                         ):
@@ -143,6 +184,32 @@ class CommitProxy:
                                 body["columns"][0]["type_params"]["precision"] = -1
                             elif name == "bad_cols":
                                 body["columns"][1]["name"] = "Team"
+                    if self.command == "POST" and path.path.endswith("/commit"):
+                        owner.commit_results.append((response.status_code, body))
+                        if owner.lost_acks and response.is_success:
+                            # the server published; the client hears
+                            # what Hoglite says for a lost acknowledgement
+                            owner.lost_acks -= 1
+                            self.send_response(503)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Retry-After", "1")
+                            self.end_headers()
+                            self.wfile.write(
+                                json.dumps(
+                                    {
+                                        "error": "commit_outcome_unknown",
+                                        "detail": "ack lost",
+                                    }
+                                ).encode()
+                            )
+                            return
+                        if owner.dropped_acks and response.is_success:
+                            # the server published; the connection dies
+                            # without a status line (a reset, or what the
+                            # client's read timeout amounts to)
+                            owner.dropped_acks -= 1
+                            self.close_connection = True
+                            return
                     owner.responses.append((response.status_code, body))
                     self.send_response(response.status_code)
                     self.send_header("Content-Type", "application/json")
@@ -166,6 +233,7 @@ class CommitProxy:
         self.url = f"http://127.0.0.1:{self.server.server_port}"
 
     def close(self):
+        self.released.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
@@ -522,6 +590,308 @@ class AppendGuards(unittest.TestCase):
         self.run_sql(f"INSERT INTO {self.prefix}x VALUES (11, 22)")
         self.assertEqual(len(self.proxy.commits), 2)
         self.assertEqual(self.proxy.commits[0], self.proxy.commits[1])
+
+    def test_lost_commit_ack_replays_the_receipt(self):
+        # The server published the commit and the client saw 503
+        # commit_outcome_unknown instead of the result. The retry carries
+        # the same idempotency_key, so the server answers from the
+        # receipt: one file, one snapshot, no second registration.
+        self.proxy.lost_acks = 1
+        self.run_sql(f"INSERT INTO {self.prefix}x VALUES (11, 22)")
+        self.assertEqual(len(self.proxy.commits), 2)
+        self.assertEqual(self.proxy.commits[0], self.proxy.commits[1])
+        # the duplicate-data symptom first: unkeyed, the retry registers
+        # the same parquet again and the user still sees success
+        self.assertEqual(len(self.files("x")), 1)
+        self.assertEqual(
+            [status for status, _ in self.proxy.commit_results], [200, 200]
+        )
+        self.assertEqual(
+            self.proxy.commit_results[0][1]["snapshot_id"],
+            self.proxy.commit_results[1][1]["snapshot_id"],
+        )
+        key = self.proxy.commits[0]["idempotency_key"]
+        self.assertEqual(str(uuid.UUID(key)), key)
+
+    def test_lost_commit_ack_in_transport_replays_the_receipt(self):
+        # The same loss one layer down: the server published and the
+        # connection closed before any status reached the client. Not an
+        # IOException out of COMMIT: the loop retries under the same key
+        # and the server answers from the receipt.
+        self.proxy.dropped_acks = 1
+        self.run_sql(f"INSERT INTO {self.prefix}x VALUES (11, 22)")
+        self.assertEqual(len(self.proxy.commits), 2)
+        self.assertEqual(self.proxy.commits[0], self.proxy.commits[1])
+        self.assertEqual(len(self.files("x")), 1)
+        self.assertEqual(
+            [status for status, _ in self.proxy.commit_results], [200, 200]
+        )
+        self.assertEqual(
+            self.proxy.commit_results[0][1]["snapshot_id"],
+            self.proxy.commit_results[1][1]["snapshot_id"],
+        )
+
+    def test_gateway_error_retries_identical_request(self):
+        # A proxy's 502/504 is not the API's JSON and says nothing about
+        # whether the server saw the request: retried under the same key.
+        for status, table in ((502, "x"), (504, "y")):
+            with self.subTest(status=status):
+                self.proxy.injected = [(status, "<html>gateway error</html>")]
+                before = len(self.proxy.commits)
+                self.run_sql(f"INSERT INTO {self.prefix}{table} VALUES (11, 22)")
+                self.assertEqual(len(self.proxy.commits), before + 2)
+                self.assertEqual(
+                    self.proxy.commits[before], self.proxy.commits[before + 1]
+                )
+                self.assertEqual(len(self.files(table)), 1)
+
+    def test_untyped_503_is_an_unknown_outcome(self):
+        # A proxy's 503 with a non-API body can follow a commit it forwarded
+        # and lost the answer to. Only commit_queue_timeout and
+        # backend_unavailable are definite; this one retries only under the
+        # key, and without the capability it stops with the advice.
+        self.proxy.injected = [(503, "<html>upstream connect error</html>")]
+        before = len(self.proxy.commits)
+        self.run_sql(f"INSERT INTO {self.prefix}x VALUES (11, 22)")
+        self.assertEqual(len(self.proxy.commits), before + 2)
+        self.assertEqual(self.proxy.commits[before], self.proxy.commits[before + 1])
+        self.assertIn("idempotency_key", self.proxy.commits[before])
+        self.assertEqual(len(self.files("x")), 1)
+        self.proxy.withheld_capabilities = {"idempotent-append-v1"}
+        self.proxy.injected = [(503, "<html>upstream connect error</html>")]
+        before = len(self.proxy.commits)
+        result = self.run_sql(
+            f"INSERT INTO {self.prefix}y VALUES (11, 22)", succeeds=False
+        )
+        self.assertEqual(len(self.proxy.commits), before + 1)
+        self.assertIn("MAY be durable", result.stderr)
+        self.assertIn("idempotent-append-v1", result.stderr)
+        self.assertNotIn("retries exhausted", result.stderr)
+
+    def assert_unknown_outcome_advice(self, stderr, key):
+        # The terminal error for a commit the server may have published:
+        # names the key and the receipt route, says what a 404 there
+        # does NOT prove (an attempt may still be in flight; the server
+        # guarantees no time after which one has stopped) and how long
+        # the receipt is kept, points at the table's contents instead,
+        # and never tells the user to re-run blind. One advice, once.
+        receipt_url = (
+            f"{self.proxy.url}/v1/catalogs/{self.catalog_name}/commit/receipts/{key}"
+        )
+        self.assertEqual(stderr.count("MAY be durable"), 1, stderr)
+        self.assertIn(receipt_url, stderr)
+        self.assertIn("cannot retry under the same idempotency_key", stderr)
+        self.assertIn("A 404 is not proof either way", stderr)
+        self.assertIn("an attempt may still be in flight", stderr)
+        self.assertIn("HOGLAKE_RECEIPT_RETENTION_SECONDS", stderr)
+        self.assertIn("check the table's contents or hoglake_snapshots", stderr)
+        self.assertNotIn("HOGLAKE_COMMIT_LOCK_TIMEOUT_MS", stderr)
+        self.assertNotIn("surely stopped", stderr)
+        self.assertNotIn("404 if it did not", stderr)
+        return receipt_url
+
+    def test_exhausted_unknown_outcome_names_the_receipt(self):
+        # Out of retries on an outcome the server never settled: the
+        # error must not read as "nothing applied". It names the key and
+        # the receipt route, and that route answers for the commit the
+        # server did publish.
+        cases = (
+            ("lost_acks", "x", "commit_outcome_unknown"),
+            ("dropped_acks", "y", "no_response"),
+        )
+        for attribute, table, code in cases:
+            with self.subTest(attribute=attribute):
+                setattr(self.proxy, attribute, 1)
+                before = len(self.proxy.commits)
+                result = self.run_sql(
+                    f"SET hoglake_max_retry_count=0; "
+                    f"INSERT INTO {self.prefix}{table} VALUES (11, 22)",
+                    succeeds=False,
+                )
+                self.assertEqual(len(self.proxy.commits), before + 1)
+                key = self.proxy.commits[before]["idempotency_key"]
+                self.assertIn(code, result.stderr)
+                receipt_url = self.assert_unknown_outcome_advice(result.stderr, key)
+                self.assertEqual(len(self.files(table)), 1)
+                receipt = httpx.get(receipt_url, trust_env=False)
+                self.assertEqual(receipt.status_code, 200, receipt.text)
+                self.assertEqual(
+                    receipt.json()["snapshot_id"],
+                    self.proxy.commit_results[before][1]["snapshot_id"],
+                )
+
+    def test_unknown_outcome_outlives_a_later_definite_failure(self):
+        # The first attempt's ack is lost (the server published); the
+        # retry gets a definite answer that is not success. The commit
+        # is still MAY-be-durable: a definite failure on a retry does not
+        # prove the earlier attempt dead, so the terminal error keeps the
+        # receipt advice whether the retry's answer exhausted the budget
+        # (503 commit_queue_timeout) or stopped the loop on its own
+        # (409 ddl_since_read_snapshot). ONE message: the 409's own
+        # "re-run the statement" suffix would contradict the advice not
+        # to re-run blind, so the advice replaces it and carries the
+        # reason (a new transaction is needed) itself.
+        cases = (
+            (
+                "x",
+                (503, {"error": "commit_queue_timeout", "detail": "busy"}),
+                " (retries exhausted)",
+                "retries exhausted; after 2 attempt(s) the commit MAY be durable",
+            ),
+            (
+                "y",
+                (409, {"error": "ddl_since_read_snapshot", "detail": "changed"}),
+                " (start a new transaction and re-run the statement)",
+                (
+                    "this refusal needs a new transaction and ended the retries; "
+                    "after 2 attempt(s) the commit MAY be durable"
+                ),
+            ),
+        )
+        for table, definite, definite_suffix, lead in cases:
+            with self.subTest(code=definite[1]["error"]):
+                self.proxy.lost_acks = 1
+                self.proxy.injected = [None, definite]
+                before = len(self.proxy.commits)
+                result = self.run_sql(
+                    f"SET hoglake_max_retry_count=1; "
+                    f"INSERT INTO {self.prefix}{table} VALUES (11, 22)",
+                    succeeds=False,
+                )
+                self.assertEqual(len(self.proxy.commits), before + 2)
+                self.assertEqual(
+                    self.proxy.commits[before], self.proxy.commits[before + 1]
+                )
+                # the last attempt's answer leads, the earlier unknown
+                # outcome qualifies it
+                self.assertIn(definite[1]["error"], result.stderr)
+                key = self.proxy.commits[before]["idempotency_key"]
+                receipt_url = self.assert_unknown_outcome_advice(result.stderr, key)
+                self.assertIn(lead, result.stderr)
+                self.assertNotIn(definite_suffix, result.stderr)
+                if definite[0] == 409:
+                    self.assertIn(
+                        "before re-running the statement in a new transaction)",
+                        result.stderr,
+                    )
+                else:
+                    self.assertNotIn("new transaction", result.stderr)
+                self.assertEqual(len(self.files(table)), 1)
+                receipt = httpx.get(receipt_url, trust_env=False)
+                self.assertEqual(receipt.status_code, 200, receipt.text)
+
+    def test_internal_error_is_an_unknown_outcome(self):
+        # A 500 on /commit is not a definite failure: on the PostgreSQL
+        # backend a COMMIT whose acknowledgement the database connection
+        # lost is durable yet surfaces as the catch-all internal_error
+        # (only Hoglite raises commit_outcome_unknown). Keyed, the loop
+        # retries it under the same key; unkeyed it stops with the advice.
+        internal_error = (
+            500,
+            {"error": "internal_error", "detail": "internal server error"},
+        )
+        self.proxy.injected = [internal_error]
+        self.run_sql(f"INSERT INTO {self.prefix}x VALUES (11, 22)")
+        self.assertEqual(len(self.proxy.commits), 2)
+        self.assertEqual(self.proxy.commits[0], self.proxy.commits[1])
+        self.assertEqual(len(self.files("x")), 1)
+
+        self.proxy.withheld_capabilities = {"idempotent-append-v1"}
+        self.proxy.injected = [internal_error]
+        result = self.run_sql(
+            f"INSERT INTO {self.prefix}y VALUES (11, 22)", succeeds=False
+        )
+        self.assertEqual(len(self.proxy.commits), 3)
+        self.assertNotIn("idempotency_key", self.proxy.commits[2])
+        self.assertIn("internal_error", result.stderr)
+        self.assertIn("MAY be durable", result.stderr)
+        self.assertIn("idempotent-append-v1", result.stderr)
+        self.assertNotIn("retries exhausted", result.stderr)
+        self.assertEqual(len(self.files("y")), 0)
+
+    def test_commit_deadline_bounds_the_retry_loop(self):
+        # A hung server: every attempt times out (an unknown outcome,
+        # retried under the key) and max_retry_count alone would hold
+        # COMMIT for (retries + 1) × hoglake_commit_timeout_ms. The
+        # deadline caps the loop's wall time: the last attempt's wait is
+        # clamped to the time left, no attempt starts that could not end
+        # in time, and the error names the deadline and gives the
+        # unknown-outcome advice. The receipt is a 404 here (the proxy
+        # never forwarded), which is exactly what the advice says a 404
+        # does not prove.
+        self.proxy.commit_hang_s = 30
+        result = self.run_sql(
+            f"SET hoglake_commit_timeout_ms=1000; "
+            f"SET hoglake_commit_deadline_ms=2500; "
+            f"SET hoglake_max_retry_count=5; "
+            f"INSERT INTO {self.prefix}x VALUES (11, 22)",
+            succeeds=False,
+        )
+        # 6 without the deadline; 3 with it (0-1 s, 1-2 s, 2-2.5 s)
+        self.assertIn(len(self.proxy.commits), (2, 3), self.proxy.commit_times)
+        self.assertLess(self.proxy.commit_times[-1] - self.proxy.commit_times[0], 2.5)
+        self.assertEqual(len(set(map(json.dumps, self.proxy.commits))), 1)
+        self.assertIn("no_response", result.stderr)
+        self.assertIn(
+            "the commit deadline (hoglake_commit_deadline_ms=2500) passed; "
+            f"after {len(self.proxy.commits)} attempt(s) the commit MAY be durable",
+            result.stderr,
+        )
+        key = self.proxy.commits[0]["idempotency_key"]
+        receipt_url = self.assert_unknown_outcome_advice(result.stderr, key)
+        self.assertEqual(httpx.get(receipt_url, trust_env=False).status_code, 404)
+        self.assertEqual(len(self.files("x")), 0)
+
+    def test_unknown_outcomes_do_not_retry_without_the_capability(self):
+        # A server that does not advertise idempotent-append-v1 ignores
+        # the key, so a retry of a commit that may have published is
+        # blind. Against one the extension sends no key and stops at the
+        # first unknown outcome, saying so; the definite 503 still retries.
+        self.proxy.withheld_capabilities = {"idempotent-append-v1"}
+        for attribute, table, code in (
+            ("lost_acks", "x", "commit_outcome_unknown"),
+            ("dropped_acks", "y", "no_response"),
+        ):
+            with self.subTest(attribute=attribute):
+                setattr(self.proxy, attribute, 1)
+                before = len(self.proxy.commits)
+                result = self.run_sql(
+                    f"INSERT INTO {self.prefix}{table} VALUES (11, 22)",
+                    succeeds=False,
+                )
+                self.assertEqual(len(self.proxy.commits), before + 1)
+                self.assertNotIn("idempotency_key", self.proxy.commits[before])
+                self.assertIn(code, result.stderr)
+                self.assertIn("MAY be durable", result.stderr)
+                self.assertIn("idempotent-append-v1", result.stderr)
+                self.assertNotIn("retries exhausted", result.stderr)
+                self.assertNotIn("/commit/receipts/", result.stderr)
+                self.assertEqual(len(self.files(table)), 1)
+        self.proxy.injected = [
+            (503, {"error": "commit_queue_timeout", "detail": "busy"})
+        ]
+        before = len(self.proxy.commits)
+        self.run_sql(
+            f"CREATE TABLE {self.prefix}z (a BIGINT); INSERT INTO {self.prefix}z VALUES (11)"
+        )
+        self.assertEqual(len(self.proxy.commits), before + 2)
+        self.assertEqual(self.proxy.commits[before], self.proxy.commits[before + 1])
+        self.assertNotIn("idempotency_key", self.proxy.commits[before])
+        self.assertEqual(len(self.files("z")), 1)
+
+    def test_each_commit_mints_its_own_idempotency_key(self):
+        self.run_sql(
+            f"INSERT INTO {self.prefix}x VALUES (11, 22); "
+            f"BEGIN; INSERT INTO {self.prefix}x VALUES (33, 44); "
+            f"INSERT INTO {self.prefix}y VALUES (55, 66); COMMIT"
+        )
+        self.assertEqual(len(self.proxy.commits), 2)
+        keys = [commit["idempotency_key"] for commit in self.proxy.commits]
+        self.assertEqual(len(set(keys)), 2)
+        for key in keys:
+            self.assertEqual(str(uuid.UUID(key)), key)
+        self.assertEqual(len(self.files("x")), 2)
+        self.assertEqual(len(self.files("y")), 1)
 
     def test_legacy_recreation_refusal_does_not_retry(self):
         self.proxy.injected = [
