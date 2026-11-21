@@ -136,8 +136,8 @@ The core, which every issuer must emit:
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes, by decision | token id, for correlating a request with a token. Required because the access log names each request's token by it, and an audit line written while a request is handled reaches the token through its `request_id`; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
-| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
-| `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
+| `org` | tenant and scoped, today; a catalog-bound operator | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked. On an operator token it is the binding's: an operator token carrying `org` with no `cat` or `scope` is refused as malformed, never read as fleet-wide with its org dropped |
+| `cat`, or `scope` | tenant and scoped, one or both; either on an operator binds it | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph. On an `operator` token the grants, in either spelling (reconciled as for a tenant), are the binding: the token is an operator on the catalogs it names and nothing elsewhere (below). Every bound catalog must carry `admin`, or the token is refused as malformed; a binding that names no catalog is refused |
 
 Authorization is per catalog. The scope vocabulary is ordered,
 `read < write < maintenance < admin`: `write` includes `read`, `maintenance`
@@ -328,10 +328,28 @@ must emit all of the following:
 A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
 `invalid_predicate`, …).
 
-An `operator` token bypasses per-catalog checks and may create catalogs,
-manage containment, and read operator-only routes. Operator tokens
-are therefore only as safe as the keys in the JWKS: whoever can sign with them
-is an operator.
+An `operator` token without `cat` or `scope` is fleet-wide: it bypasses
+per-catalog checks and may create catalogs, manage containment, and read
+operator-only routes. An `operator` token with `cat` or `scope` (and so every
+routed one, since `rtg` needs exactly one `cat` entry) is **bound** to the
+catalogs it names: on them it is an operator, holding every scope, containment
+included; every other catalog answers 404 as it does for a tenant; `POST
+/v1/catalogs` creates only a catalog it names (another name is the same 404);
+the catalog listing shows its own; and the fleet routes (`/metrics`,
+`/v1/database/health`, `/v1/maintenance/status` and `/runs`, the debug
+surface) answer 403. Because a bound operator holds every scope on its
+catalog whatever the words say, the binding must grant `admin` on every
+catalog it names: `{"lake": ["read"]}` on an operator token is refused as
+`invalid_token` (malformed), never read as a reader and never as an operator.
+`scope` values outside the `hoglake:` namespace are ignored as on any token, so
+an operator whose `scope` carries only foreign values is unbound. An unbound
+operator token must not carry `org` either: `org` names the tenant a binding
+acts for, so an operator token with `org` but no `cat` or `scope` is refused as
+`invalid_token` rather than read as fleet-wide with its org dropped. This is
+the binding hoglite enforces (an unbound operator is one with neither `cat`
+nor `org`; a routed operator's `cat` must say `admin`), enforced in hoglake
+too. Operator tokens are therefore only as safe as the keys in the JWKS:
+whoever can sign with them is an operator.
 
 ### Errors
 

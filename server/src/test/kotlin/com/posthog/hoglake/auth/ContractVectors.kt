@@ -533,6 +533,50 @@ object ContractVectors {
                         ),
                     ),
             ),
+            Spec(
+                "operator_routed_without_admin",
+                "A routed operator whose cat grants read, not admin: a bound operator holds every scope on its " +
+                    "catalog whatever the words say, so a binding narrower than admin is refused as malformed, " +
+                    "never read as a reader and never as an operator. hoglite refuses the same token.",
+                "operator",
+                operatorInput().apply {
+                    put("org", ORG)
+                    put("catalog", ORG)
+                    set<JsonNode>("placement", placement())
+                },
+                14,
+                refuse(JwtViolation.MALFORMED),
+                ttl = OPERATOR_TTL,
+                mutation = "cat grants read instead of admin",
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "org" to text(ORG),
+                        "cat" to cat("read"),
+                        "cli" to text("provisioner"),
+                        "rtg" to rtg(),
+                    ),
+            ),
+            Spec(
+                "operator_org_without_binding",
+                "An operator token carrying org but neither cat nor scope: refused as malformed, never read as a " +
+                    "fleet-wide operator with its org dropped. hoglite accepts an unbound operator only when cat " +
+                    "and org are both absent.",
+                "operator",
+                operatorInput().apply { put("org", ORG) },
+                15,
+                refuse(JwtViolation.MALFORMED),
+                ttl = OPERATOR_TTL,
+                mutation = "org is set with no cat or scope",
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "org" to text(ORG),
+                        "cli" to text("provisioner"),
+                    ),
+            ),
         )
     }
 

@@ -81,12 +81,18 @@ class LocalIssuerTest {
     fun `an operator token verifies fleet-wide, and bound to one catalog`() {
         val fleet = verify.verify(local.operator("ops", "cli", 300))
         assertThat(fleet.kind).isEqualTo(Caller.Kind.OPERATOR)
+        assertThat(fleet.fleetWide).isTrue()
         assertThat(fleet.catalogScopes).isEmpty()
         val boundToken = local.operator("ops", "cli", 300, org = "local", catalog = "demo")
         val bound = verify.verify(boundToken)
         assertThat(bound.kind).isEqualTo(Caller.Kind.OPERATOR)
-        // An operator holds no tenant scope (Caller.catalogScopes is empty for
-        // the kind); the binding is the claim itself, which the vectors pin.
+        // "Bound to one catalog" (docs/auth.md): an operator on `demo` and a
+        // stranger to every other catalog, which the vectors pin as the claim.
+        assertThat(bound.fleetWide).isFalse()
+        assertThat(bound.orgId).isEqualTo("local")
+        assertThat(bound.visibleCatalogs()).containsExactly("demo")
+        assertThat(bound.holds("demo", Scope.ADMIN)).isTrue()
+        assertThat(bound.knowsCatalog("other")).isFalse()
         val boundClaims = mapper.readTree(Base64.getUrlDecoder().decode(boundToken.split('.')[1]))
         assertThat(boundClaims["cat"]["demo"][0].asText()).isEqualTo("admin")
         assertThatThrownBy { local.operator("ops", "cli", 300, catalog = "demo") }.hasMessageContaining("org")
@@ -223,8 +229,12 @@ class LocalIssuerTest {
             "scoped_without_ten",
             "operator_without_ten",
             "scoped_over_lifetime_cap",
+            // A bound operator whose cat says read: this issuer binds with admin only (operatorClaims).
+            "operator_routed_without_admin",
             // The session profile (docs/auth.md) is minted by no issuer yet, this one included.
             "tenant_session_profile_disabled",
+            // An unbound operator carrying org: this issuer sets org only on a bound operator.
+            "operator_org_without_binding",
         )
     }
 }
