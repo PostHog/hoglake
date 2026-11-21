@@ -36,8 +36,8 @@ class HogliteClientTest {
     @AfterEach
     fun stop() = servers.forEach { it.stop(0) }
 
-    /** A scripted endpoint: each call consumes one [Step] (status + body), then repeats the last. */
-    private class Step(val status: Int, val body: String = "")
+    /** A scripted endpoint: each call consumes one [Step] (status + body + headers), then repeats the last. */
+    private class Step(val status: Int, val body: String = "", val headers: Map<String, String> = emptyMap())
 
     private val servedBodies = ConcurrentLinkedQueue<String>()
 
@@ -49,6 +49,7 @@ class HogliteClientTest {
             val i = calls.getAndIncrement()
             bodies += ex.requestBody.readBytes().decodeToString()
             val step = steps[minOf(i, steps.size - 1)]
+            step.headers.forEach { (name, value) -> ex.responseHeaders.add(name, value) }
             ex.sendResponseHeaders(step.status, step.body.toByteArray().size.toLong())
             ex.responseBody.use { it.write(step.body.toByteArray()) }
         }
@@ -201,6 +202,236 @@ class HogliteClientTest {
         assertThat(result[0].affected).isEqualTo(1)
         assertThat(result[1].rows).containsExactly(listOf(7, 3))
         assertThat(calls.get()).isEqualTo(1)
+    }
+
+    // ---- the trusted data_path -------------------------------------------
+
+    private val dataPath = mapOf(HogliteClient.DATA_PATH_HEADER to "s3://b/cat")
+
+    @Test
+    fun `a tenant create sends the data_path and returns the one hoglite stored`() {
+        val (server, _) = serve(Step(200, "{\"tenant\":\"t\",\"owner\":\"o\",\"data_path\":\"s3://b/cat\"}", dataPath))
+        val answer = client("http://127.0.0.1:${server.address.port}").createTenant("t", "s3://b/cat")
+        assertThat(answer.dataPath).isEqualTo("s3://b/cat")
+        // One JSON object, the field always a string, nothing after it:
+        // hoglite refuses `"data_path": null` and trailing content.
+        assertThat(servedBodies.single()).isEqualTo("{\"data_path\":\"s3://b/cat\"}")
+    }
+
+    @Test
+    fun `a tenant create on an engine without the header returns null and an existing tenant its stored path`() {
+        val (old, _) = serve(Step(200, "{\"tenant\":\"t\",\"owner\":\"o\"}"))
+        val onOld = client("http://127.0.0.1:${old.address.port}").createTenant("t", "s3://b/cat")
+        assertThat(onOld.dataPath).isNull()
+        // `existing: true` or not, the answer carries the stored path and
+        // nothing else the client reads: it says nothing about who made it.
+        val (existing, _) = serve(Step(200, "{\"tenant\":\"t\",\"owner\":\"o\",\"existing\":true}", dataPath))
+        val found = client("http://127.0.0.1:${existing.address.port}").createTenant("t", "s3://b/cat")
+        assertThat(found.dataPath).isEqualTo("s3://b/cat")
+    }
+
+    @Test
+    fun `a data_path mismatch or overlap is a final 409 and any other 409 still means the tenant exists`() {
+        for (code in listOf("data_path_mismatch", "data_path_overlap")) {
+            val (refusing, calls) =
+                serve(Step(409, "{\"error\":\"tenant t2 holds s3://b/other\",\"code\":\"$code\"}"))
+            val thrown =
+                catchThrowable { client("http://127.0.0.1:${refusing.address.port}").createTenant("t", "s3://b/cat") }
+            assertThat(thrown).describedAs(code).isInstanceOf(HogliteRejected::class.java)
+            assertThat((thrown as HogliteRejected).status).isEqualTo(409)
+            assertThat(thrown.body).contains(code)
+            assertThat(calls.get()).describedAs("final: no retry").isEqualTo(1)
+        }
+
+        val (racing, _) = serve(Step(409, "{\"error\":\"create raced\"}", dataPath))
+        val raced = client("http://127.0.0.1:${racing.address.port}").createTenant("t", "s3://b/cat")
+        assertThat(raced.dataPath).isEqualTo("s3://b/cat")
+
+        val (invalid, _) = serve(Step(400, "{\"error\":\"bad\",\"code\":\"invalid_data_path\"}"))
+        assertThatThrownBy { client("http://127.0.0.1:${invalid.address.port}").createTenant("t", "s3:///") }
+            .isInstanceOf(HogliteRejected::class.java)
+
+        // hoglite's overlap scan not finishing is a 503: retried like any
+        // other, and the retry's answer stands.
+        val (scanFailed, scanCalls) =
+            serve(
+                Step(503, "{\"error\":\"data_path overlap check did not finish: list failed; retry\"}"),
+                Step(200, "{\"tenant\":\"t\",\"owner\":\"o\"}", dataPath),
+            )
+        assertThat(client("http://127.0.0.1:${scanFailed.address.port}").createTenant("t", "s3://b/cat").dataPath)
+            .isEqualTo("s3://b/cat")
+        assertThat(scanCalls.get()).isEqualTo(2)
+    }
+
+    @Test
+    fun `clients cloned for requests share one create lock per backend`() {
+        // Production builds a store per request on a per-request clone, so a
+        // lock owned by the store or the clone would serialize nothing.
+        val root = client("http://127.0.0.1:9")
+        val a = root.forRequest("token-a")
+        val b = a.forRequest("token-b")
+        assertThat(a.createLock).isSameAs(root.createLock)
+        assertThat(b.createLock).isSameAs(root.createLock)
+        assertThat(client("http://127.0.0.1:9").createLock).describedAs("another backend").isNotSameAs(root.createLock)
+    }
+
+    @Test
+    fun `every result carries the data_path hoglite served beside it`() {
+        val (txServer, _) =
+            serve(
+                Step(
+                    200,
+                    "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}," +
+                        "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}]}",
+                    dataPath,
+                ),
+            )
+        val tx =
+            client("http://127.0.0.1:${txServer.address.port}").tx(
+                "t",
+                "tx-dp",
+                null,
+                listOf(HogliteStatement("UPDATE kv SET v=1"), HogliteStatement("SELECT 1")),
+            )
+        assertThat(tx.map { it.dataPath }).containsExactly("s3://b/cat", "s3://b/cat")
+
+        val (querySrv, _) = serve(Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}", dataPath))
+        assertThat(
+            client("http://127.0.0.1:${querySrv.address.port}").query("t", "SELECT 1").dataPath,
+        ).isEqualTo("s3://b/cat")
+
+        val (readSrv, _) =
+            serve(
+                Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}]}", dataPath),
+            )
+        assertThat(
+            client(
+                "http://127.0.0.1:${readSrv.address.port}",
+            ).readTx("t", listOf(HogliteStatement("SELECT 1"))).single().dataPath,
+        ).isEqualTo("s3://b/cat")
+
+        // A legacy tenant: no header, no value, never an empty string.
+        val (legacy, _) = serve(Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}"))
+        assertThat(client("http://127.0.0.1:${legacy.address.port}").query("t", "SELECT 1").dataPath).isNull()
+    }
+
+    @Test
+    fun `a batch answer carries each item's own data_path and not the batch header`() {
+        val (server, _) =
+            serve(
+                Step(
+                    200,
+                    "{\"results\":[" +
+                        "{\"status\":200,\"body\":{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}," +
+                        "\"data_path\":\"s3://b/one\"}," +
+                        "{\"status\":200,\"body\":{\"cols\":[\"x\"],\"rows\":[[2]],\"affected\":0}}," +
+                        "{\"status\":404,\"body\":{\"error\":\"tenant does not exist\"}}]}",
+                    mapOf(HogliteClient.DATA_PATH_HEADER to "s3://b/wrong"),
+                ),
+            )
+        val answers =
+            client("http://127.0.0.1:${server.address.port}").queryBatch(
+                listOf("one", "two", "gone").map { HogliteClient.BatchRead(it, "SELECT 1") },
+            )!!
+        assertThat(answers.map { it.result?.dataPath }).containsExactly("s3://b/one", null, null)
+    }
+
+    @Test
+    fun `two differing data_path headers on one answer are refused, as unknown on an applied write`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, "s3://b/one")
+            ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, "s3://b/two")
+            val body =
+                if (ex.requestURI.path.endsWith("/tx")) {
+                    "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}"
+                } else {
+                    "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}"
+                }.toByteArray()
+            ex.sendResponseHeaders(200, body.size.toLong())
+            ex.responseBody.use { it.write(body) }
+        }
+        server.start()
+        servers += server
+        val c = client("http://127.0.0.1:${server.address.port}")
+        // A read: retryable, the next answer settles it.
+        assertThatThrownBy { c.query("t", "SELECT 1") }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("differing")
+        // A write that answered 200 APPLIED: never a 500 over a durable
+        // write, but the outcome the caller retries with its txid.
+        assertThatThrownBy { c.tx("t", "tx-two-headers", null, listOf(HogliteStatement("UPDATE kv SET v=1"))) }
+            .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .hasMessageContaining("differing")
+    }
+
+    @Test
+    fun `a tenant that served a data_path is never read as legacy because one answer lacked it`() {
+        val query = "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}"
+        // Served once, then absent: the absence is the anomaly, not a legacy
+        // tenant. (One scripted step per call, in call order.)
+        val (read, _) =
+            serve(
+                Step(200, query, dataPath),
+                Step(200, query),
+                Step(200, query),
+                Step(200, query),
+                Step(200, query, dataPath),
+            )
+        val c = client("http://127.0.0.1:${read.address.port}")
+        assertThat(c.query("t", "SELECT 1").dataPath).isEqualTo("s3://b/cat")
+        assertThatThrownBy { c.query("t", "SELECT 1") }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("served as 's3://b/cat' before")
+        // The memory is per tenant, shared with the per-request clients,
+        // and does not block another tenant's legacy reading.
+        assertThatThrownBy { c.forRequest("tok").query("t", "SELECT 1") }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        assertThat(c.query("other", "SELECT 1").dataPath).isNull()
+        // The next answer that carries it settles the tenant again.
+        assertThat(c.query("t", "SELECT 1").dataPath).isEqualTo("s3://b/cat")
+
+        // On a write tx the 200 applied: unknown, not a 500.
+        val tx = "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}"
+        val (write, _) = serve(Step(200, tx, dataPath), Step(200, tx))
+        val w = client("http://127.0.0.1:${write.address.port}")
+        w.tx("t", "tx-1", null, listOf(HogliteStatement("UPDATE kv SET v=1")))
+        assertThatThrownBy { w.tx("t", "tx-2", null, listOf(HogliteStatement("UPDATE kv SET v=2"))) }
+            .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .hasMessageContaining("without ${HogliteClient.DATA_PATH_HEADER}")
+
+        // A 404 forgets the tenant (its id may be created again), and a
+        // different value replaces the remembered one (dropped and
+        // created again under another prefix): neither is an anomaly.
+        val (recreated, _) =
+            serve(
+                Step(200, query, dataPath),
+                Step(404, "{\"error\":\"tenant does not exist\"}"),
+                Step(200, query),
+                Step(200, query, mapOf(HogliteClient.DATA_PATH_HEADER to "s3://b/moved")),
+            )
+        val r = client("http://127.0.0.1:${recreated.address.port}")
+        assertThat(r.query("t", "SELECT 1").dataPath).isEqualTo("s3://b/cat")
+        assertThatThrownBy { r.query("t", "SELECT 1") }.isInstanceOf(HogliteRejected::class.java)
+        assertThat(r.query("t", "SELECT 1").dataPath).isNull()
+        assertThat(r.query("t", "SELECT 1").dataPath).isEqualTo("s3://b/moved")
+    }
+
+    @Test
+    fun `a batch item without a data_path for a tenant that served one fails the batch`() {
+        val item = "{\"status\":200,\"body\":{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}"
+        val (server, _) =
+            serve(
+                Step(200, "{\"results\":[$item,\"data_path\":\"s3://b/one\"}]}"),
+                Step(200, "{\"results\":[$item}]}"),
+            )
+        val c = client("http://127.0.0.1:${server.address.port}")
+        val reads = listOf(HogliteClient.BatchRead("one", "SELECT 1"))
+        assertThat(c.queryBatch(reads)!!.single().result?.dataPath).isEqualTo("s3://b/one")
+        assertThatThrownBy { c.queryBatch(reads) }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("'one'")
     }
 
     // ---- the outcome taxonomy: committed, not committed, unknown ----------
@@ -914,7 +1145,7 @@ class HogliteClientTest {
             "tx" -> c.tx(tenant, "url-tx", "url-fp", listOf(HogliteStatement("SELECT ?", listOf("a/b?#%"))))
             "query" -> c.query(tenant, "SELECT ?", listOf("a/b?#%"))
             "readTx" -> c.readTx(tenant, listOf(HogliteStatement("SELECT ?", listOf("a/b?#%"))))
-            "create" -> c.createTenant(tenant)
+            "create" -> c.createTenant(tenant, "s3://b/t")
             "delete" -> c.deleteTenant(tenant)
             "release" -> c.release(tenant, "whale")
             "batch" -> c.queryBatch(listOf(HogliteClient.BatchRead(tenant, "SELECT 1")))

@@ -2,9 +2,11 @@ package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.storage.PathOutsidePrefixException
 import com.posthog.hoglake.storage.StorageAccess
 import com.posthog.hoglake.storage.StorageCredentialProvider
 import com.posthog.hoglake.storage.StorageCredentialProviders
+import com.posthog.hoglake.storage.StoragePrefix
 import io.github.oshai.kotlinlogging.KotlinLogging
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
 import software.amazon.awssdk.awscore.AwsRequest
@@ -58,13 +60,37 @@ open class ObjectStore private constructor(
      * — the shared keys under `ambient`/`static`, a refusal under `broker`.
      */
     private val credentials: AwsCredentialsProvider?,
+    /**
+     * Non-null on a catalog VIEW: the catalog and the prefix every path
+     * this view touches must stay under, and (under an unscoped provider)
+     * the base store its IO forwards to. Null on the base store, which
+     * does catalog IO only through its views.
+     */
+    private val view: CatalogView?,
 ) : AutoCloseable {
     constructor(
         endpoint: String?,
         region: String,
         pathStyle: Boolean,
         provider: StorageCredentialProvider,
-    ) : this(endpoint, region, pathStyle, provider, shared = null, credentials = null)
+    ) : this(endpoint, region, pathStyle, provider, shared = null, credentials = null, view = null)
+
+    /**
+     * What makes a store a catalog view: the catalog, its [StoragePrefix],
+     * and the base store to forward IO to under an unscoped provider. The
+     * forwarding is what keeps a fault-injecting subclass of the base
+     * store (compaction's and the hydrator's failure-path tests) in the
+     * loop: the view checks the bound, then calls the base's own `open`
+     * method, so the override runs. Under `broker` the view signs with
+     * its own session and sends itself ([delegate] is null).
+     */
+    private class CatalogView(
+        val catalog: String,
+        val prefix: StoragePrefix,
+        val delegate: ObjectStore?,
+    ) {
+        fun require(pathUri: String) = prefix.require(pathUri, catalog, SURFACE)
+    }
 
     /**
      * The key-pair shape every test fixture builds: static keys when both
@@ -127,32 +153,73 @@ open class ObjectStore private constructor(
 
     /**
      * The store to do [access] on [catalog]'s objects under [prefix] (its
-     * `data_path`) with. Under an unscoped provider that is this very
-     * store — same client, same keys, and the same subclass, so a
-     * fault-injecting test store keeps injecting. Under `broker` it is a
-     * thin view over THIS store's client that signs each request with the
-     * catalog's own session, cached here for the life of the base store;
-     * the session refreshes underneath it, so nothing is rebuilt.
+     * `data_path`) with: ALWAYS a view bounded to that prefix, which
+     * refuses a path outside it ([PathOutsidePrefixException]) before any
+     * S3 call. Under an unscoped provider the view forwards its IO to
+     * this very store — same client, same keys, and the base's own
+     * (possibly overridden) methods, so a fault-injecting test store
+     * keeps injecting. Under `broker` it signs each request with the
+     * catalog's own session over THIS store's client. Views are cached
+     * for the life of the base store; a session refreshes underneath
+     * its view, so nothing is rebuilt.
+     *
+     * The bound is what stands between a catalog row naming another
+     * catalog's object and a write under that prefix with the server's
+     * identity (#668): the broker's grant enforces it in IAM, and this
+     * enforces it in process for every provider.
      */
     fun forCatalog(
         catalog: String,
         prefix: String,
         access: StorageAccess,
     ): ObjectStore {
-        if (!provider.scoped) return this
-        check(credentials == null) { "forCatalog on a catalog view" }
+        check(view == null) { "forCatalog on a catalog view" }
         return views.computeIfAbsent(Triple(catalog, prefix, access)) {
-            ObjectStore(endpoint, region, pathStyle, provider, s3, provider.credentialsFor(catalog, prefix, access))
+            val bound = StoragePrefix.of(prefix)
+            if (provider.scoped) {
+                ObjectStore(
+                    endpoint,
+                    region,
+                    pathStyle,
+                    provider,
+                    s3,
+                    provider.credentialsFor(catalog, prefix, access),
+                    CatalogView(catalog, bound, delegate = null),
+                )
+            } else {
+                ObjectStore(
+                    endpoint,
+                    region,
+                    pathStyle,
+                    provider,
+                    s3,
+                    null,
+                    CatalogView(catalog, bound, delegate = this),
+                )
+            }
         }
     }
+
+    /** The prefix this view is bounded to; null on the base store. */
+    val boundPrefix: StoragePrefix? get() = view?.prefix
 
     private val log = KotlinLogging.logger {}
 
     data class Location(val bucket: String, val key: String)
 
+    /**
+     * The location of [pathUri], after the view's bound check. Every IO
+     * method starts here, so the check cannot be skipped by one of them.
+     */
+    private fun locate(pathUri: String): Location {
+        view?.require(pathUri)
+        return parse(pathUri)
+    }
+
     /** Fetch the whole object at [pathUri] (`s3://bucket/key`). */
     open fun get(pathUri: String): ByteArray {
-        val loc = parse(pathUri)
+        val loc = locate(pathUri)
+        view?.delegate?.let { return it.get(pathUri) }
         return s3.getObjectAsBytes(
             GetObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build(),
         ).asByteArray()
@@ -164,6 +231,8 @@ open class ObjectStore private constructor(
         startInclusive: Long,
     ): ByteArray {
         require(startInclusive >= 0) { "negative range start $startInclusive for $pathUri" }
+        locate(pathUri)
+        view?.delegate?.let { return it.getTail(pathUri, startInclusive) }
         return getRange(pathUri, "bytes=$startInclusive-")
     }
 
@@ -182,10 +251,13 @@ open class ObjectStore private constructor(
     ): ByteArray {
         require(startInclusive >= 0) { "negative range start $startInclusive for $pathUri" }
         require(length > 0) { "non-positive range length $length for $pathUri" }
+        locate(pathUri)
+        view?.delegate?.let { return it.getRange(pathUri, startInclusive, length) }
         val endInclusive = startInclusive + length - 1
         return getRange(pathUri, "bytes=$startInclusive-$endInclusive")
     }
 
+    /** The raw ranged GET; its callers have located the path. */
     private fun getRange(
         pathUri: String,
         range: String,
@@ -209,7 +281,8 @@ open class ObjectStore private constructor(
         pathUri: String,
         bytes: ByteArray,
     ) {
-        val loc = parse(pathUri)
+        val loc = locate(pathUri)
+        view?.delegate?.let { return it.put(pathUri, bytes) }
         s3.putObject(
             PutObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build(),
             RequestBody.fromBytes(bytes),
@@ -237,7 +310,8 @@ open class ObjectStore private constructor(
      * failure path owes an [abortMultipartUpload].
      */
     open fun startMultipartUpload(pathUri: String): String {
-        val loc = parse(pathUri)
+        val loc = locate(pathUri)
+        view?.delegate?.let { return it.startMultipartUpload(pathUri) }
         return s3.createMultipartUpload(
             CreateMultipartUploadRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build(),
         ).uploadId()
@@ -255,7 +329,8 @@ open class ObjectStore private constructor(
         length: Int,
     ): String {
         require(partNumber >= 1) { "part numbers start at 1, got $partNumber for $pathUri" }
-        val loc = parse(pathUri)
+        val loc = locate(pathUri)
+        view?.delegate?.let { return it.uploadPart(pathUri, uploadId, partNumber, bytes, length) }
         return s3.uploadPart(
             UploadPartRequest.builder()
                 .bucket(loc.bucket).key(loc.key)
@@ -273,7 +348,8 @@ open class ObjectStore private constructor(
         etags: List<String>,
     ) {
         require(etags.isNotEmpty()) { "cannot complete an upload with no parts: $pathUri" }
-        val loc = parse(pathUri)
+        val loc = locate(pathUri)
+        view?.delegate?.let { return it.completeMultipartUpload(pathUri, uploadId, etags) }
         val parts =
             etags.mapIndexed { i, etag ->
                 CompletedPart.builder().partNumber(i + 1).eTag(etag).build()
@@ -306,7 +382,8 @@ open class ObjectStore private constructor(
         pathUri: String,
         uploadId: String,
     ) {
-        val loc = parse(pathUri)
+        val loc = locate(pathUri)
+        view?.delegate?.let { return it.abortMultipartUpload(pathUri, uploadId) }
         runCatching {
             s3.abortMultipartUpload(
                 AbortMultipartUploadRequest.builder()
@@ -342,6 +419,9 @@ open class ObjectStore private constructor(
 
     companion object {
         private const val SCHEME = "s3://"
+
+        /** The `surface` tag of the out-of-prefix metric for this store's views. */
+        private const val SURFACE = "object_store"
 
         /** Parse `s3://bucket/key`; throws [IllegalArgumentException] on anything else. */
         fun parse(pathUri: String): Location {

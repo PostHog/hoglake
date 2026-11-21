@@ -1034,6 +1034,15 @@ The drain checks live and historical file references and active uploads.
 It uses the server's object-store configuration, as PostgreSQL cleanup does.
 Per-call AWS identity remains separate work. Hoglite has no cleanup loop,
 catalog registry, or loop lease.
+Cleanup acts only on the catalog's trusted `data_path` (the tenant manifest's,
+served in `X-Hoglite-Data-Path`; see the top-level README). A legacy catalog,
+one whose tenant was created before hoglite held the field, answers 409
+`data_path_unverified` to it, so its removal queue never drains and a drop
+with removals queued is refused as `removals_pending` for good (the refusal
+says so). Such catalogs exist in dev only, none in prod; the procedure is to
+drop and recreate them: have an operator delete the catalog's objects by hand
+and remove its tenant with hoglite's `DELETE /v1/tenants/{tid}`, then create
+the catalog again. A legacy catalog with nothing queued drops as any other.
 
 Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/compact` for the
 catalog in the token's placement. Its `CompactionStorage` adapter uses the same

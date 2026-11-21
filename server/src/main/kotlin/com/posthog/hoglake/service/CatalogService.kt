@@ -82,6 +82,9 @@ class CatalogService(private val jdbi: Jdbi) {
          */
         const val MAX_DATA_PATH_LENGTH = 512
 
+        /** The characters a data_path may hold: see [validateDataPath]. */
+        private val PRINTABLE_ASCII = 0x21..0x7E
+
         /**
          * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
          * bucket, no whitespace/control chars, no dot segments. The
@@ -94,6 +97,16 @@ class CatalogService(private val jdbi: Jdbi) {
          * hydrator/cleanup object store only speaks s3 — a catalog with an
          * unparseable data_path poisons the removal queue (rows retry
          * forever). Both catalog stores call it.
+         *
+         * PRINTABLE ASCII ONLY (0x21..0x7E). On the Hoglite backend the
+         * value travels in an HTTP header (`X-Hoglite-Data-Path`, #668):
+         * hoglite writes header bytes as UTF-8 and Java's HttpClient reads
+         * them as ISO-8859-1, so any other character fails to round-trip
+         * and the create refuses the echo as "not the requested path".
+         * hoglite itself accepts any valid UTF-8 there, so this rule is
+         * hoglake's and is stricter than the engine's; a PostgreSQL
+         * catalog follows it too, so a data_path is one thing on both
+         * backends.
          */
         internal fun validateDataPath(dataPath: String) {
             if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
@@ -110,6 +123,12 @@ class CatalogService(private val jdbi: Jdbi) {
             }
             if (dataPath.any { it.isWhitespace() || it.isISOControl() }) {
                 throw HoglakeException.Validation("data_path must not contain whitespace or control characters")
+            }
+            if (dataPath.any { it.code !in PRINTABLE_ASCII }) {
+                throw HoglakeException.Validation(
+                    "data_path must be printable ASCII (it travels in an HTTP header on the Hoglite backend), " +
+                        "got '${Identifiers.cap(dataPath)}'",
+                )
             }
             val rest =
                 dataPath.removePrefix("s3://").takeIf { it != dataPath }

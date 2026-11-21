@@ -191,15 +191,43 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "422":
+        "409":
           description: >-
-            Validation failure (bad name, blank data_path, or a reserved
-            name: a canonical lowercase UUID followed by `-events`)
+            `already_exists`: the name is taken. On Hoglite also when the
+            name's tenant exists and holds a different `data_path` (or
+            none): a tenant's `data_path` is set at create and never
+            changes, so drop the catalog first.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422":
+          description: >-
+            Validation failure (bad name, blank or non-printable-ASCII
+            data_path, or a reserved name: a canonical lowercase UUID
+            followed by `-events`), or a `data_path` that equals,
+            contains or lies under another catalog's: catalog data_paths
+            must be disjoint. The same 422 on both backends; on Hoglite
+            the engine's own overlap check (409 `data_path_overlap` on
+            the tenant create) answers it, over every tenant of that
+            backend.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: >-
+            `backend_unavailable`: the catalog backend did not answer, or
+            (Hoglite) the hoglited it reached served no
+            `X-Hoglite-Data-Path` on the tenant create — an engine from
+            before the trusted data_path. No catalog is created in either
+            case (a tenant the create made is deleted again); roll
+            hoglited forward, then retry.
+          headers:
+            Retry-After:
+              description: Seconds to back off before retrying.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}:
     get:
@@ -1472,6 +1500,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CompactionResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/DataPathUnverified" }
         "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/rehydrate:
@@ -1550,6 +1579,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/DataPathUnverified" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /database/health:
@@ -2540,7 +2570,14 @@ paths:
                   file_kind: { type: string, enum: [data, delete] }
                   state: { type: string, enum: [active, registered, abandoned] }
                   expires_at: { type: string, format: date-time }
-        "409": { description: Upload identity reused with different intent }
+        "409":
+          description: >-
+            Upload identity reused with different intent; or, on Hoglite,
+            `data_path_unverified` (see that component response): a claim
+            is a licence to write under the prefix.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422": { description: Invalid prefix or file kind }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
@@ -3811,6 +3848,21 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
+    DataPathUnverified:
+      description: >
+        409 `data_path_unverified` (Hoglite only): the catalog's hoglite
+        tenant holds no trusted `data_path` (its manifest predates the
+        field, so the tenant's own `meta.data_path` row is the only
+        source of its prefix, and that row is writable by any tenant
+        writer). Nothing acts on object storage on the row's word:
+        cleanup, compaction and an upload claim refuse until the catalog
+        is dropped and created again. Reads, commits, expiry, retirement
+        and the expired-upload sweep (which only queue removal rows) are
+        unaffected, so the catalog can still be emptied and dropped. Not
+        retryable.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
     BackendUnavailable:
       description: >
         The catalog backend did not answer. Only a catalog backend that is
@@ -3920,7 +3972,11 @@ components:
           type: string
           description: >
             The prefix the dropped catalog owned. Nothing under it was
-            deleted; list it to find what is left.
+            deleted; list it to find what is left. On Hoglite a tenant
+            whose catalog never finished bootstrapping (a create that
+            failed between the tenant create and its one transaction) is
+            dropped too; its `data_path` is then the manifest's, or empty
+            when the tenant holds none.
 
     StorageUsage:
       type: object

@@ -49,6 +49,9 @@ internal class HogliteExpiry(
                 if (batchSize <= 0) {
                     throw HoglakeException.Validation("batch size must be positive (got $batchSize)")
                 }
+                // No trusted-data_path gate: phase B only QUEUES removal
+                // rows, and cleanup (gated, #668) is what deletes; a legacy
+                // tenant must still be able to satisfy its drop guards.
                 store.meta(catalog)
             } catch (e: Throwable) {
                 Audit.event("expiry", catalog, null, Audit.failureOutcome(e), e.message)

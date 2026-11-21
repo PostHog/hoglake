@@ -169,6 +169,10 @@ class HogliteAlterRaceIntegrationTest {
                             responses += answer.body().decodeToString()
                         }
                         ex.responseHeaders.add("Content-Type", "application/json")
+                        // The tenant's trusted data_path rides on a header (#668); a relay must carry it.
+                        answer.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                            ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                        }
                         ex.sendResponseHeaders(answer.statusCode(), answer.body().size.toLong())
                         ex.responseBody.use { it.write(answer.body()) }
                     } catch (_: Throwable) {

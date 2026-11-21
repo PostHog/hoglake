@@ -40,6 +40,8 @@ import com.posthog.hoglake.model.StorageUsage
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.model.assignFieldIds
+import com.posthog.hoglake.observability.Audit
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ColumnTrees
@@ -47,6 +49,7 @@ import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.columnsByFieldId
 import com.posthog.hoglake.service.requireOperationMetadata
+import com.posthog.hoglake.storage.StoragePrefix
 import com.posthog.hoglake.store.CatalogStore
 import java.time.Instant
 import java.util.UUID
@@ -223,7 +226,58 @@ class HogliteCatalogStore(
      * [tenants]. The caller checks cross-catalog rules (unique names,
      * disjoint data paths) before it calls this function.
      *
-     * A create on a tenant that already holds a catalog is AlreadyExists.
+     * The tenant create carries [dataPath], which hoglite stores in the
+     * tenant manifest as the TRUSTED copy (see [HogliteClient]'s KDoc):
+     * the `meta.data_path` row written below is the tenant's own,
+     * writable copy, and every S3-acting path reads the manifest's
+     * instead. A tenant that already holds a different data_path (or none)
+     * is AlreadyExists: the manifest's value is set at create or never,
+     * so the catalog has to be dropped before it can move. An engine that
+     * does not echo the value stored it nowhere hoglake can trust, and
+     * the create fails rather than bootstrap a catalog whose maintenance
+     * would be refused for good ([HoglakeException.DataPathUnverified]).
+     * hoglite's own overlap refusal (409 `data_path_overlap`: another
+     * tenant of the backend owns a prefix that equals, contains or lies
+     * under this one) is the rule [CatalogService.createCatalog] applies
+     * between PostgreSQL catalogs, and surfaces as the same 422
+     * [HoglakeException.Validation].
+     *
+     * "ALREADY EXISTS" IS DECIDED FROM THE TENANT'S META, never from
+     * hoglite's answer. The tenant is probed first ([probeTenant]:
+     * absent, present without hoglake's schema, or holding a catalog);
+     * one that holds a catalog is AlreadyExists before any PUT. hoglite's
+     * create answer says `existing: true` only when ANOTHER pod holds the
+     * tenant; a pod that holds it itself, or that takes it over from an
+     * expired owner, answers a duplicate create exactly like a fresh one,
+     * so that field can tell a create of a live catalog from a new
+     * tenant only by luck, and nothing here reads it.
+     *
+     * A FAILED CREATE NEVER DELETES A TENANT. When the bootstrap is
+     * refused (no served data_path) or fails, the tenant stays and the
+     * failure surfaces as it is. hoglite cannot tell a create that made
+     * the tenant from one that found it (see above), so no answer here is
+     * proof that a tenant holds nothing worth keeping. A retry with the
+     * same data_path completes the create: the probe finds no catalog, the
+     * PUT is idempotent, and the bootstrap runs. A tenant left with a
+     * different data_path, or without one (an older hoglited), is
+     * removed by an explicit [dropCatalog] (which deletes a tenant with no
+     * `meta` table) or by an operator.
+     *
+     * Creates are SERIALIZED per backend within this process
+     * ([HogliteClient.createLock], shared by every client and store of
+     * the backend; a store is built per request, so a lock of its own
+     * would serialize nothing): hoglite's overlap scan runs without a
+     * cross-tenant lock, so two concurrent creates of different tenants
+     * with overlapping paths can both pass it, and two creates of the
+     * same tenant can both find it absent. Within one hoglake process
+     * they cannot. [dropCatalog]'s deletion of a tenant with no catalog
+     * takes the same lock, so a drop cannot probe between this call's
+     * PUT and its bootstrap, see a tenant with no catalog, and delete it
+     * under the create. ACROSS PODS NO SERIALIZATION IS PROVIDED: hoglite's
+     * overlap check is the only cross-pod guard, with that known race
+     * between two concurrent creates (hoglite's README says to serialize
+     * creates in front of it).
+     *
      * A fresh txid per CALL: a same-name create is a 409, so the guard,
      * not hoglite's dedup, answers a second create. The client's own
      * retries reuse the txid, so one call applies at most once.
@@ -238,48 +292,171 @@ class HogliteCatalogStore(
             validateCatalogName(name)
             CatalogService.validateDataPath(dataPath)
             val tenantId = boundTenant(name)
-            backendCall(name) { client.createTenant(tenantId) }
-            probeForeignKeys(name, tenantId)
-            val boot = HogliteTx()
-            // The schema is bootstrapped in ONE transaction, so the meta
-            // table exists exactly when an earlier create committed.
-            boot.expectZero("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'") {
-                HoglakeException.AlreadyExists("catalog '$name' already exists")
+            synchronized(client.createLock) {
+                val before = probeTenant(name, tenantId)
+                if (before is TenantProbe.Bootstrapped) throw alreadyExists(name, dataPath, before.dataPath)
+                val answer =
+                    try {
+                        backendCall(name) { client.createTenant(tenantId, dataPath) }
+                    } catch (r: HogliteRejected) {
+                        throw createRefusal(name, dataPath, r)
+                    }
+                probeForeignKeys(name, tenantId)
+                bootstrap(name, tenantId, dataPath, answer.dataPath, author, message)
+                // The read-back under the lock too: a drop waiting on it
+                // cannot remove the catalog between the bootstrap and this.
+                return getCatalog(name)
             }
-            // The schema's FOREIGN KEYs and cascades hold only on a
-            // connection with PRAGMA foreign_keys on, which hoglite sets for
-            // every tenant connection and lets no client change. The guard
-            // reads the flag on the very connection that lays the schema
-            // down ([probeForeignKeys] read it on a reader a moment ago) and
-            // refuses to bootstrap a tenant without it: a catalog whose
-            // integrity rested on nothing would be a misconfigured backend,
-            // not a catalog. 503, so a caller retries once the engine is
-            // fixed; the tenant stays empty and a retry re-runs this
-            // transaction (HogliteSchema, Referential integrity).
-            boot.expectScalar(1, FOREIGN_KEYS_PROBE_SQL) {
-                HoglakeException.BackendUnavailable(foreignKeysOff(tenantId))
-            }
-            HogliteSchema.DDL.forEach { boot.add(it) }
-            boot.add(
-                "INSERT INTO meta(id, name, data_path) VALUES (1, ?, ?)",
-                name,
-                dataPath,
-            )
-            boot.add(
-                "INSERT INTO snapshots(id, ts, author, message, schema_version) VALUES (0, ?, ?, ?, 0)",
-                HogliteSchema.now(),
-                author,
-                message,
-            )
-            try {
-                client.tx(tenantId, freshTxid("create-catalog"), null, boot.statements())
-            } catch (g: HogliteGuardFailure) {
-                throw boot.classify(g)
-            } catch (r: HogliteRejected) {
-                throw mapRejected(name, r)
-            }
-            return getCatalog(name)
         }
+
+    /** What [probeTenant] found in a catalog's tenant before (and after) a create. */
+    private sealed interface TenantProbe {
+        /** No tenant: a create's PUT makes it. */
+        data object Absent : TenantProbe
+
+        /** The tenant exists without hoglake's schema (a create failed between its PUT and its one transaction). */
+        data object Unbootstrapped : TenantProbe
+
+        /** The tenant holds a catalog; [dataPath] is the manifest's, or null on a legacy tenant. */
+        data class Bootstrapped(val dataPath: String?) : TenantProbe
+    }
+
+    /**
+     * Whether [tenant] exists and holds hoglake's schema, from one read
+     * of [META_TABLE_EXISTS_SQL]. A 404 is the absent tenant; an
+     * authority refusal is mapped; any other refusal surfaces as the
+     * client raised it, as [backendCall] would.
+     */
+    private fun probeTenant(
+        catalog: String,
+        tenant: String,
+    ): TenantProbe {
+        val result =
+            try {
+                client.query(tenant, META_TABLE_EXISTS_SQL, emptyList())
+            } catch (r: HogliteRejected) {
+                if (tenantAbsent(r)) return TenantProbe.Absent
+                if (r.status == 401 || r.status == 403) throw mapRejected(catalog, r)
+                throw r
+            }
+        return if (result.firstRow()!![0].asLong() == 0L) {
+            TenantProbe.Unbootstrapped
+        } else {
+            TenantProbe.Bootstrapped(result.dataPath)
+        }
+    }
+
+    /**
+     * The AlreadyExists for a create of [name] at [dataPath] on a tenant
+     * that holds a catalog under [held] (the manifest's data_path, null on
+     * a legacy tenant): the plain duplicate when the paths agree, else
+     * the one a `data_path_mismatch` would have said.
+     */
+    private fun alreadyExists(
+        name: String,
+        dataPath: String,
+        held: String?,
+    ): HoglakeException.AlreadyExists =
+        if (held == dataPath) {
+            HoglakeException.AlreadyExists("catalog '$name' already exists")
+        } else {
+            HoglakeException.AlreadyExists(
+                "catalog '$name' already has a tenant whose data_path is not '$dataPath' " +
+                    "(a tenant's data_path is set at create and never changes; drop the catalog first)",
+            )
+        }
+
+    /** The hoglake refusal for a final answer of the tenant create. */
+    private fun createRefusal(
+        name: String,
+        dataPath: String,
+        r: HogliteRejected,
+    ): Throwable =
+        when {
+            r.status == 409 && rejectionCode(r) == HogliteClient.CODE_DATA_PATH_MISMATCH ->
+                alreadyExists(name, dataPath, held = null)
+            // hoglite's own validation of the path: malformed, or inside the
+            // engine's own storage. CatalogService's check runs first, so
+            // this is hoglite knowing something hoglake does not; a request
+            // refusal (422), in the engine's words, never a 500.
+            r.status == 400 && rejectionCode(r) == HogliteClient.CODE_INVALID_DATA_PATH ->
+                HoglakeException.Validation(
+                    "hoglite refused data_path '${Identifiers.cap(dataPath)}' for catalog '$name': " +
+                        rejectionDetail(r),
+                )
+            // PostgreSQL's overlap answer, in its words (CatalogService.createCatalog):
+            // one condition, one error, whichever store refuses it. hoglite
+            // names the other TENANT; this backend keeps no name for it.
+            r.status == 409 && rejectionCode(r) == HogliteClient.CODE_DATA_PATH_OVERLAP ->
+                HoglakeException.Validation(
+                    "data_path '${Identifiers.cap(dataPath)}' overlaps another catalog's on this backend; " +
+                        "catalog data_paths must be disjoint (${rejectionDetail(r)})",
+                )
+            // Every other final answer surfaces as the client raised it,
+            // as before this field existed.
+            else -> r
+        }
+
+    /**
+     * The catalog's schema, after the tenant create answered [served]:
+     * refused (BackendUnavailable) unless hoglite echoed [dataPath] as the
+     * tenant's trusted copy, then bootstrapped in ONE transaction.
+     */
+    private fun bootstrap(
+        name: String,
+        tenantId: String,
+        dataPath: String,
+        served: String?,
+        author: String?,
+        message: String?,
+    ) {
+        if (served != dataPath) {
+            throw HoglakeException.BackendUnavailable(
+                if (served == null) {
+                    "hoglite did not record the data_path of catalog '$name' (no " +
+                        "${HogliteClient.DATA_PATH_HEADER} on the tenant create); the engine predates the " +
+                        "trusted data_path and a catalog created on it could never be maintained"
+                } else {
+                    "hoglite recorded data_path '$served' for catalog '$name', not the requested '$dataPath'"
+                },
+            )
+        }
+        val boot = HogliteTx()
+        // The schema is bootstrapped in ONE transaction, so the meta
+        // table exists exactly when an earlier create committed.
+        boot.expectZero(META_TABLE_EXISTS_SQL) {
+            HoglakeException.AlreadyExists("catalog '$name' already exists")
+        }
+        // The schema's FOREIGN KEYs and cascades hold only on a connection
+        // with PRAGMA foreign_keys on, which hoglite sets for every tenant
+        // connection and lets no client change. The guard reads the flag on
+        // the very connection that lays the schema down ([probeForeignKeys]
+        // read it on a reader a moment ago) and refuses to bootstrap a
+        // tenant without it: 503, so a caller retries once the engine is
+        // fixed (HogliteSchema, Referential integrity).
+        boot.expectScalar(1, FOREIGN_KEYS_PROBE_SQL) {
+            HoglakeException.BackendUnavailable(foreignKeysOff(tenantId))
+        }
+        HogliteSchema.DDL.forEach { boot.add(it) }
+        boot.add(
+            "INSERT INTO meta(id, name, data_path) VALUES (1, ?, ?)",
+            name,
+            dataPath,
+        )
+        boot.add(
+            "INSERT INTO snapshots(id, ts, author, message, schema_version) VALUES (0, ?, ?, ?, 0)",
+            HogliteSchema.now(),
+            author,
+            message,
+        )
+        try {
+            client.tx(tenantId, freshTxid("create-catalog"), null, boot.statements())
+        } catch (g: HogliteGuardFailure) {
+            throw boot.classify(g)
+        } catch (r: HogliteRejected) {
+            throw mapRejected(name, r)
+        }
+    }
 
     override fun getCatalog(name: String): CatalogInfo =
         catalogOperation(name) {
@@ -323,7 +500,8 @@ class HogliteCatalogStore(
         val metas = readMetas(bound)
         return bound.indices.mapNotNull { i ->
             val name = bound[i].first
-            val row = metas[i]
+            val result = metas[i]
+            val row = result?.firstRow()
             when {
                 row == null -> {
                     log.warn { "catalog '$name' has no readable tenant; skipping" }
@@ -333,7 +511,7 @@ class HogliteCatalogStore(
                     log.warn { "catalog '$name' resolved to a tenant whose meta names '${row[0]}'; skipping" }
                     null
                 }
-                else -> metaRow(row).toCatalogInfo()
+                else -> metaRow(name, row, result.dataPath).toCatalogInfo()
             }
         }
     }
@@ -342,17 +520,18 @@ class HogliteCatalogStore(
     internal var listBatchSize: Int = LIST_BATCH_SIZE
 
     /**
-     * The meta row of each (name, tenant) in [bound], in order: the row,
-     * or null when that tenant does not exist (404) or has no meta row.
-     * Any other answer for an item is retried on its own through
-     * [HogliteClient.query] (which owns re-routing and the retry budget),
-     * and an item that still fails fails the call, as a single
-     * [getCatalog] would. That covers a whale-class tenant: the batch goes
-     * to the standard pool, which answers that item 421 with the class,
-     * and the retry follows the hint to the whale pool.
+     * The meta read of each (name, tenant) in [bound], in order: the
+     * result (its first row is the meta row, or absent when the tenant has
+     * none; its data_path is the tenant's served one), or null when that
+     * tenant does not exist (404). Any other answer for an item is retried
+     * on its own through [HogliteClient.query] (which owns re-routing and
+     * the retry budget), and an item that still fails fails the call, as
+     * a single [getCatalog] would. That covers a whale-class tenant: the
+     * batch goes to the standard pool, which answers that item 421 with
+     * the class, and the retry follows the hint to the whale pool.
      */
-    private fun readMetas(bound: List<Pair<String, String>>): List<List<Any?>?> {
-        val out = arrayOfNulls<List<Any?>>(bound.size)
+    private fun readMetas(bound: List<Pair<String, String>>): List<HogliteQueryResult?> {
+        val out = arrayOfNulls<HogliteQueryResult>(bound.size)
         val retry = mutableListOf<Int>()
         val sql = metaSql
         val chunks = bound.indices.chunked(listBatchSize.coerceIn(1, HogliteClient.MAX_BATCH_READS))
@@ -372,7 +551,7 @@ class HogliteCatalogStore(
             for ((k, i) in chunk.withIndex()) {
                 val a = answers[k]
                 when {
-                    a.status == 200 -> out[i] = a.result!!.firstRow()
+                    a.status == 200 -> out[i] = a.result!!
                     a.status == 404 -> out[i] = null
                     a.status == 401 || a.status == 403 ->
                         throw mapRejected(bound[i].first, HogliteRejected(a.status, a.body))
@@ -391,9 +570,9 @@ class HogliteCatalogStore(
         catalog: String,
         tenant: String,
         sql: String,
-    ): List<Any?>? =
+    ): HogliteQueryResult? =
         try {
-            client.query(tenant, sql, emptyList()).firstRow()
+            client.query(tenant, sql, emptyList())
         } catch (r: HogliteRejected) {
             if (r.status == 404) null else throw mapRejected(catalog, r)
         }
@@ -437,6 +616,32 @@ class HogliteCatalogStore(
      * transaction, then release and delete its tenant. A retry after a
      * partial failure proceeds: the fence transaction itself is not
      * fenced.
+     *
+     * A tenant with no catalog in it — no `meta` TABLE, so the schema
+     * never bootstrapped — is deleted without the fence: there is nothing
+     * to prove empty and nothing a writer could land, and the tenant is
+     * what keeps the name (and, when it holds one, the data_path)
+     * unusable. The answer's `data_path` is then the manifest's, or empty
+     * when the tenant holds none (a create on an older engine that failed
+     * its bootstrap). A `meta` table WITHOUT its row is not that: the
+     * bootstrap is one transaction, so the row can only have been deleted
+     * with raw SQL, and a tenant so damaged is refused
+     * (BackendUnavailable), never deleted on the strength of the damage.
+     *
+     * The probe and that deletion run under [HogliteClient.createLock],
+     * the monitor [createCatalog] holds from its probe through its
+     * bootstrap: a tenant with no catalog is exactly what a create looks
+     * like between its PUT and its one transaction, so without the lock a
+     * drop probing in that window would go on to delete the tenant
+     * after the create's bootstrap landed in it: a live catalog gone
+     * without the fence or the emptiness proof, and a create that
+     * answered success for it. A catalog that IS bootstrapped is dropped
+     * outside the lock: its fence, not the lock, is what stops writers.
+     *
+     * A legacy tenant (no trusted data_path) can never drain its removal
+     * queue, because cleanup refuses it ([trustedDataPath]), so its
+     * `removals_pending` refusal says so and names the way out: an
+     * operator deletes the tenant and its objects by hand.
      */
     override fun dropCatalog(
         catalog: String,
@@ -450,9 +655,16 @@ class HogliteCatalogStore(
         binding?.missing?.let { throw it }
         val tenantId = binding?.tenant ?: tenants.tenantFor(catalog)
         val info =
-            when (val probe = dropMetadata(catalog, tenantId)) {
-                DropMetadata.Absent -> throw missingCatalog(catalog)
-                is DropMetadata.Present -> probe.meta
+            synchronized(client.createLock) {
+                when (val probe = dropMetadata(catalog, tenantId)) {
+                    DropMetadata.Absent -> throw missingCatalog(catalog)
+                    is DropMetadata.Unbootstrapped -> {
+                        log.warn { "catalog '$catalog': its tenant holds no catalog; deleting the tenant" }
+                        deleteTenant(catalog, tenantId)
+                        return DroppedCatalog(catalog, probe.dataPath ?: "")
+                    }
+                    is DropMetadata.Present -> probe.meta
+                }
             }
 
         // The emptiness preconditions AND the write fence in ONE
@@ -503,7 +715,15 @@ class HogliteCatalogStore(
         emptyGuard(
             "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL",
             CatalogNotEmptyReason.REMOVALS_PENDING,
-        ) { "$it removal(s) are not drained" }
+        ) {
+            if (info.dataPathTrusted) {
+                "$it removal(s) are not drained"
+            } else {
+                "$it removal(s) are not drained and never will be: the catalog predates the trusted " +
+                    "data_path, so cleanup refuses it; have an operator delete its objects and its hoglite " +
+                    "tenant by hand, then create the catalog again"
+            }
+        }
         emptyGuard(
             "SELECT COUNT(*) FROM compaction_claims WHERE expires_at > '$fenceNow'",
             CatalogNotEmptyReason.ACTIVE_COMPACTION_CLAIMS,
@@ -535,32 +755,40 @@ class HogliteCatalogStore(
 
         // Order matters: the fence stops new writes, then the owner is
         // released so nothing in flight can re-materialize the tenant,
-        // THEN its durable state. hoglite routes
-        // release AND delete to the owning pod (a 421/503 rides the
-        // client's retry taxonomy) and answers release idempotently once
-        // no live owner remains. The 409 catch is transitional: an old
-        // engine (pre delete-routing) refuses a delete under a live
-        // remote owner — release again and retry with a pause.
+        // THEN its durable state.
+        deleteTenant(catalog, tenantId)
+        return DroppedCatalog(catalog, info.dataPath)
+    }
+
+    /**
+     * Release and delete [catalog]'s tenant [tenantId]: the tail of
+     * [dropCatalog], and the clean-up of a [createCatalog] that failed
+     * after making the tenant. hoglite routes release AND delete to the
+     * owning pod (a 421/503 rides the client's retry taxonomy) and
+     * answers release idempotently once no live owner remains. The 409
+     * catch is transitional: an old engine (pre delete-routing) refuses a
+     * delete under a live remote owner — release again and retry with a
+     * pause.
+     */
+    private fun deleteTenant(
+        catalog: String,
+        tenantId: String,
+    ) {
         var fencingFailure: HogliteRejected? = null
-        var deleted = false
         for (attempt in 0 until 3) {
             if (attempt > 0) Thread.sleep(200)
             backendCall(catalog) { client.release(tenantId) }
             try {
                 client.deleteTenant(tenantId)
-                deleted = true
-                break
+                return
             } catch (e: HogliteRejected) {
                 if (e.status == 409) fencingFailure = e else throw mapRejected(catalog, e)
             }
         }
-        if (!deleted) {
-            throw HoglakeException.BackendUnavailable(
-                "hoglite refused to delete tenant '$catalog' three times in a row (a live owner " +
-                    "kept re-claiming it): ${fencingFailure?.body}",
-            )
-        }
-        return DroppedCatalog(catalog, info.dataPath)
+        throw HoglakeException.BackendUnavailable(
+            "hoglite refused to delete tenant '$catalog' three times in a row (a live owner " +
+                "kept re-claiming it): ${fencingFailure?.body}",
+        )
     }
 
     /**
@@ -817,7 +1045,7 @@ class HogliteCatalogStore(
                         ),
                     ),
                 )
-            val meta = metaRow(pre[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+            val meta = metaRow(catalog, pre[0])
             val ns =
                 pre[1].firstRow()?.let { namespaceInfo(it) }
                     ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
@@ -1280,7 +1508,7 @@ class HogliteCatalogStore(
                     ),
                 ),
             )
-        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val m = metaRow(catalog, metaResult)
         val ns =
             nsResult.firstRow()?.let { namespaceInfo(it) }
                 ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
@@ -1331,7 +1559,7 @@ class HogliteCatalogStore(
                     ),
                 ),
             )
-        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val m = metaRow(catalog, metaResult)
         val at = resolveRead(catalog, m, null, null)
         nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
         val row =
@@ -1506,7 +1734,7 @@ class HogliteCatalogStore(
                     ),
                 ),
             )
-        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val m = metaRow(catalog, metaResult)
         nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
         // One transaction is one engine snapshot, so a statement head that
         // differs from the meta row is an engine defect, never a race.
@@ -1758,7 +1986,12 @@ class HogliteCatalogStore(
                     if (rows.size < count) break
                     last = rows.last()
                 }
-                return withOrderingBounds(catalog, t.tableId, at, page)
+                return withOrderingBounds(
+                    catalog,
+                    t.tableId,
+                    at,
+                    underTrustedPrefix(catalog, m, "files", page) { listOf(it.file.path) },
+                )
             }
         }
 
@@ -1990,7 +2223,13 @@ class HogliteCatalogStore(
             // Expiry can purge barriers or ended files/DVs between these reads.
             // Their snapshots precede the floor. Recheck the exclusive lower bound before returning.
             requireRetained(meta(catalog).earliestSnapshotId)
-            return ChangesPlan(t.tableUuid, fromSnapshot, to, files, dvs)
+            return ChangesPlan(
+                t.tableUuid,
+                fromSnapshot,
+                to,
+                underTrustedPrefix(catalog, m, "changes", files) { listOf(it.path) },
+                underTrustedPrefix(catalog, m, "changes", dvs) { listOf(it.path) },
+            )
         }
 
     // ==================== snapshots ========================================
@@ -2182,7 +2421,12 @@ class HogliteCatalogStore(
                     afterRow = last[7].asLong()
                     afterId = last[0].asLong()
                 }
-                files = collected
+                // A file whose DV lies outside the prefix goes with it: serving
+                // the file without its vector would resurrect deleted rows.
+                files =
+                    underTrustedPrefix(catalog, m, "scan", collected) { (sf, _) ->
+                        listOfNotNull(sf.dataFile.path, sf.deleteFile?.path)
+                    }
                 val providedFiles =
                     if (columnStats == null) {
                         0L
@@ -2428,7 +2672,15 @@ class HogliteCatalogStore(
             }
         }
 
-    /** The one meta row of a catalog tenant. */
+    /**
+     * The one meta row of a catalog tenant. [dataPath] is the TRUSTED
+     * value when [dataPathTrusted]: the one hoglite served from the tenant
+     * manifest beside the row, not the row's own `meta.data_path`, which
+     * any tenant writer can rewrite (#668). On a legacy tenant (a
+     * manifest with no data_path) it is the row's value and
+     * [dataPathTrusted] is false: reads and commits use it as before, and
+     * every S3-acting path refuses through [trustedDataPath].
+     */
     internal class MetaRow(
         val name: String,
         val dataPath: String,
@@ -2438,6 +2690,7 @@ class HogliteCatalogStore(
         val earliestSnapshotTime: Instant?,
         val retentionSeconds: Long?,
         val consumerFloor: Boolean,
+        val dataPathTrusted: Boolean,
     ) {
         fun toCatalogInfo(): CatalogInfo =
             CatalogInfo(
@@ -2461,45 +2714,194 @@ class HogliteCatalogStore(
         "SELECT name, data_path, next_snapshot - 1, schema_version, earliest_snapshot_id, " +
             "earliest_snapshot_time, snapshot_retention_seconds, consumer_floor FROM meta WHERE id = 1"
 
-    internal fun meta(catalog: String): MetaRow {
-        val row =
-            queryCatalog(catalog, metaSql).firstRow()
-                ?: throw HoglakeException.NotFound("catalog '$catalog'")
-        return metaRow(row)
-    }
+    internal fun meta(catalog: String): MetaRow = metaRow(catalog, queryCatalog(catalog, metaSql))
 
     private sealed interface DropMetadata {
         data class Present(val meta: MetaRow) : DropMetadata
 
+        /** The tenant exists and holds no catalog: no `meta` table at all. [dataPath] is the manifest's. */
+        data class Unbootstrapped(val dataPath: String?) : DropMetadata
+
         data object Absent : DropMetadata
     }
 
-    /** Only this drop-private probe permits proven absence without poisoning an operation. */
+    /**
+     * Only this drop-private probe permits proven absence without
+     * poisoning an operation. The `meta` table is probed before the row
+     * is read, so a tenant whose bootstrap never landed (the create
+     * failed between the tenant PUT and its one transaction) is
+     * [DropMetadata.Unbootstrapped] rather than a SQL error. A `meta`
+     * table without its row is integrity damage (the bootstrap writes
+     * both in one transaction; only raw SQL removes the row alone) and
+     * is refused: the drop must not read it as "nothing here" and delete
+     * a tenant whose other tables may still name live objects.
+     */
     private fun dropMetadata(
         catalog: String,
         tenant: String,
     ): DropMetadata {
-        val row =
+        fun read(sql: String): HogliteQueryResult? =
             try {
-                client.query(tenant, metaSql, emptyList()).firstRow()
+                client.query(tenant, sql, emptyList())
             } catch (r: HogliteRejected) {
-                if (tenantAbsent(r)) return DropMetadata.Absent
-                throw mapRejected(catalog, r)
-            } ?: throw HoglakeException.BackendUnavailable("catalog '$catalog' has no metadata row")
-        return DropMetadata.Present(metaRow(row))
+                if (tenantAbsent(r)) null else throw mapRejected(catalog, r)
+            }
+        val probe = read(META_TABLE_EXISTS_SQL) ?: return DropMetadata.Absent
+        if (probe.firstRow()!![0].asLong() == 0L) return DropMetadata.Unbootstrapped(probe.dataPath)
+        val result = read(metaSql) ?: return DropMetadata.Absent
+        val row =
+            result.firstRow()
+                ?: throw HoglakeException.BackendUnavailable(
+                    "catalog '$catalog' has no metadata row: its tenant holds hoglake's schema but `meta` is " +
+                        "empty, which only raw SQL can do (the bootstrap writes both at once); refusing to drop a " +
+                        "damaged tenant as an empty one — repair the row or remove the tenant by hand",
+                )
+        return DropMetadata.Present(metaRow(catalog, row, result.dataPath))
     }
 
-    internal fun metaRow(row: List<Any?>): MetaRow =
-        MetaRow(
+    /** [metaRow] of a [metaSql] answer; a missing row is the missing catalog. */
+    internal fun metaRow(
+        catalog: String,
+        result: HogliteQueryResult,
+    ): MetaRow =
+        metaRow(
+            catalog,
+            result.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"),
+            result.dataPath,
+        )
+
+    /**
+     * THE ONE PLACE the tenant's data_path is read: [row] is a [metaSql]
+     * row and [served] the data_path hoglite sent beside it
+     * ([HogliteQueryResult.dataPath]). The served value wins; the row's
+     * is compared and nothing more (see [servedDataPath]).
+     */
+    internal fun metaRow(
+        catalog: String,
+        row: List<Any?>,
+        served: String?,
+    ): MetaRow {
+        val rowDataPath = row[1].asString()
+        val trusted = servedDataPath(catalog, rowDataPath, served)
+        return MetaRow(
             name = row[0].asString(),
-            dataPath = row[1].asString(),
+            dataPath = trusted ?: rowDataPath,
             head = row[2].asLong(),
             schemaVersion = row[3].asLong(),
             earliestSnapshotId = row[4].asLong(),
             earliestSnapshotTime = (row[5] as? String)?.let { HogliteSchema.parse(it) },
             retentionSeconds = row[6].asLongOrNull(),
             consumerFloor = row[7].asLong() != 0L,
+            dataPathTrusted = trusted != null,
         )
+    }
+
+    /**
+     * The data_path hoglite [served] from the tenant manifest beside a
+     * row carrying [rowDataPath] (`meta.data_path`), or null on a legacy
+     * tenant. A row that differs from the manifest is a tenant writer
+     * steering hoglake at another prefix, or a create that half-applied:
+     * audited (`data_path_mismatch`, outcome `invariant_violation`) and
+     * counted, never thrown — the served value is what every caller acts
+     * on, and refusing the read would let the row deny service to the
+     * catalog it belongs to.
+     */
+    internal fun servedDataPath(
+        catalog: String,
+        rowDataPath: String,
+        served: String?,
+    ): String? {
+        if (served != null && served != rowDataPath) {
+            Metrics.hogliteDataPathMismatch(catalog)
+            Audit.event(
+                "data_path_mismatch",
+                catalog,
+                null,
+                outcome = "invariant_violation",
+                detail =
+                    "meta.data_path='$rowDataPath' differs from the tenant manifest's '$served'; " +
+                        "acting on the manifest's",
+            )
+        }
+        return served
+    }
+
+    /**
+     * The trusted data_path of [m], for a path that ACTS on object
+     * storage: cleanup's deletes, compaction's reads and writes, an
+     * upload claim's prefix (a licence to write there). A legacy tenant
+     * (no manifest data_path) is refused with
+     * [HoglakeException.DataPathUnverified]: its row is the only source
+     * of the prefix, and the row is what #668 is about. Not gated:
+     * expiry, retirement and the expired-upload sweep, which only queue
+     * removal rows (cleanup, gated, is what deletes); gating them would
+     * leave a legacy catalog's drop guards (`FILES_PENDING_EXPIRY`,
+     * `TABLES_PENDING_RETIREMENT`) unsatisfiable, so it could never be
+     * dropped and recreated with a trusted path.
+     */
+    internal fun trustedDataPath(
+        catalog: String,
+        m: MetaRow,
+    ): String = if (m.dataPathTrusted) m.dataPath else throw dataPathUnverified(catalog)
+
+    /** [trustedDataPath] for a row read outside [metaRow] (a join on `meta`), from its served value. */
+    internal fun trustedDataPath(
+        catalog: String,
+        rowDataPath: String,
+        served: String?,
+    ): String = servedDataPath(catalog, rowDataPath, served) ?: throw dataPathUnverified(catalog)
+
+    private fun dataPathUnverified(catalog: String): HoglakeException.DataPathUnverified =
+        HoglakeException.DataPathUnverified(
+            "catalog '$catalog' has no trusted data_path: its hoglite tenant was created before hoglite held " +
+                "one, so nothing may delete or write under its prefix on the tenant's word; drop and recreate " +
+                "the catalog (reads and commits are unaffected)",
+        )
+
+    /**
+     * [items] whose object paths all lie under the catalog's trusted
+     * data_path, for an answer that hands a reader file or DV paths
+     * (scan plans, file listings, the changefeed). A row outside it was
+     * written around hoglake's commit (which refuses such a path), so it
+     * is dropped from the answer, audited and counted, rather than
+     * served as the catalog's object or refused wholesale (a single such
+     * row would otherwise deny every read of the table). Nothing is
+     * dropped on a legacy tenant, whose only prefix is the row's own.
+     * Compaction's planning uses the [String] form on its trusted prefix
+     * (surface `compaction`), so a file outside it is skipped at planning
+     * rather than failing the table's every run at the rewrite's open.
+     */
+    internal fun <T> underTrustedPrefix(
+        catalog: String,
+        m: MetaRow,
+        surface: String,
+        items: List<T>,
+        paths: (T) -> List<String>,
+    ): List<T> = if (m.dataPathTrusted) underTrustedPrefix(catalog, m.dataPath, surface, items, paths) else items
+
+    /** [underTrustedPrefix] over [dataPath], a prefix the caller has already established as trusted. */
+    internal fun <T> underTrustedPrefix(
+        catalog: String,
+        dataPath: String,
+        surface: String,
+        items: List<T>,
+        paths: (T) -> List<String>,
+    ): List<T> {
+        val prefix = StoragePrefix.of(dataPath)
+        return items.filter { item ->
+            val outside = paths(item).filter { !prefix.admits(it) }
+            if (outside.isEmpty()) return@filter true
+            Metrics.pathOutsideDataPath(catalog, surface)
+            Audit.event(
+                "path_outside_data_path",
+                catalog,
+                outside.first(),
+                outcome = "invariant_violation",
+                detail = "dropped from the $surface answer: outside the catalog's data_path '$dataPath'",
+            )
+            false
+        }
+    }
 
     /** Resolve the read snapshot for a read path, with hoglake's guard order and typed refusals. */
     internal fun resolveRead(
@@ -3236,6 +3638,14 @@ class HogliteCatalogStore(
         "hoglite tenant '$tenantId' does not enforce foreign keys (PRAGMA foreign_keys is off); " +
             "the catalog schema relies on them, so the engine is misconfigured"
 
+    /** The engine's `code` label on a rejection body, or null. */
+    private fun rejectionCode(r: HogliteRejected): String? =
+        runCatching { json.readTree(r.body) }.getOrNull()?.get("code")?.asText()
+
+    /** The engine's `error` message on a rejection body, else the body. */
+    private fun rejectionDetail(r: HogliteRejected): String =
+        runCatching { json.readTree(r.body) }.getOrNull()?.get("error")?.asText() ?: r.body
+
     /**
      * The typed exception a deterministic hoglite refusal means. A
      * [HoglakeException] (a client-visible status) for everything the
@@ -3386,5 +3796,9 @@ class HogliteCatalogStore(
         internal const val FOREIGN_KEY_REFUSAL = "FOREIGN KEY constraint failed"
 
         internal fun freshTxid(prefix: String): String = "$prefix:${UUID.randomUUID()}"
+
+        /** 1 when the tenant holds hoglake's schema (the bootstrap landed), else 0. */
+        internal const val META_TABLE_EXISTS_SQL =
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
     }
 }

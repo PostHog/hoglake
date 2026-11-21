@@ -65,6 +65,12 @@ internal class HogliteInterposer(
                         )
                     val bytes = answer.body()
                     ex.responseHeaders.add("Content-Type", "application/json")
+                    // The tenant's trusted data_path rides on a header (#668);
+                    // a proxy that dropped it would turn every catalog behind
+                    // it into a legacy one.
+                    answer.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                        ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                    }
                     ex.sendResponseHeaders(answer.statusCode(), if (bytes.isEmpty()) -1 else bytes.size.toLong())
                     if (bytes.isNotEmpty()) ex.responseBody.use { it.write(bytes) } else ex.close()
                 } catch (e: Throwable) {
