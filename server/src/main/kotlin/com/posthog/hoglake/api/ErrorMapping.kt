@@ -65,6 +65,10 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  *                          file namespace containment (V33) does not admit
  * - ContainmentUnverified -> 503 `containment_unverified`: marking could
  *                          not prove the prefix clean in time
+ * - DataPathUnverified  -> 409 `data_path_unverified`: a Hoglite catalog
+ *                          whose tenant holds no trusted data_path asked
+ *                          for cleanup, compaction or an upload claim
+ *                          (the paths that act on S3); recreate it
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
@@ -181,6 +185,8 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
                 )
         is HoglakeException.ContainmentUnverified ->
             HttpStatusCode.ServiceUnavailable to apiError("containment_unverified", cause)
+        is HoglakeException.DataPathUnverified ->
+            HttpStatusCode.Conflict to apiError("data_path_unverified", cause)
         // 401, and the ONLY arm whose status is added by a header the
         // caller must also honour (WWW-Authenticate, below). `error`
         // carries the verifier's closed reason vocabulary rather than a

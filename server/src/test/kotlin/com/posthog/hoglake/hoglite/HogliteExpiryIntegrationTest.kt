@@ -110,6 +110,12 @@ class HogliteExpiryIntegrationTest {
                         ).build()
                 val resp = forward.send(req, HttpResponse.BodyHandlers.ofByteArray())
                 hook?.after?.invoke()
+                // The tenant's trusted data_path rides on a header (#668): a
+                // proxy that dropped it would make every catalog behind it a
+                // legacy one.
+                resp.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                    ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                }
                 respond(resp.statusCode(), resp.body())
             } catch (e: Throwable) {
                 ex.sendResponseHeaders(599, -1)

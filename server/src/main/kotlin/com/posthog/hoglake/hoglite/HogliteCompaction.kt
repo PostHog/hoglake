@@ -104,15 +104,23 @@ internal class HogliteCompaction(
         cfg: CompactionConfig,
     ): TableContext {
         // Read the head, schema fence, data path and current names together.
-        val row =
+        val read =
             store.queryCatalog(
                 catalog,
                 "SELECT m.next_snapshot - 1, t.schema_version, m.data_path, v.namespace, v.name FROM tables t " +
                     "JOIN table_versions v ON v.table_id = t.id AND v.end_snapshot IS NULL CROSS JOIN meta m " +
                     "WHERE t.id = ? AND t.dropped_snapshot IS NULL AND m.id = 1",
                 tableId,
-            ).firstRow() ?: throw TableNoLongerLive(tableId)
-        val state = PlanningState(row[0].asLong(), row[1].asLong(), row[2].asString())
+            )
+        val row = read.firstRow() ?: throw TableNoLongerLive(tableId)
+        // The data path the rewrite reads under and writes under is the
+        // TRUSTED one hoglite served beside this row, never the row's (#668).
+        val state =
+            PlanningState(
+                row[0].asLong(),
+                row[1].asLong(),
+                store.trustedDataPath(catalog, row[2].asString(), read.dataPath),
+            )
         val columns = store.columnsAt(catalog, tableId, state.head)
         val sort = store.sortSpecAt(catalog, tableId, state.head)
         val prefixField = store.layoutAt(catalog, tableId, state.head)
@@ -229,7 +237,18 @@ internal class HogliteCompaction(
                     beginSnapshot = r[7].asLong(),
                 ) to Pair(r[8].asLongOrNull(), partitionValues)
             }
-        val byBucket = candidates.groupBy({ Bucket(it.second.first, it.second.second) }) { it.first }
+        // A row whose file or DV lies outside the trusted prefix is written
+        // around hoglake's commit (#668): it is SKIPPED here, counted and
+        // audited like a scan's, rather than packed into a group whose
+        // open the bounded store view then refuses — which would fail the
+        // same group on every run and stall the table's compaction. The
+        // cursor still advances over it (`rows` below), so it is not
+        // re-fetched first on every sweep.
+        val admitted =
+            store.underTrustedPrefix(catalog, m.dataPath, "compaction", candidates) { (candidate, _) ->
+                listOfNotNull(candidate.path, candidate.dv?.path)
+            }
+        val byBucket = admitted.groupBy({ Bucket(it.second.first, it.second.second) }) { it.first }
         if (ctx.objectPrefixFieldId != null) {
             for (ids in byBucket.keys.mapNotNull { it.specId }.distinct().chunked(PAGE_SIZE)) {
                 val specs =
@@ -247,14 +266,16 @@ internal class HogliteCompaction(
                 }
             }
         }
-        m.candidates = candidates.map { it.first.dataFileId }
+        m.candidates = admitted.map { it.first.dataFileId }
         // Retain at most minInputFiles - 1 rows from the last contiguous bucket.
         // The window always advances: candidateBudget is at least minInputFiles.
         // This progress rule does not pack groups or repeat admission rules.
         var next = HogliteCompactionCursors.START
         if (!exhausted && rows.isNotEmpty()) {
+            // The last FETCHED row names the bucket; its admitted rows are
+            // the tail (none, when every row of that bucket was skipped).
             val tail =
-                byBucket.getValue(Bucket(candidates.last().second.first, candidates.last().second.second))
+                byBucket[Bucket(candidates.last().second.first, candidates.last().second.second)].orEmpty()
                     .takeLast(cfg.minInputFiles - 1)
             val first =
                 tail.firstOrNull()?.let {
@@ -406,7 +427,9 @@ internal class HogliteCompaction(
 
         override fun liveTables(catalog: String): List<Pair<String, String>> {
             interrupted()
-            store.meta(catalog)
+            // Before any plan: a tenant with no trusted data_path gets no
+            // rewrite, no staging ticket and no claim (#668).
+            store.trustedDataPath(catalog, store.meta(catalog))
             indexes[catalog] =
                 store.queryCatalog(
                     catalog,
@@ -568,7 +591,7 @@ internal class HogliteCompaction(
 
         override fun isTerminalFailure(error: Throwable): Boolean =
             error is HoglakeException.NotFound || error is HoglakeException.BackendUnavailable ||
-                error is HoglakeException.CommitOutcomeUnknown ||
+                error is HoglakeException.CommitOutcomeUnknown || error is HoglakeException.DataPathUnverified ||
                 error is InterruptedException || Thread.currentThread().isInterrupted
 
         override fun isRecoverablePlanningFailure(error: Throwable): Boolean =

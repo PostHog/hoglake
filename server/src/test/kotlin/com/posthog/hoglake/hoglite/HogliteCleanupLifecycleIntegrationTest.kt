@@ -96,6 +96,11 @@ class HogliteCleanupLifecycleIntegrationTest {
             if (decision?.first == 422) check(answer!!.statusCode() == 200)
             if (answer?.statusCode() == 200) afterApply(txid)
             val bytes = decision?.second?.toByteArray() ?: answer!!.body()
+            // The tenant's trusted data_path rides on a header (#668): a relay
+            // that dropped it would make every catalog behind it a legacy one.
+            answer?.headers()?.allValues(HogliteClient.DATA_PATH_HEADER)?.forEach {
+                ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+            }
             ex.sendResponseHeaders(
                 decision?.first ?: answer!!.statusCode(),
                 if (bytes.isEmpty()) -1 else bytes.size.toLong(),

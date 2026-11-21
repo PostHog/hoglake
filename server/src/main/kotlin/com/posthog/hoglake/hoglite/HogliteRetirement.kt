@@ -96,6 +96,9 @@ internal class HogliteRetirement(
         fun interrupted() {
             if (Thread.currentThread().isInterrupted) throw InterruptedException("retirement cancelled")
         }
+        // No trusted-data_path gate: retirement only QUEUES removal rows,
+        // and cleanup (gated, #668) is what deletes; a legacy tenant must
+        // still be able to satisfy its drop guards.
         val floor = store.meta(catalog).earliestSnapshotId
         tally.floor = floor
         tally.remaining = store.queryCatalog(catalog, REMAINING_SQL, floor).firstRow()!![0].asLong()

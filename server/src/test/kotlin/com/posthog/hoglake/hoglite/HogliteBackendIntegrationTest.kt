@@ -139,7 +139,8 @@ class HogliteBackendIntegrationTest {
                 cat,
                 """WITH RECURSIVE n(i) AS (VALUES(?) UNION ALL SELECT i + 1 FROM n WHERE i < ?)
                     INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start, stats_state, begin_snapshot)
-                    SELECT i, ?, 's3://hoglake-it/scale/' || i || '.parquet', 1, 100, i / 2, 'pending', ? FROM n""",
+                    SELECT i, ?, 's3://hoglake-it/$cat/scale/' || i || '.parquet', 1, 100, i / 2, 'pending', ?
+                    FROM n""",
                 start,
                 minOf(start + 4_999, count),
                 table.tableId,
@@ -302,6 +303,10 @@ class HogliteBackendIntegrationTest {
                     cancelledError.set(json.readTree(response.body())["error"]?.asText())
                 }
                 ex.responseHeaders.add("Content-Type", "application/json")
+                // The tenant's trusted data_path rides on a header (#668); a relay must carry it.
+                response.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                    ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                }
                 ex.sendResponseHeaders(response.statusCode(), response.body().size.toLong())
                 ex.responseBody.use { it.write(response.body()) }
             } catch (e: Throwable) {

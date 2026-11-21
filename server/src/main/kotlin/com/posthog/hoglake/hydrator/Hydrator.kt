@@ -21,6 +21,7 @@ import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.service.HydratorMaintenanceBackend
+import com.posthog.hoglake.storage.PathOutsidePrefixException
 import com.posthog.hoglake.storage.StorageAccess
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
@@ -1019,10 +1020,12 @@ class Hydrator(
     // ---- footer fetch ------------------------------------------------------
 
     /**
-     * The store to read [catalogId]'s files with: the shared store under
-     * an unscoped provider, else a view on the catalog's own read grant,
-     * resolved once per catalog per sweep from its `data_path`. The
-     * lookup runs inside the sweep transaction, under the file's
+     * The store to read [catalogId]'s files with: a view bounded to the
+     * catalog's `data_path` (and, under `broker`, on its own read grant),
+     * resolved once per catalog per sweep. Every provider goes through
+     * the view: a file row whose path lies outside the prefix is refused
+     * before the fetch, and marked `failed` (see [classifyFetchFailure]).
+     * The lookup runs inside the sweep transaction, under the file's
      * savepoint, so the one way it can fail — a row that vanished after
      * the claim, which the claim's locks rule out — marks that file and
      * nothing else.
@@ -1032,7 +1035,6 @@ class Hydrator(
         catalogId: Long,
         stores: MutableMap<Long, ObjectStore>,
     ): ObjectStore {
-        if (!store.scoped) return store
         return stores.getOrPut(catalogId) {
             val cat =
                 h.createQuery("SELECT name, data_path FROM hog_catalog WHERE catalog_id = :id")
@@ -1101,7 +1103,9 @@ class Hydrator(
 
     /**
      * Structural iff the object is definitively absent (NoSuchKey / bare
-     * 404); everything else the store can throw — throttle, 5xx, auth
+     * 404) or its path lies outside the catalog's data_path (the store
+     * view refused it before any fetch; no retry changes a path);
+     * everything else the store can throw — throttle, 5xx, auth
      * hiccups, connection resets, timeouts — is transient: retrying is
      * free (the file just stays pending) and correct once the condition
      * clears, whereas a terminal 'failed' would permanently de-stat every
@@ -1111,7 +1115,7 @@ class Hydrator(
         e: Exception,
         path: String,
     ): Exception =
-        if (isMissingObject(e)) {
+        if (isMissingObject(e) || e is PathOutsidePrefixException) {
             e
         } else {
             TransientFetchException("transient object-store failure fetching $path", e)

@@ -10,9 +10,11 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.MaintenanceRunStore
+import com.posthog.hoglake.storage.PathOutsidePrefixException
 import com.posthog.hoglake.storage.StorageAccess
 import com.posthog.hoglake.storage.StorageCredentialProvider
 import com.posthog.hoglake.storage.StorageCredentialProviders
+import com.posthog.hoglake.storage.StoragePrefix
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -80,6 +82,12 @@ open class RemovalStore private constructor(
      * `ambient`/`static`, a refusal under `broker`.
      */
     private val credentials: AwsCredentialsProvider?,
+    /**
+     * Non-null on a catalog VIEW: the catalog, the prefix every path this
+     * view deletes must stay under, and (under an unscoped provider) the
+     * base store its IO forwards to. Null on the base store.
+     */
+    private val view: CatalogView?,
 ) : AutoCloseable {
     constructor(
         endpoint: String?,
@@ -87,7 +95,21 @@ open class RemovalStore private constructor(
         pathStyle: Boolean,
         provider: StorageCredentialProvider,
         commitLockTimeoutMs: Long = com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
-    ) : this(endpoint, region, pathStyle, provider, commitLockTimeoutMs, shared = null, credentials = null)
+    ) : this(endpoint, region, pathStyle, provider, commitLockTimeoutMs, shared = null, credentials = null, view = null)
+
+    /**
+     * What makes a store a catalog view: see `ObjectStore.CatalogView`.
+     * The forwarding keeps a fault-injecting subclass of the base store
+     * (cleanup's failure-path tests override [deleteBatch] and
+     * [deleteChunk]) in the loop under an unscoped provider.
+     */
+    private class CatalogView(
+        val catalog: String,
+        val prefix: StoragePrefix,
+        val delegate: RemovalStore?,
+    ) {
+        fun require(pathUri: String) = prefix.require(pathUri, catalog, SURFACE)
+    }
 
     /**
      * The key-pair shape every test fixture builds: static keys when both
@@ -160,12 +182,18 @@ open class RemovalStore private constructor(
     private val views = ConcurrentHashMap<Triple<String, String, StorageAccess>, RemovalStore>()
 
     /**
-     * The store to delete [catalog]'s objects under [prefix] with: this
-     * very store under an unscoped provider (same client, same subclass,
-     * so a fault-injecting test store keeps injecting), a thin view over
-     * this store's client that signs each request with the catalog's own
-     * session under `broker`, cached for the life of the base store.
-     * Deletes need [StorageAccess.DELETE], the one level that carries
+     * The store to delete [catalog]'s objects under [prefix] with: ALWAYS
+     * a view bounded to that prefix. A path outside it fails on its own
+     * before any S3 call — per key in [deleteBatch], as a
+     * [PathOutsidePrefixException] from [exists] and [deleteIfExists] —
+     * so a removal row that names another catalog's object stays queued
+     * and deletes nothing (#668). Under an unscoped provider the view
+     * forwards its IO to this very store (same client, same keys, the
+     * base's own methods, so a fault-injecting test store keeps
+     * injecting); under `broker` it signs each request with the
+     * catalog's own session over this store's client. Views are cached
+     * for the life of the base store. Deletes need
+     * [StorageAccess.DELETE], the one level that carries
      * `s3:DeleteObject`; cleanup is the only job that asks for it.
      */
     fun forCatalog(
@@ -173,20 +201,37 @@ open class RemovalStore private constructor(
         prefix: String,
         access: StorageAccess = StorageAccess.DELETE,
     ): RemovalStore {
-        if (!provider.scoped) return this
-        check(credentials == null) { "forCatalog on a catalog view" }
+        check(view == null) { "forCatalog on a catalog view" }
         return views.computeIfAbsent(Triple(catalog, prefix, access)) {
-            RemovalStore(
-                endpoint,
-                region,
-                pathStyle,
-                provider,
-                commitLockTimeoutMs,
-                s3,
-                provider.credentialsFor(catalog, prefix, access),
-            )
+            val bound = StoragePrefix.of(prefix)
+            if (provider.scoped) {
+                RemovalStore(
+                    endpoint,
+                    region,
+                    pathStyle,
+                    provider,
+                    commitLockTimeoutMs,
+                    s3,
+                    provider.credentialsFor(catalog, prefix, access),
+                    CatalogView(catalog, bound, delegate = null),
+                )
+            } else {
+                RemovalStore(
+                    endpoint,
+                    region,
+                    pathStyle,
+                    provider,
+                    commitLockTimeoutMs,
+                    s3,
+                    null,
+                    CatalogView(catalog, bound, delegate = this),
+                )
+            }
         }
     }
+
+    /** The prefix this view is bounded to; null on the base store. */
+    val boundPrefix: StoragePrefix? get() = view?.prefix
 
     private val log = KotlinLogging.logger {}
 
@@ -194,6 +239,8 @@ open class RemovalStore private constructor(
     enum class Outcome { REMOVED, MISSING }
 
     fun exists(pathUri: String): Boolean {
+        view?.require(pathUri)
+        view?.delegate?.let { return it.exists(pathUri) }
         val loc = ObjectStore.parse(pathUri)
         return try {
             s3.headObject(HeadObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build())
@@ -233,6 +280,8 @@ open class RemovalStore private constructor(
      * [deleteBatch].
      */
     open fun deleteIfExists(pathUri: String): Outcome {
+        view?.require(pathUri)
+        view?.delegate?.let { return it.deleteIfExists(pathUri) }
         if (!exists(pathUri)) return Outcome.MISSING
         val loc = ObjectStore.parse(pathUri)
         s3.deleteObject(DeleteObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build())
@@ -255,7 +304,8 @@ open class RemovalStore private constructor(
      * its own key; a whole-call failure (the request threw, the bucket is
      * gone, credentials expired) fails every key in that call and leaves
      * the other calls' keys alone; and a path that is not an
-     * `s3://bucket/key` URI fails on its own before any call is made. The
+     * `s3://bucket/key` URI, or (on a catalog view) one outside the
+     * catalog's data_path, fails on its own before any call is made. The
      * drain leaves every failed row queued with `attempts + 1`, which is
      * what a per-object delete failure always did.
      *
@@ -266,8 +316,23 @@ open class RemovalStore private constructor(
      */
     open fun deleteBatch(paths: Collection<String>): Map<String, String> {
         val failures = mutableMapOf<String, String>()
+        val admitted =
+            paths.distinct().filter { path ->
+                val bound = view ?: return@filter true
+                try {
+                    bound.require(path)
+                    true
+                } catch (e: PathOutsidePrefixException) {
+                    failures[path] = e.message ?: "outside the catalog's data_path"
+                    false
+                }
+            }
+        view?.delegate?.let { base ->
+            if (admitted.isNotEmpty()) failures += base.deleteBatch(admitted)
+            return failures
+        }
         val byBucket = mutableMapOf<String, MutableList<Pair<String, String>>>()
-        for (path in paths.distinct()) {
+        for (path in admitted) {
             val loc =
                 try {
                     ObjectStore.parse(path)
@@ -385,6 +450,9 @@ open class RemovalStore private constructor(
     companion object {
         /** S3's own ceiling on one DeleteObjects request. */
         const val MAX_KEYS_PER_DELETE = 1000
+
+        /** The `surface` tag of the out-of-prefix metric for this store's views. */
+        private const val SURFACE = "removal_store"
 
         /**
          * Overall SDK call cap, including retries and backoff. At this

@@ -193,6 +193,10 @@ object Audit {
             is HoglakeException.NamespaceNotEmpty,
             is HoglakeException.IdlessFilesPresent,
             -> "refused"
+            // The maintenance refusal of a Hoglite tenant with no trusted
+            // data_path (#668): its own outcome, so the trail says which
+            // catalogs need recreating rather than "error".
+            is HoglakeException.DataPathUnverified -> "data_path_unverified"
             is HoglakeException.NotFound -> "not_found"
             // Authentication and authorization refusals are their own
             // outcomes, not "error". A 401 next to a 500 in the trail is

@@ -77,6 +77,10 @@ class HogliteReadParityIntegrationTest {
                                 .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(raw))
                         ex.requestHeaders.getFirst("Content-Type")?.let { builder.header("Content-Type", it) }
                         val answer = http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+                        // The tenant's trusted data_path rides on a header (#668); a relay must carry it.
+                        answer.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                            ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                        }
                         ex.sendResponseHeaders(answer.statusCode(), answer.body().size.toLong())
                         ex.responseBody.use { it.write(answer.body()) }
                     }

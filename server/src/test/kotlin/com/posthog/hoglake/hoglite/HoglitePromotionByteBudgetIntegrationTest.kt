@@ -89,6 +89,10 @@ class HoglitePromotionByteBudgetIntegrationTest {
                                 .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body)).build(),
                             HttpResponse.BodyHandlers.ofByteArray(),
                         )
+                    // The tenant's trusted data_path rides on a header (#668); a relay must carry it.
+                    response.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                        ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                    }
                     ex.sendResponseHeaders(response.statusCode(), response.body().size.toLong())
                     ex.responseBody.use { it.write(response.body()) }
                 } finally {

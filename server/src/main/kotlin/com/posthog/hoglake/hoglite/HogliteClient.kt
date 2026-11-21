@@ -28,11 +28,21 @@ data class HogliteStatement(
     val expectScalarInt: Long? = null,
 )
 
-/** One statement's result: column names, rows, and the affected-row count. */
+/**
+ * One statement's result: column names, rows, and the affected-row count,
+ * plus [dataPath], the tenant's trusted `data_path` as hoglite served it
+ * beside this answer (`X-Hoglite-Data-Path`, or a `/query-batch` item's
+ * `data_path`): the operator-set copy in the tenant manifest, which only
+ * hoglite writes. Null when the tenant's manifest has none (a tenant
+ * created before the field existed). It rides on the result rather than
+ * in a per-tenant cache so a row and the prefix it is judged against
+ * come from the same answer.
+ */
 class HogliteQueryResult(
     val cols: List<String>,
     val rows: List<List<Any?>>,
     val affected: Long,
+    val dataPath: String? = null,
 ) {
     /** The one row a scalar query returns, or null. */
     fun firstRow(): List<Any?>? = rows.firstOrNull()
@@ -142,6 +152,40 @@ class HogliteRejected(
  * into instant typed 503s instead of timeout convoys — hoglake's
  * Postgres path fails fast through Hikari's 5 s connectionTimeout, and
  * this is the hoglite equivalent of that contract.
+ *
+ * ## The trusted data_path
+ *
+ * [createTenant] sends the catalog's `data_path` in the PUT body, and
+ * hoglite stores it in the tenant MANIFEST, which only hoglite writes
+ * and only an operator can create; it is immutable after creation (a
+ * create naming a different one is a 409 `data_path_mismatch`). Every
+ * tenant-scoped answer then repeats it in [DATA_PATH_HEADER], served
+ * from the owner's in-memory copy, and every [HogliteQueryResult] this
+ * client builds carries it as [HogliteQueryResult.dataPath]. That value,
+ * never the tenant's own `meta.data_path` row, is what hoglake's S3-acting
+ * paths trust (#668): the row is writable by any tenant writer with raw
+ * SQL; the manifest is not. An absent header is a tenant whose manifest
+ * has no data_path (created before the field existed), never an empty
+ * one.
+ *
+ * WHAT "KNOWN TO HAVE ONE" MEANS. The legacy reading of an absent header
+ * is decided per TENANT, not per answer: this client remembers, per
+ * tenant, the data_path the engine last served ([knownDataPaths], shared
+ * across the per-request clients like the route pins), and a 200 for a
+ * tenant that served one before and lacks the header now is an anomaly
+ * (a proxy or engine defect), refused rather than read as "the tenant
+ * has none" — [HoglakeException.BackendUnavailable] on a read, which
+ * the next answer settles, and [HoglakeException.CommitOutcomeUnknown]
+ * on a write `tx`, which applied. Two differing header values on one
+ * answer are the same anomaly. The memory is a hint about the engine's
+ * CONSISTENCY, never a source of the value: a header carrying a
+ * different data_path replaces it (the catalog was dropped and created
+ * again under another prefix), and a tenant that answers 404 or that
+ * this client deletes is forgotten. A process that has not yet seen a
+ * tenant's header still reads the first absent one as legacy: there is
+ * no cheaper oracle (`/status` carries the manifest, but only for an
+ * operator), and the legacy reading is fail-closed for storage anyway
+ * (every S3-acting path refuses it).
  */
 class HogliteClient(
     private val standardUrl: String,
@@ -188,6 +232,14 @@ class HogliteClient(
     }
 
     private val tenantRoutes: ConcurrentHashMap<String, Route> = shared?.tenantRoutes ?: ConcurrentHashMap()
+
+    /**
+     * The data_path the engine last served per tenant (class KDoc, "what
+     * known means"): one entry per tenant this process has talked to,
+     * the same population as [tenantRoutes].
+     */
+    private val knownDataPaths: ConcurrentHashMap<String, String> =
+        shared?.knownDataPaths ?: ConcurrentHashMap()
 
     private val breakers: Map<Pool, CircuitBreaker> =
         shared?.breakers ?: mapOf(
@@ -249,11 +301,17 @@ class HogliteClient(
                     put("statements", materialized)
                 },
             )
-        return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
+        return call(
+            tenant,
+            "/v1/t/${tenantSegment(tenant)}/tx",
+            body,
+            commitTimeoutMs,
+            txid = txid,
+        ) { status, bytes, dataPath ->
             when {
                 status == 200 ->
                     try {
-                        parseWriteTxResults(bytes, statementCount)
+                        parseWriteTxResults(bytes, statementCount, dataPath)
                     } catch (e: Exception) {
                         throw HoglakeException.CommitOutcomeUnknown(
                             txid,
@@ -289,9 +347,9 @@ class HogliteClient(
         args: List<Any?> = emptyList(),
     ): HogliteQueryResult {
         val body = json.writeValueAsBytes(mapOf("sql" to sql, "args" to args))
-        return call(tenant, "/v1/t/${tenantSegment(tenant)}/query", body, readTimeoutMs) { status, bytes ->
+        return call(tenant, "/v1/t/${tenantSegment(tenant)}/query", body, readTimeoutMs) { status, bytes, dataPath ->
             when (status) {
-                200 -> parseQueryResult(bytes)
+                200 -> parseQueryResult(bytes, dataPath)
                 // /query's error channel is a bare 409 with no guard index:
                 // a SQL error, not a conflict a caller can re-prepare for.
                 else -> throw HogliteRejected(status, String(bytes))
@@ -347,10 +405,10 @@ class HogliteClient(
                     put("statements", statements.map { it.toWire() })
                 },
             )
-        return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, readTimeoutMs) { status, bytes ->
+        return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, readTimeoutMs) { status, bytes, dataPath ->
             when {
                 status == 200 ->
-                    parseTxResults(bytes).also {
+                    parseTxResults(bytes, dataPath).also {
                         check(it.size == statements.size) {
                             "hoglite answered ${it.size} results for a ${statements.size}-statement read"
                         }
@@ -371,7 +429,9 @@ class HogliteClient(
     /**
      * One item's answer from [queryBatch]: [result] when the engine
      * answered 200, otherwise the [status] and [body] that `/query`
-     * would have answered for that tenant alone.
+     * would have answered for that tenant alone. The item's `data_path`
+     * (what `/query` would have sent in [DATA_PATH_HEADER]) rides on
+     * [result].
      */
     class BatchAnswer(
         val status: Int,
@@ -405,7 +465,7 @@ class HogliteClient(
             json.writeValueAsBytes(
                 mapOf("queries" to reads.map { mapOf("tenant" to it.tenant, "sql" to it.sql, "args" to it.args) }),
             )
-        return call(BATCH_ROUTE_KEY, "/v1/query-batch", body, readTimeoutMs) { status, bytes ->
+        return call(BATCH_ROUTE_KEY, "/v1/query-batch", body, readTimeoutMs) { status, bytes, _ ->
             when {
                 status == 200 -> {
                     val decoded = json.readValue<Map<String, Any?>>(bytes)
@@ -415,12 +475,29 @@ class HogliteClient(
                     check(results != null && results.size == reads.size) {
                         "hoglite answered ${results?.size} results for a ${reads.size}-read batch"
                     }
-                    results.map { r ->
+                    results.mapIndexed { i, r ->
                         val itemStatus = (r["status"] as Number).toInt()
                         val itemBody = r["body"]
+                        // Per item, never the batch header: a batch may name
+                        // many tenants, and the header is set only when every
+                        // item agrees. The same per-tenant consistency rule as
+                        // a header (class KDoc); an anomaly fails the batch,
+                        // as a failed single read would fail its item.
+                        val itemDataPath =
+                            try {
+                                servedDataPath(
+                                    reads[i].tenant,
+                                    tenantScoped = true,
+                                    itemStatus,
+                                    (r["data_path"] as? String)?.takeIf { it.isNotEmpty() },
+                                )
+                            } catch (e: DataPathAnomaly) {
+                                throw HoglakeException.BackendUnavailable(e.message ?: "data_path anomaly")
+                            }
 
                         @Suppress("UNCHECKED_CAST")
-                        val parsed = if (itemStatus == 200) (itemBody as Map<String, Any?>).toQueryResult() else null
+                        val parsed =
+                            if (itemStatus == 200) (itemBody as Map<String, Any?>).toQueryResult(itemDataPath) else null
                         BatchAnswer(itemStatus, json.writeValueAsString(itemBody), parsed)
                     }
                 }
@@ -442,19 +519,78 @@ class HogliteClient(
         shared?.batchUnsupportedUntilNanos ?: AtomicLong(Long.MIN_VALUE)
 
     /**
-     * Create [tenant], idempotently: 200 is "created" and a 409/422
-     * from a racing or replayed create on an existing tenant is success
-     * too — the tenant exists either way, which is all the caller
-     * needs. Anything else is transient and retries within the budget.
+     * What [createTenant] learned: [dataPath] is the one hoglite served
+     * back ([DATA_PATH_HEADER]) — the stored value, or null from an engine
+     * that predates the field, which the caller must treat as "not
+     * recorded". NOT whether this call made the tenant: hoglite's body
+     * says `existing: true` only when another pod holds it, and a pod
+     * that holds the tenant itself, or takes it over from an expired
+     * owner, answers a duplicate create exactly like a fresh one. A caller
+     * that needs to know reads the tenant before and after (the store's
+     * create does); nothing is inferred from the answer's shape.
      */
-    fun createTenant(tenant: String) {
-        call(tenant, "/v1/tenants/${tenantSegment(tenant)}", null, readTimeoutMs, method = "PUT") { status, bytes ->
-            when (status) {
-                200, 409, 422 -> Unit
+    class TenantCreate(
+        val dataPath: String?,
+    )
+
+    /**
+     * Create [tenant] with [dataPath] as its trusted prefix, idempotently:
+     * 200 is "the tenant exists now" (made by this call, or found holding
+     * this data_path), and a 409/422 from a racing or replayed create on
+     * an existing tenant is success too — the tenant exists either way.
+     * Returns what hoglite served as a [TenantCreate].
+     *
+     * Three 4xx answers are final, as [HogliteRejected]: a 409
+     * `data_path_mismatch` (the tenant exists and holds a DIFFERENT
+     * data_path, or none; the field is set at create or never, so the
+     * caller cannot proceed), a 409 `data_path_overlap` (the tenant does
+     * not exist, and another tenant of the backend owns a prefix that
+     * contains, equals or lies under this one; nothing was created), and
+     * a 400 `invalid_data_path` (hoglite's validation is CatalogService's,
+     * so this is a bug, not a request to retry). A 503 is hoglite's
+     * overlap scan not finishing (the tenant listing or a manifest read
+     * failed): retried within the budget like any other 503. Anything
+     * else is transient and retries within the budget.
+     */
+    fun createTenant(
+        tenant: String,
+        dataPath: String,
+    ): TenantCreate {
+        // Never `"data_path": null`: hoglite refuses a present non-string
+        // (400 invalid_data_path), and only the absent field makes no
+        // claim. The parameter is non-null, so the field is always a
+        // string here; the body is one JSON object, nothing after it, and
+        // no key but this one (hoglite answers 400 to a key it does not
+        // know, `class` and `data_path` being the only ones).
+        val body = json.writeValueAsBytes(mapOf("data_path" to dataPath))
+        return call(
+            tenant,
+            "/v1/tenants/${tenantSegment(tenant)}",
+            body,
+            readTimeoutMs,
+            method = "PUT",
+        ) { status, bytes, served ->
+            when {
+                status == 200 -> TenantCreate(served)
+                status == 409 && errorCode(bytes) in setOf(CODE_DATA_PATH_MISMATCH, CODE_DATA_PATH_OVERLAP) ->
+                    throw HogliteRejected(status, String(bytes))
+                status == 409 || status == 422 -> TenantCreate(served)
                 else -> throw HogliteRejected(status, String(bytes))
             }
         }
     }
+
+    /**
+     * The monitor the store's catalog create holds (and its drop of a
+     * tenant with no catalog in it), one per backend in
+     * this process: shared by every client cloned from a backend's root
+     * client ([forRequest]) and so by every per-request store built on
+     * them, which is what makes it serialize anything (a store lives for
+     * one request). It serializes creates within THIS PROCESS only;
+     * across pods hoglite's own overlap check is the guard, with its
+     * known race between two concurrent creates.
+     */
+    internal val createLock: Any = shared?.createLock ?: Any()
 
     /**
      * Delete [tenant]'s durable state. hoglite routes the delete to the
@@ -466,9 +602,17 @@ class HogliteClient(
      * retry it as transitional during rolling upgrades.)
      */
     fun deleteTenant(tenant: String) {
-        call(tenant, "/v1/tenants/${tenantSegment(tenant)}", null, readTimeoutMs, method = "DELETE") { status, bytes ->
+        call(
+            tenant,
+            "/v1/tenants/${tenantSegment(tenant)}",
+            null,
+            readTimeoutMs,
+            method = "DELETE",
+        ) { status, bytes, _ ->
             when (status) {
-                200, 404 -> Unit
+                // Gone: whatever is created under this id next is a new
+                // tenant, with its own data_path.
+                200, 404 -> knownDataPaths.remove(tenant)
                 else -> throw HogliteRejected(status, String(bytes))
             }
         }
@@ -480,7 +624,7 @@ class HogliteClient(
         newClass: String? = null,
     ) {
         val query = if (newClass != null) "?class=$newClass" else ""
-        call(tenant, "/v1/t/${tenantSegment(tenant)}/release$query", null, readTimeoutMs) { status, bytes ->
+        call(tenant, "/v1/t/${tenantSegment(tenant)}/release$query", null, readTimeoutMs) { status, bytes, _ ->
             when (status) {
                 200, 409 -> Unit
                 else -> throw HogliteRejected(status, String(bytes))
@@ -507,9 +651,10 @@ class HogliteClient(
 
     /**
      * One logical call, retried per the taxonomy in the class KDoc.
-     * [parse] turns a final HTTP answer into the result or the
-     * deterministic exception it carries; the loop owns everything
-     * retryable.
+     * [parse] turns a final HTTP answer — status, body and the tenant's
+     * served data_path ([DATA_PATH_HEADER], null when absent) — into the
+     * result or the deterministic exception it carries; the loop owns
+     * everything retryable.
      */
     private fun <T> call(
         tenant: String,
@@ -519,7 +664,7 @@ class HogliteClient(
         method: String = "POST",
         /** Set for a `tx`: its attempts can apply, so the call tracks whether one may have. */
         txid: String? = null,
-        parse: (Int, ByteArray) -> T,
+        parse: (Int, ByteArray, String?) -> T,
     ): T {
         val deadline = System.nanoTime() + retryBudgetMs * 1_000_000
         var lastFailure: Throwable? = null
@@ -550,16 +695,27 @@ class HogliteClient(
             }
         }
 
-        fun finalAnswer(
-            status: Int,
-            bytes: ByteArray,
-        ): T {
+        fun finalAnswer(resp: HttpResponse<ByteArray>): T {
+            val status = resp.statusCode()
             // A later refusal cannot disprove an earlier ambiguous apply.
             // Only a complete successful answer can settle this exact request.
             if (txid != null && mayHaveApplied && status != 200) {
                 throw HoglakeException.CommitOutcomeUnknown(txid, "hoglite answered $status after an ambiguous attempt")
             }
-            return parse(status, bytes)
+            val served =
+                try {
+                    servedDataPath(tenant, path.startsWith(TENANT_ROUTE_PREFIX), status, dataPathOf(resp))
+                } catch (e: DataPathAnomaly) {
+                    // A 200 on a write tx APPLIED: the answer is the only
+                    // thing in doubt, so the caller learns "unknown", never
+                    // a 500 over a durable write. A read's next answer
+                    // settles it; so does a write's retry with its txid.
+                    if (txid != null && status == 200) {
+                        throw HoglakeException.CommitOutcomeUnknown(txid, e.message ?: "data_path anomaly")
+                    }
+                    throw HoglakeException.BackendUnavailable(e.message ?: "data_path anomaly")
+                }
+            return parse(status, resp.body(), served)
         }
         while (true) {
             val pin = tenantRoutes[tenant]
@@ -627,7 +783,7 @@ class HogliteClient(
             breaker.onSuccess()
             when (resp.statusCode()) {
                 200 -> {
-                    return finalAnswer(200, resp.body())
+                    return finalAnswer(resp)
                 }
                 503 -> {
                     // Owner lost mid-flight / transient infra: retryable.
@@ -643,7 +799,7 @@ class HogliteClient(
                     // (query_timeout) is deterministic and rolled back:
                     // final, not retried. Only the label tells it apart
                     // from outcome_unknown or a gateway timeout.
-                    if (errorCode(resp.body()) in GUARD_REFUSAL_CODES) return finalAnswer(504, resp.body())
+                    if (errorCode(resp.body()) in GUARD_REFUSAL_CODES) return finalAnswer(resp)
                     // outcome_unknown: applied on an owner that then failed
                     // before durability was confirmed (or a gateway timeout
                     // in front of the engine). The same txid makes the
@@ -667,7 +823,7 @@ class HogliteClient(
                     // Surface other statuses without another transport attempt.
                     // Operation-specific classification distinguishes request
                     // refusals, unknown read failures, and ambiguous writes.
-                    return finalAnswer(resp.statusCode(), resp.body())
+                    return finalAnswer(resp)
                 }
             }
         }
@@ -829,6 +985,69 @@ class HogliteClient(
     private fun errorCode(bytes: ByteArray): String? =
         runCatching { json.readValue<Map<String, Any?>>(bytes)["code"] as? String }.getOrNull()
 
+    /**
+     * A served data_path this client cannot take at its word (class KDoc,
+     * "what known means"): two differing header values on one answer, or
+     * none on a 200 for a tenant that served one before. Internal: the
+     * call loop maps it to the caller's outcome vocabulary.
+     */
+    private class DataPathAnomaly(message: String) : RuntimeException(message)
+
+    /**
+     * The tenant's served data_path on [resp] ([DATA_PATH_HEADER]), or
+     * null when absent. hoglite sends it exactly once and never empty;
+     * two differing values are a proxy or engine defect, a
+     * [DataPathAnomaly], and a prefix hoglake cannot trust is refused
+     * rather than guessed.
+     */
+    private fun dataPathOf(resp: HttpResponse<ByteArray>): String? {
+        val values = resp.headers().allValues(DATA_PATH_HEADER).distinct()
+        if (values.size > 1) {
+            throw DataPathAnomaly("hoglite answered with ${values.size} differing $DATA_PATH_HEADER values")
+        }
+        return values.singleOrNull()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * [served], the data_path an answer of [status] for [tenant] carried
+     * (null when none), checked against and recorded in [knownDataPaths].
+     * A value is remembered from any route; a 404 forgets the tenant,
+     * whose id may be created again. Only a 200 on a TENANT-SCOPED route
+     * ([tenantScoped]: `/v1/t/{tid}/...`, or a batch item) is judged for
+     * absence: a refusal may legitimately carry no header (a 421, an
+     * authority refusal), and so may the answer to the tenant's own
+     * deletion (`DELETE /v1/tenants/{tid}`: nothing is left to serve it
+     * from). A value replaces a remembered one (a drop and a create
+     * under another prefix); an absence after a value is a
+     * [DataPathAnomaly]. The batch route key is no tenant and is not
+     * judged.
+     */
+    private fun servedDataPath(
+        tenant: String,
+        tenantScoped: Boolean,
+        status: Int,
+        served: String?,
+    ): String? {
+        if (tenant == BATCH_ROUTE_KEY) return served
+        if (status == 404) {
+            knownDataPaths.remove(tenant)
+            return served
+        }
+        if (served != null) {
+            knownDataPaths[tenant] = served
+            return served
+        }
+        if (status != 200 || !tenantScoped) return null
+        val known = knownDataPaths[tenant]
+        if (known != null) {
+            throw DataPathAnomaly(
+                "hoglite answered for tenant '$tenant' without $DATA_PATH_HEADER, which it served as '$known' " +
+                    "before; refusing to read the tenant as one without a data_path",
+            )
+        }
+        return null
+    }
+
     /** True when [e] proves the request never left: the connection itself failed. */
     private fun neverSent(e: Throwable): Boolean =
         generateSequence(e) { it.cause }.take(8).any {
@@ -847,6 +1066,7 @@ class HogliteClient(
     private fun parseWriteTxResults(
         bytes: ByteArray,
         statementCount: Int,
+        dataPath: String?,
     ): List<HogliteQueryResult> {
         val decoded = json.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(bytes)
         val results = decoded?.get("results")
@@ -873,27 +1093,33 @@ class HogliteClient(
                         row.map { json.treeToValue(it, Any::class.java) }
                     }
                 }
-            HogliteQueryResult(names, values, affected.longValue())
+            HogliteQueryResult(names, values, affected.longValue(), dataPath)
         }
     }
 
-    private fun parseTxResults(bytes: ByteArray): List<HogliteQueryResult> {
+    private fun parseTxResults(
+        bytes: ByteArray,
+        dataPath: String?,
+    ): List<HogliteQueryResult> {
         val decoded = json.readValue<Map<String, Any?>>(bytes)
 
         @Suppress("UNCHECKED_CAST")
         val results = decoded["results"] as? List<Map<String, Any?>> ?: emptyList()
-        return results.map { it.toQueryResult() }
+        return results.map { it.toQueryResult(dataPath) }
     }
 
-    private fun parseQueryResult(bytes: ByteArray): HogliteQueryResult =
-        json.readValue<Map<String, Any?>>(bytes).toQueryResult()
+    private fun parseQueryResult(
+        bytes: ByteArray,
+        dataPath: String?,
+    ): HogliteQueryResult = json.readValue<Map<String, Any?>>(bytes).toQueryResult(dataPath)
 
-    private fun Map<String, Any?>.toQueryResult(): HogliteQueryResult {
+    private fun Map<String, Any?>.toQueryResult(dataPath: String?): HogliteQueryResult {
         @Suppress("UNCHECKED_CAST")
         return HogliteQueryResult(
             cols = (this["cols"] as? List<String>) ?: emptyList(),
             rows = (this["rows"] as? List<List<Any?>>) ?: emptyList(),
             affected = this["affected"].asLongOrNull() ?: 0,
+            dataPath = dataPath,
         )
     }
 
@@ -981,8 +1207,37 @@ class HogliteClient(
         /** hoglite's label for a failure it knows did not apply (503). */
         const val CODE_NOT_APPLIED = "not_applied"
 
+        /**
+         * The header every tenant-scoped hoglite answer carries when the
+         * tenant's manifest holds a data_path: the trusted copy. Absent
+         * for a tenant created before the field existed; never empty.
+         */
+        const val DATA_PATH_HEADER = "X-Hoglite-Data-Path"
+
+        /**
+         * hoglite's label on the 409 for a create that names a data_path
+         * other than the one the existing tenant holds (or any, when it
+         * holds none): final, the field is set at create or never.
+         */
+        const val CODE_DATA_PATH_MISMATCH = "data_path_mismatch"
+
+        /**
+         * hoglite's label on the 409 for a create whose data_path equals,
+         * contains or lies under another tenant's on the same backend
+         * (hoglite#666, option A): final, nothing was created. The same
+         * rule CatalogService applies between PostgreSQL catalogs, so the
+         * store maps it to the same 422.
+         */
+        const val CODE_DATA_PATH_OVERLAP = "data_path_overlap"
+
+        /** hoglite's label on the 400 for a malformed data_path in a create. */
+        const val CODE_INVALID_DATA_PATH = "invalid_data_path"
+
         /** The `client` half of hoglite's (client, txid) dedup key. */
         const val CLIENT_NAME = "hoglake"
+
+        /** The routes a tenant answers for itself (`/v1/t/{tid}/...`), as opposed to its management (`/v1/tenants/{tid}`). */
+        private const val TENANT_ROUTE_PREFIX = "/v1/t/"
 
         /** The txid prefix of a [readTx]: the engine keeps no receipt for it. */
         const val READ_TXID_PREFIX = "read:"
