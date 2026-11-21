@@ -108,6 +108,10 @@ public:
 	//! receipt only while the receipt exists; one sent after cleanup
 	//! purged it publishes the same files again and reports success.
 	static constexpr idx_t MAX_COMMIT_DEADLINE_MS = 1800000;
+	//! Least wait an attempt must have to start: above the server's default
+	//! commit-lock wait (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, 30 s), so its clean
+	//! 503 commit_queue_timeout is heard rather than timed out.
+	static constexpr idx_t MIN_COMMIT_ATTEMPT_MS = 35000;
 
 	// -- catalog entry cache ----------------------------------------------
 	//! A name the listing does not hold is asked of the server once per

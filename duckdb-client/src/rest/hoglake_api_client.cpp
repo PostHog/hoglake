@@ -446,13 +446,13 @@ string HoglakeApiClient::TravelQuery(const HoglakeTravel &travel) {
 //! its 401 is final.
 HoglakeApiClient::Response HoglakeApiClient::TryRequest(const string &method, const string &path,
                                                         const string &json_body, idx_t read_timeout_ms) {
-	auto token = CurrentToken();
+	auto token = CurrentToken(read_timeout_ms);
 	auto response = SendOnce(method, path, json_body, token, read_timeout_ms);
 	if (response.status != 401 || !auth.UsesClientCredentials()) {
 		return response;
 	}
 	InvalidateToken(token);
-	return SendOnce(method, path, json_body, CurrentToken(), read_timeout_ms);
+	return SendOnce(method, path, json_body, CurrentToken(read_timeout_ms), read_timeout_ms);
 }
 
 HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const string &path,
@@ -464,14 +464,14 @@ HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const
 	return response;
 }
 
-string HoglakeApiClient::CurrentToken() {
+string HoglakeApiClient::CurrentToken(idx_t budget_ms) {
 	if (!auth.UsesClientCredentials()) {
 		return auth.token;
 	}
 	// one lock: threads that all find the token stale mint once
 	std::lock_guard<std::mutex> guard(token_lock);
 	if (cached_token.empty() || std::chrono::steady_clock::now() >= refresh_at) {
-		MintToken();
+		MintToken(budget_ms);
 	}
 	return cached_token;
 }
@@ -483,7 +483,7 @@ void HoglakeApiClient::InvalidateToken(const string &token) {
 	}
 }
 
-void HoglakeApiClient::MintToken() {
+void HoglakeApiClient::MintToken(idx_t budget_ms) {
 	// split http://host[:port]/path into the client base and the request path
 	auto scheme_end = auth.token_url.find("://");
 	auto path_start = auth.token_url.find('/', scheme_end + 3);
@@ -491,8 +491,10 @@ void HoglakeApiClient::MintToken() {
 	auto token_path = path_start == string::npos ? string("/") : auth.token_url.substr(path_start);
 
 	duckdb_httplib::Client client(base);
-	client.set_connection_timeout(10, 0);
-	client.set_read_timeout(10, 0);
+	// no wait outlasts the caller's budget (a commit attempt's time left)
+	auto wait_ms = MinValue<idx_t>(budget_ms, 10000);
+	client.set_connection_timeout(NumericCast<time_t>(wait_ms / 1000), NumericCast<time_t>((wait_ms % 1000) * 1000));
+	client.set_read_timeout(NumericCast<time_t>(wait_ms / 1000), NumericCast<time_t>((wait_ms % 1000) * 1000));
 	client.set_basic_auth(auth.client_id, auth.client_secret);
 	duckdb_httplib::Headers headers {{"User-Agent", USER_AGENT}, {"Accept", "application/json"}};
 	auto body = "grant_type=client_credentials&audience=" + EncodeSegment(auth.audience);
@@ -525,10 +527,15 @@ void HoglakeApiClient::MintToken() {
 HoglakeApiClient::Response HoglakeApiClient::SendOnce(const string &method, const string &path, const string &json_body,
                                                       const string &token, idx_t read_timeout_ms) {
 	duckdb_httplib::Client client(endpoint);
-	client.set_connection_timeout(10, 0);
+	// connect and write keep their own limits, but never outlast the read
+	// budget: for a commit attempt that is the time left before the deadline
+	auto connect_ms = MinValue<idx_t>(read_timeout_ms, 10000);
+	auto write_ms = MinValue<idx_t>(read_timeout_ms, 30000);
+	client.set_connection_timeout(NumericCast<time_t>(connect_ms / 1000),
+	                              NumericCast<time_t>((connect_ms % 1000) * 1000));
 	client.set_read_timeout(NumericCast<time_t>(read_timeout_ms / 1000),
 	                        NumericCast<time_t>((read_timeout_ms % 1000) * 1000));
-	client.set_write_timeout(30, 0);
+	client.set_write_timeout(NumericCast<time_t>(write_ms / 1000), NumericCast<time_t>((write_ms % 1000) * 1000));
 	duckdb_httplib::Headers headers {{"User-Agent", USER_AGENT}};
 	if (!token.empty()) {
 		headers.emplace("Authorization", "Bearer " + token);

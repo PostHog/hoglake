@@ -192,9 +192,9 @@ private:
 	                  idx_t read_timeout_ms);
 	//! The bearer token to send, minting one if none is cached or it is
 	//! near expiry. Empty when no credential is configured.
-	string CurrentToken();
+	string CurrentToken(idx_t budget_ms = DEFAULT_READ_TIMEOUT_MS);
 	void InvalidateToken(const string &token);
-	void MintToken();
+	void MintToken(idx_t budget_ms);
 
 	//! scheme://host[:port] (no trailing slash); /v1 is appended per call
 	string endpoint;

@@ -476,7 +476,7 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 			throw TransactionException(
 			    "hoglake: commit failed: %s%s", error.RawMessage(),
 			    UnknownOutcomeAdvice(Api(), attempt + 1,
-			                         StringUtil::Format("attempt %llu failed before the server answered", attempt + 1),
+			                         StringUtil::Format("attempt %llu failed without a usable answer", attempt + 1),
 			                         false, request.idempotency_key));
 		}
 		if (outcome.success) {
@@ -543,8 +543,13 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 			sleep_ms = static_cast<idx_t>(current_wait);
 			current_wait = MinValue<double>(current_wait * backoff, MAX_WAIT_MS);
 		}
-		if (stop.empty() && retryable && attempt < max_retries && elapsed_ms() + sleep_ms >= deadline_ms) {
-			// the next attempt could not start before the deadline
+		// An attempt left with less than the server's commit-lock wait (or
+		// the whole commit timeout, if shorter) turns a queued commit's clean
+		// 503 into a timeout, an unknown outcome: do not start one.
+		auto min_attempt_ms = MinValue<uint64_t>(commit_timeout_ms, MIN_COMMIT_ATTEMPT_MS);
+		if (stop.empty() && retryable && attempt < max_retries &&
+		    elapsed_ms() + sleep_ms + min_attempt_ms > deadline_ms) {
+			// the next attempt could not get a useful wait before the deadline
 			stop = StringUtil::Format(" (hoglake_commit_deadline_ms=%llu passed)", deadline_ms);
 			ended = StringUtil::Format("the commit deadline (hoglake_commit_deadline_ms=%llu) passed", deadline_ms);
 		}

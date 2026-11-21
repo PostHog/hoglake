@@ -121,9 +121,10 @@ server's one-hour floor on `HOGLAKE_RECEIPT_RETENTION_SECONDS`, so a
 retry under the key never outlives its receipt and publishes the files
 again): without it retried read
 timeouts could hold COMMIT for max retries × 120 s (~22 min) against a
-hung server. No attempt waits past the deadline (its read timeout is
-clamped to the time left) and no attempt starts that could not end
-before it; the commit then stops, with the unknown-outcome advice when
+hung server. No attempt waits past the deadline (its connect, write, read and
+token-mint timeouts are clamped to the time left) and no attempt starts
+with less than the server's commit-lock wait plus a margin (35 s, or the
+whole `hoglake_commit_timeout_ms` if shorter) left before it; the commit then stops, with the unknown-outcome advice when
 an attempt timed out. Only `commit_queue_timeout` and
 `backend_unavailable` are definite 503s; any other 503 (a proxy's
 untyped one included) is an unknown outcome, retried only under a key.
