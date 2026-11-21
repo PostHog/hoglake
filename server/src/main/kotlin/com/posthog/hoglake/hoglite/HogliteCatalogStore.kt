@@ -80,7 +80,10 @@ fun interface HogliteTenantResolver {
  *
  * This class keeps no cross-catalog state. [tenants] tells it which
  * tenant holds a catalog. Cross-catalog rules (unique names, disjoint
- * data paths) belong to the component that owns the catalogs.
+ * data paths) belong to the component that owns the catalogs; the one
+ * such rule this class applies, the data_path overlap check of
+ * [createCatalog], runs over the catalogs that component hands it
+ * through [peerCatalogs].
  *
  * It implements [CatalogStore], the seam used by the request-scoped backend selector.
  */
@@ -88,6 +91,20 @@ class HogliteCatalogStore(
     internal val client: HogliteClient,
     /** Catalog name -> tenant id. See [HogliteTenantResolver]. */
     private val tenants: HogliteTenantResolver,
+    /**
+     * The catalogs of this server's OTHER backend, read when a create
+     * checks its data_path for overlap ([createCatalog]). The selector
+     * passes the PostgreSQL catalogs of a server with a PostgreSQL
+     * backend, default or lazily opened; nothing else enumerates
+     * catalogs here, because the server keeps no list of hoglite
+     * tenants, so the reverse (a PostgreSQL create against hoglite
+     * catalogs) is checked by nothing. Hoglite-vs-hoglite disjointness
+     * on one backend lands with #668, when the tenant create carries the
+     * data_path for hoglite to check (today it carries none); until
+     * then, and against another server's PostgreSQL catalogs or across
+     * hoglite backends, it is the operator's. The default sees none.
+     */
+    private val peerCatalogs: () -> List<CatalogInfo> = { emptyList() },
     /** CommitService's blind-partitioned-append enforcement flag, for the commit port. */
     internal val refuseBlindPartitionedAppends: Boolean = false,
     internal val ledgerRetentionSeconds: Long = com.posthog.hoglake.service.CleanupService.LEDGER_RETENTION_SECONDS,
@@ -220,8 +237,8 @@ class HogliteCatalogStore(
 
     /**
      * Create the catalog's tenant and its schema. The tenant id comes from
-     * [tenants]. The caller checks cross-catalog rules (unique names,
-     * disjoint data paths) before it calls this function.
+     * [tenants]. Of the cross-catalog rules, only the data_path overlap
+     * check runs here, over [peerCatalogs]; unique names are the caller's.
      *
      * A create on a tenant that already holds a catalog is AlreadyExists.
      * A fresh txid per CALL: a same-name create is a 409, so the guard,
@@ -237,6 +254,17 @@ class HogliteCatalogStore(
         catalogOperation(name, creating = true) {
             validateCatalogName(name)
             CatalogService.validateDataPath(dataPath)
+            // The data_path must be disjoint from every catalog this
+            // server can see, both directions, as CatalogService.createCatalog
+            // refuses it on PostgreSQL (#666): a catalog on another's
+            // prefix can register the other's objects, drop them, and
+            // have cleanup delete them from under it. A same-name
+            // PostgreSQL catalog is still another catalog on this
+            // backend, so it is not skipped. Before the tenant PUT, so a
+            // refused create leaves no tenant behind. Not serialized
+            // against a concurrent PostgreSQL create, like PostgreSQL's
+            // own dev-era check.
+            peerCatalogs().forEach { CatalogService.refuseDataPathOverlap(dataPath, it) }
             val tenantId = boundTenant(name)
             backendCall(name) { client.createTenant(tenantId) }
             probeForeignKeys(name, tenantId)
