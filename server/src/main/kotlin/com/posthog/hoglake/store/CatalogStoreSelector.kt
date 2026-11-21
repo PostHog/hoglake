@@ -698,6 +698,15 @@ class CatalogStoreSelector(
 
     private fun defaultPostgres(): CatalogStore? = postgres?.takeIf { cfg == null || cfg.defaultBackend == "postgres" }
 
+    /**
+     * The PostgreSQL store when this server has a PostgreSQL backend at all:
+     * the default one, or the lazily opened one of `HOGLAKE_DEFAULT_BACKEND=none`
+     * with `HOGLAKE_POSTGRES_BACKEND_ID` ([requirePostgresInstance]'s rule).
+     * Unlike [defaultPostgres], a call on the result may open that backend.
+     */
+    private fun configuredPostgres(): CatalogStore? =
+        postgres?.takeIf { cfg == null || cfg.defaultBackend == "postgres" || cfg.postgresBackendId.isNotEmpty() }
+
     private fun routed(
         call: ApplicationCall,
         routing: Routing,
@@ -725,7 +734,27 @@ class CatalogStoreSelector(
             BackendKind.HOGLITE -> hogliteStore(placement, client(placement.backendId), operatorAuthority = true)
         }
 
-    /** Share store construction without sharing request authority. */
+    /**
+     * Share store construction without sharing request authority.
+     *
+     * The store's create checks its data_path against the catalogs this
+     * server can enumerate: the PostgreSQL catalogs of its PostgreSQL
+     * backend, default or lazily opened ([configuredPostgres]). Those
+     * catalogs exist whether or not a request has opened the backend yet,
+     * so a hoglite create does open it (`HOGLAKE_DEFAULT_BACKEND=none`
+     * with `HOGLAKE_POSTGRES_BACKEND_ID`), as a PostgreSQL-routed request
+     * would; an open that fails is that request's 503
+     * `backend_unavailable`, and the create does not proceed unchecked.
+     * The other direction, a PostgreSQL create against hoglite catalogs,
+     * has nothing to read here: this server holds no list of hoglite
+     * tenants, so it is checked by nothing. Disjointness between hoglite
+     * catalogs on one backend lands with #668, when the tenant create
+     * (`PUT /v1/tenants/{tenant}`) carries the data_path for hoglite to
+     * check against the other tenants' manifests; today it carries no
+     * body. Until then, and against another server's PostgreSQL catalogs
+     * or across hoglite backends, disjointness is the operator's
+     * responsibility.
+     */
     private fun hogliteStore(
         placement: Routing,
         client: HogliteClient,
@@ -740,6 +769,7 @@ class CatalogStoreSelector(
                     throw HoglakeException.NotFound("catalog '$catalog'")
                 }
             },
+            peerCatalogs = { configuredPostgres()?.listCatalogs(null).orEmpty() },
             refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
             ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
             smallFileThresholdBytes = cfg.compactionTargetBytes,

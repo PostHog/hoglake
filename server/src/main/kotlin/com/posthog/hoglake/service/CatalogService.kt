@@ -125,6 +125,35 @@ class CatalogService(private val jdbi: Jdbi) {
                 throw HoglakeException.Validation("data_path must not contain '.' or '..' segments")
             }
         }
+
+        /**
+         * Refuse a new catalog at [dataPath] whose prefix overlaps
+         * [existing]'s in either direction: equal, nested under it, or a
+         * parent of it. Prefixes are compared whole, ending in `/`, so the
+         * trailing-slash form is the same prefix and a sibling that shares a
+         * string prefix (`.../base` and `.../base2`) stays legal.
+         *
+         * One predicate for both stores: [createCatalog] runs it over the
+         * PostgreSQL catalogs and the hoglite store over the catalogs its
+         * selector can see (HogliteCatalogStore.createCatalog), so the two
+         * refuse the same overlaps with the same 422. The message quotes
+         * neither path whole ([Identifiers.cap]).
+         */
+        internal fun refuseDataPathOverlap(
+            dataPath: String,
+            existing: CatalogInfo,
+        ) {
+            val newPrefix = dataPath.trimEnd('/') + "/"
+            val theirPrefix = existing.dataPath.trimEnd('/') + "/"
+            if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
+                throw HoglakeException.Validation(
+                    "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
+                        "'${existing.name}' (data_path " +
+                        "'${Identifiers.cap(existing.dataPath)}'); " +
+                        "catalog data_paths must be disjoint",
+                )
+            }
+        }
     }
 
     // ---- catalogs --------------------------------------------------------
@@ -153,23 +182,16 @@ class CatalogService(private val jdbi: Jdbi) {
                 // here at the only place overlap can be introduced).
                 // Runs inside the insert transaction; the hog_catalog
                 // name-unique insert serializes concurrent creates enough
-                // for this dev-era check.
-                val newPrefix = dataPath.trimEnd('/') + "/"
+                // for this dev-era check. This list is PostgreSQL's own:
+                // a hoglite catalog is not in it, and the hoglite store
+                // checks its creates against this list in turn (#666).
                 CatalogRepo.listAll(h).forEach { existing ->
                     // Same-name recreate falls through to the insert's
                     // unique constraint -> AlreadyExists (409), the
                     // canonical duplicate answer; overlap 422s are for
                     // OTHER catalogs' prefixes.
                     if (existing.name == name) return@forEach
-                    val theirPrefix = existing.dataPath.trimEnd('/') + "/"
-                    if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
-                        throw HoglakeException.Validation(
-                            "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
-                                "'${existing.name}' (data_path " +
-                                "'${Identifiers.cap(existing.dataPath)}'); " +
-                                "catalog data_paths must be disjoint",
-                        )
-                    }
+                    refuseDataPathOverlap(dataPath, existing)
                 }
                 val info = CatalogRepo.insert(h, name, dataPath)
                 // Snapshot 0: the empty catalog at schema_version 0, no changes.
