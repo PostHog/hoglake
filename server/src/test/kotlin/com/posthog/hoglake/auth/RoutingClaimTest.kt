@@ -48,13 +48,17 @@ class RoutingClaimTest {
     }
 
     @Test
-    fun `catalog operators retain their operator kind and empty scope map`() {
+    fun `catalog operators retain their operator kind and are bound to the catalog they place`() {
         val claims = TestTokens.operatorClaims().dropLast(1) + """, "org":"org-1", "cat":{"lake":["admin"]}}"""
         val caller = verify(claims = claims)
         assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
         assertThat(caller.orgId).isEqualTo("org-1")
-        assertThat(caller.catalogScopes).isEmpty()
         assertThat(caller.routing?.catalog).isEqualTo("lake")
+        // Bound as hoglite binds it: an operator on the placed catalog only.
+        assertThat(caller.fleetWide).isFalse()
+        assertThat(caller.catalogScopes.keys).containsExactly("lake")
+        assertThat(caller.knowsCatalog("lake")).isTrue()
+        assertThat(caller.knowsCatalog("other")).isFalse()
     }
 
     @ParameterizedTest

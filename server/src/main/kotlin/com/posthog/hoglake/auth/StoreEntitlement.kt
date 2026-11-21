@@ -77,12 +77,15 @@ internal fun ApplicationCall.refuseIgnoredRouting(catalog: String) {
  *
  * - No caller: 401.
  * - A catalog the token does not name ([Caller.knowsCatalog]: `cat` for a
- *   tenant and a scoped caller, any catalog for an operator): 404 worded as
- *   a missing catalog.
+ *   tenant, a scoped caller and a catalog-bound operator, any catalog for a
+ *   fleet-wide operator): 404 worded as a missing catalog. This is also what
+ *   holds `POST /v1/catalogs` to a bound operator's own catalog: the handler
+ *   asks for the body's name.
  * - A catalog the token names without the scope the route asks for (`read`,
  *   `write`, `maintenance` or `admin` in the route table): 403. An operator
- *   holds every scope. A route that asks for no catalog scope, and a path
- *   the table does not list, are held to the name alone.
+ *   holds every scope on a catalog it knows. A route that asks for no
+ *   catalog scope, and a path the table does not list, are held to the name
+ *   alone.
  */
 private fun storeRefusal(
     caller: Caller?,

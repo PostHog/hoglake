@@ -89,12 +89,13 @@ internal class StoreGrant private constructor(
     /**
      * A listing of the catalogs in [visible], or of every catalog when it is
      * null. It names no single catalog, so the rule is the token's: every
-     * name must be one the token names, and "every catalog" is an operator's.
+     * name must be one the token names, and "every catalog" is a fleet-wide
+     * operator's.
      */
     fun catalogs(visible: Set<String>?) {
         val other =
             if (visible == null) {
-                "*".takeIf { caller?.kind?.isOperator() != true }
+                "*".takeIf { caller?.fleetWide != true }
             } else {
                 visible.firstOrNull { caller?.knowsCatalog(it) != true }
             }

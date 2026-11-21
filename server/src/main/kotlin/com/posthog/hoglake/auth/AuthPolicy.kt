@@ -23,7 +23,13 @@ enum class Requirement {
      */
     AUTHENTICATED,
 
-    /** PostHog-operated only: cross-tenant reads, instance health, debug surfaces. */
+    /**
+     * PostHog-operated only: cross-tenant reads, instance health, debug
+     * surfaces, and the per-catalog containment routes. A catalog-bound
+     * operator ([Caller.fleetWide] false) reaches only the routes that name
+     * one of its catalogs, plus [AuthPolicy.PROVISIONING], whose catalog is
+     * in the body and is held to the binding by the handler.
+     */
     OPERATOR,
 
     READ,
@@ -88,6 +94,15 @@ object AuthPolicy {
     private val CATALOG = "{catalog}"
 
     /**
+     * The one [Requirement.OPERATOR] route open to a catalog-bound operator
+     * although its path names no catalog: the catalog it creates is in the
+     * body, and the handler asks the selector for that name, which holds it
+     * to the binding (StoreEntitlement.kt). hoglite is provisioned this way,
+     * by an operator whose `rtg` places exactly that catalog (docs/auth.md).
+     */
+    internal const val PROVISIONING = "/v1/catalogs"
+
+    /**
      * The table. Ordered longest-pattern-first at construction; see [rules].
      *
      * Reading rules:
@@ -138,7 +153,7 @@ object AuthPolicy {
             Entry(HttpMethod.Post, "/v1/debug/decode-bound", Requirement.OPERATOR),
             // ---- fleet-wide listings: authenticated, then FILTERED --------
             Entry(HttpMethod.Get, "/v1/catalogs", Requirement.AUTHENTICATED),
-            Entry(HttpMethod.Post, "/v1/catalogs", Requirement.OPERATOR),
+            Entry(HttpMethod.Post, PROVISIONING, Requirement.OPERATOR),
             // OPERATOR, not "authenticated then filtered". These two are
             // keyset-paginated cross-catalog feeds (`after` + `limit`), and a
             // post-hoc filter would return short pages whose cursor had skipped
@@ -454,10 +469,25 @@ object AuthPolicy {
         return when (match.requirement) {
             Requirement.AUTHENTICATED -> AuthDecision.Allow
             Requirement.OPERATOR ->
-                if (caller.kind.isOperator()) {
-                    AuthDecision.Allow
-                } else {
-                    AuthDecision.InsufficientScope(match.pattern, Scope.ADMIN)
+                when {
+                    !caller.kind.isOperator() -> AuthDecision.InsufficientScope(match.pattern, Scope.ADMIN)
+                    caller.fleetWide -> AuthDecision.Allow
+                    // A catalog-bound operator: on a route that names a catalog
+                    // (containment), the 404 of a tenant's unknown catalog, for
+                    // the same reason. The provisioning route names its catalog
+                    // in the body, which the handler holds to the binding
+                    // through the selector (StoreEntitlement.kt), as a tenant's
+                    // body-scoped routes are held. Every other fleet route is
+                    // closed to it: a 403 as for a tenant, since no catalog is
+                    // named that a 404 could hide.
+                    match.catalog != null ->
+                        if (caller.knowsCatalog(match.catalog)) {
+                            AuthDecision.Allow
+                        } else {
+                            AuthDecision.UnknownCatalog(match.catalog)
+                        }
+                    match.pattern == PROVISIONING -> AuthDecision.Allow
+                    else -> AuthDecision.InsufficientScope(match.pattern, Scope.ADMIN)
                 }
             else -> {
                 val catalog =
