@@ -797,7 +797,8 @@ class HogliteExtendedGuardRaceIntegrationTest {
             val replay = runCatching { pstore.commit(c, req) }
             assertThat(replay.exceptionOrNull()).isNull()
             assertThat(replay.getOrThrow()).isEqualTo(winner)
-            assertThat(guardIndex).isEqualTo(2)
+            // The receipt guard is the commit's first statement, after runTx's fence (1-based on the wire).
+            assertThat(guardIndex).isEqualTo(HogliteCatalogStore.FENCE_STATEMENTS + 1)
             assertThat(
                 seen.count {
                     it.contains("/query ") && "SELECT fingerprint, snapshot_id, schema_version FROM receipts" in it
@@ -1444,24 +1445,32 @@ class HogliteExtendedGuardRaceIntegrationTest {
 
     @Test
     fun `alter does not replan other guard indices or arbitrary statuses`() {
-        // Index 0 is the prepended catalog fence; 1 is table identity; 2
-        // is the only private schema guard. Allocator and unknown indices
-        // never share that marker, regardless of misleading error prose.
+        // The wire guard_index is 1-based. Statements 1..FENCE_STATEMENTS
+        // are runTx's fence (name guard, drop fence); the next is table
+        // identity; the one after is the only private schema guard. Fence,
+        // identity, allocator and unknown indices never share that marker,
+        // regardless of misleading error prose.
+        val fence = HogliteCatalogStore.FENCE_STATEMENTS
+        val identity = fence + 1
+        val planning = "table schema changed while planning alter"
+
+        fun expectFailed(
+            index: Int,
+            error: String,
+        ) = """{"code":"expect_failed","guard_index":$index,"error":"$error"}"""
+
         val answers =
             listOf(
-                409 to """{"code":"expect_failed","guard_index":-1,"error":"schema changed"}""",
-                409 to """{"code":"expect_failed","guard_index":0,"error":"schema changed"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":1,"error":"table schema changed while planning alter"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":2,"error":"table schema changed while planning alter"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":9,"error":"table schema changed while planning alter"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":999,"error":"schema changed"}""",
-                409 to """{"error":"table schema changed while planning alter"}""",
-                422 to """{"error":"table schema changed while planning alter"}""",
-                503 to """{"error":"table schema changed while planning alter"}""",
+                409 to expectFailed(-1, "schema changed"),
+                409 to expectFailed(0, "schema changed"),
+                409 to expectFailed(1, "schema changed"),
+                409 to expectFailed(fence, planning),
+                409 to expectFailed(identity, planning),
+                409 to expectFailed(9, planning),
+                409 to expectFailed(999, "schema changed"),
+                409 to """{"error":"$planning"}""",
+                422 to """{"error":"$planning"}""",
+                503 to """{"error":"$planning"}""",
             )
         for ((status, body) in answers) {
             val (c, _) = setup()
@@ -1492,13 +1501,15 @@ class HogliteExtendedGuardRaceIntegrationTest {
         val before = head(c)
         val lose = Hook(::isAlterTx, dropResponse = { true })
         // First really commits. The next transport attempt sees a schema-
-        // looking refusal; it cannot settle the earlier ambiguous apply.
+        // looking refusal (the schema guard follows the fence and table
+        // identity; 1-based); it cannot settle the earlier ambiguous apply.
+        val schemaGuard = HogliteCatalogStore.FENCE_STATEMENTS + 2
         val refusal =
             Hook(
                 ::isAlterTx,
                 remaining = Int.MAX_VALUE,
                 shortCircuit = 409,
-                shortCircuitBody = """{"code":"expect_failed","guard_index":3,"error":"schema changed"}""",
+                shortCircuitBody = """{"code":"expect_failed","guard_index":$schemaGuard,"error":"schema changed"}""",
             )
         hooks += lose
         hooks += refusal
@@ -1718,8 +1729,11 @@ class HogliteExtendedGuardRaceIntegrationTest {
     fun `a view create re-asserts its namespace inside the transaction`() {
         val c = freshCatalog()
         store.createNamespace(c, "vns")
-        // The create has resolved the namespace; the namespace is dropped
-        // (no views yet, so the drop's check passes) before the insert.
+        // The create has resolved the namespace (liveNamespace: a read-only
+        // `/tx` carrying the meta row and the namespace); the namespace is
+        // dropped (no views yet, so the drop's check passes) before the
+        // insert. The write tx re-asserts the namespace with similar SQL,
+        // so the match is pinned to the read batch.
         val hook =
             Hook(
                 {
@@ -1727,7 +1741,7 @@ class HogliteExtendedGuardRaceIntegrationTest {
                         p,
                         b,
                     ->
-                    m == "POST" && p.endsWith("/query") && "FROM namespaces WHERE name = ?" in b
+                    m == "POST" && p.endsWith("/tx") && isReadBatch(b) && "FROM namespaces WHERE name = ?" in b
                 },
                 after = { store.dropNamespace(c, "vns", null, "test", "drop") },
             )
