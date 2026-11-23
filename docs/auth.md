@@ -183,6 +183,50 @@ issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
 
+hoglite's rules are stricter than hoglake's. On the catalog and store
+routes, a token hoglake accepts is refused by hoglite when any of these hold
+(`backend_expect` in the [contract vectors](../server/src/test/resources/oauth/contract-vectors.json)
+pins one token per rule that a token can show):
+
+| rule | hoglite answers | the caller sees |
+| --- | --- | --- |
+| `aud` is not exactly two values, hoglake's audience and `hoglite` | 401 | 403 `backend_refused_authority` |
+| `sub` or `jti` is the empty string | 401 | 403 `backend_refused_authority` |
+| `iat` or `nbf` is present but not an integer (hoglake ignores it) | 401 | 403 `backend_refused_authority` |
+| a routed token's `org` is absent or empty (hoglake requires `org` only on tenant and scoped tokens, and accepts an empty string) | 401 | 403 `backend_refused_authority` |
+| the header carries `b64` | 401 | 403 `backend_refused_authority` |
+| `kid` is over 256 characters; hoglite also refuses a JWKS that holds such a key | 401 | 403 `backend_refused_authority` |
+| `kid` names a key hoglite has not fetched yet: it refetches the JWKS at most once a minute, and retries a failed fetch after 30 s | 401 | 403 `backend_refused_authority` |
+| `iat` or `nbf` is more than 60 s ahead of hoglite's clock; only with `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` above 60, as hoglite's skew is fixed at 60 s | 401 | 403 `backend_refused_authority` |
+| `exp` passed more than 60 s ago; only with `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` above 60 | 401 | 401 `token_expired` |
+| `ten` is absent or `scoped`; the token carries `scope`, `usr` or `prd`; a routed token has no scope hoglite knows on it; a routed `operator` lacks `admin` | 403 | 403 `forbidden` |
+
+The rules both apply are not in the table: `rtg` with keys other than `b`,
+`be` and `t`, an `rtg.t` that is not a valid tenant id, and a routed token
+with other than one `cat` entry are refused by hoglake first. hoglite's
+32 KiB token limit is not reached: hoglake's listener refuses a request whose
+headers exceed 8 KiB.
+
+hoglite's 401 does not say which rule failed. hoglake answers it as 401
+`token_expired` (with the bearer challenge) only when the forwarded token's
+`exp` has passed by hoglake's clock, which a new token fixes. Any other
+hoglite 401 is 403 `backend_refused_authority`, with no challenge. It is not
+a reason to re-mint: a new token with the same claims is refused again.
+Two rows of the table pass with time, and the answer does not tell them
+from the rest: a new signing key succeeds after hoglite's next JWKS refresh,
+and a token issued ahead of hoglite's clock succeeds once that clock catches
+up. Both are deployment faults, fixed where they arise: an issuer publishes
+a key in the JWKS at least a minute before signing with it, and
+`HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` stays at 60 or below in front of hoglite
+backends, with hoglake's and hoglite's clocks in sync, so hoglake refuses
+such a token itself. A client may retry the same token after a delay; it
+must not re-mint in answer to this code.
+
+The typed scoped reads below verify under their own rules, and hoglite answers
+404 for authority they do not support. Their 401 maps the same way: 401
+`token_expired` for a token past its `exp`, 403 `backend_refused_authority`
+otherwise, never the 503 with `Retry-After` an outage gets.
+
 #### Typed scoped namespace read
 
 This operation is disabled by default.
@@ -348,6 +392,10 @@ is an operator.
   where it is off (`profile_not_enabled`). The reason strings are part of the
   contract; clients branch on them.
 - `403` for a scope shortfall on a catalog the token can see.
+- `403` `backend_refused_authority` (no `WWW-Authenticate`) when a backend that
+  verifies the token itself refuses a token hoglake accepted; see
+  [Backends that verify the token themselves](#backends-that-verify-the-token-themselves).
+  Do not re-mint.
 - `404` for a catalog the token cannot see.
 
 ## What hoglake does not do

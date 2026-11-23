@@ -52,4 +52,19 @@ class BackendErrorMappingTest {
                 Audit.failureOutcome(HoglakeException.CommitOutcomeUnknown("lost", "connection closed")),
             ).isEqualTo("commit_outcome_unknown")
         }
+
+    /** A backend's own token rule (#681): no bearer challenge, so no client re-mints into it. */
+    @Test
+    fun `a backend authority refusal is a 403 with its own code and no bearer challenge`() =
+        testApplication {
+            application {
+                install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                install(StatusPages) { installErrorMapping() }
+                routing { get("/refused") { throw HoglakeException.BackendRefusedAuthority("hoglite refused") } }
+            }
+            val response = client.get("/refused")
+            assertThat(response.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(response.headers[HttpHeaders.WWWAuthenticate]).isNull()
+            assertThat(response.bodyAsText()).contains("\"error\":\"backend_refused_authority\"")
+        }
 }

@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.auth.JwtViolation
 import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
@@ -9,18 +10,52 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Deterministic engine refusals must not invite unchanged retries. */
 class HogliteRefusalMappingTest {
     private val store = HogliteCatalogStore(HogliteClient("http://unused.invalid"), { "opaque_1" })
 
+    /** A compact token whose only claim is [exp]; mapRejected reads it, nothing verifies it. */
+    private fun tokenExpiring(exp: Long): String {
+        val enc = Base64.getUrlEncoder().withoutPadding()
+        val header = enc.encodeToString("""{"alg":"ES256"}""".toByteArray())
+        val payload = enc.encodeToString("""{"exp":$exp}""".toByteArray())
+        return "$header.$payload.${enc.encodeToString("sig".toByteArray())}"
+    }
+
+    private fun storeFor(token: String?) =
+        HogliteCatalogStore(HogliteClient("http://unused.invalid").forRequest(token), { "opaque_1" })
+
+    /**
+     * hoglite's 401 for a token hoglake accepted and that has not expired is
+     * one of hoglite's own rules (#681): a 403 `backend_refused_authority`,
+     * so a client does not re-mint the same claims in a loop.
+     */
     @Test
-    fun `backend authority refusals retain authentication semantics`() {
-        assertThat(store.mapRejected("cat", HogliteRejected(401, """{"code":"refused"}""")))
-            .isInstanceOf(HoglakeException.Unauthenticated::class.java)
+    fun `a backend 401 for an unexpired token is a backend refusal, not a re-mint`() {
+        val now = System.currentTimeMillis() / 1000
+        for (token in listOf(tokenExpiring(now + 3600), null, "not-a-jwt")) {
+            assertThat(storeFor(token).mapRejected("cat", HogliteRejected(401, """{"code":"refused"}""")))
+                .describedAs("token %s", token)
+                .isExactlyInstanceOf(HoglakeException.BackendRefusedAuthority::class.java)
+        }
+    }
+
+    @Test
+    fun `a backend 401 for an expired token stays a 401 the client renews`() {
+        val now = System.currentTimeMillis() / 1000
+        val refused = HogliteRejected(401, """{"code":"refused"}""")
+        val failure = storeFor(tokenExpiring(now - 1)).mapRejected("cat", refused)
+        assertThat(failure).isExactlyInstanceOf(HoglakeException.Unauthenticated::class.java)
+        assertThat((failure as HoglakeException.Unauthenticated).reason).isEqualTo(JwtViolation.EXPIRED)
+    }
+
+    @Test
+    fun `a backend 403 keeps the forbidden code`() {
         assertThat(store.mapRejected("cat", HogliteRejected(403, """{"code":"refused"}""")))
-            .isInstanceOf(HoglakeException.Forbidden::class.java)
+            .isExactlyInstanceOf(HoglakeException.Forbidden::class.java)
     }
 
     @ParameterizedTest
@@ -182,7 +217,7 @@ class HogliteRefusalMappingTest {
                     val selected = HogliteCatalogStore(client, { "opaque_1" })
                     val expected =
                         if (status == 401) {
-                            HoglakeException.Unauthenticated::class.java
+                            HoglakeException.BackendRefusedAuthority::class.java
                         } else {
                             HoglakeException.Forbidden::class.java
                         }

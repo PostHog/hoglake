@@ -6,6 +6,8 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.api.ScanFileDto
+import com.posthog.hoglake.auth.Jwt
+import com.posthog.hoglake.auth.JwtViolation
 import com.posthog.hoglake.model.HoglakeException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.ConnectException
@@ -204,6 +206,33 @@ class HogliteClient(
             sleeper, shared = shared ?: this, bearerToken = token,
         )
 
+    /**
+     * Whether the forwarded token's `exp` has passed, by this pod's clock.
+     * False with no token or no readable `exp`: hoglake verified the token
+     * it forwards, so neither is an expiry a re-mint would fix.
+     */
+    internal fun bearerExpired(nowSeconds: Long = System.currentTimeMillis() / 1000): Boolean {
+        val token = bearerToken ?: return false
+        val exp = runCatching { Jwt.seconds(Jwt.parse(token).claims, "exp") }.getOrNull() ?: return false
+        return nowSeconds >= exp
+    }
+
+    /**
+     * What hoglite's 401 for the forwarded token means to the caller. It does
+     * not say which rule failed: a token past its `exp` is renewed by a
+     * re-mint; any other broke a rule hoglake does not apply, which a re-mint
+     * with the same claims cannot satisfy (#681).
+     */
+    internal fun authorityRefusal(): HoglakeException =
+        if (bearerExpired()) {
+            HoglakeException.Unauthenticated(JwtViolation.EXPIRED, "backend refused request authority: expired")
+        } else {
+            HoglakeException.BackendRefusedAuthority(
+                "hoglite refused a token hoglake accepted; a token with the same claims is refused again " +
+                    "(docs/auth.md, Backends that verify the token themselves)",
+            )
+        }
+
     // ---- public API -------------------------------------------------------
 
     /**
@@ -218,7 +247,16 @@ class HogliteClient(
     ): NamespaceDto? {
         val token = bearerToken
         if (shared == null || token == null) throw HogliteScopedNamespaceRead.unavailable()
-        return HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, readTimeoutMs)
+        return HogliteScopedNamespaceRead.read(
+            http,
+            standardUrl,
+            token,
+            tenant,
+            catalog,
+            namespace,
+            readTimeoutMs,
+            ::authorityRefusal,
+        )
     }
 
     /**
@@ -242,6 +280,7 @@ class HogliteClient(
             namespace,
             table,
             readTimeoutMs,
+            ::authorityRefusal,
         )
     }
 
@@ -270,6 +309,7 @@ class HogliteClient(
             snapshot,
             tableUuid,
             readTimeoutMs,
+            ::authorityRefusal,
         )
     }
 

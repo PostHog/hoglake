@@ -1,9 +1,12 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.databind.node.ObjectNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthService
+import com.posthog.hoglake.auth.ContractVectors
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
@@ -138,7 +141,7 @@ class HogliteJwtIntegrationTest {
                             setBody("""{"namespace":"ns","name":"pending","columns":[{"name":"id","type":"long"}]}""")
                         }.status,
                     ).isEqualTo(HttpStatusCode.OK)
-                    val json = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+                    val json = jacksonObjectMapper()
                     val existing = client.get(statusPath) { header(HttpHeaders.Authorization, "Bearer $reader") }
                     assertThat(existing.status).isEqualTo(HttpStatusCode.OK)
                     assertThat(json.readTree(existing.bodyAsText())["state"].asText()).isEqualTo("prepared")
@@ -199,6 +202,54 @@ class HogliteJwtIntegrationTest {
                             header(HttpHeaders.Authorization, "Bearer not-verified")
                         }.status,
                     ).isEqualTo(HttpStatusCode.Unauthorized)
+                    // A third audience: hoglake accepts it, hoglite requires exactly two (#681).
+                    // Not a 401: a fresh token with the same claims would be refused again.
+                    val thirdAudience =
+                        TestTokens.mint(
+                            pair,
+                            """{"iss":"${TestTokens.ISSUER}","aud":["hoglake","hoglite","other"],""" +
+                                """"sub":"test-client","jti":"test-third-audience","ten":"tenant",""" +
+                                """"org":"org-not-the-tid","cat":{"lake":["read"]},"iat":$now,"nbf":$now,""" +
+                                """"exp":${now + 900},"rtg":{"b":"hoglite","be":"$id","t":"opaque_1"}}""",
+                        )
+                    val refused =
+                        client.get("/v1/catalogs/lake") {
+                            header(HttpHeaders.Authorization, "Bearer $thirdAudience")
+                        }
+                    assertThat(refused.status).isEqualTo(HttpStatusCode.Forbidden)
+                    assertThat(refused.headers[HttpHeaders.WWWAuthenticate]).isNull()
+                    assertThat(refused.bodyAsText()).contains("\"error\":\"backend_refused_authority\"")
+                    // Every contract vector's backend_expect, against this hoglited: the
+                    // vector's claims re-issued by this test's issuer, now, for tenant opaque_1.
+                    val vectors =
+                        json.readTree(javaClass.getResourceAsStream("/oauth/contract-vectors.json"))["vectors"]
+                    val placed = vectors.filter { it.has("backend_expect") }
+                    assertThat(placed).isNotEmpty()
+                    HogliteClient(engine.url()).use { shared ->
+                        for (vector in placed) {
+                            val claims = vector["claims"].deepCopy<ObjectNode>()
+                            assertThat(claims["rtg"]["be"].asText()).isEqualTo(id)
+                            claims.put("iss", TestTokens.ISSUER)
+                            (claims["rtg"] as ObjectNode).put("t", "opaque_1")
+                            for (time in listOf("exp", "iat", "nbf")) {
+                                claims[time]?.takeIf { it.isIntegralNumber }?.let {
+                                    claims.put(time, it.asLong() - ContractVectors.ISSUED_AT + now)
+                                }
+                            }
+                            val token = TestTokens.mint(pair, json.writeValueAsString(claims))
+                            val status =
+                                try {
+                                    shared.forRequest(token).query("opaque_1", "SELECT 1")
+                                    null
+                                } catch (rejected: HogliteRejected) {
+                                    rejected.status
+                                }
+                            val expect = vector["backend_expect"]
+                            assertThat(status).describedAs(vector["name"].asText()).isEqualTo(
+                                if (expect["verdict"].asText() == "accept") null else expect["status"].asInt(),
+                            )
+                        }
+                    }
                 }
             }
             // Warn mode bypasses generic policy refusals, not backend lifecycle capabilities.

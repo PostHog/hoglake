@@ -98,6 +98,11 @@ object ContractVectors {
             "expect is the verdict at verify_at for HOGLAKE_AUTH_ISSUER=issuer, HOGLAKE_AUTH_AUDIENCE=hoglake, " +
                 "HOGLAKE_AUTH_PREDICATE_FIELDS=team_id, the default scoped lifetime cap (900s), the rtg " +
                 "backends configured as hoglite, and HOGLAKE_AUTH_SESSION_PROFILE=off (the default).",
+            "backend_expect, on a vector routed to hoglite, is the verdict of a hoglite whose issuer is issuer and " +
+                "whose backend id is rtg.be, on a tenant route, when hoglake forwards the token: accept, or refuse " +
+                "with hoglite's status and the error hoglake answers the caller (docs/auth.md, \"Backends that " +
+                "verify the token themselves\"). hoglite's rules are stricter than hoglake's, so a token can be " +
+                "hoglake's accept and hoglite's refuse.",
             "The session profile's own vectors, verified with HOGLAKE_AUTH_SESSION_PROFILE=on, are in " +
                 "session-profile-vectors.json beside this file.",
             "ES256 signatures are randomised: re-minting gives the same header and claims segments, " +
@@ -207,6 +212,20 @@ object ContractVectors {
             put("reason", reason)
         }
 
+    /** hoglite accepts the forwarded token. */
+    private fun backendAccept(): ObjectNode = mapper.createObjectNode().put("verdict", "accept")
+
+    /**
+     * hoglite refuses the forwarded token with [status]; hoglake answers the
+     * caller 403 with the code the mapping gives that status (#681).
+     */
+    private fun backendRefuse(status: Int): ObjectNode =
+        mapper.createObjectNode().apply {
+            put("verdict", "refuse")
+            put("status", status)
+            put("error", if (status == 401) "backend_refused_authority" else "forbidden")
+        }
+
     /** The JWKS entry every vector file publishes for the shared test key. */
     internal fun jwk(): ObjectNode =
         mapper.createObjectNode().apply {
@@ -236,7 +255,14 @@ object ContractVectors {
          * that no conforming issuer makes. Rendered as `mutation`.
          */
         val mutation: String? = null,
-        /** Claims between `jti` and `exp`, in the order the token carries them. */
+        /** On a vector routed to hoglite: hoglite's verdict on it. Rendered as `backend_expect`. */
+        val backendExpect: ObjectNode? = null,
+        /** Audiences after the two a hoglite-placed token carries; only a verifier-only vector has any. */
+        val extraAudiences: List<String> = emptyList(),
+        /**
+         * Claims between `jti` and `exp`, in the order the token carries them.
+         * A `jti`, `iat` or `nbf` here replaces the generated one.
+         */
         val body: List<Pair<String, JsonNode>>,
     ) {
         fun render(): ObjectNode {
@@ -250,7 +276,7 @@ object ContractVectors {
                             (inputKey == "operator" && input["placement"] == null)
                     )
                 ) {
-                    mapper.valueToTree(listOf(AUDIENCE, "hoglite"))
+                    mapper.valueToTree(listOf(AUDIENCE, "hoglite") + extraAudiences)
                 } else {
                     mapper.valueToTree(audience)
                 }
@@ -258,8 +284,8 @@ object ContractVectors {
             claims["jti"] = mapper.valueToTree(jtiText)
             body.filter { it.first != "sub" }.forEach { (k, v) -> claims[k] = v }
             claims["exp"] = mapper.valueToTree(ISSUED_AT + ttl)
-            claims["iat"] = mapper.valueToTree(ISSUED_AT)
-            claims["nbf"] = mapper.valueToTree(ISSUED_AT)
+            if ("iat" !in claims) claims["iat"] = mapper.valueToTree(ISSUED_AT)
+            if ("nbf" !in claims) claims["nbf"] = mapper.valueToTree(ISSUED_AT)
             val header = mapper.createObjectNode().put("alg", "ES256").put("kid", KID).put("typ", "JWT")
 
             return mapper.createObjectNode().apply {
@@ -270,6 +296,7 @@ object ContractVectors {
                 put("jti", jtiText)
                 mutation?.let { put("mutation", it) }
                 set<JsonNode>("expect", expect)
+                backendExpect?.let { set<JsonNode>("backend_expect", it) }
                 put("token", sign(header, mapper.createObjectNode().setAll<ObjectNode>(claims)))
                 set<JsonNode>("header", header)
                 // Sorted, for reading; the token carries the minted order.
@@ -389,6 +416,7 @@ object ContractVectors {
                 },
                 6,
                 accept("tenant"),
+                backendExpect = backendAccept(),
                 body =
                     listOf(
                         "sub" to text(reader),
@@ -406,6 +434,8 @@ object ContractVectors {
                 scopedInput().apply { set<JsonNode>("placement", placement()) },
                 7,
                 accept("scoped"),
+                // hoglite's tenant routes serve tenant and operator tokens only.
+                backendExpect = backendRefuse(403),
                 body =
                     listOf(
                         "sub" to text(team),
@@ -431,6 +461,7 @@ object ContractVectors {
                 8,
                 accept("operator"),
                 ttl = OPERATOR_TTL,
+                backendExpect = backendAccept(),
                 body =
                     listOf(
                         "sub" to text("issuer:provisioner"),
@@ -533,8 +564,212 @@ object ContractVectors {
                         ),
                     ),
             ),
+            // hoglake accepts each of the following and hoglite refuses it
+            // (docs/auth.md, "Backends that verify the token themselves").
+            Spec(
+                "tenant_routed_third_audience",
+                "A routed token with a third audience: hoglake needs its own in aud, hoglite exactly two.",
+                "client",
+                routedReader(),
+                14,
+                accept("tenant"),
+                mutation = "aud gains a third value, other-service",
+                backendExpect = backendRefuse(401),
+                extraAudiences = listOf("other-service"),
+                body = routedReaderBody(),
+            ),
+            Spec(
+                "tenant_routed_string_iat",
+                "A routed token whose iat is a string: hoglake reads only an integer iat, hoglite refuses any other.",
+                "client",
+                routedReader(),
+                15,
+                accept("tenant"),
+                mutation = "iat is the string form of issued_at",
+                backendExpect = backendRefuse(401),
+                body = routedReaderBody() + ("iat" to text(ISSUED_AT.toString())),
+            ),
+            Spec(
+                "operator_routed_without_org",
+                "A routed operator token with no org: hoglake reads org only to log it, hoglite requires it.",
+                "operator",
+                operatorInput().apply {
+                    put("catalog", ORG)
+                    set<JsonNode>("placement", placement())
+                },
+                16,
+                accept("operator"),
+                ttl = OPERATOR_TTL,
+                mutation = "the org claim is omitted",
+                backendExpect = backendRefuse(401),
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "cat" to cat("admin"),
+                        "cli" to text("provisioner"),
+                        "rtg" to rtg(),
+                    ),
+            ),
+            Spec(
+                "operator_routed_empty_sub",
+                "A routed operator token whose sub is the empty string: " +
+                    "hoglake needs a string, hoglite a non-empty one.",
+                "operator",
+                operatorInput().apply {
+                    put("org", ORG)
+                    put("catalog", ORG)
+                    set<JsonNode>("placement", placement())
+                },
+                17,
+                accept("operator"),
+                ttl = OPERATOR_TTL,
+                mutation = "sub is the empty string",
+                backendExpect = backendRefuse(401),
+                body =
+                    listOf(
+                        "sub" to text(""),
+                        "ten" to text("operator"),
+                        "org" to text(ORG),
+                        "cat" to cat("admin"),
+                        "cli" to text("provisioner"),
+                        "rtg" to rtg(),
+                    ),
+            ),
+            Spec(
+                "tenant_routed_without_ten",
+                "A routed token that omits ten: hoglake reads it as tenant, hoglite requires ten to say so.",
+                "client",
+                routedReader(),
+                18,
+                accept("tenant"),
+                mutation = "the ten claim is omitted",
+                backendExpect = backendRefuse(403),
+                body = routedReaderBody().filter { it.first != "ten" },
+            ),
+            Spec(
+                "tenant_routed_extra_rtg_key",
+                "A routed token whose rtg carries a key besides b, be and t: refused here, as hoglite refuses it.",
+                "client",
+                routedReader(),
+                19,
+                refuse(JwtViolation.MALFORMED),
+                mutation = "rtg gains a key, x",
+                body =
+                    routedReaderBody().map { (k, v) ->
+                        k to if (k == "rtg") rtg().put("x", "1") else v
+                    },
+            ),
+            Spec(
+                "tenant_routed_empty_org",
+                "A routed token whose org is the empty string: hoglake needs a string, hoglite a non-empty one.",
+                "client",
+                routedReader(),
+                20,
+                accept("tenant"),
+                mutation = "org is the empty string",
+                backendExpect = backendRefuse(401),
+                body = routedReaderBody().map { (k, v) -> k to if (k == "org") text("") else v },
+            ),
+            Spec(
+                "tenant_routed_empty_jti",
+                "A routed token whose jti is the empty string: hoglake needs a string, hoglite a non-empty one.",
+                "client",
+                routedReader(),
+                21,
+                accept("tenant"),
+                mutation = "jti is the empty string",
+                backendExpect = backendRefuse(401),
+                body = routedReaderBody() + ("jti" to text("")),
+            ),
+            Spec(
+                "tenant_routed_string_nbf",
+                "A routed token whose nbf is a string: hoglake reads only an integer nbf, hoglite refuses any other.",
+                "client",
+                routedReader(),
+                22,
+                accept("tenant"),
+                mutation = "nbf is the string form of issued_at",
+                backendExpect = backendRefuse(401),
+                body = routedReaderBody() + ("nbf" to text(ISSUED_AT.toString())),
+            ),
+            Spec(
+                "tenant_routed_with_scope",
+                "A routed token that also carries scope, with no hoglake value in it: " +
+                    "hoglake ignores it, hoglite refuses any scope claim.",
+                "client",
+                routedReader(),
+                23,
+                accept("tenant"),
+                mutation = "scope openid is added",
+                backendExpect = backendRefuse(403),
+                body = routedReaderBody() + ("scope" to text("openid")),
+            ),
+            Spec(
+                "tenant_routed_with_usr",
+                "A routed tenant token that carries usr: hoglake ignores it, hoglite refuses any usr claim.",
+                "client",
+                routedReader(),
+                24,
+                accept("tenant"),
+                mutation = "usr is added",
+                backendExpect = backendRefuse(403),
+                body = routedReaderBody() + ("usr" to text(owner)),
+            ),
+            Spec(
+                "tenant_routed_with_prd",
+                "A routed token whose ten is tenant and that carries prd: hoglake ignores it, " +
+                    "hoglite refuses any prd claim.",
+                "client",
+                routedReader(),
+                25,
+                accept("tenant"),
+                mutation = "prd is added",
+                backendExpect = backendRefuse(403),
+                body = routedReaderBody() + ("prd" to prd()),
+            ),
+            Spec(
+                "operator_routed_without_admin",
+                "A routed operator token whose cat holds read: hoglake does not read an operator's cat, " +
+                    "hoglite requires admin.",
+                "operator",
+                operatorInput().apply {
+                    put("org", ORG)
+                    put("catalog", ORG)
+                    set<JsonNode>("placement", placement())
+                },
+                26,
+                accept("operator"),
+                ttl = OPERATOR_TTL,
+                mutation = "cat holds read in place of admin",
+                backendExpect = backendRefuse(403),
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "org" to text(ORG),
+                        "cat" to cat("read"),
+                        "cli" to text("provisioner"),
+                        "rtg" to rtg(),
+                    ),
+            ),
         )
     }
+
+    private fun routedReader(): ObjectNode =
+        tenantInput("hlc_0123456789abcdef01234567", "pyhoglake-reader", "read", false).apply {
+            set<JsonNode>("placement", placement())
+        }
+
+    private fun routedReaderBody(): List<Pair<String, JsonNode>> =
+        listOf(
+            "sub" to mapper.valueToTree("hlc_0123456789abcdef01234567"),
+            "ten" to mapper.valueToTree("tenant"),
+            "org" to mapper.valueToTree(ORG),
+            "cat" to cat("read"),
+            "cli" to mapper.valueToTree("pyhoglake-reader"),
+            "rtg" to rtg(),
+        )
 
     internal fun sign(
         header: JsonNode,

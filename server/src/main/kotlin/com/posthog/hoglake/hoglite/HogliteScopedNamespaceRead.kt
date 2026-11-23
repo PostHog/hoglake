@@ -101,6 +101,7 @@ internal object HogliteScopedNamespaceRead {
         catalog: String,
         namespace: String,
         timeoutMs: Long,
+        onUnauthorized: () -> HoglakeException,
     ): NamespaceDto? =
         execute(
             http = http,
@@ -112,8 +113,9 @@ internal object HogliteScopedNamespaceRead {
             query = null,
             timeoutMs = timeoutMs,
             maxResponseBytes = MAX_NAMESPACE_RESPONSE_BYTES,
-            acceptedStatuses = setOf(200, 404),
+            acceptedStatuses = setOf(200, 401, 404),
             onUnavailable = ::unavailable,
+            onUnauthorized = onUnauthorized,
         ) { status, body ->
             decodeNamespace(status, body, namespace)
         }
@@ -127,6 +129,7 @@ internal object HogliteScopedNamespaceRead {
         namespace: String,
         table: String,
         timeoutMs: Long,
+        onUnauthorized: () -> HoglakeException,
     ): ScopedReadOutcome<ScopedTableResult> =
         execute(
             http = http,
@@ -139,8 +142,9 @@ internal object HogliteScopedNamespaceRead {
             query = null,
             timeoutMs = timeoutMs,
             maxResponseBytes = MAX_TABLE_RESPONSE_BYTES,
-            acceptedStatuses = setOf(200, 403, 404),
+            acceptedStatuses = setOf(200, 401, 403, 404),
             onUnavailable = ::tableUnavailable,
+            onUnauthorized = onUnauthorized,
         ) { status, body ->
             decodeTable(status, body, namespace, table)
         }
@@ -156,6 +160,7 @@ internal object HogliteScopedNamespaceRead {
         snapshot: Long,
         tableUuid: UUID,
         timeoutMs: Long,
+        onUnauthorized: () -> HoglakeException,
     ): ScopedReadOutcome<List<ScanFileDto>> {
         if (snapshot < 0) throw scanUnavailable()
         val query = "snapshot=$snapshot&table_uuid=$tableUuid"
@@ -170,8 +175,9 @@ internal object HogliteScopedNamespaceRead {
             query = query,
             timeoutMs = timeoutMs,
             maxResponseBytes = MAX_SCAN_RESPONSE_BYTES,
-            acceptedStatuses = setOf(200, 403, 404),
+            acceptedStatuses = setOf(200, 401, 403, 404),
             onUnavailable = ::scanUnavailable,
+            onUnauthorized = onUnauthorized,
         ) { status, body ->
             decodeScan(status, body, namespace, tableUuid, snapshot)
         }
@@ -187,6 +193,7 @@ internal object HogliteScopedNamespaceRead {
         maxResponseBytes: Int,
         acceptedStatuses: Set<Int>,
         onUnavailable: () -> HoglakeException.BackendUnavailable,
+        onUnauthorized: () -> HoglakeException,
         decode: (Int, Body) -> T,
     ): T {
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(minOf(BUDGET_MS, timeoutMs))
@@ -233,12 +240,21 @@ internal object HogliteScopedNamespaceRead {
             pending = responseFuture
             val response = responseFuture.get(remaining(deadline, onUnavailable), TimeUnit.NANOSECONDS)
             remaining(deadline, onUnavailable)
+            if (response.statusCode() == 401) {
+                // Only hoglite's exact refusal object; anything else under a 401 stays unavailable.
+                if (!decodeUtf8(response.body(), namespaceJson).hasCode("unauthorized")) throw onUnavailable()
+                throw Unauthorized()
+            }
             val result = decode(response.statusCode(), response.body())
             remaining(deadline, onUnavailable)
             return result
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             throw onUnavailable()
+        } catch (_: Unauthorized) {
+            // A deterministic refusal, not an outage: a 503 with Retry-After
+            // would send the caller into the retry loop #681 removed.
+            throw onUnauthorized()
         } catch (_: Exception) {
             // Never retain a peer body, a target, or a credential in the exception chain.
             throw onUnavailable()
@@ -247,6 +263,9 @@ internal object HogliteScopedNamespaceRead {
             pending?.cancel(true)
         }
     }
+
+    /** hoglite's own verifier refused the forwarded token; carries nothing of the response. */
+    private class Unauthorized : RuntimeException(null, null, false, false)
 
     private fun remaining(
         deadline: Long,

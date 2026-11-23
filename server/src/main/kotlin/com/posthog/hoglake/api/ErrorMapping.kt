@@ -188,6 +188,10 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // signed with the wrong key" without parsing prose.
         is HoglakeException.Unauthenticated ->
             HttpStatusCode.Unauthorized to ApiErrorDto(error = cause.reason, detail = cause.message)
+        // BEFORE Forbidden, which it is: its own code, so a client and an
+        // operator can tell the backend's verifier from hoglake's scopes.
+        is HoglakeException.BackendRefusedAuthority ->
+            HttpStatusCode.Forbidden to apiError("backend_refused_authority", cause)
         is HoglakeException.Forbidden -> HttpStatusCode.Forbidden to apiError("forbidden", cause)
         is HoglakeException.Expired -> HttpStatusCode.Gone to apiError("expired", cause)
         // Explicit backpressure: the commit queued too long on the catalog

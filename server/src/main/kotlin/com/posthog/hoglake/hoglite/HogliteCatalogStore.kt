@@ -3253,7 +3253,7 @@ class HogliteCatalogStore(
         val code = body?.get("code")?.asText()
         val detail = body?.get("error")?.asText() ?: r.body
         return when {
-            r.status == 401 -> HoglakeException.Unauthenticated("invalid_token", "backend refused request authority")
+            r.status == 401 -> client.authorityRefusal()
             r.status == 403 -> HoglakeException.Forbidden("backend refused request authority")
             r.status == 404 -> missingCatalog(catalog)
             code == "result_too_large" ->

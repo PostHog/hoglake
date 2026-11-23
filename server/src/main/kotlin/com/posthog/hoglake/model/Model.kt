@@ -2776,7 +2776,21 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * A 403 is only ever returned for a catalog the caller already knows
      * is its own.
      */
-    class Forbidden(detail: String) : HoglakeException(detail)
+    open class Forbidden(detail: String) : HoglakeException(detail)
+
+    /**
+     * A backend that verifies the token itself (hoglite) answered 401 for a
+     * token hoglake verified and that has not expired -> HTTP 403
+     * `backend_refused_authority`, with no bearer challenge. The two
+     * verifiers' rules differ (docs/auth.md, "Backends that verify the
+     * token themselves"), so a fresh token with the same claims is refused
+     * again: a 401 sent clients into a re-mint loop (#681).
+     *
+     * Subclasses [Forbidden] so audit, metrics and the clients' 403 arm
+     * treat it as a refused credential; its own code tells an operator
+     * that the backend, not hoglake, refused it.
+     */
+    class BackendRefusedAuthority(detail: String) : Forbidden(detail)
 
     class OffsetRegression(detail: String) : HoglakeException(detail)
 

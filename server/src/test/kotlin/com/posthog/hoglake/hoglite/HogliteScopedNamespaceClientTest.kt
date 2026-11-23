@@ -9,6 +9,7 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
@@ -169,6 +170,42 @@ class HogliteScopedNamespaceClientTest {
             assertThat(calls.get()).isEqualTo(1)
         }
         assertThat(redirectedCalls.get()).isZero()
+    }
+
+    /**
+     * hoglite's 401 on a typed read is its own verifier refusing the token
+     * (#681): not an outage with Retry-After, and a re-mint only for a token
+     * whose `exp` has passed.
+     */
+    @Test
+    fun `an unauthorized refusal on every typed read is the caller's authority answer, not unavailable`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+        val calls = AtomicInteger()
+        val server =
+            serve {
+                calls.incrementAndGet()
+                reply(it, """{"code":"unauthorized"}""".toByteArray(), 401)
+            }
+        val now = System.currentTimeMillis() / 1000
+        HogliteClient(url(server), retryBudgetMs = 50, sleeper = { error("unexpected retry") }).use { base ->
+            for ((token, expected) in listOf(
+                tokenExpiring(now + 3600) to HoglakeException.BackendRefusedAuthority::class.java,
+                TOKEN to HoglakeException.BackendRefusedAuthority::class.java,
+                tokenExpiring(now - 1) to HoglakeException.Unauthenticated::class.java,
+            )) {
+                val client = base.forRequest(token)
+                val reads =
+                    listOf<() -> Any?>(
+                        { client.readScopedNamespace("tenant_1", "lake", "reports") },
+                        { client.readScopedTable("tenant_1", "lake", "reports", "metrics") },
+                        { client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) },
+                    )
+                for (read in reads) {
+                    assertThatThrownBy { read() }.isExactlyInstanceOf(expected).hasNoCause()
+                }
+            }
+        }
+        assertThat(calls.get()).isEqualTo(9)
     }
 
     @Test
@@ -634,6 +671,13 @@ class HogliteScopedNamespaceClientTest {
         HogliteClient(url(server), connectTimeoutMs = 100, readTimeoutMs = 150).use { base ->
             expectUnavailable(base.forRequest(TOKEN))
         }
+    }
+
+    /** A compact token whose only claim is [exp]; the client reads it, nothing verifies it. */
+    private fun tokenExpiring(exp: Long): String {
+        val enc = Base64.getUrlEncoder().withoutPadding()
+        return enc.encodeToString("""{"alg":"ES256"}""".toByteArray()) + "." +
+            enc.encodeToString("""{"exp":$exp}""".toByteArray()) + "." + enc.encodeToString("sig".toByteArray())
     }
 
     companion object {

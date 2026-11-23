@@ -5,6 +5,7 @@
     "An issuer conforms by minting each vector's client/operator input at issued_at and matching header and claims; hoglake's suite checks every token against its verifier and the vector's expect.",
     "A vector with a mutation field is verifier-only: its input minted as usual, then changed as the mutation says. No conforming issuer produces it; an issuer's suite skips it.",
     "expect is the verdict at verify_at for HOGLAKE_AUTH_ISSUER=issuer, HOGLAKE_AUTH_AUDIENCE=hoglake, HOGLAKE_AUTH_PREDICATE_FIELDS=team_id, the default scoped lifetime cap (900s), the rtg backends configured as hoglite, and HOGLAKE_AUTH_SESSION_PROFILE=off (the default).",
+    "backend_expect, on a vector routed to hoglite, is the verdict of a hoglite whose issuer is issuer and whose backend id is rtg.be, on a tenant route, when hoglake forwards the token: accept, or refuse with hoglite's status and the error hoglake answers the caller (docs/auth.md, \"Backends that verify the token themselves\"). hoglite's rules are stricter than hoglake's, so a token can be hoglake's accept and hoglite's refuse.",
     "The session profile's own vectors, verified with HOGLAKE_AUTH_SESSION_PROFILE=on, are in session-profile-vectors.json beside this file.",
     "ES256 signatures are randomised: re-minting gives the same header and claims segments, a different signature.",
     "The key is a test constant; test_private_key_d is published on purpose."
@@ -43,7 +44,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.ZDpYDmaIZObgtH0NZBUrHSsue6LyWWNTP0sozMUDe_3rN3CT2xuvNqi9RjK7H8VZDF2MKAOdPt6C5IoxNjuwwg",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.61NKzro2ow8Sm0xGytxekap40Rs_Pk6H97knOG1vZwuQlaZH8ouJDVLfIXQ1dtY15BzoBpOiTa6NisiVCamHnQ",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -83,7 +84,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAyIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoidHJpbm8tcG9vbCIsImRsZyI6dHJ1ZSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.Vqgbvsw0IKWF6e9ufjqlpCHspYK5T73S8dBqVRpLBfekI6kJ4dKwqXCx4Z_nRNVuv8q6ZIREX5tkPyJOq7hUHQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAyIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoidHJpbm8tcG9vbCIsImRsZyI6dHJ1ZSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.Znf9nvu2XI3awyeCr2t1G3JVUv1LJMXVQ3iE8x2R1q2XP3ME31pwj-GiwCKfPcIKzCHu-cXJcquWRDOv6863Bw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -124,7 +125,7 @@
         "verdict": "refuse",
         "reason": "invalid_audience"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6Im90aGVyLXNlcnZpY2UiLCJzdWIiOiJobGNfZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoiZHVja2RiLWNsaWVudCIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.sIoRx7fCyHug6VMmG9X4EFoSb6QUWQPYJUb2lQIyUAohbL7UXsklhop09ZIJFmneJq2S4kJ6pjeJXOn5O1-QjQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6Im90aGVyLXNlcnZpY2UiLCJzdWIiOiJobGNfZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoiZHVja2RiLWNsaWVudCIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.xj7OXr0_TMC-kvh6acu0O_sNKSLkKT0Ee619C0sLbxTvh4MFnnNU_0kbk1m9LnFs7mIPUpR0MTjWCaa8i0Lv9w",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -161,7 +162,7 @@
         "verdict": "accept",
         "kind": "operator"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.EgBFp2D_2s6EM78q3bJCrI9Q6PLl3iAcnopdzdUSfg6BqBjEwDNd2A-40gi6HbjpjhHOZD3eXPfSEYpdI9OODQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.uHxbH_YhuhQDzSRZ1_y6-4gVIQVOXUir9Q9Kkou8GRTvYDysTFw7KVVuqYTSDfUVvVuCZqquYCouqaQgVmiNMw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -203,7 +204,7 @@
         "verdict": "accept",
         "kind": "scoped"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA1IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.D2aNn2QdgB0RS1VMUvW0x0laxT5qqIGKHSGZyCqbxAK1TGMJOuibvenUoUU_zPnyMepTBYl-K6qAsizj0nkDDA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA1IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.Z9yzgCGjf5ejvZKLymKcBVCjuINWO25yiu4_8pLbSERgfUfZX1tLN1tZFd59wHb9bJFo2a-LGQrR1tNJkhkR7A",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -256,7 +257,10 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA2IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.9leBPrwVkp4yoJnd9D3Kp6ccrhMWPQ2VbGDLd5CtTTFM3007h8fkhy_u3IDO090ExJaZ6CyoVye-sZmHN_W4wg",
+      "backend_expect": {
+        "verdict": "accept"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA2IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.aZRmnGbMUFH2Ut081rsdIJklUNjdqMTnp6nun00VQUm4-Sm1FigPHPVTPC6DBP8JkFNnhc44ePa4njnfkoxaSQ",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -315,7 +319,12 @@
         "verdict": "accept",
         "kind": "scoped"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA3IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.4cV5JwAlohsq5FxXo5NnvWatOs-QsanXAH5vNxjljabmYK72Y38CdBStKycPVtXpuaqPNXJezauJQsR3iSP4GA",
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 403,
+        "error": "forbidden"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA3IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.wx_4sPgdm-GwwLZhv4OXnvikssFrNC9_7W5nC1DW_aDG4mgc1R-9-whTjg2-A1cmQC6be6ZWhgBQfNJB6JdXSA",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -375,7 +384,10 @@
         "verdict": "accept",
         "kind": "operator"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.vhbPoWIhNQvEDsfKj7Z6KOvd5rmhooaGqxO3OJkkabgOQBL2juR2aKPUhePHQm60Pnub29PrRdJEs9oqX5aKKw",
+      "backend_expect": {
+        "verdict": "accept"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0._oD-SdsTKu6iQ3htprpJAdNHSBWdD_wYdh5ePqnHzDGByEyfKh5lh-LoiURcJJ3AljT909QHe9gPX1EK3oReIg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -424,7 +436,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA5Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.K8BvUQNzBwr6IODyalyLCtO8RblWjI1W9DKzKqidGIE_6MWO72xKPMKroQHVOibGZWk5z9Cnt-UXwhmfN8gEGw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA5Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.lljt8J47ggoaWJYtBGV2IbGGpNH5lW6BZ1IKobWH8V8j5d_Ffw403fnWPlbAV-ejUQjughzMfBUui-oidRn8ag",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -469,7 +481,7 @@
         "verdict": "refuse",
         "reason": "invalid_token"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEwIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.AZEwm0RUvXhmZw6xljMj9NVLP6H4Zhg-pqtfZy9FaLFHr94p1Q_YGu__sa3XnqRRbgfrJANRUZrs1XwcX_NdOw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEwIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.xYCdO3UmEfdjD9LMe5zIfPgNFa65_Jeh5mL0b6KpL-pc1sx-ABHAz3MVuwraHjOKJSzzxxzTAiif9etIQO-Klw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -513,7 +525,7 @@
         "verdict": "refuse",
         "reason": "missing_claim"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.h8-G2WdsvdO_LAjiyQbd2tIfJe3CusYWcIusw0NtaNBFIuEPHltcsfTP6CMq-PN_l3XS8hwgoLz6M29XuddOwA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.R4xQzYsx4RzYUUd1kfa8y9qqLylTzxJX3Xg9LhoeKHT1-8V2oq6BHfSv8_gYPfJLzOjxC9qyyK8McyyfZ77ZRg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -555,7 +567,7 @@
         "verdict": "refuse",
         "reason": "invalid_token"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEyIiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDEsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.Q8W6PDfvKG3NQUGSXllr66HCguTT8xAxUUpFFjw-vX7U0ngHxsK3wDh9UtvBHngtvCbUrRQTrbFP9eJesz0xnA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEyIiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDEsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.-2X5Md5S0bMbMxICQUeajq5SL6YjI9ig1F72dRCXHVms4KUifVO4nAnsfwWxbe9PJkiclH18Pxc4SKN61xtCEg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -603,7 +615,7 @@
         "verdict": "refuse",
         "reason": "profile_not_enabled"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicHJvZmlsZSI6InN0b3JhZ2Utc2Vzc2lvbiIsInZlcnNpb24iOjEsInB1cnBvc2UiOiJ1c2VyLXNlc3Npb24iLCJwcmltYXJ5X2NhdGFsb2ciOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiLCJyZW1vdGVfc2NoZW1hcyI6eyJzaGFyZWQiOlsicmVhZCJdLCJpbXBvcnRzIjpbInJlYWQiXX0sImF3cyI6eyJhY2Nlc3Nfa2V5X2lkIjoiRklDVElPTkFMX0FDQ0VTU19LRVlfSUQiLCJzZWNyZXRfYWNjZXNzX2tleSI6IkZJQ1RJT05BTF9TRUNSRVRfQUNDRVNTX0tFWSIsInNlc3Npb25fdG9rZW4iOiJGSUNUSU9OQUxfU0VTU0lPTl9UT0tFTiIsInJlZ2lvbiI6InVzLWVhc3QtMSIsImV4cGlyZXNfYXQiOjE3NjcyMjY4MDB9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.RjVbk0sHACXDEoKDJ_Pe_RGb41cOLcrIYnuAABDj5L7ehsd1k1V3tQ0moyhVe69KjCZHUxiklHOZmXEstMFsAg",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicHJvZmlsZSI6InN0b3JhZ2Utc2Vzc2lvbiIsInZlcnNpb24iOjEsInB1cnBvc2UiOiJ1c2VyLXNlc3Npb24iLCJwcmltYXJ5X2NhdGFsb2ciOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiLCJyZW1vdGVfc2NoZW1hcyI6eyJzaGFyZWQiOlsicmVhZCJdLCJpbXBvcnRzIjpbInJlYWQiXX0sImF3cyI6eyJhY2Nlc3Nfa2V5X2lkIjoiRklDVElPTkFMX0FDQ0VTU19LRVlfSUQiLCJzZWNyZXRfYWNjZXNzX2tleSI6IkZJQ1RJT05BTF9TRUNSRVRfQUNDRVNTX0tFWSIsInNlc3Npb25fdG9rZW4iOiJGSUNUSU9OQUxfU0VTU0lPTl9UT0tFTiIsInJlZ2lvbiI6InVzLWVhc3QtMSIsImV4cGlyZXNfYXQiOjE3NjcyMjY4MDB9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.zhsl20mToiFq-WGHo3y_bIIlT5lu-VlJrAjp719BZwnPRhjsednjUgnZ11X_bMNTj7ZcD55SDGR7KZqnO-uF4A",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -644,6 +656,785 @@
         "sub": "hlc_0123456789abcdef01234567",
         "ten": "tenant",
         "version": 1
+      }
+    },
+    {
+      "name": "tenant_routed_third_audience",
+      "description": "A routed token with a third audience: hoglake needs its own in aud, hoglite exactly two.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000014",
+      "mutation": "aud gains a third value, other-service",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSIsIm90aGVyLXNlcnZpY2UiXSwic3ViIjoiaGxjXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAxNCIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHlob2dsYWtlLXJlYWRlciIsInJ0ZyI6eyJiIjoiaG9nbGl0ZSIsImJlIjoiN2M5ZTJhMTQtM2Y1MS00YjhkLTllNjAtMmQ1YTFmOGM0NGFhIiwidCI6InRfM2ZhOGMxZDllMl8xIn0sImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.uMzyK-_D1PP1Eru9Jgft5cLaT_ZE3ni5kMtF34VD5I2UQMdSQ6yrsgwjcrjA_3429ch7u_98OMbOj1A7qEvihw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite",
+          "other-service"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000014",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "tenant_routed_string_iat",
+      "description": "A routed token whose iat is a string: hoglake reads only an integer iat, hoglite refuses any other.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000015",
+      "mutation": "iat is the string form of issued_at",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDE1IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiaWF0IjoiMTc2NzIyNTYwMCIsImV4cCI6MTc2NzIyNjUwMCwibmJmIjoxNzY3MjI1NjAwfQ.vyJBXhmCbScrxue22VL9DaJmap-7-AH4uomzu2m6_c5jOhbIPJt-1_0oGZthUxbsq7FvDRSCHwwQD8yRSCw9Zw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": "1767225600",
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000015",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "operator_routed_without_org",
+      "description": "A routed operator token with no org: hoglake reads org only to log it, hoglite requires it.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner",
+        "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000016",
+      "mutation": "the org claim is omitted",
+      "expect": {
+        "verdict": "accept",
+        "kind": "operator"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTYiLCJ0ZW4iOiJvcGVyYXRvciIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.bxcPM2MAWRihOhKOpBCTH-dzncFZPtIjKhBxy0_54iMtxqFfxtj1MenkmfBoMJ_EJ6sCokVGb8SUw96gFo_h-Q",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "admin"
+          ]
+        },
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000016",
+        "nbf": 1767225600,
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "issuer:provisioner",
+        "ten": "operator"
+      }
+    },
+    {
+      "name": "operator_routed_empty_sub",
+      "description": "A routed operator token whose sub is the empty string: hoglake needs a string, hoglite a non-empty one.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000017",
+      "mutation": "sub is the empty string",
+      "expect": {
+        "verdict": "accept",
+        "kind": "operator"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTciLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.5zUZ-V4BgcImi20vvAxEsoX1jtcaLDQD7JOP9Ce4Jgt5K4msmacc1mYkZiOgeY9WBFf25HGDWPCReH9lmwjcqQ",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "admin"
+          ]
+        },
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000017",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "",
+        "ten": "operator"
+      }
+    },
+    {
+      "name": "tenant_routed_without_ten",
+      "description": "A routed token that omits ten: hoglake reads it as tenant, hoglite requires ten to say so.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000018",
+      "mutation": "the ten claim is omitted",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 403,
+        "error": "forbidden"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDE4Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.yF_szFEDbw41RaHIJGrxGVfnEz2qu1f1RPW-3Nnjyt40S7Z8y7SBEnQ0K4yo7VxiikQUAwPM29iZSFnyOdScxw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000018",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567"
+      }
+    },
+    {
+      "name": "tenant_routed_extra_rtg_key",
+      "description": "A routed token whose rtg carries a key besides b, be and t: refused here, as hoglite refuses it.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000019",
+      "mutation": "rtg gains a key, x",
+      "expect": {
+        "verdict": "refuse",
+        "reason": "invalid_token"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDE5IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEiLCJ4IjoiMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.IejG9BuR_B6cBKUbspAHSlYfAwdjdCwnu7LxwerfcQAUxPDWeNOAl8bGgo5eq_sFafMy3Ol2DivM92A09JXPqg",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000019",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1",
+          "x": "1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "tenant_routed_empty_org",
+      "description": "A routed token whose org is the empty string: hoglake needs a string, hoglite a non-empty one.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000020",
+      "mutation": "org is the empty string",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDIwIiwidGVuIjoidGVuYW50Iiwib3JnIjoiIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.8mCHAtB8Zf648vryJ8XDug1TIU-CU3uSBfC9ZaJN23ajcfYdfxYhG3KfMCKf_qC1_HJEGbN4sIAjM---XvcKRw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000020",
+        "nbf": 1767225600,
+        "org": "",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "tenant_routed_empty_jti",
+      "description": "A routed token whose jti is the empty string: hoglake needs a string, hoglite a non-empty one.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000021",
+      "mutation": "jti is the empty string",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.4nKYWnDUq-WmBn87RxEMXr-GkPvuqHz0Xncurt0XxD0gA4V6gkJlObQ-h-Zrq5zrWytsSQFveFZTx1e6ESO9EQ",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "tenant_routed_string_nbf",
+      "description": "A routed token whose nbf is a string: hoglake reads only an integer nbf, hoglite refuses any other.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000022",
+      "mutation": "nbf is the string form of issued_at",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 401,
+        "error": "backend_refused_authority"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDIyIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwibmJmIjoiMTc2NzIyNTYwMCIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwfQ.iYIMR7IdblMbGuEhOjsAxY3ji0ACq-g0G_ZnX4C0hL3BlpMfgyq4QNrbyY_ray-tuOdffPuOLo5UAsfuXyLzoA",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000022",
+        "nbf": "1767225600",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "tenant_routed_with_scope",
+      "description": "A routed token that also carries scope, with no hoglake value in it: hoglake ignores it, hoglite refuses any scope claim.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000023",
+      "mutation": "scope openid is added",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 403,
+        "error": "forbidden"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDIzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwic2NvcGUiOiJvcGVuaWQiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.NbD3TbAwytRNI-rcGHuLsZlDkkN1s2Ky4pSfJdx8w266EIbfde2QfkPuW3NssLid9ck3HplRH7qoJXT8HCGr5w",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000023",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "scope": "openid",
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "tenant_routed_with_usr",
+      "description": "A routed tenant token that carries usr: hoglake ignores it, hoglite refuses any usr claim.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000024",
+      "mutation": "usr is added",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 403,
+        "error": "forbidden"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDI0IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwidXNyIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMDAwMDAwMDAwMDQyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.6qtsnnyatoGsfhBiu9eMrDLCys5GMkski0J2mTrPb-N8QDpkGANZ0cyb0GrOxC4G_f2ihKc3czCqlpc5G7KtKw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000024",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant",
+        "usr": "0190a1b2-c3d4-7e5f-8a9b-000000000042"
+      }
+    },
+    {
+      "name": "tenant_routed_with_prd",
+      "description": "A routed token whose ten is tenant and that carries prd: hoglake ignores it, hoglite refuses any prd claim.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000025",
+      "mutation": "prd is added",
+      "expect": {
+        "verdict": "accept",
+        "kind": "tenant"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 403,
+        "error": "forbidden"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDI1IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.y1z_7LP1cz52fuOUGgyFPAY6A9h_LJY-spo2QQcoJorTvSTlulPBdN7Yshcsqb3MlmgL0AuNNco2OvUqG-kawA",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000025",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "prd": {
+          "team_id": {
+            "42": "write",
+            "7": "read"
+          }
+        },
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "operator_routed_without_admin",
+      "description": "A routed operator token whose cat holds read: hoglake does not read an operator's cat, hoglite requires admin.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000026",
+      "mutation": "cat holds read in place of admin",
+      "expect": {
+        "verdict": "accept",
+        "kind": "operator"
+      },
+      "backend_expect": {
+        "verdict": "refuse",
+        "status": 403,
+        "error": "forbidden"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMjYiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHJvdmlzaW9uZXIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjU5MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.PoqTcy1thzW25ZvvNMxH5Q8nkbZgYU4v4t2WDcySVyUfIniZ006SfVVENWphfd2YD6mAPK1pEFPQViXcmXMdAw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000026",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "issuer:provisioner",
+        "ten": "operator"
       }
     }
   ]
