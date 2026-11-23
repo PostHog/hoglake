@@ -63,6 +63,22 @@ internal class HogliteCompaction(
     ): CompactionResult =
         runOnce(catalog, defaults.copy(maxGroupsPerRun = batchOverride ?: defaults.maxGroupsPerRun), trigger)
 
+    /**
+     * One sweep. The executor runs it inside [HogliteCatalogStore.recorded],
+     * one catalog operation: a MANUAL sweep on a request thread holds its
+     * request's bulkhead permit for the whole sweep — planning, rewrites,
+     * object-store I/O and the ledger write — rather than one per store
+     * call, so N concurrent manual sweeps hold N request threads INSIDE
+     * the bulkhead (#679). Store calls made on the request thread nest in
+     * that operation and take no permit of their own. At
+     * `parallelGroups > 1` the per-group [operation] scopes below run on
+     * the executor's rewrite workers while the request thread waits for
+     * them, so the workers carry its admission
+     * ([CompactionStorage.carriesRequestAdmission]) and run under the
+     * same permit and budget cap, as the list's fan-out does. A
+     * background sweep has no admission to carry, and its workers stay
+     * ungated.
+     */
     fun runOnce(
         catalog: String,
         cfg: CompactionConfig,
@@ -565,6 +581,8 @@ internal class HogliteCompaction(
         ): CompactionResult = store.recorded(catalog, MaintenanceTask.COMPACTION, trigger, body)
 
         override fun isStatementLockTimeout(error: Throwable): Boolean = false
+
+        override val carriesRequestAdmission: Boolean get() = true
 
         override fun isTerminalFailure(error: Throwable): Boolean =
             error is HoglakeException.NotFound || error is HoglakeException.BackendUnavailable ||

@@ -639,6 +639,40 @@ class HogliteCompactionIntegrationTest {
     }
 
     @Test
+    fun `a manual sweep's parallel group workers run under its request's admission`() {
+        // A manual sweep's thread blocks on its group workers, so their
+        // hoglite calls are the request's: they carry its admission and
+        // so its bulkhead permit and budget cap (#679), as the list's
+        // fan-out does. The hook runs inside each group's publish, on the
+        // worker.
+        //
+        // MUTATION: submit `terminalAwareGroup` bare in
+        // `CompactionExecutor.executeWave` (or return false from
+        // `carriesRequestAdmission`) and the workers see null.
+        val cat = fixture()
+        appendReal(cat, "a.parquet", 4)
+        appendReal(cat, "b.parquet", 4)
+        appendReal(cat, "c.parquet", 6)
+        appendReal(cat, "d.parquet", 6)
+        val seen = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, Any?>>()
+        val sweep =
+            HogliteCompaction(store, objects, defaults().copy(parallelGroups = 2), beforeCommit = { _, _ ->
+                seen += Thread.currentThread().name to com.posthog.hoglake.RequestAdmission.current()
+            })
+        val admission =
+            com.posthog.hoglake.RequestAdmission(System.nanoTime(), 30_000).also { it.admit(System.nanoTime()) }
+        val result =
+            com.posthog.hoglake.RequestAdmission.carrying(admission) {
+                sweep.runOnce(cat, null, MaintenanceTrigger.MANUAL)
+            }
+        assertThat(result.groupsCompacted).isEqualTo(2)
+        assertThat(seen).hasSize(2)
+        assertThat(seen.map { it.first }).allMatch { it == "compaction-group" }
+        assertThat(seen.map { it.second }).allMatch { it === admission }
+        assertThat(com.posthog.hoglake.RequestAdmission.current()).describedAs("the sweep thread's restored").isNull()
+    }
+
+    @Test
     fun `interruption after an earlier publication preserves partial counters`() {
         val cat = fixture()
         appendReal(cat, "a.parquet", 4)

@@ -116,6 +116,59 @@ class RequestAdmissionTest {
     }
 
     @Test
+    fun `the remaining budget is the admission bound less the queue wait, and nothing when unbounded`() {
+        // What a backend call made on the request's behalf has to fit
+        // inside (#679): the same arithmetic and floor as the lock
+        // bound, read off the budget the seam dispatched the request
+        // under, so the hoglite client needs no view of the config.
+        //
+        // MUTATION: return `budgetMs` unchanged and the first reds; drop
+        // the `<= 0` guard and the last reds with 0 where "no cap" is
+        // the contract.
+        val queued25s = RequestAdmission(System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(25_000), 30_000)
+        queued25s.admit(System.nanoTime())
+        assertThat(queued25s.remainingBudgetMs()).isBetween(4_000L, 5_200L)
+        val queuedPast = RequestAdmission(System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(40_000), 30_000)
+        queuedPast.admit(System.nanoTime())
+        assertThat(queuedPast.remainingBudgetMs()).isEqualTo(RequestAdmission.MIN_REMAINING_LOCK_TIMEOUT_MS)
+        assertThat(admissionAgedMs(9_000).remainingBudgetMs())
+            .describedAs("the default budget is 0: unbounded, so no cap")
+            .isNull()
+        // Queue wait ONLY, frozen: a request enqueued 40 s ago that was
+        // admitted 10 ms later has spent 40 s in its handler (a hoglite
+        // compaction sweep, say) and still has its whole bound, not the
+        // floor. Elapsed-since-enqueue would hand its next call 1 s.
+        val enqueued = System.nanoTime() - TimeUnit.SECONDS.toNanos(40)
+        val longHandler = RequestAdmission(enqueued, 30_000)
+        longHandler.admit(enqueued + TimeUnit.MILLISECONDS.toNanos(10))
+        assertThat(longHandler.remainingBudgetMs()).isEqualTo(29_990L)
+    }
+
+    @Test
+    fun `carrying runs a block under an admission on this thread and restores what was there`() {
+        // The fan-out exception (class comment): a worker doing a
+        // request's work while the request thread waits reads the
+        // request's admission, and its pool thread carries nothing onto
+        // its next task — or carries back whatever it had.
+        //
+        // MUTATION: drop the `finally` restore and the post-condition
+        // reds with the carried admission still ambient.
+        val carried = admissionAgedMs(5)
+        assertThat(RequestAdmission.current()).isNull()
+        assertThat(RequestAdmission.carrying(carried) { RequestAdmission.current() }).isSameAs(carried)
+        assertThat(RequestAdmission.current()).describedAs("nothing before, nothing after").isNull()
+        val outer = admissionAgedMs(7)
+        RequestAdmission.carrying(outer) {
+            assertThat(RequestAdmission.carrying(carried) { RequestAdmission.current() }).isSameAs(carried)
+            assertThat(RequestAdmission.current()).describedAs("the outer ambient is back").isSameAs(outer)
+            assertThat(RequestAdmission.carrying(null) { RequestAdmission.current() })
+                .describedAs("a background fan-out carries none")
+                .isNull()
+        }
+        assertThat(RequestAdmission.current()).isNull()
+    }
+
+    @Test
     fun `a queue wait past the budget is shed as the typed retryable 503`() {
         // Typed, so StatusPages answers the documented 503 +
         // Retry-After `commit_queue_timeout` rather than a shape

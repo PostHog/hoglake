@@ -97,4 +97,13 @@ internal interface CompactionStorage {
 
     /** Skip a corrupt table plan. PostgreSQL retains its existing planning failure behavior. */
     fun isRecoverablePlanningFailure(error: Throwable): Boolean = false
+
+    /**
+     * Run a sweep's group workers under the sweep thread's request
+     * admission (`RequestAdmission.carrying`). Hoglite: a manual sweep's
+     * thread blocks on its workers, so their calls are the request's —
+     * under its bulkhead permit and budget cap (#679). PostgreSQL keeps
+     * them background work, as the `RequestAdmission` KDoc describes.
+     */
+    val carriesRequestAdmission: Boolean get() = false
 }

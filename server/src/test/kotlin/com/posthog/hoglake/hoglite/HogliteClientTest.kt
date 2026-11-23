@@ -1,8 +1,12 @@
 package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.RequestAdmission
+import com.posthog.hoglake.api.RequestDispatcher
 import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatCode
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -16,6 +20,7 @@ import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -33,10 +38,19 @@ import java.util.concurrent.atomic.AtomicReference
 class HogliteClientTest {
     private val servers = mutableListOf<HttpServer>()
 
-    @AfterEach
-    fun stop() = servers.forEach { it.stop(0) }
+    /** The production dispatcher, so [underRequest] carries the admission the way the seam does. */
+    private val requests = RequestDispatcher(threads = 4, threadNamePrefix = "test-request")
 
-    /** A scripted endpoint: each call consumes one [Step] (status + body), then repeats the last. */
+    @AfterEach
+    fun stop() {
+        servers.forEach { it.stop(0) }
+        requests.close()
+    }
+
+    /**
+     * A scripted endpoint: each call consumes one [Step] (status + body), then repeats the last.
+     * A negative status drops the connection unanswered: a transport failure.
+     */
     private class Step(val status: Int, val body: String = "")
 
     private val servedBodies = ConcurrentLinkedQueue<String>()
@@ -49,6 +63,8 @@ class HogliteClientTest {
             val i = calls.getAndIncrement()
             bodies += ex.requestBody.readBytes().decodeToString()
             val step = steps[minOf(i, steps.size - 1)]
+            // HttpServer closes the connection on a handler's exception.
+            if (step.status < 0) throw IllegalStateException("scripted connection drop")
             ex.sendResponseHeaders(step.status, step.body.toByteArray().size.toLong())
             ex.responseBody.use { it.write(step.body.toByteArray()) }
         }
@@ -148,6 +164,482 @@ class HogliteClientTest {
         assertThatThrownBy { txOne(c) }
             .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
             .hasMessageContaining("circuit is open")
+    }
+
+    @Test
+    fun `a transport failure against an owner pin clears the pin and does not feed the pool breaker`() {
+        // The service hints an owner, the owner is dead, and the service
+        // answers the re-routed retry itself. Threshold 1: ONE counted
+        // transport failure opens the standard breaker, so if the dead
+        // owner counted, the retry through the service would be refused
+        // "circuit is open" — one dead pod failing every tenant (#679).
+        //
+        // MUTATION: call `breaker.onFailure()` for an owner pin too and
+        // the first assertion reds with the open-circuit refusal.
+        val (dead, _) = serve(Step(200, writeAnswer))
+        val deadPort = dead.address.port
+        dead.stop(0)
+        val (entry, entryCalls) =
+            serve(
+                Step(421, "{\"error\":\"misdirected\",\"owner\":\"$deadPort\"}"),
+                Step(200, writeAnswer),
+            )
+        val c = client(url(entry), threshold = 1, ownerUrlPattern = "http://127.0.0.1:{owner}")
+        assertThat(txOne(c).single().rows.single().single()).isEqualTo(1)
+        assertThat(entryCalls.get()).isEqualTo(2)
+        // The pin was cleared: the next call goes to the service, not
+        // back to the dead owner.
+        txOne(c)
+        assertThat(entryCalls.get()).isEqualTo(3)
+    }
+
+    @Test
+    fun `a dead owner pin does not spend the half-open trial`() {
+        // Tenant t is pinned to a live owner, the owner dies, and the
+        // service's own silence opens the standard breaker (threshold
+        // 1). Past the open window the half-open trial belongs to the
+        // service: the dead pin's failure reports nothing, so had it
+        // spent the trial the breaker would re-open on the cleared
+        // pin's retry and refuse it without the service ever being
+        // tried.
+        //
+        // MUTATION: `admit()` in place of `admit(trial = pin !is
+        // Route.Owner)` and the last call reds with "circuit is open".
+        val (owner, ownerCalls) = serve(Step(200, writeAnswer))
+        val (entry, entryCalls) =
+            serve(
+                Step(421, "{\"error\":\"misdirected\",\"owner\":\"${owner.address.port}\"}"),
+                Step(-1),
+                Step(200, writeAnswer),
+            )
+        val c = client(url(entry), threshold = 1, ownerUrlPattern = "http://127.0.0.1:{owner}")
+        txOne(c)
+        assertThat(ownerCalls.get()).isEqualTo(1)
+        owner.stop(0)
+        assertThatThrownBy {
+            c.tx("u", "tx-" + UUID.randomUUID(), null, listOf(HogliteStatement("SELECT 1", emptyList())))
+        }.isInstanceOf(HoglakeException.BackendUnavailable::class.java).hasMessageContaining("circuit is open")
+        Thread.sleep(300) // past circuitOpenMs (250)
+        assertThat(txOne(c).single().rows.single().single()).isEqualTo(1)
+        assertThat(entryCalls.get()).isEqualTo(3)
+    }
+
+    @Test
+    fun `an owner's answer neither closes the breaker nor takes the service's half-open trial`() {
+        // Tenant t is pinned to a live owner; the service itself is dead
+        // (every call after the 421 drops), and two transport failures
+        // of tenant u's open the standard breaker (threshold 2). Past the
+        // open window t's owner answers 200: that proves one pod, not
+        // the service, so the breaker stays open and u's next call takes
+        // the half-open trial, fails it, and is refused after ONE attempt
+        // at the service. Had the owner's answer closed the breaker, u
+        // would find it closed with the count at zero and spend TWO
+        // attempts re-opening it — and with live owners answering often
+        // enough, a dead service would never trip it at all (#679).
+        //
+        // MUTATION: call `breaker.onSuccess()` for an owner's answer too
+        // and the last count reds at 5.
+        val (owner, ownerCalls) = serve(Step(200, writeAnswer))
+        val (entry, entryCalls) =
+            serve(
+                Step(421, "{\"error\":\"misdirected\",\"owner\":\"${owner.address.port}\"}"),
+                Step(-1),
+            )
+        val c = client(url(entry), threshold = 2, ownerUrlPattern = "http://127.0.0.1:{owner}")
+
+        fun txU() =
+            catchThrowable {
+                c.tx("u", "tx-" + UUID.randomUUID(), null, listOf(HogliteStatement("SELECT 1", emptyList())))
+            }
+
+        txOne(c)
+        assertThat(ownerCalls.get()).isEqualTo(1)
+        assertThat(txU()).isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("circuit is open")
+        assertThat(entryCalls.get()).describedAs("the 421, then the two failures that opened it").isEqualTo(3)
+        Thread.sleep(300) // past circuitOpenMs (250)
+        assertThat(txOne(c).single().rows.single().single()).isEqualTo(1)
+        assertThat(ownerCalls.get()).isEqualTo(2)
+        assertThat(txU()).isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("circuit is open")
+        assertThat(entryCalls.get()).describedAs("u's call was the service's one half-open trial").isEqualTo(4)
+    }
+
+    @Test
+    fun `a call that will not send does not spend the half-open trial`() {
+        // The service's silence opens the standard breaker (threshold 1).
+        // Past the open window tenant t's call goes to its dead owner pin
+        // (not a trial), clears the pin and backs off past its budget, so
+        // its next iteration routes to the service with nothing left. That
+        // iteration is refused for the budget without sending; had it
+        // asked the half-open breaker first, it would have spent the one
+        // trial with nothing to report, and u's call right after would be
+        // refused "circuit is open" for another window with the service
+        // never tried.
+        //
+        // MUTATION: ask `breaker.admit` before the budget check and the
+        // last call reds with "circuit is open".
+        val (owner, ownerCalls) = serve(Step(200, writeAnswer))
+        val (entry, entryCalls) =
+            serve(
+                Step(421, "{\"error\":\"misdirected\",\"owner\":\"${owner.address.port}\"}"),
+                Step(-1),
+                Step(200, writeAnswer),
+            )
+        val drain = AtomicBoolean(false)
+        val c =
+            HogliteClient(
+                standardUrl = url(entry),
+                ownerUrlPattern = "http://127.0.0.1:{owner}",
+                retryBudgetMs = 400,
+                circuitFailureThreshold = 1,
+                circuitOpenMs = 250,
+                sleeper = { if (drain.get()) Thread.sleep(450) },
+            )
+
+        fun txU() = c.tx("u", "tx-" + UUID.randomUUID(), null, listOf(HogliteStatement("SELECT 1", emptyList())))
+
+        txOne(c)
+        assertThat(ownerCalls.get()).isEqualTo(1)
+        owner.stop(0)
+        assertThatThrownBy { txU() }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("circuit is open")
+        assertThat(entryCalls.get()).describedAs("the 421, then the failure that opened it").isEqualTo(2)
+        Thread.sleep(300) // past circuitOpenMs (250)
+        drain.set(true)
+        assertThatThrownBy { txOne(c) }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("did not answer")
+        assertThat(entryCalls.get()).describedAs("t's call sent nothing to the service").isEqualTo(2)
+        assertThat(txU().single().affected).isEqualTo(1)
+        assertThat(entryCalls.get()).describedAs("u's call was the service's half-open trial").isEqualTo(3)
+    }
+
+    @Test
+    fun `a request's call budget is capped at what it has left of its admission bound`() {
+        // A SLOW engine (answers 200 after 3 s) and a 10 s retry budget,
+        // read on behalf of a request that queued 4 s of its 5 s
+        // admission bound: the call has 1 s, not 10, so its one attempt
+        // times out after ~1 s and the exhaustion names the capped
+        // budget. Without the cap the attempt waits out the 3 s and the
+        // call SUCCEEDS — for a caller the dispatcher had already
+        // charged 4 s, holding a request thread the whole time (#679).
+        // (A `tx` is not capped: the next test.)
+        //
+        // MUTATION: set `deadline` from `retryBudgetMs` alone and this
+        // reds: no throw, after 3 s.
+        val server = slowServer(3_000)
+        val c = client(url(server), budgetMs = 10_000)
+        val started = System.nanoTime()
+        val thrown = underRequest(budgetMs = 5_000, queuedMs = 4_000) { catchThrowable { c.query("t", "SELECT 1") } }
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        assertThat(thrown)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("1000ms retry budget")
+            .hasMessageContaining("capped")
+        assertThat(elapsedMs).isLessThan(2_500)
+        // The scoped namespace read is capped the same way: 1 s of its
+        // 5 s, so it gives up before the engine's 3 s answer.
+        //
+        // MUTATION: pass `readTimeoutMs` instead of the capped budget to
+        // `HogliteScopedNamespaceRead.read` and this reds at ~3 s.
+        val scopedStarted = System.nanoTime()
+        val scoped =
+            underRequest(budgetMs = 5_000, queuedMs = 4_000) {
+                catchThrowable { c.forRequest("a.b.c").readScopedNamespace("t", "lake", "reports") }
+            }
+        assertThat(scoped).isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        assertThat((System.nanoTime() - scopedStarted) / 1_000_000).isLessThan(2_500)
+        // Outside a request the configured budget is the budget, so the
+        // same slow engine is waited for and answers.
+        assertThat(c.query("t", "SELECT 1").rows.single().single()).isEqualTo(1)
+    }
+
+    @Test
+    fun `a tx is not capped by its request's admission bound, so its attempt is never cut short`() {
+        // The same late request (4 s of its 5 s bound queued, 1 s left)
+        // and slow engine, for a `tx`. Capped, its one attempt would be
+        // cut to 1 s after it was sent and time out as COMMIT OUTCOME
+        // UNKNOWN; refused before sending instead, every write the cap
+        // engages for would 503, where PostgreSQL still tries the same
+        // late commit. So a tx runs on the configured retry budget and
+        // the engine's 3 s answer commits.
+        //
+        // MUTATION: cap a tx's budget like a read's (drop `takeIf {
+        // txid == null }`) and this reds: CommitOutcomeUnknown after ~1 s.
+        val server = slowServer(3_000)
+        val c = client(url(server), budgetMs = 10_000)
+        assertThat(underRequest(budgetMs = 5_000, queuedMs = 4_000) { txOne(c) }.single().affected).isEqualTo(1)
+    }
+
+    /** An engine that answers every call 200 after [delayMs]: a query's answer on `/query`, a write's on `/tx`. */
+    private fun slowServer(delayMs: Long): HttpServer {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            servedBodies += ex.requestBody.readBytes().decodeToString()
+            Thread.sleep(delayMs)
+            val answer = if (ex.requestURI.path.endsWith("/query")) queryAnswer else writeAnswer
+            ex.sendResponseHeaders(200, answer.length.toLong())
+            ex.responseBody.use { it.write(answer.toByteArray()) }
+        }
+        // Concurrently: an abandoned slow exchange must not queue the next.
+        server.executor = Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        return server
+    }
+
+    @Test
+    fun `the permit is per request, so an operation's later calls run under its first`() {
+        // One permit, one request, several calls: the operation takes the
+        // permit once (`underRequestPermit`, as the store does around
+        // `catalogOperation`) and every call inside runs under it rather
+        // than queueing for a second one it could only get from itself.
+        // A bare call outside an operation takes and returns its own.
+        //
+        // MUTATION: drop the `holders.add` check in `takeRequestPermit`
+        // and the first call inside the operation waits 200 ms for the
+        // permit the operation holds, then is refused.
+        val (server, calls) = serve(Step(200, writeAnswer))
+        val root =
+            HogliteClient(
+                standardUrl = url(server),
+                retryBudgetMs = 10_000,
+                maxConcurrentCalls = 1,
+                sleeper = {},
+            )
+        underRequest(budgetMs = 30_000, queuedMs = 0) {
+            root.underRequestPermit("a two-call operation") {
+                assertThat(root.callsInFlight).isEqualTo(1)
+                txOne(root)
+                assertThat(root.callsInFlight).describedAs("the call ran under the operation's permit").isEqualTo(1)
+                txOne(root.forRequest("tok"))
+            }
+            assertThat(root.callsInFlight).describedAs("the operation returned its permit").isEqualTo(0)
+            txOne(root)
+            assertThat(root.callsInFlight).isEqualTo(0)
+        }
+        assertThat(calls.get()).isEqualTo(3)
+    }
+
+    @Test
+    fun `the bulkhead refuses a request's call past max_concurrent_calls and lets background work through`() {
+        // One permit. A request's call parks on the engine (a latch the
+        // test holds); a second request's call is refused within the
+        // bulkhead wait, having sent nothing; a call with no ambient
+        // request — a background loop's — is not gated and reaches the
+        // engine. Releasing the latch returns the permit.
+        //
+        // MUTATION: drop the `admit` call (or `gate?.release()`) and the
+        // refusal assertion reds (or the final call after release does).
+        val release = CountDownLatch(1)
+        val arrived = AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            arrived.incrementAndGet()
+            release.await(10, TimeUnit.SECONDS)
+            ex.sendResponseHeaders(200, writeAnswer.length.toLong())
+            ex.responseBody.use { it.write(writeAnswer.toByteArray()) }
+        }
+        // The default executor serves one exchange at a time, which would
+        // make the engine the bulkhead.
+        server.executor = Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        val root =
+            HogliteClient(
+                standardUrl = url(server),
+                retryBudgetMs = 10_000,
+                maxConcurrentCalls = 1,
+                sleeper = {},
+            )
+        // A per-request clone shares its root's bulkhead.
+        val holder = Thread { underRequest(budgetMs = 30_000, queuedMs = 0) { txOne(root.forRequest("tok")) } }
+        holder.start()
+        await(5_000) { arrived.get() == 1 }
+        assertThat(root.callsInFlight).isEqualTo(1)
+
+        val started = System.nanoTime()
+        val refused = underRequest(budgetMs = 30_000, queuedMs = 0) { catchThrowable { txOne(root) } }
+        val waitedMs = (System.nanoTime() - started) / 1_000_000
+        assertThat(refused)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .hasMessageContaining("max_concurrent_calls")
+        assertThat(waitedMs).isBetween(HogliteClient.BULKHEAD_WAIT_MS - 50, 2_000L)
+        assertThat(arrived.get()).describedAs("a refused call sends nothing").isEqualTo(1)
+        // The scoped namespace read holds the request thread too, so it
+        // takes the same permit and is refused the same way.
+        assertThat(
+            underRequest(budgetMs = 30_000, queuedMs = 0) {
+                catchThrowable { root.forRequest("a.b.c").readScopedNamespace("t", "lake", "reports") }
+            },
+        ).isInstanceOf(HoglakeException.BackendUnavailable::class.java).hasMessageContaining("max_concurrent_calls")
+        assertThat(arrived.get()).isEqualTo(1)
+
+        val background = Thread { txOne(root) }
+        background.start()
+        await(5_000) { arrived.get() == 2 }
+        assertThat(root.callsInFlight).describedAs("background work holds no permit").isEqualTo(1)
+
+        release.countDown()
+        holder.join(10_000)
+        background.join(10_000)
+        assertThat(root.callsInFlight).isEqualTo(0)
+        assertThat(underRequest(budgetMs = 30_000, queuedMs = 0) { txOne(root) }.single().affected).isEqualTo(1)
+    }
+
+    @Test
+    fun `a full backend lets one request wait and refuses the next at once`() {
+        // One permit, held by a request parked on the engine. A second
+        // request waits for it (BULKHEAD_MAX_WAITERS); a third finds the
+        // backend full AND the waiter there, and is refused without
+        // waiting, so its request thread goes straight back to the
+        // dispatcher. Were every arrival let wait 200 ms, a stall would
+        // cost the other backends a thread per arrival (#679).
+        //
+        // MUTATION: drop the `waiting.incrementAndGet() >
+        // BULKHEAD_MAX_WAITERS` branch (always wait) and the third
+        // refusal reds on its elapsed time and message.
+        val release = CountDownLatch(1)
+        val arrived = AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            arrived.incrementAndGet()
+            release.await(10, TimeUnit.SECONDS)
+            ex.sendResponseHeaders(200, writeAnswer.length.toLong())
+            ex.responseBody.use { it.write(writeAnswer.toByteArray()) }
+        }
+        server.executor = Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        val root =
+            HogliteClient(
+                standardUrl = url(server),
+                retryBudgetMs = 10_000,
+                maxConcurrentCalls = 1,
+                sleeper = {},
+            )
+        val holder = Thread { underRequest(budgetMs = 30_000, queuedMs = 0) { txOne(root) } }
+        holder.start()
+        await(5_000) { arrived.get() == 1 }
+        val waiterRefusal = AtomicReference<Throwable?>()
+        val waiter =
+            Thread {
+                waiterRefusal.set(underRequest(budgetMs = 30_000, queuedMs = 0) { catchThrowable { txOne(root) } })
+            }
+        try {
+            waiter.start()
+            await(5_000) { root.permitWaiters == 1 }
+
+            val started = System.nanoTime()
+            val refused = underRequest(budgetMs = 30_000, queuedMs = 0) { catchThrowable { txOne(root) } }
+            val waitedMs = (System.nanoTime() - started) / 1_000_000
+            assertThat(refused)
+                .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessageContaining("max_concurrent_calls")
+                .hasMessageContaining("already waiting")
+            assertThat(waitedMs).isLessThan(HogliteClient.BULKHEAD_WAIT_MS / 2)
+            waiter.join(5_000)
+            assertThat(waiterRefusal.get())
+                .describedAs("the one waiter waited out its 200 ms")
+                .hasMessageContaining("none freed within")
+            assertThat(root.permitWaiters).isEqualTo(0)
+            assertThat(arrived.get()).describedAs("neither refused request sent anything").isEqualTo(1)
+        } finally {
+            release.countDown()
+            holder.join(10_000)
+            waiter.join(10_000)
+        }
+        assertThat(root.callsInFlight).isEqualTo(0)
+    }
+
+    @Test
+    fun `a permit given back goes to the request already waiting, not to one that arrives after`() {
+        // One permit, held; a waiter parked for it in the fair queue. The
+        // holder gives it back and, on the same thread, before the waiter
+        // can wake, a third request asks: the free permit is the
+        // waiter's, so the late arrival is refused and the waiter
+        // admitted. The zero-timeout first take respects the queue; a
+        // barging one would grab the permit the release just freed, and
+        // the waiter that arrived first would be refused at the end of
+        // its 200 ms.
+        //
+        // MUTATION: make the first take `gate.tryAcquire()` and this reds:
+        // the late arrival is admitted and the waiter refused.
+        val root = HogliteClient(standardUrl = "http://127.0.0.1:1", maxConcurrentCalls = 1, sleeper = {})
+        val far = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+        val holder = RequestAdmission(System.nanoTime(), 30_000)
+        assertThat(root.takeRequestPermit(holder, far, "holder")).isTrue()
+        val waiter = RequestAdmission(System.nanoTime(), 30_000)
+        val waited = AtomicReference<Any?>()
+        val waiting =
+            Thread { waited.set(runCatching { root.takeRequestPermit(waiter, far, "waiter") }.fold({ it }, { it })) }
+        waiting.start()
+        try {
+            await(5_000) { root.permitWaiters == 1 }
+            // Past `permitWaiters` the waiter is in, or about to enter,
+            // the semaphore's queue; let it park.
+            Thread.sleep(50)
+
+            // Nothing between the release and the late take that could
+            // load a class (a `catchThrowable` lambda's, the first time)
+            // and give the waiter time to wake: the window a barging take
+            // would win in is microseconds.
+            val lateArrival = RequestAdmission(System.nanoTime(), 30_000)
+            root.releaseRequestPermit(holder)
+            val lateTake = runCatching { root.takeRequestPermit(lateArrival, far, "late") }
+            waiting.join(5_000)
+            if (lateTake.getOrNull() == true) root.releaseRequestPermit(lateArrival)
+            val late = lateTake.exceptionOrNull()
+
+            assertThat(late)
+                .describedAs("the late arrival is refused")
+                .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessageContaining("max_concurrent_calls")
+            assertThat(waited.get()).describedAs("the waiter took the permit").isEqualTo(true)
+            assertThat(root.callsInFlight).isEqualTo(1)
+        } finally {
+            waiting.join(5_000)
+        }
+        if (waited.get() == true) root.releaseRequestPermit(waiter)
+        assertThat(root.callsInFlight).isEqualTo(0)
+    }
+
+    /**
+     * Run [block] as a dispatched request would: on a request thread of
+     * [requests], under the admission context element the seam installs
+     * (`installBlockingDispatch`), for an admission that queued
+     * [queuedMs] of [budgetMs]. Through the real carrier rather than a
+     * bare `holder.set`, so what the client reads in `call` is what a
+     * handler's call reads.
+     */
+    private fun <T> underRequest(
+        budgetMs: Long,
+        queuedMs: Long,
+        block: () -> T,
+    ): T {
+        val admission = RequestAdmission(System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(queuedMs), budgetMs)
+        return runBlocking {
+            withContext(requests.dispatcher + RequestAdmission.element(admission)) {
+                admission.admit(System.nanoTime())
+                block()
+            }
+        }
+    }
+
+    private fun await(
+        timeoutMs: Long,
+        condition: () -> Boolean,
+    ) {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (!condition()) {
+            check(System.nanoTime() < deadline) { "condition not met within ${timeoutMs}ms" }
+            Thread.sleep(10)
+        }
     }
 
     @Test

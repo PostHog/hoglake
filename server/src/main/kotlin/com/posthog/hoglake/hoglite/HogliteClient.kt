@@ -4,9 +4,11 @@ import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.api.ScanFileDto
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.ConnectException
 import java.net.URI
@@ -17,6 +19,9 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /** One statement of a hoglite transaction (`/v1/t/{tid}/tx`), or the single statement of a `/query`. */
@@ -132,17 +137,116 @@ class HogliteRejected(
  * ## Circuit breaking
  *
  * One breaker per POOL (standard, whale) — the pools fail
- * independently. Only TRANSPORT failures count toward tripping: a 503
- * is hoglite's per-tenant owner-loss signal, and folding it into a
- * pool-wide breaker would let one tenant's failover fail every OTHER
- * tenant fast for the open window. Any HTTP answer (2xx, 4xx, 421,
- * 503) proves the pool is up and resets the count. An open breaker
- * fails fast with [HoglakeException.BackendUnavailable] until
- * [circuitOpenMs] has passed, then lets one trial through (half-open:
- * success closes, failure re-opens). This is what converts a down pool
- * into instant typed 503s instead of timeout convoys — hoglake's
- * Postgres path fails fast through Hikari's 5 s connectionTimeout, and
- * this is the hoglite equivalent of that contract.
+ * independently. Only TRANSPORT failures AGAINST THE POOL'S SERVICE
+ * count toward tripping: a 503 is hoglite's per-tenant owner-loss
+ * signal, and folding it into a pool-wide breaker would let one
+ * tenant's failover fail every OTHER tenant fast for the open window.
+ * A transport failure against an OWNER pin is the same per-tenant
+ * signal in another form (one dead pod, or a tenant that moved while
+ * the pin said otherwise), so it clears the pin and is retried through
+ * the service, and only the service's own silence feeds the breaker
+ * (#679) — before that, one dead pod under enough stale pins opened
+ * the standard breaker and failed every tenant for [circuitOpenMs].
+ * Any HTTP answer from the service (2xx, 4xx, 421, 503) proves the pool
+ * is up and resets the count; an owner's answer, like its silence, says
+ * nothing to the breaker. An open breaker fails fast with
+ * [HoglakeException.BackendUnavailable] until [circuitOpenMs] has
+ * passed, then lets one trial through (half-open: success closes,
+ * failure re-opens). An owner-pinned attempt is not that trial — its
+ * failure cannot re-open the breaker nor its answer close it, so it
+ * must not spend the trial the service's own attempt needs. Were an
+ * owner's answer to reset the count, live owners of pinned tenants
+ * would keep a dead service's breaker from ever tripping, and the
+ * unpinned tenants would pay a full timeout per attempt. This is what
+ * converts a down pool into instant typed 503s instead of timeout
+ * convoys — hoglake's Postgres path fails fast through Hikari's 5 s
+ * connectionTimeout, and this is the hoglite equivalent of that
+ * contract.
+ *
+ * ## Bulkhead
+ *
+ * Every route handler runs on one bounded dispatcher
+ * (`api/BlockingDispatch.kt`, `HOGLAKE_REQUEST_THREADS` wide, sized to
+ * the PostgreSQL pool), and a call here can hold its thread for the
+ * whole [retryBudgetMs] while an operation makes several. Nothing in
+ * the dispatcher knows which backend a request is for, so without a
+ * bound here one stalled tenant, or an owner failover across many,
+ * takes every thread and the PostgreSQL catalogs — whose database is
+ * fine — stop being served (#679). [maxConcurrentCalls] is that bound:
+ * a semaphore, shared by every per-request clone of this client, on
+ * the REQUEST THREADS a backend may hold at once.
+ *
+ * The permit is PER REQUEST, not per call. A request takes one on its
+ * first gated call and every further call it makes while holding it —
+ * on its own thread, or on a fan-out worker [RequestAdmission.carrying]
+ * its admission — runs under the same permit; the holder releases it
+ * when what it was taken for ends. `HogliteCatalogStore` takes it for a
+ * whole operation ([underRequestPermit] around `catalogOperation` and
+ * the list), so a multi-step operation is refused before its first
+ * step or not at all: a `createCatalog` that has committed its boot
+ * transaction is never refused the `getCatalog` after it, and a drop
+ * that has fenced is never refused its release (#683 is a transport
+ * failure's to cause, not the bulkhead's). A call made outside any
+ * operation takes and releases its own.
+ *
+ * Three things follow from "it bounds threads":
+ *
+ *  - it gates only work done under a dispatched request (an ambient
+ *    [RequestAdmission]). A background loop, and a background sweep's
+ *    compaction workers, hold no request thread, so there is nothing
+ *    for it to protect, and refusing their calls would fail an
+ *    iteration for nobody's benefit. A fan-out the request thread
+ *    blocks on IS the request's work — the hoglite list reads its
+ *    chunks and retries on a worker pool, and a manual sweep rewrites
+ *    and publishes its groups on the executor's, while the request
+ *    thread waits — so the admission is carried onto those workers,
+ *    and they run under the request's permit and budget rather than as
+ *    background;
+ *  - a request that finds the backend full waits at most
+ *    [BULKHEAD_WAIT_MS] — long enough that a burst of fast operations
+ *    one over the cap is served rather than refused — and is then
+ *    refused with a typed [HoglakeException.BackendUnavailable] (503,
+ *    Retry-After), counted as `hoglake_hoglite_bulkhead_refusals_total`.
+ *    No attempt was sent, so a refused `tx` is never outcome-unknown.
+ *    A waiter holds a request thread too, and the dispatcher is FIFO
+ *    and backend-blind: were every arrival let wait, each refusal would
+ *    cost a thread 200 ms, and hoglite traffic above (threads left ÷
+ *    0.2 s) during a stall would fill the dispatcher's queue and shed
+ *    the PostgreSQL requests behind it. So at most
+ *    [BULKHEAD_MAX_WAITERS] wait; one that arrives to find the backend
+ *    full AND that many already waiting is refused at once. A backend
+ *    holds at most [maxConcurrentCalls] + [BULKHEAD_MAX_WAITERS]
+ *    request threads, whatever its arrival rate;
+ *  - the permit is held for the operation's whole duration, retry
+ *    loops and backoffs included, because that is how long the thread
+ *    is held.
+ *
+ * Every path to the engine on a request's behalf goes through the gate:
+ * [call] (and so `tx`, `query`, `queryBatch` and the tenant lifecycle)
+ * and [readScopedNamespace]. [reachable] does not; it is the readiness
+ * probe's, which bypasses the dispatcher.
+ *
+ * The budget a request's call runs under is also capped at what the
+ * request has left of its admission bound
+ * ([RequestAdmission.remainingBudgetMs]: `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`
+ * less the QUEUE WAIT, frozen at admission and floored as the lock
+ * bound is). The dispatcher sheds a request that queued PAST the bound;
+ * one that queued for most of it used to arrive here and spend the
+ * full retry budget on top, holding a thread for a caller that had
+ * gone. It is not a bound on the request's total time — the handler's
+ * own elapsed time is deliberately not charged, for the reason
+ * [RequestAdmission.remainingBudgetMs] gives — so an operation of
+ * several calls can still spend several retry budgets. The bulkhead is
+ * what bounds the threads it holds while doing so. A write `tx` (one
+ * with a txid) is not capped: it runs on the full [retryBudgetMs], as
+ * before #679. Its attempt cut short after it was sent is
+ * outcome-unknown, and refusing it before sending instead would refuse
+ * every write the cap engages for (an uncapped attempt already gets no
+ * more than the retry budget, below [commitTimeoutMs] at the
+ * defaults), where PostgreSQL still tries the same late commit with a
+ * shortened lock wait and never cuts the commit itself. The permit
+ * still bounds the threads write calls hold, and [retryBudgetMs] how
+ * long each holds one.
  */
 class HogliteClient(
     private val standardUrl: String,
@@ -158,12 +262,15 @@ class HogliteClient(
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
     private val shared: HogliteClient? = null,
     private val bearerToken: String? = null,
+    /** The bulkhead's width (class KDoc); `0` is no bulkhead, for a client built outside `Config`. */
+    private val maxConcurrentCalls: Int = 0,
 ) : AutoCloseable {
     init {
         require(connectTimeoutMs > 0) { "connectTimeoutMs=$connectTimeoutMs must be positive" }
         require(readTimeoutMs > 0) { "readTimeoutMs=$readTimeoutMs must be positive" }
         require(commitTimeoutMs > 0) { "commitTimeoutMs=$commitTimeoutMs must be positive" }
         require(retryBudgetMs > 0) { "retryBudgetMs=$retryBudgetMs must be positive" }
+        require(maxConcurrentCalls >= 0) { "maxConcurrentCalls=$maxConcurrentCalls must not be negative" }
     }
 
     private val log = KotlinLogging.logger {}
@@ -196,12 +303,44 @@ class HogliteClient(
             Pool.WHALE to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
         )
 
-    /** Bind immutable request authority. Share transport, routing pins, and breakers. */
+    /**
+     * The bulkhead (class KDoc): one per backend, so every per-request
+     * clone shares its root's. Fair, so a waiter that arrived first is
+     * served first — the dispatcher's own queue is FIFO and this is its
+     * continuation. Null when [maxConcurrentCalls] is 0.
+     */
+    private val bulkhead: Semaphore? =
+        shared?.bulkhead ?: maxConcurrentCalls.takeIf { it > 0 }?.let { Semaphore(it, true) }
+
+    /**
+     * The requests holding a permit right now, shared with [bulkhead]:
+     * what makes the permit per request (class KDoc). A gated call whose
+     * admission is already here runs under the permit that admission
+     * holds, instead of waiting for a second one it could never get
+     * from itself — the fan-out's workers, and every call of an
+     * operation after its first.
+     */
+    private val holders: MutableSet<RequestAdmission> = shared?.holders ?: ConcurrentHashMap.newKeySet()
+
+    /**
+     * Requests waiting for a [bulkhead] permit right now, shared with it:
+     * exact, unlike `Semaphore.getQueueLength`, because it is what
+     * bounds the waiters at [BULKHEAD_MAX_WAITERS] (class KDoc).
+     */
+    private val waiting: AtomicInteger = shared?.waiting ?: AtomicInteger()
+
+    /** Permits in use: request threads this backend holds right now. For tests and gauges. */
+    internal val callsInFlight: Int get() = bulkhead?.let { maxConcurrentCalls - it.availablePermits() } ?: 0
+
+    /** Requests waiting for a permit right now. For tests. */
+    internal val permitWaiters: Int get() = waiting.get()
+
+    /** Bind immutable request authority. Share transport, routing pins, breakers and the bulkhead. */
     internal fun forRequest(token: String?): HogliteClient =
         HogliteClient(
             standardUrl, whaleUrl, ownerUrlPattern, connectTimeoutMs, readTimeoutMs,
             commitTimeoutMs, retryBudgetMs, circuitFailureThreshold, circuitOpenMs,
-            sleeper, shared = shared ?: this, bearerToken = token,
+            sleeper, shared = shared ?: this, bearerToken = token, maxConcurrentCalls = maxConcurrentCalls,
         )
 
     // ---- public API -------------------------------------------------------
@@ -210,6 +349,9 @@ class HogliteClient(
      * Read one namespace through the typed metadata protocol.
      * The caller supplies verified request authority and a trusted local placement.
      * This operation does not use SQL, routing pins, retries, or circuit breakers.
+     * It does hold the request thread, so under a dispatched request it
+     * takes a bulkhead permit and runs under the request's budget cap like
+     * every [call] (class KDoc, "Bulkhead"); the refusal names no target.
      */
     internal fun readScopedNamespace(
         tenant: String,
@@ -218,7 +360,43 @@ class HogliteClient(
     ): NamespaceDto? {
         val token = bearerToken
         if (shared == null || token == null) throw HogliteScopedNamespaceRead.unavailable()
-        return HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, readTimeoutMs)
+        val admission = RequestAdmission.current()
+        val budgetMs = admission?.remainingBudgetMs()?.let { minOf(readTimeoutMs, it) } ?: readTimeoutMs
+        val held = takeRequestPermit(admission, System.nanoTime() + budgetMs * 1_000_000, "GET scoped namespace read")
+        try {
+            return HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, budgetMs)
+        } finally {
+            if (held) releaseRequestPermit(admission)
+        }
+    }
+
+    /**
+     * Run [block] holding one bulkhead permit for the current request,
+     * when there is one: the store's operation-level hold (class KDoc).
+     * Every gated call inside runs under it, on this thread or on a
+     * worker carrying the request's admission, and none is refused once
+     * the operation has started. Refused before [block] runs when no
+     * permit frees within [BULKHEAD_WAIT_MS]. Outside a dispatched
+     * request, or with no bulkhead, it is [block].
+     */
+    internal inline fun <T> underRequestPermit(
+        what: String,
+        block: () -> T,
+    ): T {
+        val admission = RequestAdmission.current()
+        val held = takeRequestPermit(admission, operationDeadline(admission), what)
+        try {
+            return block()
+        } finally {
+            if (held) releaseRequestPermit(admission)
+        }
+    }
+
+    /** How long an operation's permit wait may run: the request's capped budget, as [call] computes it. */
+    @PublishedApi
+    internal fun operationDeadline(admission: RequestAdmission?): Long {
+        val budgetMs = admission?.remainingBudgetMs()?.let { minOf(retryBudgetMs, it) } ?: retryBudgetMs
+        return System.nanoTime() + budgetMs * 1_000_000
     }
 
     /**
@@ -563,6 +741,14 @@ class HogliteClient(
      * [parse] turns a final HTTP answer into the result or the
      * deterministic exception it carries; the loop owns everything
      * retryable.
+     *
+     * Under a dispatched request the call first fits itself to the
+     * request (class KDoc, "Bulkhead"): its budget is the retry budget
+     * capped at what the request has left of its admission bound, and
+     * it runs under the request's bulkhead permit — the one its
+     * operation already holds, or one taken here for its own duration —
+     * or is refused before any attempt when none frees in time. A write
+     * `tx` takes the permit but not the cap (class KDoc).
      */
     private fun <T> call(
         tenant: String,
@@ -574,7 +760,113 @@ class HogliteClient(
         txid: String? = null,
         parse: (Int, ByteArray) -> T,
     ): T {
-        val deadline = System.nanoTime() + retryBudgetMs * 1_000_000
+        val admission = RequestAdmission.current()
+        // A write tx is not capped: its attempt cut short after it was
+        // sent is outcome-unknown (class KDoc).
+        val budgetMs =
+            admission?.remainingBudgetMs()?.takeIf { txid == null }?.let { minOf(retryBudgetMs, it) }
+                ?: retryBudgetMs
+        val deadline = System.nanoTime() + budgetMs * 1_000_000
+        val held = takeRequestPermit(admission, deadline, "$method $path")
+        try {
+            return attempts(tenant, path, body, timeoutMs, method, txid, budgetMs, deadline, parse)
+        } finally {
+            if (held) releaseRequestPermit(admission)
+        }
+    }
+
+    /**
+     * Take a bulkhead permit for [admission]'s request, or refuse
+     * [what]. True when THIS caller took it and owes
+     * [releaseRequestPermit]; false when there is nothing to take (no
+     * bulkhead, or no dispatched request) or the request already holds
+     * one, in which case the caller runs under that.
+     *
+     * The wait is the smaller of [BULKHEAD_WAIT_MS] and what is left
+     * before [deadline], so a request already short of time is not kept
+     * waiting for a permit it could not use, and there is no wait at all
+     * when [BULKHEAD_MAX_WAITERS] requests are already waiting: the
+     * refusal is immediate and the thread goes back to the dispatcher
+     * (class KDoc). Nothing has been sent when
+     * this throws, so the refusal is a plain
+     * [HoglakeException.BackendUnavailable] for a `tx` too — never
+     * outcome-unknown.
+     */
+    @PublishedApi
+    internal fun takeRequestPermit(
+        admission: RequestAdmission?,
+        deadline: Long,
+        what: String,
+    ): Boolean {
+        val gate = bulkhead
+        if (admission == null || gate == null) return false
+        // The request is registered BEFORE it has the permit, so a
+        // worker that starts on its behalf while it is still waiting
+        // sees the hold rather than queueing for a second permit; the
+        // registration is undone when the wait fails.
+        if (!holders.add(admission)) return false
+        val waitMs = minOf(BULKHEAD_WAIT_MS, maxOf(0L, (deadline - System.nanoTime()) / 1_000_000))
+        var queueFull = false
+        val admitted =
+            try {
+                // A free permit is taken at once; the timed zero wait,
+                // unlike `tryAcquire()`, does not barge past a waiter
+                // the fair semaphore owes it to.
+                gate.tryAcquire(0, TimeUnit.MILLISECONDS) ||
+                    if (waiting.incrementAndGet() > BULKHEAD_MAX_WAITERS) {
+                        waiting.decrementAndGet()
+                        queueFull = true
+                        false
+                    } else {
+                        try {
+                            gate.tryAcquire(waitMs, TimeUnit.MILLISECONDS)
+                        } finally {
+                            waiting.decrementAndGet()
+                        }
+                    }
+            } catch (e: InterruptedException) {
+                holders.remove(admission)
+                Thread.currentThread().interrupt()
+                throw HoglakeException.BackendUnavailable("interrupted while waiting for a hoglite call permit")
+            }
+        if (!admitted) {
+            holders.remove(admission)
+            Metrics.hogliteBulkheadRefused()
+            throw HoglakeException.BackendUnavailable(
+                "hoglite backend is holding its $maxConcurrentCalls permitted request threads " +
+                    "(max_concurrent_calls) and " +
+                    (
+                        if (queueFull) {
+                            "$BULKHEAD_MAX_WAITERS more already waiting for one"
+                        } else {
+                            "none freed within ${waitMs}ms"
+                        }
+                    ) +
+                    "; refusing $what rather than taking a thread from the other backends — retry",
+            )
+        }
+        return true
+    }
+
+    /** Give back the permit [takeRequestPermit] returned true for. */
+    @PublishedApi
+    internal fun releaseRequestPermit(admission: RequestAdmission?) {
+        if (admission != null) holders.remove(admission)
+        bulkhead?.release()
+    }
+
+    /** The retry loop of [call]; [budgetMs] is what [deadline] was set from, for the exhaustion message. */
+    private fun <T> attempts(
+        tenant: String,
+        path: String,
+        body: ByteArray?,
+        timeoutMs: Long,
+        method: String,
+        txid: String?,
+        budgetMs: Long,
+        deadline: Long,
+        parse: (Int, ByteArray) -> T,
+    ): T {
         var lastFailure: Throwable? = null
         // True once an attempt of a tx may have applied. From then on the
         // call ends committed or unknown, never "not committed".
@@ -618,7 +910,32 @@ class HogliteClient(
             val pin = tenantRoutes[tenant]
             val (pool, base) = routeFor(pin)
             val breaker = breakers.getValue(pool)
-            if (!breaker.admit()) {
+            // Never START an attempt that cannot fit the budget: cap
+            // the attempt's timeout at what is left so the worst case is
+            // the budget, not budget + one full timeout.
+            // A RETRY squeezed into the budget's last few milliseconds
+            // can only time out, and a tx attempt that timed out after
+            // being sent is outcome-unknown: it would turn a clean "not
+            // applied" exhaustion into a spurious unknown.
+            // Checked BEFORE the breaker is asked: a half-open breaker's
+            // admit spends its one trial, and an attempt that is then
+            // not sent reports nothing, so the breaker would stay open
+            // another full window without the service being tried.
+            val remainingMs = (deadline - System.nanoTime()) / 1_000_000
+            if (remainingMs <= 0 || (lastFailure != null && remainingMs < MIN_RETRY_ATTEMPT_MS)) {
+                val capped =
+                    if (budgetMs < retryBudgetMs) {
+                        " (the ${retryBudgetMs}ms budget, capped at what the request had left of its admission bound)"
+                    } else {
+                        ""
+                    }
+                throw unavailable(
+                    "hoglite ${pool.name.lowercase()} pool did not answer $method $path within the " +
+                        "${budgetMs}ms retry budget$capped ${outcomes.summary(ownerUrlPattern.isNotBlank())} " +
+                        "(last failure: ${lastFailure?.message})",
+                )
+            }
+            if (!breaker.admit(trial = pin !is Route.Owner)) {
                 throw unavailable(
                     "hoglite ${pool.name.lowercase()} pool circuit is open " +
                         "(${breaker.consecutiveFailures} consecutive failures); refusing fast for " +
@@ -629,21 +946,6 @@ class HogliteClient(
                                     "(last failure: ${it.message})"
                             } ?: ""
                         ),
-                )
-            }
-            // Never START an attempt that cannot fit the budget: cap
-            // the attempt's timeout at what is left so the worst case is
-            // the budget, not budget + one full timeout.
-            // A RETRY squeezed into the budget's last few milliseconds
-            // can only time out, and a tx attempt that timed out after
-            // being sent is outcome-unknown: it would turn a clean "not
-            // applied" exhaustion into a spurious unknown.
-            val remainingMs = (deadline - System.nanoTime()) / 1_000_000
-            if (remainingMs <= 0 || (lastFailure != null && remainingMs < MIN_RETRY_ATTEMPT_MS)) {
-                throw unavailable(
-                    "hoglite ${pool.name.lowercase()} pool did not answer $method $path within the " +
-                        "${retryBudgetMs}ms retry budget ${outcomes.summary(ownerUrlPattern.isNotBlank())} " +
-                        "(last failure: ${lastFailure?.message})",
                 )
             }
             val resp =
@@ -661,11 +963,17 @@ class HogliteClient(
                 } catch (e: Exception) {
                     // Transport failure. A stale OWNER pin (dead pod, moved
                     // tenant) must not pin forever: clear it so the next
-                    // attempt re-resolves through the service proxy. Only
-                    // THIS outcome feeds the breaker — a 503 is per-tenant
-                    // owner loss, not a pool outage.
-                    if (pin is Route.Owner) tenantRoutes.remove(tenant, pin)
-                    breaker.onFailure()
+                    // attempt re-resolves through the service proxy, and
+                    // say nothing to the breaker — one pod's silence is
+                    // this tenant's news, not the pool's (#679). Only the
+                    // SERVICE's silence feeds the breaker, and only
+                    // transport silence at that: a 503 is per-tenant owner
+                    // loss, not a pool outage.
+                    if (pin is Route.Owner) {
+                        tenantRoutes.remove(tenant, pin)
+                    } else {
+                        breaker.onFailure()
+                    }
                     // Only a connect that never completed proves the
                     // request was not sent; a timeout or reset after that
                     // can follow a commit.
@@ -675,9 +983,12 @@ class HogliteClient(
                     backoff()
                     continue
                 }
-            // Any HTTP answer at all proves the pool is up: the breaker
-            // only tracks transport silence.
-            breaker.onSuccess()
+            // Any HTTP answer from the SERVICE proves the pool is up: the
+            // breaker only tracks transport silence. An owner's answer
+            // proves that one pod is, and no more than its silence trips
+            // the breaker does its answer close it — a half-open breaker
+            // waits for the service's own trial (#679).
+            if (pin !is Route.Owner) breaker.onSuccess()
             when (resp.statusCode()) {
                 200 -> {
                     return finalAnswer(200, resp.body())
@@ -983,15 +1294,22 @@ class HogliteClient(
 
         val consecutiveFailures: Int get() = failures
 
-        /** True when a call may proceed. A tripped breaker re-admits one trial after [openMs]. */
+        /**
+         * True when a call may proceed. A tripped breaker re-admits one
+         * trial after [openMs]. An attempt that is not a [trial] (an
+         * owner pin, whose failure and answer both report nothing) is
+         * let through half-open without spending it: a dead pin would
+         * otherwise re-open the breaker for a full window without the
+         * service ever being tried (#679).
+         */
         @Synchronized
-        fun admit(): Boolean {
+        fun admit(trial: Boolean = true): Boolean {
             if (threshold <= 0 || failures < threshold) return true
             if (openSinceNanos == 0L) openSinceNanos = System.nanoTime()
             if ((System.nanoTime() - openSinceNanos) / 1_000_000 < openMs) return false
             // Half-open: let ONE trial through. A failure re-opens with a
             // fresh clock; a success closes in onSuccess.
-            openSinceNanos = System.nanoTime()
+            if (trial) openSinceNanos = System.nanoTime()
             return true
         }
 
@@ -1020,7 +1338,26 @@ class HogliteClient(
                 retryBudgetMs = backend.retryBudgetMs,
                 circuitFailureThreshold = backend.circuitFailureThreshold,
                 circuitOpenMs = backend.circuitOpenMs,
+                maxConcurrentCalls = backend.maxConcurrentCalls,
             )
+
+        /**
+         * How long a request waits for a bulkhead permit before it is
+         * refused (class KDoc). The same 200 ms `PartitionLookupAdmission`
+         * caps its wait at, for the same reason: a full backend answering
+         * in milliseconds is a burst to absorb, one still full after this
+         * long is a stall to stay out of.
+         */
+        const val BULKHEAD_WAIT_MS = 200L
+
+        /**
+         * How many requests may wait [BULKHEAD_WAIT_MS] for a full
+         * backend's permit at once; the next is refused without waiting
+         * (class KDoc). One: the burst one over the cap is served, and a
+         * stall costs the other backends one thread more than the cap,
+         * not one per arrival.
+         */
+        const val BULKHEAD_MAX_WAITERS = 1
 
         /** hoglite's label for a deterministic refusal (422). */
         const val CODE_REFUSED = "refused"

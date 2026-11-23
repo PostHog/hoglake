@@ -7,6 +7,7 @@ import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.TeamNamespaces
@@ -41,12 +42,17 @@ class SecretString(
 
 private val servedNamespacesLog = KotlinLogging.logger {}
 
+/** Boot warnings about the hoglite bulkhead, under [Config]'s own name so a test can listen for them. */
+private val bulkheadLog = KotlinLogging.logger(Config::class.java.name)
+
 /** Process configuration, with an optional backend allowlist file. */
 data class Config(
     /**
      * Optional JSON file: {"backends": [{"id": UUID, "kind": "hoglite", "url": HTTP_URL}]}.
      * Optional keys: whale_url, owner_url_pattern, connect_timeout_ms, read_timeout_ms,
-     * commit_timeout_ms, retry_budget_ms, circuit_failure_threshold, circuit_open_ms.
+     * commit_timeout_ms, retry_budget_ms, circuit_failure_threshold, circuit_open_ms,
+     * max_concurrent_calls (the backend's bulkhead on the request threads, #679; the
+     * default is [defaultHogliteConcurrentCalls]).
      * Entries contain endpoints, never credentials. Each id must be unique and canonical.
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
@@ -1496,7 +1502,42 @@ data class Config(
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
     val maintenanceSummaryRefreshSeconds: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS", "60").toLong(),
 ) {
-    val hogliteBackends: Map<UUID, HogliteBackend> = readBackends(backendsFile)
+    /**
+     * Whether a PostgreSQL backend is part of this process: the default
+     * one (`App` opens [jdbcUrl] at boot whenever [defaultBackend] is
+     * `postgres`, and every request no backend id routes elsewhere is
+     * served from it), or a routed one named by [postgresBackendId]. A
+     * hoglite-only deployment says so with `HOGLAKE_DEFAULT_BACKEND=none`
+     * and no PostgreSQL id; on the env defaults PostgreSQL IS served, and
+     * the bulkhead has something to shield. Declared before
+     * [defaultHogliteConcurrentCalls], which reads it.
+     */
+    val servesPostgres: Boolean = defaultBackend == "postgres" || postgresBackendId.isNotEmpty()
+
+    /**
+     * A hoglite backend's `max_concurrent_calls` when its entry does not
+     * say: the bulkhead that keeps a slow tenant or an owner failover
+     * from taking every request thread away from the PostgreSQL
+     * catalogs (#679).
+     *
+     * Half of [requestThreads] (at least one) while this process
+     * [servesPostgres], so under a full hoglite stall the other half
+     * still serves PostgreSQL; the whole dispatcher when nothing but
+     * hoglite is served, because then there is nothing to bulkhead
+     * against and a smaller cap would be capacity given up for no one.
+     * It is a per-backend cap, so two hoglite backends may together hold
+     * more than half — the isolation this buys is between a hoglite
+     * backend and everything else, not between hoglite backends, and an
+     * operator who needs the latter sets the key. A cap that, with the
+     * request the bulkhead lets wait for a permit
+     * (`HogliteClient.BULKHEAD_MAX_WAITERS`), leaves PostgreSQL no thread
+     * (one or two request threads, or a key within one of
+     * [requestThreads]) boots, with a warning: see `init`.
+     */
+    val defaultHogliteConcurrentCalls: Int =
+        if (servesPostgres) maxOf(1, requestThreads / 2) else maxOf(1, requestThreads)
+
+    val hogliteBackends: Map<UUID, HogliteBackend> = readBackends(backendsFile, defaultHogliteConcurrentCalls)
 
     /** [authSessionProfile] resolved: true for `on`. */
     val authSessionProfileEnabled: Boolean = authSessionProfile.trim().lowercase() == "on"
@@ -1742,6 +1783,37 @@ data class Config(
         }
         require(postgresBackendId.isEmpty() || canonicalBackendId(postgresBackendId) !in hogliteBackends) {
             "HOGLAKE_POSTGRES_BACKEND_ID duplicates a hoglite backend id"
+        }
+        // A bulkhead as wide as the dispatcher shields nothing, and one
+        // wider than it is the dispatcher's bound wearing another name.
+        // Neither is refused — a hoglite-only pod, or a developer with
+        // one request thread, is correct that way — but a pod that also
+        // serves PostgreSQL is told what it has not got (#679). The
+        // requests the bulkhead lets wait for a permit hold threads too,
+        // so beside PostgreSQL it is the cap plus those that must leave
+        // one over.
+        val waiters = HogliteClient.BULKHEAD_MAX_WAITERS
+        for (backend in hogliteBackends.values) {
+            val cap = backend.maxConcurrentCalls
+            if (cap > requestThreads || (servesPostgres && cap + waiters >= requestThreads)) {
+                bulkheadLog.warn {
+                    "hoglite backend ${backend.id}: max_concurrent_calls=$cap " +
+                        when {
+                            cap > requestThreads -> "is above"
+                            cap == requestThreads -> "is the whole of"
+                            else -> "plus the $waiters request it lets wait for a permit is the whole of"
+                        } +
+                        " HOGLAKE_REQUEST_THREADS=$requestThreads, so the dispatcher is the bound and the " +
+                        "bulkhead shields nothing" +
+                        if (servesPostgres) {
+                            ": a hoglite stall can still hold every request thread and the PostgreSQL catalogs " +
+                                "with it; raise HOGLAKE_REQUEST_THREADS (with HOGLAKE_DB_POOL_SIZE) or set the " +
+                                "key more than $waiters below it (the default is half)"
+                        } else {
+                            ""
+                        }
+                }
+            }
         }
         checkRemovedEnv(System::getenv)
         // THE SPILL DIRECTORY IS CHECKED AT BOOT, and only where the
@@ -2230,7 +2302,10 @@ private fun canonicalBackendId(value: String): UUID {
     return id
 }
 
-private fun readBackends(file: String): Map<UUID, HogliteBackend> {
+private fun readBackends(
+    file: String,
+    defaultMaxConcurrentCalls: Int,
+): Map<UUID, HogliteBackend> {
     if (file.isBlank()) return emptyMap()
     val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
     val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
@@ -2246,6 +2321,7 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
             setOf(
                 "id", "kind", "url", "whale_url", "owner_url_pattern", "connect_timeout_ms", "read_timeout_ms",
                 "commit_timeout_ms", "retry_budget_ms", "circuit_failure_threshold", "circuit_open_ms",
+                "max_concurrent_calls",
             )
         require(entry.properties().all { it.key in keys }) { "backend entry has unknown fields" }
 
@@ -2294,6 +2370,8 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
         }
         val threshold = positive("circuit_failure_threshold", 10)
         require(threshold <= Int.MAX_VALUE) { "circuit_failure_threshold is too large" }
+        val concurrentCalls = positive("max_concurrent_calls", defaultMaxConcurrentCalls.toLong())
+        require(concurrentCalls <= Int.MAX_VALUE) { "max_concurrent_calls is too large" }
         result[id] =
             HogliteBackend(
                 id = id,
@@ -2306,6 +2384,7 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
                 retryBudgetMs = positive("retry_budget_ms", 8000),
                 circuitFailureThreshold = threshold.toInt(),
                 circuitOpenMs = positive("circuit_open_ms", 5000),
+                maxConcurrentCalls = concurrentCalls.toInt(),
             )
     }
     return result
