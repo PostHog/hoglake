@@ -2947,14 +2947,27 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * one without a key is at-least-once, the same as a lost COMMIT
      * acknowledgement on Postgres. [txid] stays in the message for
      * operators.
+     *
+     * [applied] marks the other case with this code: [txid] did apply and
+     * a later call of the same request failed in a way that cannot mean
+     * "nothing ran" (hoglite refusing a token that expired mid-request).
+     * The request partly applied, so the message says to re-read state
+     * rather than that the outcome is unknown.
      */
     class CommitOutcomeUnknown(
         val txid: String,
         detail: String,
+        val applied: Boolean = false,
     ) : BackendUnavailable(
-            "commit outcome unknown: it may or may not have been applied. A retry with the same " +
-                "idempotency_key is exactly-once; without a key, read the table before a retry " +
-                "(backend transaction '$txid'): $detail",
+            if (applied) {
+                "request partly applied: backend transaction '$txid' applied and a later step " +
+                    "failed. A retry with the same idempotency_key is exactly-once; without a key, " +
+                    "re-read the catalog's state before a retry: $detail"
+            } else {
+                "commit outcome unknown: it may or may not have been applied. A retry with the same " +
+                    "idempotency_key is exactly-once; without a key, read the table before a retry " +
+                    "(backend transaction '$txid'): $detail"
+            },
         )
 
     /**

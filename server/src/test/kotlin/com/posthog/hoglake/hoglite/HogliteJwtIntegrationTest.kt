@@ -7,6 +7,7 @@ import com.posthog.hoglake.auth.AuthService
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
+import com.posthog.hoglake.model.HoglakeException
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -20,6 +21,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -244,5 +246,83 @@ class HogliteJwtIntegrationTest {
                 }
             }
         }
+    }
+
+    /**
+     * hoglite verifies the forwarded token on every hop, PostgreSQL once
+     * when the request starts. A token that expires between a request's
+     * applied write and its next hop must not answer invalid_token, which
+     * a client re-mints and replays the whole request on as if nothing ran.
+     */
+    @Test
+    fun `a token that expires after a request's write leaves an unknown outcome, not invalid_token`() {
+        val pair = TestTokens.keyPair()
+        val id = "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa"
+        val jwks = dir.resolve("public.json")
+        Files.writeString(jwks, TestTokens.jwks(pair))
+        HogliteConformanceEngine(
+            listOf(
+                "-auth-mode",
+                "enforce",
+                "-auth-issuer",
+                TestTokens.ISSUER,
+                "-auth-backend-id",
+                id,
+                "-auth-jwks-file",
+                jwks.toString(),
+            ),
+        ).use { engine ->
+            val now = Instant.now().epochSecond
+
+            fun token(
+                kind: String,
+                scope: String,
+                exp: Long,
+            ): String =
+                TestTokens.mint(
+                    pair,
+                    """{"iss":"${TestTokens.ISSUER}","aud":["hoglake","hoglite"],"sub":"test-client",""" +
+                        """"jti":"test-$kind-$scope-$exp","ten":"$kind","org":"org-not-the-tid",""" +
+                        """"cat":{"lake":["$scope"]},"iat":${now - 120},"nbf":${now - 120},"exp":$exp,""" +
+                        """"rtg":{"b":"hoglite","be":"$id","t":"opaque_1"}}""",
+                )
+            HogliteClient(engine.url(), sleeper = {}).use { shared ->
+                val operator =
+                    HogliteCatalogStore(shared.forRequest(token("operator", "admin", now + 900)), { "opaque_1" })
+                operator.createCatalog("lake", "s3://hoglake-it/lake", null, null)
+
+                // hoglited accepts a token up to HOGLITED_LEEWAY_SECONDS past its exp. Minted
+                // after the cold createCatalog, so the write alone races the lifetime.
+                val exp = Instant.now().epochSecond - HOGLITED_LEEWAY_SECONDS + EXPIRING_LIFETIME_SECONDS
+                val expiring = token("tenant", "write", exp)
+                val request = HogliteCatalogStore(shared.forRequest(expiring), { "opaque_1" })
+                assertThat(catchThrowable { request.createNamespace("lake", "ns") })
+                    .describedAs("the write must land within EXPIRING_LIFETIME_SECONDS; raise it on a slow runner")
+                    .isNull()
+                // Past the leeway by CLOCK_SKEW_SECONDS, in case hoglited's clock lags the JVM's.
+                while (Instant.now().epochSecond < exp + HOGLITED_LEEWAY_SECONDS + CLOCK_SKEW_SECONDS) Thread.sleep(100)
+
+                val failure = catchThrowable { request.listNamespaces("lake") }
+                assertThat(failure).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                assertThat((failure as HoglakeException.CommitOutcomeUnknown).applied).isTrue()
+                // A request that applied nothing keeps the refusal a client re-mints for.
+                val fresh = HogliteCatalogStore(shared.forRequest(expiring), { "opaque_1" })
+                val refused = catchThrowable { fresh.listNamespaces("lake") }
+                assertThat(refused).isExactlyInstanceOf(HoglakeException.Unauthenticated::class.java)
+                assertThat((refused as HoglakeException.Unauthenticated).reason).isEqualTo("invalid_token")
+                // The write stands.
+                assertThat(operator.listNamespaces("lake").map { it.name }).contains("ns")
+            }
+        }
+    }
+
+    private companion object {
+        const val HOGLITED_LEEWAY_SECONDS = 60L
+
+        /** Long enough for the write to land before the token lapses, short enough to wait out. */
+        const val EXPIRING_LIFETIME_SECONDS = 15L
+
+        /** Margin past the leeway for a hoglited clock behind the JVM's. */
+        const val CLOCK_SKEW_SECONDS = 2L
     }
 }

@@ -18,6 +18,7 @@ import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /** One statement of a hoglite transaction (`/v1/t/{tid}/tx`), or the single statement of a `/query`. */
 data class HogliteStatement(
@@ -129,6 +130,21 @@ class HogliteRejected(
  * or timed-out connect; once one has, the call can only end committed or
  * unknown.
  *
+ * ## Request authority
+ *
+ * A client bound to one request ([forRequest]) forwards the caller's
+ * token on every call, and hoglite verifies it on every call, where
+ * PostgreSQL checks it once when the request starts. Once a `tx` of the
+ * request has applied (or may have), a later 401 cannot mean "nothing
+ * ran": it surfaces as [HoglakeException.CommitOutcomeUnknown] naming
+ * that `tx` (marked [HoglakeException.CommitOutcomeUnknown.applied] when
+ * it answered 200), never as the refusal a caller re-mints its token and
+ * replays the whole request on. Only 401: hoglite answers it for every
+ * token it cannot verify, an expired one included, and 403 only for a
+ * verified token whose authority never covers the call (a tenant
+ * mismatch, a non-operator on an operator route), which a retry cannot
+ * change, so a 403 stays a refusal.
+ *
  * ## Circuit breaking
  *
  * One breaker per POOL (standard, whale) — the pools fail
@@ -195,6 +211,19 @@ class HogliteClient(
             Pool.STANDARD to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
             Pool.WHALE to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
         )
+
+    /** A `tx` of this request that applied ([certain]) or may have applied. */
+    private class RequestTx(
+        val txid: String,
+        val certain: Boolean,
+    )
+
+    /**
+     * The last `tx` of this request that applied, else the last that may
+     * have applied, null until one has. Not tracked on the shared client, which serves
+     * every request. See "Request authority" in the class KDoc.
+     */
+    private val appliedTx: AtomicReference<RequestTx?>? = if (shared != null) AtomicReference(null) else null
 
     /** Bind immutable request authority. Share transport, routing pins, and breakers. */
     internal fun forRequest(token: String?): HogliteClient =
@@ -302,6 +331,26 @@ class HogliteClient(
                     put("statements", materialized)
                 },
             )
+        try {
+            return applyTx(tenant, txid, body, statementCount).also { appliedTx?.set(RequestTx(txid, certain = true)) }
+        } catch (e: HoglakeException.CommitOutcomeUnknown) {
+            // Only this tx's own unknown outcome: a 401 naming an earlier tx
+            // records nothing new. Never downgrades a tx known to have applied.
+            if (e.txid == txid && !e.applied) {
+                appliedTx?.updateAndGet { earlier ->
+                    earlier?.takeIf { it.certain } ?: RequestTx(txid, certain = false)
+                }
+            }
+            throw e
+        }
+    }
+
+    private fun applyTx(
+        tenant: String,
+        txid: String,
+        body: ByteArray,
+        statementCount: Int,
+    ): List<HogliteQueryResult> {
         return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
             when {
                 status == 200 ->
@@ -611,6 +660,15 @@ class HogliteClient(
             // Only a complete successful answer can settle this exact request.
             if (txid != null && mayHaveApplied && status != 200) {
                 throw HoglakeException.CommitOutcomeUnknown(txid, "hoglite answered $status after an ambiguous attempt")
+            }
+            // Nor can a token that lapsed mid-request disprove an earlier tx of it.
+            val earlier = appliedTx?.get()
+            if (earlier != null && status == 401) {
+                throw HoglakeException.CommitOutcomeUnknown(
+                    earlier.txid,
+                    "hoglite refused the request's token (401), as it does once the token expires",
+                    applied = earlier.certain,
+                )
             }
             return parse(status, bytes)
         }

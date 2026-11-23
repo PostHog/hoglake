@@ -3824,6 +3824,11 @@ components:
         containment verification may return containment_unverified. Both are retryable.
         A retry without a key can apply the commit a second
         time, as after a lost COMMIT acknowledgement on PostgreSQL.
+        On Hoglite, which verifies the request's token on every backend
+        call, a token that expires after one of the request's writes
+        applied answers `commit_outcome_unknown` naming that write, not
+        401 `invalid_token`: the request partly applied, so re-read the
+        catalog's state before a retry.
       headers:
         Retry-After:
           description: Seconds to back off before retrying.

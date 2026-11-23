@@ -313,6 +313,9 @@ class CommitConflictSpecParityTest {
                     // CatalogNotEmpty's reason. One wire code for every
                     // reason, by design (see the exception's KDoc).
                     CatalogNotEmptyReason::class -> CatalogNotEmptyReason.entries.first()
+                    // CommitOutcomeUnknown's applied: it changes the message, not the
+                    // code. Both cases are a 503 a caller must not read as "nothing ran".
+                    Boolean::class -> true
                     else ->
                         error(
                             "add a placeholder for ${parameter.type} in instantiate(), and while " +
