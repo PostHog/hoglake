@@ -162,14 +162,31 @@ class ReadSessionProfileTest {
                 "s3://example-customer/tables/team_id=42/nested/part(1)+v2.parquet",
             ),
         ).isTrue()
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/part\uD83D\uDE00.parquet",
+            ),
+        ).isTrue()
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/" + "a".repeat(1024 - "tables/team_id=42/".length),
+            ),
+        ).isTrue()
         for (rejected in listOf(
             "s3://example-customer/tables/team_id=42/../team_id=43/part(1).parquet",
             "s3://example-customer/tables/team_id=42/./part(1).parquet",
             "s3://example-customer/tables/team_id=42//part(1).parquet",
             "s3://example-customer/tables/team_id=42/part\u0000.parquet",
             "s3://example-customer/tables/team_id=42/part\n.parquet",
+            "s3://example-customer/tables/team_id=42/part\uD800.parquet",
+            "s3://example-customer/tables/team_id=42/part\uD800",
+            "s3://example-customer/tables/team_id=42/part\uDC00.parquet",
+            "s3://example-customer/tables/team_id=42/part\uDC00\uD800.parquet",
             "s3://example-customer/tables/team_id=42/",
-            "s3://example-customer/tables/team_id=42/" + "a".repeat(1024),
+            "s3://example-customer/tables/team_id=42/" + "a".repeat(1025 - "tables/team_id=42/".length),
+            "s3://example-customer/tables/team_id=42/" + "é".repeat(512),
             "s3://example-customer/tables/team_id=43/part(1).parquet",
             "s3://other-bucket/tables/team_id=42/part(1).parquet",
         )) {

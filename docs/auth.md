@@ -190,7 +190,8 @@ An operator can configure one exact local namespace binding.
 The binding names the catalog, backend ID, routed tenant, and namespace.
 It confirms tenant isolation and support at every eligible owner.
 It requires enforced authentication with mounted public JWKS.
-It cannot coexist with Remote Schema or served namespace configuration.
+It cannot coexist with served namespace configuration.
+The bound namespace cannot be a reserved or remote schema name.
 
 The caller uses `GET /v1/catalogs/{catalog}/namespaces/{namespace}`.
 The request has no body or query parameters.

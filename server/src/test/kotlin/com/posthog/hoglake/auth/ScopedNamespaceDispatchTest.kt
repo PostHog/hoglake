@@ -19,6 +19,8 @@ import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountHostResolver
+import com.posthog.hoglake.store.StaticMountHosts
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.head
@@ -63,6 +65,8 @@ class ScopedNamespaceDispatchTest {
     private val sessionDigests = CopyOnWriteArrayList<String>()
     private val legacy = CopyOnWriteArrayList<String>()
     private var server: HttpServer? = null
+    private var remoteServer: HttpServer? = null
+    private var mountHosts: StaticMountHosts? = null
 
     @Volatile
     private var status = 200
@@ -72,6 +76,8 @@ class ScopedNamespaceDispatchTest {
 
     @AfterEach
     fun stop() {
+        mountHosts?.close()
+        remoteServer?.stop(0)
         server?.stop(0)
         Metrics.clear()
     }
@@ -144,6 +150,7 @@ class ScopedNamespaceDispatchTest {
         withReadSession: Boolean = false,
         readFixture: Boolean = withReadSession,
         table: String? = null,
+        mountHostsJson: String? = null,
     ): Config {
         val peer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server = peer
@@ -183,13 +190,16 @@ class ScopedNamespaceDispatchTest {
             binding.put("table", table)
         }
         val bindingFile = Files.writeString(dir.resolve("binding.json"), binding.toString())
+        val hostsFile = mountHostsJson?.let { Files.writeString(dir.resolve("hosts.json"), it).toString() } ?: ""
         return Config(
             backendsFile = backendsFile.toString(),
             scopedNamespaceFile = if (enabled) bindingFile.toString() else "",
+            mountHostsFile = hostsFile,
             postgresBackendId = postgresId.toString(),
             authMode = "enforce",
             authJwksFile = "mounted-public-jwks.json",
             authPredicateFields = "team_id",
+            authSessionProfile = if (mountHostsJson != null) "on" else "off",
         )
     }
 
@@ -244,7 +254,13 @@ class ScopedNamespaceDispatchTest {
                     else -> error("unexpected legacy method: ${method.name}")
                 }
             } as CatalogStore
-        val selector = CatalogStoreSelector(postgres, cfg)
+        val resolver =
+            if (cfg.mountHosts.isNotEmpty()) {
+                StaticMountHosts(cfg.mountHosts).also { mountHosts = it }
+            } else {
+                MountHostResolver.NONE
+            }
+        val selector = CatalogStoreSelector(postgres, cfg, resolver)
         val service =
             AuthService(
                 AuthMode.ENFORCE,
@@ -259,6 +275,7 @@ class ScopedNamespaceDispatchTest {
                     },
                     predicateFields = setOf("team_id"),
                     backends = cfg.backendKinds,
+                    sessionProfile = cfg.authSessionProfileEnabled,
                 ) { if (readFixture) readVector["verify_at"].asLong() else 1_700_000_100L },
             )
         if (publicListener) {
@@ -269,7 +286,7 @@ class ScopedNamespaceDispatchTest {
         installNamespaceGate(selector)
         install(ContentNegotiation) { jackson { configureHoglakeWire() } }
         install(StatusPages) { installErrorMapping() }
-        installApiRoutes(selector)
+        installApiRoutes(selector, reservedNamespaces = cfg.reservedNamespaces)
         installScanRoutes(selector)
     }
 
@@ -1084,6 +1101,63 @@ class ScopedNamespaceDispatchTest {
             }
             assertThat(legacy).containsExactly("getNamespace", "getNamespace")
             assertThat(requests).isEmpty()
+        }
+
+    @Test
+    fun `mount hosts for the team family coexist with typed scoped reads without SQL or mount fallback`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val remote = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            remoteServer = remote
+            remote.createContext("/") { exchange ->
+                exchange.requestBody.readBytes()
+                remoteRequests.add("${exchange.requestMethod} ${exchange.requestURI}")
+                exchange.sendResponseHeaders(500, -1)
+                exchange.close()
+            }
+            remote.start()
+            val hostsJson =
+                """{"hosts":[{"id":"$id","match":{"type":"namespace_family","family":"team"},""" +
+                    """"kind":"hoglake","url":"http://127.0.0.1:${remote.address.port}","auth":"forward",""" +
+                    """"allow_insecure_http":true}]}"""
+            val cfg = config(withReadSession = true, table = "metrics", mountHostsJson = hostsJson)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            body = success
+            val nsResponse = client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(nsResponse.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(nsResponse.bodyAsText()).contains("\"namespace_id\":17", "\"name\":\"reports\"")
+
+            body = tableSuccess
+            val tableResponse = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(tableResponse.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(tableResponse.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+            assertThat(mapper.readTree(tableResponse.bodyAsText())["table_uuid"].asText()).isEqualTo(tableUuid)
+
+            body = scanSuccess
+            val query = "?snapshot=5&table_uuid=$tableUuid"
+            val scanResponse = client.get("$readScanPath$query") { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(scanResponse.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(scanResponse.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+            assertThat(mapper.readTree(scanResponse.bodyAsText()).size()).isEqualTo(1)
+
+            for (remoteTarget in listOf(
+                "/v1/catalogs/example-catalog/namespaces/team_42",
+                "/v1/catalogs/example-catalog/namespaces/team_42/tables/events",
+                "/v1/catalogs/example-catalog/namespaces/team_42/tables/events/scan$query",
+            )) {
+                val response = client.get(remoteTarget) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(remoteTarget).isEqualTo(HttpStatusCode.Unauthorized)
+            }
+
+            assertThat(requests.map { it.first }).containsExactly(
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports",
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics",
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics/scan$query",
+            )
+            assertThat(remoteRequests).isEmpty()
+            assertThat(legacy).isEmpty()
         }
 
     @Test
