@@ -55,14 +55,22 @@ internal fun HogliteTx.allocateCommitSnapshot() {
 /**
  * The snapshot row for the snapshot this transaction just allocated.
  *
- * The timestamp is computed IN the transaction as the greater of the
- * previous snapshot's ts and the pod's clock (Postgres's clock_timestamp
- * under the commit lock): snapshot ids are issued serially, so AS OF
+ * The timestamp is computed IN the transaction, from the ENGINE's clock
+ * ([HogliteSchema.NOW_SQL]), as the greater of the previous snapshot's
+ * ts and now. That is Postgres's `clock_timestamp()` under the commit
+ * lock (SnapshotRepo.insert): the time the snapshot became visible, read
+ * by the one clock every tenant transaction shares. A time bound by the
+ * pod when it BUILT the transaction was neither — a replica with a fast
+ * clock pinned every later snapshot forward through the clamp, and a
+ * commit that queued or retried before landing recorded a time before
+ * it was visible — so `at_timestamp=T` could resolve to a snapshot that
+ * was not head at T (#672). Snapshot ids are issued serially, so AS OF
  * time resolution only stays consistent with snapshot order when ts is
- * monotone with id. The fixed-width codec makes lexical comparison the
- * chronological one, and the LATEST row (id DESC LIMIT 1, the primary
- * key's tail) is both the tightest lower bound and an O(1) read — a
- * MAX(ts) aggregate would walk every retained snapshot per commit.
+ * monotone with id, which the clamp keeps across an engine clock step.
+ * The fixed-width codec makes lexical comparison the chronological one,
+ * and the LATEST row (id DESC LIMIT 1, the primary key's tail) is both
+ * the tightest lower bound and an O(1) read — a MAX(ts) aggregate would
+ * walk every retained snapshot per commit.
  *
  * Call it right after the allocator bump and BEFORE any `changes` row:
  * `changes.snapshot_id` REFERENCES `snapshots(id)` immediately, so a
@@ -72,14 +80,12 @@ internal fun HogliteTx.allocateCommitSnapshot() {
 internal fun HogliteTx.insertSnapshotRow(
     author: String?,
     message: String?,
-    ts: String = HogliteSchema.now(),
 ) {
     add(
         "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
             "VALUES (${HogliteSchema.HEAD_SQL}, " +
-            "MAX(COALESCE((SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1), ''), ?), ?, ?, " +
-            "(SELECT schema_version FROM meta WHERE id = 1))",
-        ts,
+            "MAX(COALESCE((SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1), ''), ${HogliteSchema.NOW_SQL}), " +
+            "?, ?, (SELECT schema_version FROM meta WHERE id = 1))",
         author,
         message,
     )

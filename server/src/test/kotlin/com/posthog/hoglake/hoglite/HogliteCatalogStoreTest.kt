@@ -315,6 +315,13 @@ class HogliteCatalogStoreTest {
         assertThat(requests[2]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
         // The enforcement probe is statement 1, still before any DDL.
         assertThat(txStatements.single()[1]).isEqualTo(HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL)
+        // Snapshot 0 is stamped by the engine's clock in the transaction, not
+        // a time this pod bound (#672): author and message are the only
+        // parameters.
+        assertThat(txStatements.single().last()).isEqualTo(
+            "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
+                "VALUES (0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, 0)",
+        )
         // The read-back of the new catalog reuses the operation's binding.
         assertThat(resolved.get()).isEqualTo(1)
     }

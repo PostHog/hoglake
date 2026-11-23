@@ -25,7 +25,10 @@ import java.time.format.DateTimeFormatter
  *    truncate, expiry, and compaction are writers of a column that
  *    every read predicate already honors — not a schema migration.
  *  - Timestamps are fixed-width UTC text (millis), so lexical order IS
- *    chronological order in SQLite. [fmt]/[parse] are the only codec.
+ *    chronological order in SQLite. [fmt]/[parse] are the only codec;
+ *    [NOW_SQL] and [NOW_MINUS_SECONDS_SQL] are the same encoding of the
+ *    engine's clock, for the snapshot rows and the retention cutoff
+ *    they are compared with.
  *
  * All DDL is `IF NOT EXISTS` so the bootstrap transaction is
  * idempotent, and hoglite's (client, txid) dedup makes a replayed
@@ -162,6 +165,39 @@ internal object HogliteSchema {
 
     /** Numeric storage-execution time, using SQLite's timestamp parser. */
     const val CREATION_NOW_SQL = "julianday('now')"
+
+    /**
+     * [fmt]'s pattern as SQLite's `strftime` format: `%f` is `SS.SSS`, so
+     * the result is the 24-byte `yyyy-MM-ddTHH:mm:ss.SSSZ` that [fmt]
+     * writes and [parse] reads, byte for byte.
+     */
+    const val TS_FORMAT_SQL = "'%Y-%m-%dT%H:%M:%fZ'"
+
+    /**
+     * The engine's clock in the [fmt] encoding, as an SQL expression.
+     * Snapshot rows stamp their ts with it ([insertSnapshotRow],
+     * createCatalog's snapshot 0) so the time is read inside the tenant's
+     * serial transaction, from one clock, as Postgres's `clock_timestamp()`
+     * under the commit lock is; a pod's clock at transaction build is
+     * neither (#672). [now] stays the codec for the rows hoglake compares
+     * against its own clock (upload expiry, receipt retention, claims).
+     */
+    const val NOW_SQL = "strftime($TS_FORMAT_SQL, 'now')"
+
+    /**
+     * [NOW_SQL] a bound number of seconds ago (one `?`, an integer): the
+     * retention cutoff ExpiryService spells `now() - make_interval(secs =>
+     * :retention)`, on the clock that stamped the snapshots it is compared
+     * with ([HogliteExpiry]). A pod-clock cutoff against engine-clock rows
+     * expired early or late by the skew between the two. SQLite's modifier
+     * is text, so the bound seconds are spliced into `'-NNN seconds'`.
+     *
+     * NULL, not an error, when the seconds put the result outside SQLite's
+     * calendar (make_interval raises instead): a caller comparing against
+     * it reads the value back and refuses a NULL, or `ts >= NULL` matches
+     * no row and silently means "everything is stale".
+     */
+    const val NOW_MINUS_SECONDS_SQL = "strftime($TS_FORMAT_SQL, 'now', '-' || ? || ' seconds')"
 
     /**
      * The data files a replacement ended, by its idempotency key: what a replay and
