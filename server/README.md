@@ -2570,9 +2570,17 @@ The catalog reports on itself instead of waiting for ops SQL:
   hydrator's structural failures (above): flips `failed` → `pending`,
   catalog-wide or scoped to one namespace+table.
   Hoglite uses the token's placement and excludes ended files and dropped tables.
-  The manual action changes metadata only; it does not start a hydration sweep.
   One transaction updates all matching files, subject to the engine's write limits.
-  Full hydration still needs the existing server-side `ObjectStore` path and per-run AWS identity.
+  Hoglite has no hydrator loop, so the requeue then runs one bounded hydration sweep over the
+  same scope (#675): up to 1,000 live `pending` files of live tables, started within 10 s, read
+  through the server's `ObjectStore` with the PostgreSQL hydrator's footer read, aggregate, size
+  floor and object-prefix proof. Files already pending go before the ones the requeue flipped, so
+  files that fail on every call cannot hold back newer ones. Each file flips in its own transaction,
+  fenced on its table's `schema_version`, so a concurrent ALTER leaves it pending; one bad file is
+  marked `failed` and the sweep goes on. A file whose path is outside the catalog's `data_path` is
+  marked `failed` without being read. The sweep records its own `hydrator` run; its failure is logged
+  and does not fail the requeue. Call it again to drain a larger backlog (`pending_files` in
+  `GET /maintenance/status`, which reports the Hoglite hydrator with no loop: manual only).
   Hoglite retirement is available through the backend seam for trusted placement.
   It has no HTTP trigger or background driver.
   Each retirement batch queues current vector and data paths before it deletes their rows.

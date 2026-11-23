@@ -654,7 +654,8 @@ internal class HogliteAlters(
      * decode bounds under the LIVE type. The stored stats are the file
      * row's JSON column-stats list, so the re-encode is read-patch-write
      * per file, guarded on the old content. All promotions share one plan and
-     * one rewrite per file; an allocator fence detects files added after the read.
+     * one rewrite per file; an allocator fence detects files added after the read,
+     * and a stat-less count fence files hydrated after it.
      */
     private fun reencodeStatsOnPromote(
         catalog: String,
@@ -686,6 +687,17 @@ internal class HogliteAlters(
                 store.queryCatalog(catalog, "SELECT next_file_id FROM meta WHERE id = 1")
                     .firstRow()!![0].asLong()
             tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_FILE_SET_CHANGED }
+            // Hydration gives an EXISTING file id its stats, which the allocator fence cannot see
+            // (#675). Below the ceiling nothing makes a file stat-less, so a hydration between this
+            // read and the commit lowers the count and forces a fresh plan that re-encodes it
+            // (an expiry delete lowers it too, which only costs a replan).
+            val statless = "SELECT COUNT(*) FROM files WHERE table_id = ? AND id < ? AND stats_json IS NULL"
+            tx.expectScalar(
+                store.queryCatalog(catalog, statless, tableId, nextFile).firstRow()!![0].asLong(),
+                statless,
+                tableId,
+                nextFile,
+            ) { ALTER_FILE_SET_CHANGED }
             // Reuse files_listing's complete ordering, including ended rows. The
             // pinned allocator ceiling excludes later appends; its tx guard will
             // force a fresh plan if anything was appended while paging.

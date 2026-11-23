@@ -36,7 +36,8 @@ info:
     Invalid shapes, unknown routing keys, and multiple catalogs return 401
     `invalid_token`. Hoglite listings include only the routed catalog.
 
-    Hoglite supports catalog options, manual expiry, manual cleanup, and manual requeue.
+    Hoglite supports catalog options, manual expiry, manual cleanup, and manual requeue,
+    which also hydrates pending files.
     Retirement runs before expiry; there is no public retirement trigger.
     Other maintenance operations and publications return 501 `not_supported_on_backend`.
     Engine result limits return 422 `backend_result_too_large`; query deadlines
@@ -1488,10 +1489,17 @@ paths:
         leave files 'pending' and retry on their own.
       description: >
         PostgreSQL and hoglite support this manual requeue operation.
-        The operation changes metadata only. It does not read object data.
-        The hoglite backend does not start a hydration sweep.
         One transaction updates all matching failed live files.
         The operation excludes ended files and dropped tables.
+        On PostgreSQL it changes metadata only; the background hydrator
+        sweep reads the footers. Hoglite has no hydrator loop, so after
+        the requeue a hoglite catalog runs one bounded hydration sweep
+        over the same scope: up to 1,000 live 'pending' files (including
+        files committed without column stats), started within 10 s,
+        files already pending before the ones the requeue flipped. The
+        sweep is recorded as its own hydrator run in the maintenance
+        ledger; its failure does not fail this response. Call again to
+        drain a larger backlog.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: namespace
@@ -6744,8 +6752,8 @@ components:
             The RESPONDING PROCESS's configured cadence (0 = the loop is
             off in this process; manual triggers still work — which is
             how the API workload runs compaction). Absent only for a
-            task with no loop at all, of which there are none in the
-            task list. A
+            task with no loop at all: on a hoglite catalog, the hydrator
+            (rehydrate runs its sweep) and reindex. A
             deployment may run a task's loop in a pod other than the one
             serving the API, so this must not be read as "the task is
             not running" — use `loop`.
@@ -6754,9 +6762,9 @@ components:
             - { $ref: "#/components/schemas/LoopObservation" }
             - { type: object, nullable: true, enum: [null] }
           description: >
-            Always included; null when the task has no loop at all — no
-            task in the list is in that position, so null now means an
-            older server that had one. A MISSING key means an older server
+            Always included; null when the task has no loop at all: on a
+            hoglite catalog, the hydrator (rehydrate runs its sweep, so it
+            is manual only) and reindex. A MISSING key means an older server
             that does not report the field at all, which is not the same
             claim.
         last_run:

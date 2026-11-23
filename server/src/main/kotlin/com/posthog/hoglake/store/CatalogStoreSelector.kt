@@ -28,6 +28,7 @@ import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HogliteCompaction
 import com.posthog.hoglake.hoglite.HogliteCompactionCursors
+import com.posthog.hoglake.hoglite.HogliteHydrator
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
@@ -680,7 +681,16 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
     ): HydratorMaintenanceBackend =
-        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) { it.hydratorMaintenance }
+        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) {
+            // Hoglite has no hydrator loop: the requeue then hydrates pending files (#675).
+            val config = checkNotNull(cfg)
+            HogliteHydrator(
+                it,
+                objectStore,
+                maxWholeObjectBytes = config.hydratorMaxWholeObjectBytes,
+                minFileBytes = config.hydratorMinFileBytes,
+            )
+        }
 
     fun maintenanceStatus(
         call: ApplicationCall,
@@ -697,7 +707,6 @@ class CatalogStoreSelector(
             val config = checkNotNull(cfg)
             HogliteMaintenanceStatus(
                 it,
-                config.hydratorIntervalMs,
                 config.expiryIntervalMs,
                 config.cleanupIntervalMs,
                 config.compactionIntervalMs,
