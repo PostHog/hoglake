@@ -2944,6 +2944,26 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     open class BackendUnavailable(detail: String) : HoglakeException(detail)
 
     /**
+     * hoglite refused, with its 401, a token hoglake verified whose `iat` or
+     * `nbf` is more than hoglite's fixed 60 s ahead of hoglake's clock ->
+     * HTTP 503 `backend_unavailable` with [retryAfterSeconds] as the
+     * `Retry-After`. hoglake admits such a token within
+     * `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS`, hoglite within its 60 s, so the
+     * same token passes once the clock catches up (#681).
+     *
+     * It IS a [BackendUnavailable] on the wire: nothing was applied, and a
+     * client that tells a 503 that applied nothing by its code (the DuckDB
+     * extension's commit retry) retries it as one, with the same token, not
+     * a re-mint. Metrics and audit give it its own outcome: the cause is a
+     * caller's clock or hoglake's skew setting, not the database failing to
+     * answer, and an operator pages on the latter.
+     */
+    class BackendTokenNotYetValid(
+        detail: String,
+        val retryAfterSeconds: Long,
+    ) : BackendUnavailable(detail)
+
+    /**
      * A commit the backend may or may not have applied -> HTTP 503
      * `commit_outcome_unknown` with `Retry-After`. Raised by the hoglite
      * backend when a transaction's attempts ended after at least one that

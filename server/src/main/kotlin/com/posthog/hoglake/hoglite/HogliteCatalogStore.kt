@@ -1001,6 +1001,9 @@ class HogliteCatalogStore(
             if (System.nanoTime() - deadline > 0) throw unverified(null)
             return try {
                 read()
+            } catch (e: HoglakeException.BackendTokenNotYetValid) {
+                // The caller's token, not the scan: keep its Retry-After.
+                throw e
             } catch (e: HoglakeException.BackendUnavailable) {
                 throw unverified(e)
             }

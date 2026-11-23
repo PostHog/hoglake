@@ -197,7 +197,7 @@ pins one token per rule that a token can show):
 | the header carries `b64` | 401 | 403 `backend_refused_authority` |
 | `kid` is over 256 characters; hoglite also refuses a JWKS that holds such a key | 401 | 403 `backend_refused_authority` |
 | `kid` names a key hoglite has not fetched yet: it refetches the JWKS at most once a minute, and retries a failed fetch after 30 s | 401 | 403 `backend_refused_authority` |
-| `iat` or `nbf` is more than 60 s ahead of hoglite's clock; only with `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` above 60, as hoglite's skew is fixed at 60 s | 401 | 403 `backend_refused_authority` |
+| `iat` or `nbf` is more than 60 s ahead of hoglite's clock; only with `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` above 60, as hoglite's skew is fixed at 60 s | 401 | 503 `backend_unavailable` with `Retry-After` when the time is also more than 60 s ahead of hoglake's clock; otherwise 403 `backend_refused_authority` |
 | `exp` passed more than 60 s ago; only with `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` above 60 | 401 | 401 `token_expired` |
 | `ten` is absent or `scoped`; the token carries `scope`, `usr` or `prd`; a routed token has no scope hoglite knows on it; a routed `operator` lacks `admin` | 403 | 403 `forbidden` |
 
@@ -209,23 +209,35 @@ headers exceed 8 KiB.
 
 hoglite's 401 does not say which rule failed. hoglake answers it as 401
 `token_expired` (with the bearer challenge) only when the forwarded token's
-`exp` has passed by hoglake's clock, which a new token fixes. Any other
+`exp` has passed by hoglake's clock, which a new token fixes. When the
+token's integer `iat` or `nbf` is more than hoglite's 60 s ahead of hoglake's
+clock, hoglake answers 503 `backend_unavailable` with no challenge and a
+`Retry-After` of the seconds until the later of the two is within those 60 s
+(at most 300): hoglite admits the same token once its clock catches up, so a
+client retries that token after the wait and does not re-mint. A token ahead
+by 60 s or less is inside hoglite's leeway, so another rule refused it. Any
+other
 hoglite 401 is 403 `backend_refused_authority`, with no challenge. It is not
 a reason to re-mint: a new token with the same claims is refused again.
-Two rows of the table pass with time, and the answer does not tell them
-from the rest: a new signing key succeeds after hoglite's next JWKS refresh,
-and a token issued ahead of hoglite's clock succeeds once that clock catches
-up. Both are deployment faults, fixed where they arise: an issuer publishes
+Two rows of the table pass with time. A new signing key succeeds after
+hoglite's next JWKS refresh, and the answer does not tell it from the
+rest. A token issued ahead of hoglite's clock succeeds once that clock
+catches up; the 503 covers it only while its time is also more than 60 s
+ahead of hoglake's, and a hoglite clock trailing hoglake's leaves the rest
+as 403.
+Both are deployment faults, fixed where they arise: an issuer publishes
 a key in the JWKS at least a minute before signing with it, and
 `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` stays at 60 or below in front of hoglite
 backends, with hoglake's and hoglite's clocks in sync, so hoglake refuses
 such a token itself. A client may retry the same token after a delay; it
-must not re-mint in answer to this code.
+must not re-mint in answer to `backend_refused_authority`.
 
 The typed scoped reads below verify under their own rules, and hoglite answers
 404 for authority they do not support. Their 401 maps the same way: 401
-`token_expired` for a token past its `exp`, 403 `backend_refused_authority`
-otherwise, never the 503 with `Retry-After` an outage gets.
+`token_expired` for a token past its `exp`, 503 `backend_unavailable` with
+the wait in `Retry-After` for one issued more than 60 s ahead of hoglake's
+clock, 403
+`backend_refused_authority` otherwise, never the fixed 503 an outage gets.
 
 #### Typed scoped namespace read
 
@@ -396,6 +408,10 @@ is an operator.
   verifies the token itself refuses a token hoglake accepted; see
   [Backends that verify the token themselves](#backends-that-verify-the-token-themselves).
   Do not re-mint.
+- `503` `backend_unavailable` with `Retry-After` (no `WWW-Authenticate`) when
+  such a backend refuses a token hoglake accepted whose `iat` or `nbf` is more
+  than 60 s ahead of hoglake's clock. Retry the same token after
+  `Retry-After`; do not re-mint.
 - `404` for a catalog the token cannot see.
 
 ## What hoglake does not do

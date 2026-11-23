@@ -1178,6 +1178,10 @@ object Metrics {
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {
             is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
+            // A caller's clock or hoglake's skew, not the database failing to
+            // answer: its own outcome, though the wire code is backend_unavailable.
+            // Before BackendUnavailable: it is one.
+            is HoglakeException.BackendTokenNotYetValid -> "backend_token_not_yet_valid"
             is HoglakeException.BackendUnavailable -> "backend_unavailable"
             is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"
             is HoglakeException.BackendQueryTimeout -> "backend_query_timeout"

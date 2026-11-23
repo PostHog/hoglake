@@ -218,20 +218,52 @@ class HogliteClient(
     }
 
     /**
+     * The later of the forwarded token's integer `iat` and `nbf`, when it is
+     * more than [HOGLITE_CLOCK_SKEW_SECONDS] ahead of this pod's clock; null
+     * otherwise. hoglake admits such a token within
+     * `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS`, hoglite within its fixed leeway, so
+     * only a token past that leeway is one hoglite's clock rule refuses with
+     * the clocks in sync. A token ahead by less was refused for another rule.
+     */
+    internal fun bearerIssuedAhead(nowSeconds: Long = System.currentTimeMillis() / 1000): Long? {
+        val token = bearerToken ?: return null
+        val claims = runCatching { Jwt.parse(token).claims }.getOrNull() ?: return null
+        return listOf("iat", "nbf")
+            .mapNotNull { name -> claims.get(name)?.takeIf { it.isIntegralNumber }?.asLong() }
+            .maxOrNull()
+            ?.takeIf { it - nowSeconds > HOGLITE_CLOCK_SKEW_SECONDS }
+    }
+
+    /**
      * What hoglite's 401 for the forwarded token means to the caller. It does
      * not say which rule failed: a token past its `exp` is renewed by a
-     * re-mint; any other broke a rule hoglake does not apply, which a re-mint
-     * with the same claims cannot satisfy (#681).
+     * re-mint; a token issued beyond hoglite's leeway ahead of this pod's
+     * clock is retried, unchanged, once hoglite's clock admits it; any other
+     * broke a rule hoglake does not apply, which a re-mint with the same
+     * claims cannot satisfy (#681).
      */
-    internal fun authorityRefusal(): HoglakeException =
-        if (bearerExpired()) {
-            HoglakeException.Unauthenticated(JwtViolation.EXPIRED, "backend refused request authority: expired")
-        } else {
-            HoglakeException.BackendRefusedAuthority(
-                "hoglite refused a token hoglake accepted; a token with the same claims is refused again " +
-                    "(docs/auth.md, Backends that verify the token themselves)",
+    internal fun authorityRefusal(nowSeconds: Long = System.currentTimeMillis() / 1000): HoglakeException {
+        if (bearerExpired(nowSeconds)) {
+            return HoglakeException.Unauthenticated(
+                JwtViolation.EXPIRED,
+                "backend refused request authority: expired",
             )
         }
+        val ahead = bearerIssuedAhead(nowSeconds)
+        if (ahead != null) {
+            // At least 1: bearerIssuedAhead answers only past hoglite's leeway.
+            val wait = (ahead - HOGLITE_CLOCK_SKEW_SECONDS - nowSeconds).coerceAtMost(MAX_NOT_YET_VALID_RETRY_SECONDS)
+            return HoglakeException.BackendTokenNotYetValid(
+                "hoglite refused a token issued ${ahead - nowSeconds}s ahead of hoglake's clock; " +
+                    "retry the same token after ${wait}s (docs/auth.md, Backends that verify the token themselves)",
+                retryAfterSeconds = wait,
+            )
+        }
+        return HoglakeException.BackendRefusedAuthority(
+            "hoglite refused a token hoglake accepted; a token with the same claims is refused again " +
+                "(docs/auth.md, Backends that verify the token themselves)",
+        )
+    }
 
     // ---- public API -------------------------------------------------------
 
@@ -1073,6 +1105,15 @@ class HogliteClient(
 
         /** hoglite's label for a failure it knows did not apply (503). */
         const val CODE_NOT_APPLIED = "not_applied"
+
+        /** hoglite's fixed leeway on `iat`, `nbf` and `exp`; not configurable there. */
+        const val HOGLITE_CLOCK_SKEW_SECONDS = 60L
+
+        /**
+         * The most [authorityRefusal] asks a caller to wait for a token issued
+         * ahead of the clock. A longer wait is asked again on the retry.
+         */
+        const val MAX_NOT_YET_VALID_RETRY_SECONDS = 300L
 
         /** The `client` half of hoglite's (client, txid) dedup key. */
         const val CLIENT_NAME = "hoglake"

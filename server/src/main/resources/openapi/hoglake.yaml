@@ -66,6 +66,9 @@ info:
       but a backend that verifies it itself (Hoglite) refused it under a
       stricter rule (docs/auth.md). A new token with the same claims is
       refused again, so there is no bearer challenge; do not re-mint.
+      When the token's `iat` or `nbf` is more than 60 s (hoglite's fixed
+      leeway) ahead of hoglake's clock, the refusal passes with time instead: **503** `backend_unavailable`,
+      with no bearer challenge. Retry the same token after `Retry-After`.
     - **404** — NOT 403 — for a catalog the caller is not entitled to.
       This is deliberate: a 403 would confirm the catalog exists and
       turn an org id the caller was never given into an enumeration
@@ -3831,6 +3834,10 @@ components:
         containment verification may return containment_unverified. Both are retryable.
         A retry without a key can apply the commit a second
         time, as after a lost COMMIT acknowledgement on PostgreSQL.
+        A Hoglite backend that refused a verified token whose `iat` or `nbf`
+        is more than 60 s ahead of hoglake's clock also answers `backend_unavailable`: it
+        admits the same token once its clock catches up, so retry that token
+        after Retry-After and do not re-mint (docs/auth.md).
       headers:
         Retry-After:
           description: Seconds to back off before retrying.

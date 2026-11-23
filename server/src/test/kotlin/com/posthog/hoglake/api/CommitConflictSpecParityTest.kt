@@ -232,8 +232,14 @@ class CommitConflictSpecParityTest {
         // walk saw all of them.
         val types = exceptionTypes()
         assertThat(types).describedAs("the reflective walk must find the exception types").isNotEmpty
+        // The one deliberate sharer: BackendTokenNotYetValid answers its
+        // parent's `backend_unavailable` (with its own Retry-After) so a
+        // client that retries that code, DuckDB's commit loop included,
+        // waits and retries the same token. A code of its own would read as
+        // an unknown 503 there. Metrics and audit name it separately.
+        val sharesParentCode = setOf("BackendTokenNotYetValid")
         val codeByType =
-            types.associate { type ->
+            types.filterNot { it.simpleName in sharesParentCode }.associate { type ->
                 val cause = instantiate(type)
                 type.simpleName to (errorBody(cause).second.error)
             }

@@ -252,8 +252,8 @@ internal object HogliteScopedNamespaceRead {
             Thread.currentThread().interrupt()
             throw onUnavailable()
         } catch (_: Unauthorized) {
-            // A deterministic refusal, not an outage: a 503 with Retry-After
-            // would send the caller into the retry loop #681 removed.
+            // Not an outage: onUnauthorized answers it from the token (#681).
+            // An outage's 503 would retry a refusal that no delay ends.
             throw onUnauthorized()
         } catch (_: Exception) {
             // Never retain a peer body, a target, or a credential in the exception chain.

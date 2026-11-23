@@ -67,4 +67,32 @@ class BackendErrorMappingTest {
             assertThat(response.headers[HttpHeaders.WWWAuthenticate]).isNull()
             assertThat(response.bodyAsText()).contains("\"error\":\"backend_refused_authority\"")
         }
+
+    /**
+     * A token hoglite refused as issued ahead of its clock passes after a
+     * known wait (#681): a 503 a client retries the same token on, after the
+     * Retry-After the refusal carries, with no bearer challenge. Metrics and
+     * audit tell it from an outage; the wire code does not.
+     */
+    @Test
+    fun `a token not yet valid at the backend is a 503 with its own Retry-After`() =
+        testApplication {
+            val refusal = HoglakeException.BackendTokenNotYetValid("issued ahead", retryAfterSeconds = 42)
+            application {
+                install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                install(StatusPages) { installErrorMapping() }
+                routing {
+                    get("/ahead") { throw refusal }
+                    get("/down") { throw HoglakeException.BackendUnavailable("down") }
+                }
+            }
+            val response = client.get("/ahead")
+            assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+            assertThat(response.headers[HttpHeaders.RetryAfter]).isEqualTo("42")
+            assertThat(response.headers[HttpHeaders.WWWAuthenticate]).isNull()
+            assertThat(response.bodyAsText()).contains("\"error\":\"backend_unavailable\"")
+            assertThat(Audit.failureOutcome(refusal)).isEqualTo("backend_token_not_yet_valid")
+            assertThat(Metrics.commitFailureResult(refusal)).isEqualTo("backend_token_not_yet_valid")
+            assertThat(client.get("/down").headers[HttpHeaders.RetryAfter]).isEqualTo("1")
+        }
 }

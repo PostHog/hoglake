@@ -18,10 +18,13 @@ class HogliteRefusalMappingTest {
     private val store = HogliteCatalogStore(HogliteClient("http://unused.invalid"), { "opaque_1" })
 
     /** A compact token whose only claim is [exp]; mapRejected reads it, nothing verifies it. */
-    private fun tokenExpiring(exp: Long): String {
+    private fun tokenExpiring(exp: Long): String = tokenWith("""{"exp":$exp}""")
+
+    /** A compact token whose payload is [claims]; mapRejected reads it, nothing verifies it. */
+    private fun tokenWith(claims: String): String {
         val enc = Base64.getUrlEncoder().withoutPadding()
         val header = enc.encodeToString("""{"alg":"ES256"}""".toByteArray())
-        val payload = enc.encodeToString("""{"exp":$exp}""".toByteArray())
+        val payload = enc.encodeToString(claims.toByteArray())
         return "$header.$payload.${enc.encodeToString("sig".toByteArray())}"
     }
 
@@ -50,6 +53,58 @@ class HogliteRefusalMappingTest {
         val failure = storeFor(tokenExpiring(now - 1)).mapRejected("cat", refused)
         assertThat(failure).isExactlyInstanceOf(HoglakeException.Unauthenticated::class.java)
         assertThat((failure as HoglakeException.Unauthenticated).reason).isEqualTo(JwtViolation.EXPIRED)
+    }
+
+    /**
+     * A token issued more than hoglite's fixed 60 s ahead of hoglake's clock
+     * is one hoglite admits once its own clock catches up (hoglake's skew
+     * above 60 s): a 503 whose Retry-After is that wait, so a client retries
+     * the same token rather than give up on it (#681). A token ahead by less
+     * is inside hoglite's leeway, so its refusal is another rule's: a 403.
+     */
+    @Test
+    fun `a backend 401 for a token issued ahead of the clock is retried after hoglite's leeway`() {
+        val now = 1_800_000_000L
+        val exp = now + 3600
+
+        fun refusal(claims: String) =
+            HogliteClient(
+                "http://unused.invalid",
+            ).forRequest(tokenWith(claims)).authorityRefusal(now)
+
+        for ((claims, wait) in listOf(
+            """{"exp":$exp,"iat":${now + 120},"nbf":${now + 120}}""" to 60L,
+            """{"exp":$exp,"iat":$now,"nbf":${now + 150}}""" to 90L,
+            """{"exp":$exp,"iat":${now + 170}}""" to 110L,
+            """{"exp":$exp,"iat":${now + 61}}""" to 1L,
+            """{"exp":$exp,"nbf":${now + 3000}}""" to HogliteClient.MAX_NOT_YET_VALID_RETRY_SECONDS,
+        )) {
+            val failure = refusal(claims)
+            assertThat(failure).describedAs(claims)
+                .isExactlyInstanceOf(HoglakeException.BackendTokenNotYetValid::class.java)
+            assertThat((failure as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds)
+                .describedAs(claims).isEqualTo(wait)
+        }
+        // Not past hoglite's leeway, or not a time hoglake reads: hoglite's own rule, final.
+        for (claims in listOf(
+            """{"exp":$exp,"iat":$now,"nbf":$now}""",
+            """{"exp":$exp,"iat":${now - 30}}""",
+            """{"exp":$exp,"iat":${now + 1}}""",
+            """{"exp":$exp,"iat":${now + 30},"nbf":${now + 60}}""",
+            """{"exp":$exp,"iat":"${now + 120}"}""",
+        )) {
+            assertThat(refusal(claims)).describedAs(claims)
+                .isExactlyInstanceOf(HoglakeException.BackendRefusedAuthority::class.java)
+        }
+        // A token past its exp is renewed first.
+        assertThat(refusal("""{"exp":${now - 1},"iat":${now + 120}}"""))
+            .isExactlyInstanceOf(HoglakeException.Unauthenticated::class.java)
+        // The catalog store maps hoglite's 401 through it.
+        val wall = System.currentTimeMillis() / 1000
+        val ahead = tokenWith("""{"exp":${wall + 3600},"iat":${wall + 600}}""")
+        val mapped = storeFor(ahead).mapRejected("cat", HogliteRejected(401, """{"code":"refused"}"""))
+        assertThat(mapped).isExactlyInstanceOf(HoglakeException.BackendTokenNotYetValid::class.java)
+        assertThat((mapped as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds).isPositive()
     }
 
     @Test

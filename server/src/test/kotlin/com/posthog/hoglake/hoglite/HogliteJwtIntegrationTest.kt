@@ -252,6 +252,42 @@ class HogliteJwtIntegrationTest {
                     }
                 }
             }
+            // HOGLAKE_AUTH_CLOCK_SKEW_SECONDS above hoglite's fixed 60 s: a token issued
+            // 120 s ahead is hoglake's to accept and hoglite's to refuse until its clock
+            // catches up, so the caller retries the same token after the wait (#681).
+            testApplication {
+                App.build(cfg).use { app ->
+                    val skewed =
+                        AuthService(
+                            AuthMode.ENFORCE,
+                            JwtVerifier(
+                                TestTokens.ISSUER,
+                                "hoglake",
+                                StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
+                                skewSeconds = 300,
+                                backends = cfg.backendKinds,
+                            ),
+                        )
+                    application { app.module(this, skewed) }
+                    val ahead = Instant.now().epochSecond + 120
+                    val early =
+                        TestTokens.mint(
+                            pair,
+                            """{"iss":"${TestTokens.ISSUER}","aud":["hoglake","hoglite"],"sub":"test-client",""" +
+                                """"jti":"test-ahead","ten":"tenant","org":"org-not-the-tid",""" +
+                                """"cat":{"lake":["read"]},"iat":$ahead,"nbf":$ahead,"exp":${ahead + 900},""" +
+                                """"rtg":{"b":"hoglite","be":"$id","t":"opaque_1"}}""",
+                        )
+                    val refused =
+                        client.get("/v1/catalogs/lake") {
+                            header(HttpHeaders.Authorization, "Bearer $early")
+                        }
+                    assertThat(refused.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                    assertThat(refused.headers[HttpHeaders.WWWAuthenticate]).isNull()
+                    assertThat(refused.headers[HttpHeaders.RetryAfter]?.toLong()).isBetween(50L, 60L)
+                    assertThat(refused.bodyAsText()).contains("\"error\":\"backend_unavailable\"")
+                }
+            }
             // Warn mode bypasses generic policy refusals, not backend lifecycle capabilities.
             testApplication {
                 App.build(cfg).use { app ->

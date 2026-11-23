@@ -68,6 +68,14 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
+ * - BackendRefusedAuthority -> 403 `backend_refused_authority`, no
+ *                          WWW-Authenticate (hoglite refused a token
+ *                          hoglake accepted; a re-mint is refused again)
+ * - BackendUnavailable  -> 503 `backend_unavailable` + Retry-After; a
+ *                          BackendTokenNotYetValid's `retryAfterSeconds`
+ *                          (hoglite refused a token issued ahead of the
+ *                          clock: the same token, retried once hoglite's
+ *                          clock admits it)
  * - malformed body / unparseable query or path params -> 400. This
  *   includes the receives ktor refuses BEFORE deserialization even
  *   starts (ContentTransformationException): a body sent under a
@@ -312,7 +320,10 @@ private suspend fun ApplicationCall.respondHoglakeFailure(cause: HoglakeExceptio
         cause is HoglakeException.MountProxyBusy ||
         cause is PartitionLookupUnavailable
     ) {
-        response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
+        // A token hoglite refused as issued ahead of its clock passes after
+        // a known delay; every other 503 backs off a beat.
+        val retryAfter = (cause as? HoglakeException.BackendTokenNotYetValid)?.retryAfterSeconds
+        response.headers.append(HttpHeaders.RetryAfter, retryAfter?.toString() ?: RETRY_AFTER_SECONDS)
     }
     if (cause is HoglakeException.Unauthenticated) {
         response.headers.append(HttpHeaders.WWWAuthenticate, bearerChallenge(cause))
