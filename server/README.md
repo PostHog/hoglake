@@ -2918,8 +2918,13 @@ transaction (`observability/`):
   readiness condition (#678). Every pod shares them, so one unhealthy
   backend would make the whole fleet unready at once and take the
   PostgreSQL catalogs with it — as hoglited's ordinary lease
-  handovers, which answer 503, would — while a hoglite call cannot hang the
-  way the zombie server's did (`HogliteClient` bounds every attempt).
+  handovers, which answer 503, would. `HogliteClient`'s attempt timeout
+  bounds the connect and the response headers but not the body: JDK
+  25's `HttpClient` stops the request timer once headers arrive, so a
+  backend that sends headers and then stalls blocks that call; neither
+  the retry budget nor the breaker bounds it. The health loop below abandons
+  such an attempt at its age bound: the series reads 0 and the thread
+  stays parked.
   The `hoglite_health` background loop samples the backends instead,
   every `HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS` (10 s; 0 disables) on any
   process with a hoglite backend, PostgreSQL or not

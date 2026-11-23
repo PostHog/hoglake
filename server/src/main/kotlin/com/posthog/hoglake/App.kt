@@ -594,8 +594,7 @@ class App private constructor(
             // has one. The hoglite backends are NOT a readiness
             // condition (#678): every pod shares them, so one unhealthy
             // backend would make the whole fleet unready and take the
-            // PostgreSQL catalogs with it, and their calls cannot hang
-            // the way the zombie server's did. The hoglite_health loop
+            // PostgreSQL catalogs with it. The hoglite_health loop
             // samples them into hoglake_hoglite_backend_reachable
             // instead (startBackground; hoglite/HogliteBackendHealth.kt);
             // this handler neither awaits nor starts a hoglite probe.

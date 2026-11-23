@@ -29,11 +29,14 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * The zombie-server rule that keeps PostgreSQL in readiness
  * ([com.posthog.hoglake.HealthProbe]) does not transfer. That incident
- * was `/healthz` saying ok while every `/v1` call HUNG; a hoglite call
- * cannot hang that way, because `HogliteClient` bounds every attempt
- * (connect, read, a retry budget) and breaks the circuit on a down
- * pool. A pod whose hoglite backend is down is a pod that answers
- * quickly and truthfully, which is what readiness asks.
+ * was `/healthz` saying ok while every `/v1` call HUNG. `HogliteClient`
+ * bounds a hoglite attempt's connect and response headers (a retry
+ * budget, a circuit that breaks on a down pool), so a down backend
+ * answers quickly and truthfully, which is what readiness asks. It does
+ * not bound the body: JDK 25's `HttpClient` stops the request timer
+ * once headers arrive, so a backend that sends headers and then stalls
+ * blocks the call. That stall is the backend's, shared by every
+ * pod, so readiness would still pull the whole fleet for it.
  *
  * ## What this class does instead
  *
@@ -49,7 +52,7 @@ import java.util.concurrent.atomic.AtomicLong
  * local run) and ticks at hoglake's cadence rather than the kubelet's.
  * `/healthz` never waits for a hoglite probe, and never starts one: a
  * kubelet readiness timeout of 3 s (the chart's default) is below one
- * backend's connect-plus-read bound, so waiting would have turned a
+ * backend's connect-plus-headers bound, so waiting would have turned a
  * slow backend into unreadiness by timeout even once its answer
  * stopped gating the status.
  *

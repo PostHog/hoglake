@@ -573,8 +573,10 @@ after initialization it checks PostgreSQL through its separate bounded probe con
 The probe itself never opens the request pool or runs migrations. The hoglite backends
 are not a readiness condition (#678): every pod shares them, so one unhealthy backend
 (hoglited answers 503 through a lease handover) would make the whole fleet unready and
-take the PostgreSQL catalogs with it, and a hoglite call cannot hang the way the
-zombie server's did — `HogliteClient` bounds every attempt. The `hoglite_health` background
+take the PostgreSQL catalogs with it. `HogliteClient`'s attempt timeout bounds the
+connect and the response headers, not the body — JDK 25's `HttpClient` stops that
+timer once headers arrive, so a backend that sends headers and then stalls blocks the
+call. The `hoglite_health` background
 loop (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`) instead samples every configured backend's
 `/v1/healthz`, single-flight per backend with an age bound, into
 `hoglake_hoglite_backend_reachable{backend}` (1, 0, or NaN before the first answer);
