@@ -192,9 +192,11 @@ class HogliteExpiryRouteIntegrationTest {
                             }
                         assertThat(other.status).isEqualTo(HttpStatusCode.NotFound)
                     }
-                    assertThat(rows(c)).hasSize(2)
+                    // Only the sweep that succeeded drives retirement (#674).
+                    assertThat(rows(c)).hasSize(3)
                     assertThat(rows(c)[0].take(3).map { it.asString() }).containsExactly("expiry", "manual", "failed")
                     assertThat(rows(c)[1].take(3).map { it.asString() }).containsExactly("expiry", "manual", "ok")
+                    assertThat(rows(c)[2].take(3).map { it.asString() }).containsExactly("retirement", "manual", "ok")
                 }
             }
         } finally {

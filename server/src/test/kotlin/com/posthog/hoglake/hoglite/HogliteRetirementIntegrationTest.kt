@@ -1,15 +1,20 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.RetirementResult
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.persistence.PartialResult
+import com.posthog.hoglake.service.PatchField
+import com.posthog.hoglake.service.RemovalStore
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -403,5 +408,83 @@ class HogliteRetirementIntegrationTest {
             val ledger = query(cat, "SELECT result_json FROM maintenance_runs ORDER BY id DESC LIMIT 1").rows.single()
             assertThat(store.json.readTree(ledger[0].asString())["tables_remaining"].asLong()).isEqualTo(1)
         }
+    }
+
+    /** A table dropped with a live file, below a floor that only expiry can advance. */
+    private fun droppedBehindRetention(cat: String): Long {
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val path = "s3://hoglake-it/$cat/live.parquet"
+        store.commit(
+            cat,
+            CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 1, 100))))),
+        )
+        store.dropTable(cat, "ns", "t", table.tableUuid, "test", "retire")
+        store.dropNamespace(cat, "ns", author = "test", message = "empty it")
+        store.options.patch(cat, PatchField.Set(1L), null, "test", "short retention")
+        write(cat, "UPDATE snapshots SET ts = '2001-01-01T00:00:00.000Z'")
+        return table.tableId
+    }
+
+    private fun dropRefusal(cat: String) =
+        (runCatching { store.dropCatalog(cat, "test", "drop") }.exceptionOrNull() as HoglakeException.CatalogNotEmpty)
+            .reason
+
+    @Test
+    fun `manual expiry drives retirement so a catalog with a dropped table can be dropped`() {
+        val cat = catalog()
+        val tableId = droppedBehindRetention(cat)
+        assertThat(dropRefusal(cat)).isEqualTo(CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT)
+        val expired = store.expiry.runOnce(cat, 100)
+        assertThat(expired.newEarliestSnapshotId).isEqualTo(store.getCatalog(cat).headSnapshotId)
+        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).isEmpty()
+        assertThat(query(cat, "SELECT path, reason FROM removals").rows.map { it[0].asString() to it[1].asString() })
+            .containsExactly("s3://hoglake-it/$cat/live.parquet" to HogliteRetirement.REASON)
+        assertThat(
+            query(cat, "SELECT task, run_trigger, status FROM maintenance_runs ORDER BY id")
+                .rows.map { row -> row.map { it.asString() } },
+        ).containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "ok"))
+        // What is left is cleanup's queue; once cleanup drains it, the drop that answered 409 goes through.
+        assertThat(dropRefusal(cat)).isEqualTo(CatalogNotEmptyReason.REMOVALS_PENDING)
+        RemovalStore(engine.config()).use { objects ->
+            assertThat(HogliteCleanup(engine.config(), store, objects).runOnce(cat, 10).removed).isEqualTo(1)
+        }
+        store.dropCatalog(cat, "test", "drop")
+        assertThatThrownBy { store.getCatalog(cat) }.isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    @Test
+    fun `retirement after expiry runs under the purge budget, so a zero budget retires nothing`() {
+        val cat = catalog()
+        val tableId = droppedBehindRetention(cat)
+        // Retirement's own 30 s budget would retire the file; the purge budget of 0 must not.
+        val zero = HogliteCatalogStore(engine.client, HogliteConformanceEngine.TENANTS, expiryPurgeBudgetMs = 0)
+        val expired = zero.expiry.runOnce(cat, 100)
+        assertThat(expired.newEarliestSnapshotId).isEqualTo(store.getCatalog(cat).headSnapshotId)
+        val ledger =
+            query(cat, "SELECT task, run_trigger, status, result_json FROM maintenance_runs ORDER BY id").rows
+        assertThat(ledger.map { row -> row.take(3).map { it.asString() } })
+            .containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "ok"))
+        val retired = store.json.readTree(ledger[1][3].asString())
+        assertThat(retired["batches"].asLong()).isZero()
+        assertThat(retired["tables_remaining"].asLong()).isEqualTo(1)
+        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).hasSize(1)
+        assertThat(dropRefusal(cat)).isEqualTo(CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT)
+    }
+
+    @Test
+    fun `a retirement failure after expiry does not fail the committed sweep`() {
+        val cat = catalog()
+        val tableId = droppedBehindRetention(cat)
+        // A restricting reference makes the real retirement batch fail; expiry does not touch live files.
+        write(cat, "CREATE TABLE hold_file(file_id INTEGER REFERENCES files(id) ON DELETE RESTRICT)")
+        write(cat, "INSERT INTO hold_file SELECT id FROM files WHERE table_id = ?", tableId)
+        val expired = store.expiry.runOnce(cat, 100)
+        assertThat(expired.newEarliestSnapshotId).isEqualTo(store.getCatalog(cat).headSnapshotId)
+        assertThat(
+            query(cat, "SELECT task, run_trigger, status FROM maintenance_runs ORDER BY id")
+                .rows.map { row -> row.map { it.asString() } },
+        ).containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "failed"))
+        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).hasSize(1)
+        assertThat(dropRefusal(cat)).isEqualTo(CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT)
     }
 }

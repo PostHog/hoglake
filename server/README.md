@@ -2573,8 +2573,13 @@ The catalog reports on itself instead of waiting for ops SQL:
   The manual action changes metadata only; it does not start a hydration sweep.
   One transaction updates all matching files, subject to the engine's write limits.
   Full hydration still needs the existing server-side `ObjectStore` path and per-run AWS identity.
-  Hoglite retirement is available through the backend seam for trusted placement.
-  It has no HTTP trigger or background driver.
+  Hoglite retirement has no route or loop of its own: each successful manual expiry runs it
+  (`POST /maintenance/expire`), recorded as its own `retirement` run, after the floor that sweep advanced.
+  It runs under the expiry purge budget (10 s by default), so one request holds both budgets;
+  the next expiry continues a backlog. It takes `HOGLAKE_RETIREMENT_QUEUE_CEILING` and `HOGLAKE_RETIREMENT_BATCH`,
+  the batch capped at 1,000 rows (one Hoglite transaction).
+  With a Hoglite backend configured, boot refuses either one below 1: no interval turns this hand-off off.
+  A retirement failure is logged and recorded as a failed `retirement` run, and does not fail the expiry response.
   Each retirement batch queues current vector and data paths before it deletes their rows.
   Candidate and victim reads use bounded keyset pages.
 - **`GET /stats/partitions`** (`service/PartitionStatsService.kt`) —

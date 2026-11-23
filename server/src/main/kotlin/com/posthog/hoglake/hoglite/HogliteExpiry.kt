@@ -8,6 +8,8 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.ExpiryBackend
+import com.posthog.hoglake.service.RetirementBackend
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.time.Instant
 
 /**
@@ -20,12 +22,21 @@ import java.time.Instant
  *
  * Hoglite serializes writes per tenant. It needs no PostgreSQL advisory lock or statement-timeout ladder.
  * The page size and wall-clock budget retain their PostgreSQL meanings.
+ *
+ * Hoglite has no retirement loop, so a successful sweep runs [retirement] after it (#674): the floor it
+ * just advanced is what makes a dropped table eligible. Retirement records its own ledger run; its failure
+ * is logged and does not fail the sweep, which has already committed. The store gives that retirement the
+ * purge budget, so one request stays near twice it; the next expiry continues any backlog. A zero budget
+ * retires nothing, as it purges nothing.
  */
 internal class HogliteExpiry(
     private val store: HogliteCatalogStore,
     private val purgePage: Int,
     private val purgeBudgetMs: Long,
+    internal val retirement: RetirementBackend? = null,
 ) : ExpiryBackend {
+    private val log = KotlinLogging.logger {}
+
     init {
         require(purgePage > 0) { "expiry purge page must be positive (got $purgePage)" }
         require(purgeBudgetMs >= 0) { "expiry purge budget must be >= 0 (got $purgeBudgetMs)" }
@@ -38,7 +49,21 @@ internal class HogliteExpiry(
     ): ExpiryResult =
         store.recorded(catalog, MaintenanceTask.EXPIRY, trigger) {
             runSweep(catalog, batchSize)
+        }.also { retire(catalog, trigger) }
+
+    private fun retire(
+        catalog: String,
+        trigger: MaintenanceTrigger,
+    ) {
+        try {
+            retirement?.runOnce(catalog, trigger)
+        } catch (e: Exception) {
+            if (e is InterruptedException) Thread.currentThread().interrupt()
+            log.error(e) {
+                "retirement after expiry failed for catalog '$catalog'"
+            }
         }
+    }
 
     private fun runSweep(
         catalog: String,
@@ -100,7 +125,7 @@ internal class HogliteExpiry(
             )
         }
         result.flooredByConsumer?.let { consumer ->
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn {
+            log.warn {
                 "expiry for catalog '$catalog' floored by consumer '$consumer' " +
                     "(earliest stays at ${result.newEarliestSnapshotId})"
             }

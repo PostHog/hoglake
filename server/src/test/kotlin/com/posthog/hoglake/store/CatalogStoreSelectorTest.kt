@@ -15,6 +15,7 @@ import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
+import com.posthog.hoglake.hoglite.HogliteRetirement
 import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
@@ -117,6 +118,50 @@ class CatalogStoreSelectorTest {
         assertThat(selector.forPlacement(pg)).isSameAs(postgres)
         assertThatThrownBy { CatalogStoreSelector(null, cfg).forPlacement(pg) }
             .isInstanceOf(com.posthog.hoglake.model.HoglakeException.NotFound::class.java)
+    }
+
+    @Test
+    fun `hoglite expiry hands retirement the configured ceiling and batch, under the purge budget`() {
+        val routing = Routing("lake", BackendKind.HOGLITE, id, "opaque_1")
+
+        fun handOff(cfg: Config): HogliteRetirement {
+            val store = CatalogStoreSelector(postgres, cfg).forPlacement(routing) as HogliteCatalogStore
+            assertThat(store.retirement.batchSize).isEqualTo(store.retirementBatch)
+            assertThat(store.retirement.queueCeiling).isEqualTo(store.retirementQueueCeiling)
+            return store.expiry.retirement as HogliteRetirement
+        }
+        val set =
+            handOff(
+                config("none").copy(retirementBatch = 250, retirementQueueCeiling = 777, expiryPurgeBudgetMs = 4321),
+            )
+        assertThat(set.batchSize).isEqualTo(250)
+        assertThat(set.queueCeiling).isEqualTo(777)
+        assertThat(set.runBudgetMs).isEqualTo(4321)
+        // The PostgreSQL default of 8,000 is past one Hoglite transaction's batch, so it is capped there.
+        val defaults = handOff(config("none"))
+        assertThat(defaults.batchSize).isEqualTo(HogliteRetirement.DEFAULT_BATCH)
+        assertThat(defaults.queueCeiling).isEqualTo(Config().retirementQueueCeiling)
+    }
+
+    @Test
+    fun `a hoglite backend refuses a retirement ceiling or batch that would stop its hand-off`() {
+        // No interval turns Hoglite retirement off, so a ceiling of 0 is "never run" and a batch
+        // below 1 fails the expiry that builds it; both are refused at boot, not at the first expiry.
+        val hoglite = config("none")
+        for (ceiling in listOf(0L, -1L)) {
+            assertThatThrownBy { hoglite.copy(retirementQueueCeiling = ceiling) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_RETIREMENT_QUEUE_CEILING=$ceiling")
+                .hasMessageContaining("HOGLAKE_BACKENDS_FILE")
+        }
+        for (batch in listOf(0, -1)) {
+            assertThatThrownBy { hoglite.copy(retirementBatch = batch) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_RETIREMENT_BATCH=$batch")
+        }
+        hoglite.copy(retirementQueueCeiling = 1, retirementBatch = 1)
+        // Without a Hoglite backend the PostgreSQL loop's own pairing still decides.
+        Config(retirementIntervalMs = 0, retirementQueueCeiling = 0, retirementBatch = 0)
     }
 
     @Test

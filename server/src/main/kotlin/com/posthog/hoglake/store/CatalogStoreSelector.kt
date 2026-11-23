@@ -30,6 +30,7 @@ import com.posthog.hoglake.hoglite.HogliteCompaction
 import com.posthog.hoglake.hoglite.HogliteCompactionCursors
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
+import com.posthog.hoglake.hoglite.HogliteRetirement
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
 import com.posthog.hoglake.hoglite.ScopedReadOutcome
 import com.posthog.hoglake.hydrator.ObjectStore
@@ -862,6 +863,9 @@ class CatalogStoreSelector(
             operatorAuthority = operatorAuthority,
             expiryPurgePage = cfg.expiryPurgePage,
             expiryPurgeBudgetMs = cfg.expiryPurgeBudgetMs,
+            // HOGLAKE_RETIREMENT_BATCH sizes PostgreSQL batches (8,000); a Hoglite batch is one transaction.
+            retirementBatch = minOf(cfg.retirementBatch, HogliteRetirement.DEFAULT_BATCH),
+            retirementQueueCeiling = cfg.retirementQueueCeiling,
         )
 
     private fun hogliteCompactionConfig(): CompactionConfig {

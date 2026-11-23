@@ -1815,6 +1815,24 @@ data class Config(
                 "is $DEFAULT_RETIREMENT_QUEUE_CEILING) or set HOGLAKE_RETIREMENT_INTERVAL_MS=0 " +
                 "to turn the loop off on purpose."
         }
+        // Hoglite retirement runs after every successful manual expiry
+        // (#674), with no interval to turn it off, so the pair above is
+        // not a pair there: a ceiling of 0 is "never run" on any pod that
+        // serves a Hoglite backend. A batch below 1 is worse: the store
+        // builds retirement with expiry, so it would fail the expiry too.
+        if (hogliteBackends.isNotEmpty()) {
+            require(retirementQueueCeiling > 0) {
+                "HOGLAKE_RETIREMENT_QUEUE_CEILING=$retirementQueueCeiling with HOGLAKE_BACKENDS_FILE " +
+                    "naming a hoglite backend would disable Hoglite retirement silently: it runs after " +
+                    "every manual expiry and would skip on the cleanup-queue check every time. Set a " +
+                    "positive ceiling (the default is $DEFAULT_RETIREMENT_QUEUE_CEILING)."
+            }
+            require(retirementBatch >= 1) {
+                "HOGLAKE_RETIREMENT_BATCH=$retirementBatch with HOGLAKE_BACKENDS_FILE naming a hoglite " +
+                    "backend would fail every Hoglite manual expiry, which builds retirement. Set a " +
+                    "positive batch."
+            }
+        }
         // A dispatcher of zero threads is a server that accepts every
         // request and serves none of them, forever: the Netty call
         // thread hands the call to a pool with nobody in it and the

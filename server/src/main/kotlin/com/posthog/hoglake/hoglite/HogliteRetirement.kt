@@ -11,9 +11,9 @@ import com.posthog.hoglake.service.RetirementBackend
 /** Retire live file rows after their table's drop reaches the retention floor. */
 internal class HogliteRetirement(
     private val store: HogliteCatalogStore,
-    private val batchSize: Int = DEFAULT_BATCH,
-    private val queueCeiling: Long = DEFAULT_QUEUE_CEILING,
-    private val runBudgetMs: Long = DEFAULT_RUN_BUDGET_MS,
+    internal val batchSize: Int = DEFAULT_BATCH,
+    internal val queueCeiling: Long = DEFAULT_QUEUE_CEILING,
+    internal val runBudgetMs: Long = DEFAULT_RUN_BUDGET_MS,
 ) : RetirementBackend {
     init {
         require(batchSize in 1..DEFAULT_BATCH) { "retirement batch must be between 1 and $DEFAULT_BATCH" }
