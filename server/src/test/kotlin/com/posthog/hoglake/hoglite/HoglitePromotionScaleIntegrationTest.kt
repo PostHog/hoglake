@@ -37,9 +37,9 @@ class HoglitePromotionScaleIntegrationTest {
             val ended = 50_000
             val bound = IcebergSingleValue.encode(ColType.INT, 7)
 
-            fun stats(nulls: Long) =
+            fun stats(lower: ByteArray) =
                 store.json.writeValueAsString(
-                    listOf(ColumnStats(1, 1, nulls, null, null, bound, bound)),
+                    listOf(ColumnStats(1, 1, 0, null, null, lower, bound)),
                 )
             store.catalogOperation(cat) {
                 for (first in 1..count step 5000) {
@@ -57,7 +57,7 @@ class HoglitePromotionScaleIntegrationTest {
                                 first,
                                 minOf(first + 4999, count),
                                 table.tableId,
-                                stats(0),
+                                stats(bound),
                                 table.readSnapshotId,
                                 ended,
                                 before,
@@ -85,6 +85,7 @@ class HoglitePromotionScaleIntegrationTest {
             val pages = CopyOnWriteArrayList<String>()
             val limits = CopyOnWriteArrayList<Int>()
             val publish = AtomicInteger()
+            val publishBytes = CopyOnWriteArrayList<Int>()
             val inject = AtomicBoolean(true)
             val http = HttpClient.newHttpClient()
             val proxy = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -100,6 +101,7 @@ class HoglitePromotionScaleIntegrationTest {
                         }
                     } else if (ex.requestURI.path.endsWith("/tx") && "table_altered" in body.decodeToString()) {
                         publish.incrementAndGet()
+                        publishBytes += body.size
                         if (inject.compareAndSet(true, false)) {
                             store.catalogOperation(cat) {
                                 store.runTx(
@@ -107,7 +109,12 @@ class HoglitePromotionScaleIntegrationTest {
                                     HogliteCatalogStore.freshTxid("late-stats-change"),
                                     null,
                                     HogliteTx().apply {
-                                        add("UPDATE files SET stats_json = ? WHERE id = ?", stats(1), count)
+                                        // A changed bound: the patch's guard on the old one must fail.
+                                        add(
+                                            "UPDATE files SET stats_json = ? WHERE id = ?",
+                                            stats(IcebergSingleValue.encode(ColType.INT, 6)),
+                                            count,
+                                        )
                                     },
                                 )
                             }
@@ -155,6 +162,8 @@ class HoglitePromotionScaleIntegrationTest {
                     assertThat(result.readSnapshotId).isEqualTo(before + 1)
                     assertBounds(store, cat, count.toLong(), 12)
                     assertThat(publish.get()).isEqualTo(2)
+                    // Bound patches, not whole stats twice per file (#684).
+                    assertThat(publishBytes).allMatch { it < 16 shl 20 }
                     assertThat(pages.size).isGreaterThan(780)
                     assertThat(pages).allMatch { "LIMIT ?" in it && "id < ?" in it }
                     assertThat(limits).allMatch { it in 1..256 }
