@@ -234,6 +234,28 @@ class HogliteBackendIntegrationTest {
     }
 
     @Test
+    fun `a read-alone payload past Jackson's default 20M-char string cap is served`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        // Each fits the requested-metadata and engine caps, and arrives as one JSON string.
+        val padding = " ".repeat(21 * 1024 * 1024)
+        scaleWrite(cat, "UPDATE files SET stats_json = ?, split_offsets_json = ?", "$padding[]", "$padding[1]")
+        assertThat(
+            store.planScan(
+                cat,
+                "ns",
+                "t",
+                null,
+                null,
+                com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                true,
+            ).single().dataFile.splitOffsets,
+        ).containsExactly(1L)
+    }
+
+    @Test
     fun `oversized scan payloads share read-alone queries up to the batch bound`() {
         val cat = freshCatalog()
         store.createNamespace(cat, "ns")

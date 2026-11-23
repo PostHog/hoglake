@@ -2119,21 +2119,32 @@ class HogliteCatalogStore(
                 val fieldIds = columnStats?.fieldIds
                 val wantedCte = if (fieldIds != null) "WITH wanted(id) AS (SELECT value FROM json_each(?)) " else ""
                 val wantedArgs: Array<Any?> = fieldIds?.let { arrayOf(json.writeValueAsString(it)) } ?: emptyArray()
-                val narrowed =
-                    if (fieldIds == null) {
-                        "f.stats_json"
-                    } else {
-                        "(SELECT json_group_array(json(s.value)) FROM json_each(f.stats_json) s " +
-                            "WHERE json_extract(s.value, '\$.fieldId') IN (SELECT id FROM wanted))"
-                    }
+                val narrowFrom =
+                    "FROM json_each(f.stats_json) s " +
+                        "WHERE json_extract(s.value, '\$.fieldId') IN (SELECT id FROM wanted)"
+                val narrowedAgg = "json_group_array(json(s.value))"
+                val narrowed = if (fieldIds == null) "f.stats_json" else "(SELECT $narrowedAgg $narrowFrom)"
                 // Narrowing walks the file's whole stats_json, so it runs ONCE
                 // per row: the MATERIALIZED page keeps SQLite from copying it
                 // into the length check, the CASE and the length column, and
                 // its LIMITed keyset subquery from running it on rows past the
                 // page. A page of 256 files of a 1,000-column table still costs
                 // about 0.1 s of hoglited time, 10,000 columns about 1 s.
+                // The page holds a narrowed payload only up to the per-row
+                // share, and the length of a larger one in its place: never
+                // 256 full payloads the CASE below then drops (128 of 2 MiB
+                // took ~380 MiB of SQLite heap or temp files). SQLite computes
+                // the three identical aggregate calls once.
+                val pageNarrowed =
+                    "(SELECT CASE WHEN length(CAST($narrowedAgg AS BLOB)) <= $SCAN_MAX_ROW_JSON_BYTES " +
+                        "THEN $narrowedAgg ELSE length(CAST($narrowedAgg AS BLOB)) END $narrowFrom)"
                 val statsColumn = if (fieldIds == null) "f.stats_json" else "p.ns"
-                val statsBytes = if (columnStats != null) "length(CAST($statsColumn AS BLOB))" else "0"
+                val statsBytes =
+                    when {
+                        columnStats == null -> "0"
+                        fieldIds == null -> "length(CAST(f.stats_json AS BLOB))"
+                        else -> "CASE WHEN typeof(p.ns) = 'integer' THEN p.ns ELSE length(CAST(p.ns AS BLOB)) END"
+                    }
                 val offsetBytes = if (splitOffsets) "length(CAST(f.split_offsets_json AS BLOB))" else "0"
 
                 fun boundedJson(
@@ -2201,7 +2212,7 @@ class HogliteCatalogStore(
                         queryCatalog(
                             catalog,
                             """${if (fieldIds != null) "$wantedCte," else "WITH"} page AS MATERIALIZED (
-                               SELECT f.id AS id, ${if (fieldIds != null) narrowed else "NULL"} AS ns
+                               SELECT f.id AS id, ${if (fieldIds != null) pageNarrowed else "NULL"} AS ns
                                  FROM (SELECT f.id FROM files f
                                         WHERE f.table_id = ? AND f.begin_snapshot <= ?
                                           AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)
