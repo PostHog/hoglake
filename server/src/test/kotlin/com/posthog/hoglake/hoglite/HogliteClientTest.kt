@@ -339,18 +339,18 @@ class HogliteClientTest {
             .hasMessageContaining("1000ms retry budget")
             .hasMessageContaining("capped")
         assertThat(elapsedMs).isLessThan(2_500)
-        // The scoped namespace read is capped the same way: 1 s of its
-        // 5 s, so it gives up before the engine's 3 s answer.
+        // The typed scoped reads are capped the same way: 1 s of their
+        // 5 s, so each gives up before the engine's 3 s answer.
         //
         // MUTATION: pass `readTimeoutMs` instead of the capped budget to
-        // `HogliteScopedNamespaceRead.read` and this reds at ~3 s.
-        val scopedStarted = System.nanoTime()
-        val scoped =
-            underRequest(budgetMs = 5_000, queuedMs = 4_000) {
-                catchThrowable { c.forRequest("a.b.c").readScopedNamespace("t", "lake", "reports") }
-            }
-        assertThat(scoped).isInstanceOf(HoglakeException.BackendUnavailable::class.java)
-        assertThat((System.nanoTime() - scopedStarted) / 1_000_000).isLessThan(2_500)
+        // `HogliteScopedNamespaceRead.read`, `readTable` or `readScan`
+        // (or bypass `scopedRead`) and that read reds at ~3 s.
+        for ((name, read) in scopedReads(c.forRequest("a.b.c"))) {
+            val scopedStarted = System.nanoTime()
+            val scoped = underRequest(budgetMs = 5_000, queuedMs = 4_000) { catchThrowable { read() } }
+            assertThat(scoped).describedAs(name).isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            assertThat((System.nanoTime() - scopedStarted) / 1_000_000).describedAs(name).isLessThan(2_500)
+        }
         // Outside a request the configured budget is the budget, so the
         // same slow engine is waited for and answers.
         assertThat(c.query("t", "SELECT 1").rows.single().single()).isEqualTo(1)
@@ -372,6 +372,14 @@ class HogliteClientTest {
         val c = client(url(server), budgetMs = 10_000)
         assertThat(underRequest(budgetMs = 5_000, queuedMs = 4_000) { txOne(c) }.single().affected).isEqualTo(1)
     }
+
+    /** Each typed scoped read on [c], by the name its bulkhead refusal gives it. */
+    private fun scopedReads(c: HogliteClient): List<Pair<String, () -> Any?>> =
+        listOf(
+            "namespace" to { c.readScopedNamespace("t", "lake", "reports") },
+            "table" to { c.readScopedTable("t", "lake", "reports", "metrics") },
+            "scan" to { c.readScopedScan("t", "lake", "reports", "metrics", 5L, UUID.randomUUID()) },
+        )
 
     /** An engine that answers every call 200 after [delayMs]: a query's answer on `/query`, a write's on `/tx`. */
     private fun slowServer(delayMs: Long): HttpServer {
@@ -470,14 +478,19 @@ class HogliteClientTest {
             .hasMessageContaining("max_concurrent_calls")
         assertThat(waitedMs).isBetween(HogliteClient.BULKHEAD_WAIT_MS - 50, 2_000L)
         assertThat(arrived.get()).describedAs("a refused call sends nothing").isEqualTo(1)
-        // The scoped namespace read holds the request thread too, so it
+        // The typed scoped reads hold the request thread too, so each
         // takes the same permit and is refused the same way.
-        assertThat(
-            underRequest(budgetMs = 30_000, queuedMs = 0) {
-                catchThrowable { root.forRequest("a.b.c").readScopedNamespace("t", "lake", "reports") }
-            },
-        ).isInstanceOf(HoglakeException.BackendUnavailable::class.java).hasMessageContaining("max_concurrent_calls")
-        assertThat(arrived.get()).isEqualTo(1)
+        //
+        // MUTATION: bypass `scopedRead` in `readScopedTable` or
+        // `readScopedScan` and that read reaches the parked engine.
+        for ((name, read) in scopedReads(root.forRequest("a.b.c"))) {
+            assertThat(underRequest(budgetMs = 30_000, queuedMs = 0) { catchThrowable { read() } })
+                .describedAs(name)
+                .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessageContaining("max_concurrent_calls")
+                .hasMessageContaining("GET scoped $name read")
+            assertThat(arrived.get()).describedAs(name).isEqualTo(1)
+        }
 
         val background = Thread { txOne(root) }
         background.start()

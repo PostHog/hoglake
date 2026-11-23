@@ -1477,8 +1477,15 @@ under a released one. A manual maintenance sweep (`POST
 its first call to its ledger write, rewrites and object-store work
 included (its parallel group workers carry the request's admission),
 so N concurrent sweeps hold N request threads inside the
-bulkhead, not beside it. The scoped namespace read of the namespace
-gate takes the same permit. A request that finds the backend full waits at most
+bulkhead, not beside it. The typed scoped reads of a scoped read
+session take the same permit and the same cap (on `read_timeout_ms`):
+the namespace gate's namespace read, and the table and pinned-scan
+reads (`GET .../namespaces/{namespace}/tables/{table}` and `.../scan`), which
+run on the dispatcher with no gate lookup before them. Every path to
+the engine on a request's behalf is gated: every catalog operation,
+list and maintenance sweep, every bare call outside one, and those
+three reads; only the readiness probe, which bypasses the dispatcher,
+is not. A request that finds the backend full waits at most
 200 ms (a burst one over the cap is served; a stall is not waited on)
 and is then refused with the typed 503 `backend_unavailable` +
 Retry-After, having sent nothing — so a refused commit is never

@@ -223,8 +223,9 @@ class HogliteRejected(
  *
  * Every path to the engine on a request's behalf goes through the gate:
  * [call] (and so `tx`, `query`, `queryBatch` and the tenant lifecycle)
- * and [readScopedNamespace]. [reachable] does not; it is the readiness
- * probe's, which bypasses the dispatcher.
+ * and the typed scoped reads ([readScopedNamespace], [readScopedTable],
+ * [readScopedScan], through [scopedRead]). [reachable] does not; it is
+ * the readiness probe's, which bypasses the dispatcher.
  *
  * The budget a request's call runs under is also capped at what the
  * request has left of its admission bound
@@ -349,9 +350,7 @@ class HogliteClient(
      * Read one namespace through the typed metadata protocol.
      * The caller supplies verified request authority and a trusted local placement.
      * This operation does not use SQL, routing pins, retries, or circuit breakers.
-     * It does hold the request thread, so under a dispatched request it
-     * takes a bulkhead permit and runs under the request's budget cap like
-     * every [call] (class KDoc, "Bulkhead"); the refusal names no target.
+     * It does hold the request thread, so it runs under [scopedRead].
      */
     internal fun readScopedNamespace(
         tenant: String,
@@ -360,11 +359,29 @@ class HogliteClient(
     ): NamespaceDto? {
         val token = bearerToken
         if (shared == null || token == null) throw HogliteScopedNamespaceRead.unavailable()
+        return scopedRead("GET scoped namespace read") { budgetMs ->
+            HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, budgetMs)
+        }
+    }
+
+    /**
+     * Run one typed scoped read, [read] given its timeout: under a
+     * dispatched request it takes a bulkhead permit and its timeout is
+     * [readTimeoutMs] capped at the request's remaining budget, like
+     * every [call] (class KDoc, "Bulkhead"). The scoped table and scan
+     * handlers call these on the request dispatcher with no
+     * `NamespaceGate` lookup before them, so this is the only bound on
+     * the threads they hold. The refusal names [what], never the target.
+     */
+    private inline fun <T> scopedRead(
+        what: String,
+        read: (Long) -> T,
+    ): T {
         val admission = RequestAdmission.current()
         val budgetMs = admission?.remainingBudgetMs()?.let { minOf(readTimeoutMs, it) } ?: readTimeoutMs
-        val held = takeRequestPermit(admission, System.nanoTime() + budgetMs * 1_000_000, "GET scoped namespace read")
+        val held = takeRequestPermit(admission, System.nanoTime() + budgetMs * 1_000_000, what)
         try {
-            return HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, budgetMs)
+            return read(budgetMs)
         } finally {
             if (held) releaseRequestPermit(admission)
         }
@@ -402,6 +419,7 @@ class HogliteClient(
     /**
      * Read one table through the typed metadata protocol.
      * This operation does not use SQL, routing pins, retries, or circuit breakers.
+     * It does hold the request thread, so it runs under [scopedRead].
      */
     internal fun readScopedTable(
         tenant: String,
@@ -411,21 +429,24 @@ class HogliteClient(
     ): ScopedReadOutcome<ScopedTableResult> {
         val token = bearerToken
         if (shared == null || token == null) throw HogliteScopedNamespaceRead.tableUnavailable()
-        return HogliteScopedNamespaceRead.readTable(
-            http,
-            standardUrl,
-            token,
-            tenant,
-            catalog,
-            namespace,
-            table,
-            readTimeoutMs,
-        )
+        return scopedRead("GET scoped table read") { budgetMs ->
+            HogliteScopedNamespaceRead.readTable(
+                http,
+                standardUrl,
+                token,
+                tenant,
+                catalog,
+                namespace,
+                table,
+                budgetMs,
+            )
+        }
     }
 
     /**
      * Read one pinned scan through the typed metadata protocol.
      * This operation does not use SQL, routing pins, retries, or circuit breakers.
+     * It does hold the request thread, so it runs under [scopedRead].
      */
     internal fun readScopedScan(
         tenant: String,
@@ -437,18 +458,20 @@ class HogliteClient(
     ): ScopedReadOutcome<List<ScanFileDto>> {
         val token = bearerToken
         if (shared == null || token == null) throw HogliteScopedNamespaceRead.scanUnavailable()
-        return HogliteScopedNamespaceRead.readScan(
-            http,
-            standardUrl,
-            token,
-            tenant,
-            catalog,
-            namespace,
-            table,
-            snapshot,
-            tableUuid,
-            readTimeoutMs,
-        )
+        return scopedRead("GET scoped scan read") { budgetMs ->
+            HogliteScopedNamespaceRead.readScan(
+                http,
+                standardUrl,
+                token,
+                tenant,
+                catalog,
+                namespace,
+                table,
+                snapshot,
+                tableUuid,
+                budgetMs,
+            )
+        }
     }
 
     /**
