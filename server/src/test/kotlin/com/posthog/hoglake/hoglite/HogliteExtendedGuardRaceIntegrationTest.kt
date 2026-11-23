@@ -596,7 +596,7 @@ class HogliteExtendedGuardRaceIntegrationTest {
     }
 
     @Test
-    fun `an ALTER between plan and tx replans once, twice is a typed 409`() {
+    fun `ALTERs between plan and tx replan up to the schema budget, then a typed 409`() {
         val (c, _) = setup()
         var k = 0
 
@@ -619,13 +619,25 @@ class HogliteExtendedGuardRaceIntegrationTest {
         assertThat(once.isSuccess).isTrue()
         assertThat(onceAttempts).isEqualTo(2) // fence tripped, replanned, applied
 
+        // #687: PostgreSQL never refuses here, so a fence that moves again
+        // during the replan replans again rather than spending a shared slot.
+        val budget = HogliteCommit.MAX_SCHEMA_REPLANS
         seen.clear()
-        hooks += Hook({ m, p, b -> isTx(m, p, b) && "twice.parquet" in b }, remaining = 2, before = { alter() })
-        val twice = runCatching { pstore.commit(c, appendReq(c, "twice.parquet", key = UUID.randomUUID())) }
-        assertThat(twice.exceptionOrNull()).isInstanceOf(HoglakeException.CommitConflict::class.java)
+        hooks += Hook({ m, p, b -> isTx(m, p, b) && "busy.parquet" in b }, remaining = budget, before = { alter() })
+        val busy = runCatching { pstore.commit(c, appendReq(c, "busy.parquet", key = UUID.randomUUID())) }
+        assertThat(busy.exceptionOrNull()).isNull()
+        assertThat(seen.count { isWriteTxLine(it, "busy.parquet") }).isEqualTo(budget + 1)
+
+        seen.clear()
+        hooks +=
+            Hook({ m, p, b -> isTx(m, p, b) && "exhausted.parquet" in b }, remaining = budget + 1, before = { alter() })
+        val exhausted = runCatching { pstore.commit(c, appendReq(c, "exhausted.parquet", key = UUID.randomUUID())) }
+        assertThat(exhausted.exceptionOrNull()).isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(exhausted.exceptionOrNull()!!.message).contains("changed the schema ${budget + 1} times")
+        assertThat(seen.count { isWriteTxLine(it, "exhausted.parquet") }).isEqualTo(budget + 1)
         assertThat(
             store.listFiles(c, "ns", "t").map { it.path.substringAfterLast('/') },
-        ).containsExactly("once.parquet")
+        ).containsExactlyInAnyOrder("once.parquet", "busy.parquet")
     }
 
     @Test
@@ -844,7 +856,7 @@ class HogliteExtendedGuardRaceIntegrationTest {
     }
 
     @Test
-    fun `replay repair shares the single replan budget with schema changes and receipt cleanup`() {
+    fun `replay repair and schema changes replan on separate budgets`() {
         for (schedule in listOf("purge", "purge-purge", "schema-purge", "purge-schema", "purge-retained")) {
             val (c, _) = setup()
             val key = UUID.randomUUID()
@@ -861,6 +873,8 @@ class HogliteExtendedGuardRaceIntegrationTest {
                             schedule == "schema-purge" && attempts == 1 -> "schema"
                             schedule == "purge-schema" && attempts == 2 -> "schema"
                             schedule == "purge" && attempts == 2 -> "none"
+                            // #687: one budget no longer spends the other's.
+                            schedule in listOf("schema-purge", "purge-schema") && attempts == 3 -> "none"
                             else -> "receipt"
                         }
                     if (cause == "schema") {
@@ -879,8 +893,9 @@ class HogliteExtendedGuardRaceIntegrationTest {
                     }
                 })
             val result = runCatching { pstore.commit(c, req) }
-            assertThat(attempts).isEqualTo(2)
-            if (schedule in listOf("purge", "purge-retained")) {
+            val separate = schedule in listOf("schema-purge", "purge-schema")
+            assertThat(attempts).isEqualTo(if (separate) 3 else 2)
+            if (separate || schedule in listOf("purge", "purge-retained")) {
                 assertThat(result.exceptionOrNull()).isNull()
                 if (schedule == "purge-retained") assertThat(result.getOrThrow()).isEqualTo(winner)
                 assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(2)
