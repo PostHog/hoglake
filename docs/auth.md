@@ -228,14 +228,21 @@ Only an isolated Hoglite fixture can opt in to this verifier.
 Add `read_session` to the binding in `HOGLAKE_SCOPED_NAMESPACE_FILE`.
 The object contains `profile` and a `remote_targets` array of two distinct target IDs.
 Configure `team_id` as the only predicate field.
+
 The API listener then requires a dedicated read token for the exact bound namespace GET.
+Add an optional canonical `table` name with `read_session` to opt in that table GET and pinned scan GET.
 All other requests keep the ordinary verifier.
 
 Hoglake sends the original token to the configured Hoglite owner.
 It does not retry with another token or use legacy SQL after a refusal.
 The public listener never selects the dedicated verifier.
 PostgreSQL catalogs do not support this fixture.
-The fixture requires a Hoglite owner that independently accepts the dedicated profile on its typed read.
+The fixture requires a Hoglite owner that accepts the dedicated profile on its typed reads.
+
+Table GET allows omitted `totals` or `totals=false`, sets `Cache-Control: no-store`, and omits totals.
+Scan GET requires canonical `snapshot` and `table_uuid` query parameters.
+Hoglake checks every returned data file and deletion vector path against verified primary-catalog storage grants.
+It refuses any out-of-grant or malformed path with a redacted `403`.
 
 The initial read scope covers one primary catalog with a Hoglite placement.
 It requires one explicit team with read permission.

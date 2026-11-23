@@ -23,7 +23,7 @@ internal class ReadSessionProfile(
         claims: JsonNode,
         now: Long,
         skew: Long,
-    ) {
+    ): ReadSessionStorageGrants {
         val audiences = claims.get("aud")
         if (audiences?.isArray != true || audiences.size() != AUDIENCES.size ||
             audiences.any { !it.isTextual } || audiences.map { it.asText() }.toSet() != AUDIENCES
@@ -88,7 +88,7 @@ internal class ReadSessionProfile(
         ) {
             invalid()
         }
-        validateGrants(claims.get("grants"), primary, backend, tenant, region)
+        return validateGrants(claims.get("grants"), primary, backend, tenant, region)
     }
 
     private fun validateGrants(
@@ -97,7 +97,7 @@ internal class ReadSessionProfile(
         backend: String,
         tenant: String,
         region: String,
-    ) {
+    ): ReadSessionStorageGrants {
         val targets = remoteTargets + catalog + backend
         if (targets.size != 4 || grants?.isArray != true || grants.size() < targets.size) invalid()
         var hash = 0x811c9dc5u
@@ -105,6 +105,7 @@ internal class ReadSessionProfile(
         val shard = (hash and 255u).toString(16).padStart(2, '0')
         val manifestSuffix = "/$shard/t/$tenant/manifest"
         val seen = HashSet<String>()
+        val parsed = ArrayList<ReadSessionStorageGrant>(grants.size())
         var previousBucket = ""
         var previousKey = ""
         for (grant in grants) {
@@ -130,8 +131,10 @@ internal class ReadSessionProfile(
             previousBucket = bucket
             previousKey = key
             seen.add(target)
+            parsed.add(ReadSessionStorageGrant(catalog, target, bucket, region, key, prefix))
         }
         if (seen != targets) invalid()
+        return ReadSessionStorageGrants(region, parsed)
     }
 
     private fun requireSingleRead(
@@ -162,9 +165,60 @@ internal class ReadSessionProfile(
 
     companion object {
         val AUDIENCES = setOf("trino-session", "hoglake-session", "hoglite-session")
+        private const val S3_PREFIX = "s3://"
+        private const val MAX_KEY_LENGTH = 1024
         private val POSITIVE_INTEGER = Regex("[1-9][0-9]*")
         private val ROUTED_TENANT = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,125}_[1-9][0-9]*")
-        private val BUCKET = Regex("[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
-        private val SEGMENT = Regex("[A-Za-z0-9_.=-]+")
+        internal val BUCKET = Regex("[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+        internal val SEGMENT = Regex("[A-Za-z0-9_.=-]+")
+
+        internal fun parseS3ObjectUri(path: String): Pair<String, String>? {
+            if (!path.startsWith(S3_PREFIX)) return null
+            val remainder = path.substring(S3_PREFIX.length)
+            val slash = remainder.indexOf('/')
+            if (slash <= 0 || slash >= remainder.length - 1) return null
+            val bucket = remainder.substring(0, slash)
+            val key = remainder.substring(slash + 1)
+            if (!BUCKET.matches(bucket) || ".." in bucket) return null
+            if (key.isEmpty() || key.length > MAX_KEY_LENGTH || key.endsWith('/')) return null
+            if (key.split('/').any { it == "." || it == ".." || !SEGMENT.matches(it) }) return null
+            return bucket to key
+        }
     }
+}
+
+/** One verified read-only S3 grant from a dedicated read session. */
+internal data class ReadSessionStorageGrant(
+    val catalog: String,
+    val target: String,
+    val bucket: String,
+    val region: String,
+    val path: String,
+    val prefix: Boolean,
+) {
+    fun covers(
+        bucket: String,
+        objectKey: String,
+    ): Boolean = this.bucket == bucket && if (prefix) objectKey.startsWith(path) else objectKey == path
+
+    override fun toString(): String = "ReadSessionStorageGrant(redacted)"
+}
+
+/** Verified storage grants from a dedicated read session without AWS credentials. */
+internal class ReadSessionStorageGrants(
+    val region: String,
+    private val grants: List<ReadSessionStorageGrant>,
+) {
+    /** Return true when a signed primary-catalog grant allows the S3 object URI. */
+    fun allowsPrimaryCatalogObject(
+        catalog: String,
+        path: String,
+    ): Boolean {
+        val (bucket, key) = ReadSessionProfile.parseS3ObjectUri(path) ?: return false
+        return grants.any {
+            it.catalog == catalog && it.target == catalog && it.region == region && it.covers(bucket, key)
+        }
+    }
+
+    override fun toString(): String = "ReadSessionStorageGrants(redacted)"
 }

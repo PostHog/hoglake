@@ -242,6 +242,7 @@ val ApplicationCall.hoglakeAuth: AuthState
 class VerifiedBackendAuthority internal constructor(
     internal val token: String,
     internal val readSessionBinding: ScopedNamespaceBinding? = null,
+    internal val storageGrants: ReadSessionStorageGrants? = null,
 ) {
     override fun toString(): String = "VerifiedBackendAuthority(redacted)"
 }
@@ -354,16 +355,19 @@ val HoglakeAuth =
                 }
 
             var caller: Caller? = null
+            var storageGrants: ReadSessionStorageGrants? = null
             var failure: HoglakeException? = null
 
             if (token != null) {
                 try {
-                    caller =
-                        if (readProfile == null) {
-                            service.verifier!!.verify(token)
-                        } else {
-                            service.verifier!!.verifyReadSession(token, readProfile)
-                        }
+                    if (readProfile == null) {
+                        caller = service.verifier!!.verify(token)
+                    } else {
+                        val (verifiedCaller, grants) =
+                            service.verifier!!.verifyReadSessionWithGrants(token, readProfile)
+                        caller = verifiedCaller
+                        storageGrants = grants
+                    }
                 } catch (v: JwtViolation) {
                     // Detail to the log, reason to the client; see JwtViolation.
                     AuthLog.debug(v) { "token refused for ${call.request.path()}" }
@@ -384,7 +388,10 @@ val HoglakeAuth =
             call.attributes.put(
                 AuthStateKey,
                 caller?.let {
-                    AuthState.Authenticated(it, token?.let { jwt -> VerifiedBackendAuthority(jwt, readBinding) })
+                    AuthState.Authenticated(
+                        it,
+                        token?.let { jwt -> VerifiedBackendAuthority(jwt, readBinding, storageGrants) },
+                    )
                 } ?: AuthState.Anonymous,
             )
 

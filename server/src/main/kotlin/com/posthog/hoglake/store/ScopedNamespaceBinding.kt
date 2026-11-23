@@ -19,15 +19,57 @@ internal data class ScopedNamespaceBinding(
     val tenant: String,
     val namespace: String,
     val readSession: ReadSessionProfile? = null,
+    val table: String? = null,
 ) {
-    fun matches(
+    init {
+        require(table == null || readSession != null) {
+            "scoped table binding requires read_session"
+        }
+    }
+
+    fun matchesNamespace(
         method: HttpMethod,
         route: RouteMatch?,
     ): Boolean =
-        method == HttpMethod.Get && route?.pattern == "/v1/catalogs/{catalog}/namespaces/{namespace}" &&
-            route.catalog == catalog && route.namespace == namespace
+        method == HttpMethod.Get &&
+            route?.pattern == NAMESPACE_PATTERN &&
+            route.catalog == catalog &&
+            route.namespace == namespace
+
+    fun matchesTable(
+        method: HttpMethod,
+        route: RouteMatch?,
+    ): Boolean =
+        table != null &&
+            readSession != null &&
+            method == HttpMethod.Get &&
+            route?.pattern == TABLE_PATTERN &&
+            route.catalog == catalog &&
+            route.namespace == namespace &&
+            route.table == table
+
+    fun matchesScan(
+        method: HttpMethod,
+        route: RouteMatch?,
+    ): Boolean =
+        table != null &&
+            readSession != null &&
+            method == HttpMethod.Get &&
+            route?.pattern == SCAN_PATTERN &&
+            route.catalog == catalog &&
+            route.namespace == namespace &&
+            route.table == table
+
+    fun matches(
+        method: HttpMethod,
+        route: RouteMatch?,
+    ): Boolean = matchesNamespace(method, route) || matchesTable(method, route) || matchesScan(method, route)
 
     companion object {
+        private const val NAMESPACE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}"
+        private const val TABLE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}"
+        private const val SCAN_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan"
+
         fun read(file: String): ScopedNamespaceBinding? {
             if (file.isBlank()) return null
             val mapper =
@@ -36,8 +78,9 @@ internal data class ScopedNamespaceBinding(
                     .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             val root = Files.newBufferedReader(Path.of(file)).use { mapper.readTree(it) }
             val keys = setOf("catalog", "backend", "backend_id", "tenant", "namespace")
+            val optional = setOf("read_session", "table")
             val actualKeys = root?.takeIf(JsonNode::isObject)?.properties()?.map { it.key }?.toSet()
-            require(root != null && actualKeys?.minus("read_session") == keys) {
+            require(root != null && actualKeys?.minus(optional) == keys) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE requires one complete binding"
             }
 
@@ -69,7 +112,15 @@ internal data class ScopedNamespaceBinding(
                 "scoped namespace tenant must be canonical"
             }
             val readSession = root.get("read_session")?.let(::readSession)
-            return ScopedNamespaceBinding(catalog, id, tenant, namespace, readSession)
+            val table =
+                root.get("table")?.let { node ->
+                    val name = node.textValue()
+                    require(name != null && Regex(Identifiers.PATTERN).matches(name)) {
+                        "scoped namespace table must be canonical"
+                    }
+                    name
+                }
+            return ScopedNamespaceBinding(catalog, id, tenant, namespace, readSession, table)
         }
 
         private fun readSession(node: JsonNode): ReadSessionProfile {
