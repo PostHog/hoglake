@@ -21,6 +21,7 @@ import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.compaction.ParquetRewriter
+import com.posthog.hoglake.hoglite.HogliteBackendHealth
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.observability.AccessLog
@@ -100,6 +101,19 @@ class App private constructor(
      * that file for the mechanism and the rejected alternatives.
      */
     val requestDispatcher = RequestDispatcher(cfg.requestThreads)
+
+    /**
+     * The per-backend hoglite reachability the `hoglite_health` loop
+     * samples and `hoglake_hoglite_backend_reachable` publishes (#678).
+     * Not a readiness condition: see the `/healthz` handler. Cheap to
+     * hold with no backends configured (an empty map and a pool with no
+     * threads), so it is not lazy; the probe reaches [catalogSelector]
+     * only when a tick asks.
+     */
+    val hogliteBackendHealth =
+        HogliteBackendHealth(HogliteBackendHealth.deadlines(cfg.hogliteBackends)) {
+            catalogSelector.hogliteReachable(it)
+        }
 
     /**
      * This instance's auth, built once so the API listener and the public
@@ -465,6 +479,12 @@ class App private constructor(
         Metrics.bind(meterRegistry)
         Metrics.registerRequestPoolGauges(meterRegistry, requestDispatcher)
         Metrics.registerHealthProbeGauge(meterRegistry) { healthProbe.outstandingAttempts }
+        Metrics.registerHogliteBackendHealthGauges(
+            meterRegistry,
+            hogliteBackendHealth.backendIds,
+            reachable = { hogliteBackendHealth.reachable(it) },
+            outstandingAttempts = { hogliteBackendHealth.outstandingAttempts(it) },
+        )
         // Every pod, not only the loop's: a manual run spills too.
         val spillDir = java.nio.file.Path.of(cfg.compactionSpillDir)
         Metrics.registerSpillDirGauge(meterRegistry) {
@@ -569,12 +589,18 @@ class App private constructor(
             // connection and its own thread, bounded four ways by
             // HOGLAKE_HEALTH_PROBE_TIMEOUT_MS, so neither a full Hikari
             // pool nor a full request dispatcher can delay it.
+            //
+            // "The catalog" is this process's PostgreSQL store, once it
+            // has one. The hoglite backends are NOT a readiness
+            // condition (#678): every pod shares them, so one unhealthy
+            // backend would make the whole fleet unready and take the
+            // PostgreSQL catalogs with it, and their calls cannot hang
+            // the way the zombie server's did. The hoglite_health loop
+            // samples them into hoglake_hoglite_backend_reachable
+            // instead (startBackground; hoglite/HogliteBackendHealth.kt);
+            // this handler neither awaits nor starts a hoglite probe.
             get("/healthz") {
-                val ok =
-                    (!postgresReady() || healthProbe.reachable()) &&
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            catalogSelector.reachable()
-                        }
+                val ok = !postgresReady() || healthProbe.reachable()
                 if (ok) {
                     call.respondText("ok")
                 } else {
@@ -640,14 +666,26 @@ class App private constructor(
      * scope ([BackgroundLoops]): structured, bounded cancellation on
      * close, per-loop failure isolation, `intervalMs <= 0` = disabled.
      * The returned handle stops every loop and closes the stores.
+     *
+     * Two groups. The PostgreSQL loops wait for PostgreSQL to initialize
+     * ([startBackgroundIfReady]), and a hoglite-only process never
+     * starts them. The hoglite health sampler starts AT ONCE, on any
+     * process with a hoglite backend configured: it needs no store, and
+     * the series it feeds is the only place a hoglite outage is read
+     * (#678), so it cannot wait on PostgreSQL, nor on a readiness probe
+     * that a Deployment may not configure.
      */
     private val backgroundLock = Any()
     private var backgroundRequested = false
     private var backgroundClosed = false
     private var background: AutoCloseable? = null
+    private var hogliteBackground: AutoCloseable? = null
 
     fun startBackground(): AutoCloseable {
-        synchronized(backgroundLock) { backgroundRequested = true }
+        synchronized(backgroundLock) {
+            backgroundRequested = true
+            if (!backgroundClosed && hogliteBackground == null) hogliteBackground = startHogliteBackground()
+        }
         startBackgroundIfReady()
         return AutoCloseable { closeBackground() }
     }
@@ -664,7 +702,24 @@ class App private constructor(
             backgroundClosed = true
             background?.close()
             background = null
+            hogliteBackground?.close()
+            hogliteBackground = null
         }
+
+    /**
+     * The `hoglite_health` loop: one [HogliteBackendHealth.sample] per
+     * `HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`, which returns at once (the
+     * probes run on the sampler's own threads). Nothing is registered
+     * without a hoglite backend, so a PostgreSQL-only process gets no
+     * loop and no thread.
+     */
+    private fun startHogliteBackground(): AutoCloseable {
+        val loops = BackgroundLoops()
+        if (hogliteBackendHealth.backendIds.isNotEmpty()) {
+            loops.register("hoglite_health", cfg.hogliteHealthIntervalMs) { hogliteBackendHealth.sample() }
+        }
+        return loops
+    }
 
     private fun startPostgresBackground(): AutoCloseable {
         // BEFORE any loop starts, once, and only where the compaction loop
@@ -754,6 +809,7 @@ class App private constructor(
         if (!hadBackground && removalStoreResource.isInitialized()) removalStore.close()
         closeObjectStore()
         healthProbe.close()
+        hogliteBackendHealth.close()
         postgresRuntime?.close()
     }
 }

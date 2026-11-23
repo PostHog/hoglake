@@ -266,6 +266,23 @@ data class Config(
      */
     val healthProbeTimeoutMs: Long = env("HOGLAKE_HEALTH_PROBE_TIMEOUT_MS", "2000").toLong(),
     /**
+     * How often the `hoglite_health` loop probes every configured
+     * hoglite backend's `/v1/healthz` into
+     * `hoglake_hoglite_backend_reachable{backend}`, in milliseconds
+     * (#678). 0 disables the loop, and the series then stays NaN.
+     *
+     * A loop of hoglake's own rather than a `/healthz` side effect, so
+     * the series is live on a process nothing probes and its cadence is
+     * this knob's rather than the kubelet's. Ten seconds is the
+     * kubelet's default readiness period, which is the cadence the
+     * series replaced; each tick is one bounded request per backend on
+     * the sampler's own threads (`HogliteBackendHealth`), with single
+     * flight per backend, so a slow backend costs one attempt per
+     * deadline and not one per tick. Not started without a hoglite
+     * backend.
+     */
+    val hogliteHealthIntervalMs: Long = env("HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS", "10000").toLong(),
+    /**
      * Netty's CALL group: the threads Ktor starts a call on, before
      * `installBlockingDispatch` hands the blocking part off (#218).
      *

@@ -1,0 +1,5 @@
+---
+hoglake: patch (Server)
+---
+
+`/healthz` no longer requires every configured hoglite backend to answer (#678). The backends are shared by every pod, so one unhealthy backend — hoglited answers 503 through an ordinary lease handover — made the whole fleet unready and took the PostgreSQL catalogs with it. Readiness is now this process's PostgreSQL store, once it has one; a hoglite-only process is ready whenever it is up, and `/healthz` neither awaits nor starts a hoglite probe. A new `hoglite_health` background loop (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`, 10 s, 0 disables) samples the hoglite backends on every process that has one (single flight per backend, an age bound past which a hung attempt reads 0, at most two attempts parked) into two new per-backend gauges: `hoglake_hoglite_backend_reachable{backend}` (1, 0, or NaN before the first answer), which is where a hoglite outage is read, and `hoglake_hoglite_health_probe_attempts_hung{backend}` (1 during any in-flight probe; 2 = the cap, held means restart the pod). `/livez` is unchanged.

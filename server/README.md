@@ -2858,6 +2858,17 @@ transaction (`observability/`):
   must be restarted** — both probe threads are parked on connection
   attempts nothing can interrupt, so `/healthz` will report 503 for the
   rest of that pod's life. The refusal is logged at ERROR.
+  `hoglake_hoglite_backend_reachable{backend}` is one series per
+  configured hoglite backend — 1 when its standard pool answered the
+  `hoglite_health` loop's last probe
+  (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`, 10 s), 0 when it did not or
+  the probe hung past its deadline, NaN before the first — and is where
+  a hoglite outage is read, because it is not in `/healthz`'s status
+  (#678; see Health below). Its companion
+  `hoglake_hoglite_health_probe_attempts_hung{backend}` counts
+  attempts started and not finished: 1 during any in-flight probe, 2
+  at the cap, where the backend's series is pinned at 0 until a parked
+  attempt returns. Alert on `== 2` held (restart the pod), not `> 0`.
 - **Audit log**: every consequential action (DDL, commits with
   outcome, options changes, expiry/cleanup runs, offset commits) emits
   one structured JSON line on the `hoglake.audit` logger — actor,
@@ -2902,7 +2913,24 @@ transaction (`observability/`):
   full pool reads 200 and only a database that does not answer reads
   503 (#218). Before that it borrowed a request connection, and a
   commit convoy that filled the pool read as "database dead" and got
-  both API pods liveness-killed.
+  both API pods liveness-killed. "The catalog" is this process's
+  PostgreSQL store, once it has one; the hoglite backends are NOT a
+  readiness condition (#678). Every pod shares them, so one unhealthy
+  backend would make the whole fleet unready at once and take the
+  PostgreSQL catalogs with it — as hoglited's ordinary lease
+  handovers, which answer 503, would — while a hoglite call cannot hang the
+  way the zombie server's did (`HogliteClient` bounds every attempt).
+  The `hoglite_health` background loop samples the backends instead,
+  every `HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS` (10 s; 0 disables) on any
+  process with a hoglite backend, PostgreSQL or not
+  (`hoglite/HogliteBackendHealth.kt`: single flight per backend, an age
+  bound of twice the backend's `connect_timeout_ms` past which the
+  attempt is abandoned and reads 0, a late answer from an abandoned
+  attempt dropped, two attempts parked at most) into
+  `hoglake_hoglite_backend_reachable{backend}`. A loop and not a
+  `/healthz` side effect, so the series is live on a pod with no
+  readiness probe. `/healthz` neither awaits nor starts a hoglite
+  probe; a hoglite-only process is ready whenever it is up.
 
 ### Background assembly
 
@@ -2998,7 +3026,7 @@ Served at the root (not under `/v1`), documented in
 | Endpoint | What | Kubernetes probe |
 |---|---|---|
 | `GET /livez` | Process liveness only — never touches the database | **liveness** (a database outage must not restart pods) |
-| `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` on the probe's own connection, bounded by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS`; the zombie-server incident is why it touches the database at all, #218 is why it no longer touches the request pool) | **readiness** (an unready pod leaves the Service) |
+| `GET /healthz` | Readiness: the PostgreSQL catalog must answer, once this process has one (`SELECT 1` on the probe's own connection, bounded by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS`; the zombie-server incident is why it touches the database at all, #218 is why it no longer touches the request pool). Hoglite backends are neither awaited nor a condition (#678): the `hoglite_health` loop samples them into `hoglake_hoglite_backend_reachable` | **readiness** (an unready pod leaves the Service) |
 | `GET /metrics` | Prometheus text exposition; operator-only on the API port, unauthenticated on the infra listener (`HOGLAKE_METRICS_PORT`, when > 0), which serves only this route | scrape target (via the infra listener), never a probe |
 
 One more read-only operational endpoint is served under `/v1`, not the

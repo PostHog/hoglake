@@ -140,8 +140,10 @@ paths:
         Readiness — the catalog database must answer (SELECT 1 on the
         probe's own dedicated connection, not through the request pool,
         bounded by HOGLAKE_HEALTH_PROBE_TIMEOUT_MS). A busy request
-        pool reads 200. Every configured hoglite backend must also answer.
-        Use as the Kubernetes readiness probe.
+        pool reads 200. Hoglite backends are not a condition and are not
+        probed here: a background loop samples them into the per-backend
+        gauge hoglake_hoglite_backend_reachable (one shared backend must
+        not make every pod unready). Use as the Kubernetes readiness probe.
       responses:
         "200":
           description: The catalog is reachable.

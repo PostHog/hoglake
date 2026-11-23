@@ -568,11 +568,20 @@ A failed open or migration closes the failed pool and returns 503 `backend_unava
 a later request can retry. If no PostgreSQL backend is configured, no PostgreSQL
 connection settings are needed. A PostgreSQL placement then returns 401 `unknown_backend`.
 
-`/livez` never checks a backend. `/healthz` checks all configured hoglite backends,
-but skips PostgreSQL until it has initialized. The probe itself never opens the request
-pool or runs migrations. After initialization, it also checks PostgreSQL through its
-separate bounded probe connection. PostgreSQL background loops and catalog metrics
-samplers start only after PostgreSQL initializes; a hoglite-only process never starts them.
+`/livez` never checks a backend. `/healthz` skips PostgreSQL until it has initialized;
+after initialization it checks PostgreSQL through its separate bounded probe connection.
+The probe itself never opens the request pool or runs migrations. The hoglite backends
+are not a readiness condition (#678): every pod shares them, so one unhealthy backend
+(hoglited answers 503 through a lease handover) would make the whole fleet unready and
+take the PostgreSQL catalogs with it, and a hoglite call cannot hang the way the
+zombie server's did — `HogliteClient` bounds every attempt. The `hoglite_health` background
+loop (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`) instead samples every configured backend's
+`/v1/healthz`, single-flight per backend with an age bound, into
+`hoglake_hoglite_backend_reachable{backend}` (1, 0, or NaN before the first answer);
+`/healthz` neither awaits nor starts those probes, and a hoglite-only process is ready
+whenever it is up. That loop runs on any process with a hoglite backend. PostgreSQL
+background loops and catalog metrics samplers start only after PostgreSQL initializes;
+a hoglite-only process never starts them.
 
 | Request | Store |
 | --- | --- |
