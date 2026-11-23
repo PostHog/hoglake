@@ -2,8 +2,26 @@ package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.compaction.CompactionWork.TableContext
 import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.observability.Metrics
 import java.security.MessageDigest
 import java.util.LinkedHashMap
+import java.util.WeakHashMap
+
+/** Weak keys ensure the process-wide sampler never owns a cache. */
+internal class MemoryRefusalCacheTracker {
+    private val live = WeakHashMap<MemoryRefusalMemory, Unit>()
+
+    @Synchronized
+    fun track(cache: MemoryRefusalMemory) {
+        live[cache] = Unit
+    }
+
+    /** O(live caches) per scrape; snapshot before taking individual cache locks. */
+    fun entryCount(): Long {
+        val caches = synchronized(this) { live.keys.toList() }
+        return caches.sumOf { it.size().toLong() }
+    }
+}
 
 /** Remembers deterministic resource refusals without retaining inputs or schemas. */
 internal class MemoryRefusalMemory(
@@ -18,8 +36,15 @@ internal class MemoryRefusalMemory(
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Identity, Reason>): Boolean = size > capacity
         }
 
-    @Synchronized
-    fun recall(key: Identity): Reason? = entries[key]
+    init {
+        live.track(this)
+    }
+
+    fun recall(key: Identity): Reason? {
+        val reason = synchronized(this) { entries[key] }
+        if (reason != null) Metrics.compactionMemoryRefusalCacheHit()
+        return reason
+    }
 
     @Synchronized
     fun remember(
@@ -33,6 +58,10 @@ internal class MemoryRefusalMemory(
     fun size(): Int = entries.size
 
     companion object {
+        private val live = MemoryRefusalCacheTracker()
+
+        fun liveEntryCount(): Long = live.entryCount()
+
         fun contextKey(ctx: TableContext): Identity =
             Hash().run {
                 feed(ctx.catalogId)

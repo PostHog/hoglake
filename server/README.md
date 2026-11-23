@@ -2411,6 +2411,19 @@ part ran, the probe is charged as one `layout_probe_only` attempt
 check and goes to the rewrite, which refuses it as
 `unconvertible_schema`.
 
+The process-local deterministic memory-refusal caches expose two unlabeled
+metrics. `hoglake_compaction_memory_refusal_cache_hits_total` counts
+successful cache lookups, not new runtime or metadata refusals. It includes
+speculative planning lookups (including loan checks), so it is not a count
+of refused groups or sweeps. `hoglake_compaction_memory_refusal_cache_entries`
+is the sum of entries across live caches in this server process, not a
+per-catalog or fleet-wide count: PostgreSQL executors and Hoglite's shared
+cursor owner both contribute. Caches are bounded individually; their weak
+tracking does not keep an owner alive, and unreachable caches leave the
+gauge after garbage collection. Sampling costs O(live owner caches), not
+O(entries); the default capacity applies per cache, not process-wide. A
+restart loses this best-effort memory.
+
 Each table's candidate list is fixed before rewriting starts, so an
 output cannot feed another group in the **same run**. Input bytes only
 estimate the output size: encoding, schema changes and DV removal all

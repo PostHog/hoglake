@@ -69,7 +69,8 @@ class MetricsFacadeTest {
         Metrics.bind(registry)
         Metrics.snapshotsExpired("lake", 0)
         Metrics.filesRemoved("lake", 0)
-        assertThat(registry.meters).isEmpty()
+        assertThat(registry.find("hoglake_snapshots_expired_total").counter()).isNull()
+        assertThat(registry.find("hoglake_files_removed_total").counter()).isNull()
     }
 
     @Test
