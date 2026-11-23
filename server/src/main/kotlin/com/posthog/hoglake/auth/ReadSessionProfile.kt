@@ -180,8 +180,13 @@ internal class ReadSessionProfile(
             val bucket = remainder.substring(0, slash)
             val key = remainder.substring(slash + 1)
             if (!BUCKET.matches(bucket) || ".." in bucket) return null
-            if (key.isEmpty() || key.length > MAX_KEY_LENGTH || key.endsWith('/')) return null
-            if (key.split('/').any { it == "." || it == ".." || !SEGMENT.matches(it) }) return null
+            if (key.isEmpty() || key.length > MAX_KEY_LENGTH ||
+                key.toByteArray(Charsets.UTF_8).size > MAX_KEY_LENGTH ||
+                key.endsWith('/') || key.any { it == '\u0000' || it.isISOControl() }
+            ) {
+                return null
+            }
+            if (key.split('/').any { it.isEmpty() || it == "." || it == ".." }) return null
             return bucket to key
         }
     }

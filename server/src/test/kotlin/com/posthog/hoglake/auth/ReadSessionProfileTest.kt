@@ -126,6 +126,7 @@ class ReadSessionProfileTest {
                 { (it["grants"][1] as ObjectNode).put("object_key", "root/2c/t/fixture_2/manifest") },
                 { (it["grants"][1] as ObjectNode).put("prefix", "root/2c/t/fixture_3/") },
                 { (it["grants"][2] as ObjectNode).put("prefix", "events/*/") },
+                { (it["grants"][2] as ObjectNode).put("prefix", "events/part(1)/") },
                 { (it["grants"][2] as ObjectNode).putArray("actions").add("s3:PutObject") },
                 { (it["grants"][3] as ObjectNode).put("catalog", "other") },
                 { (it["grants"] as ArrayNode).remove(3) },
@@ -137,6 +138,44 @@ class ReadSessionProfileTest {
                     assertThat(it.reason).isEqualTo(JwtViolation.MALFORMED)
                     assertThat(it.message).isEqualTo("read session refused")
                 }
+        }
+    }
+
+    @Test
+    fun `prefix storage grants accept valid S3 object names and reject traversal or control characters`() {
+        val jwt =
+            token { claims ->
+                val grant = claims["grants"][0] as ObjectNode
+                grant.remove("object_key")
+                grant.put("prefix", "tables/team_id=42/")
+            }
+        val (_, grants) = verifier().verifyReadSessionWithGrants(jwt, profile)
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/part(1).parquet",
+            ),
+        ).isTrue()
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/nested/part(1)+v2.parquet",
+            ),
+        ).isTrue()
+        for (rejected in listOf(
+            "s3://example-customer/tables/team_id=42/../team_id=43/part(1).parquet",
+            "s3://example-customer/tables/team_id=42/./part(1).parquet",
+            "s3://example-customer/tables/team_id=42//part(1).parquet",
+            "s3://example-customer/tables/team_id=42/part\u0000.parquet",
+            "s3://example-customer/tables/team_id=42/part\n.parquet",
+            "s3://example-customer/tables/team_id=42/",
+            "s3://example-customer/tables/team_id=42/" + "a".repeat(1024),
+            "s3://example-customer/tables/team_id=43/part(1).parquet",
+            "s3://other-bucket/tables/team_id=42/part(1).parquet",
+        )) {
+            assertThat(grants.allowsPrimaryCatalogObject("example-catalog", rejected))
+                .describedAs(rejected)
+                .isFalse()
         }
     }
 }

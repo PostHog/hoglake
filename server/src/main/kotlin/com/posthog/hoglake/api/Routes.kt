@@ -384,7 +384,7 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
-                                selector.scopedTableBinding(call.catalog(), call.namespace(), call.table())
+                                selector.scopedTableBinding(call, call.catalog(), call.namespace(), call.table())
                                     ?.takeIf {
                                         it.matchesTable(
                                             call.request.httpMethod,
@@ -851,7 +851,7 @@ private fun ApplicationCall.refuseHiddenTable(
 fun Application.installScanRoutes(selector: CatalogStoreSelector) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
-            selector.scopedTableBinding(call.catalog(), call.namespace(), call.table())
+            selector.scopedTableBinding(call, call.catalog(), call.namespace(), call.table())
                 ?.takeIf {
                     it.matchesScan(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
                 }?.let { scoped ->
@@ -1241,6 +1241,7 @@ private suspend fun handleScopedTableGet(
     selector: CatalogStoreSelector,
     binding: ScopedNamespaceBinding,
 ) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
     val expectedPath = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}/tables/${binding.table}"
     val uri = call.request.uri
     val queryIndex = uri.indexOf('?')
@@ -1260,7 +1261,6 @@ private suspend fun handleScopedTableGet(
             throw failure
         }
     recordScopedSuccess(call)
-    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
     call.respond(table)
 }
 
@@ -1269,6 +1269,7 @@ private suspend fun handleScopedScanGet(
     selector: CatalogStoreSelector,
     binding: ScopedNamespaceBinding,
 ) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
     val expectedPath = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}/tables/${binding.table}/scan"
     val uri = call.request.uri
     val queryIndex = uri.indexOf('?')
@@ -1290,7 +1291,6 @@ private suspend fun handleScopedScanGet(
             throw failure
         }
     recordScopedSuccess(call)
-    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
     call.respond(files)
 }
 

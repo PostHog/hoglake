@@ -72,8 +72,9 @@ internal object HogliteScopedNamespaceRead {
             "row_id_start",
             "stats_state",
             "begin_snapshot",
+            "explicit_row_ids",
         )
-    private val dataFileOptional = setOf("footer_size", "explicit_row_ids")
+    private val dataFileOptional = setOf("footer_size")
     private val deleteFileRequired =
         setOf("delete_file_id", "path", "delete_count", "file_size_bytes", "begin_snapshot")
     private val deleteFileOptional = setOf("data_file_id", "file_format")
@@ -473,11 +474,8 @@ internal object HogliteScopedNamespaceRead {
         if (!node.hasKeys(dataFileRequired, dataFileOptional)) throw scanUnavailable()
         val footerSize =
             node.get("footer_size")?.takeIf { !it.isNull }?.nonNegativeLong(::scanUnavailable)
-        val explicitRowIds =
-            node.get("explicit_row_ids")?.takeIf { !it.isNull }?.let { flag ->
-                if (!flag.isBoolean) throw scanUnavailable()
-                flag.booleanValue()
-            } ?: false
+        val explicitRowIdsNode = node["explicit_row_ids"]
+        if (!explicitRowIdsNode.isBoolean) throw scanUnavailable()
         return DataFileDto(
             dataFileId = node["data_file_id"].positiveLong(::scanUnavailable),
             path = node["path"].textOrFail(::scanUnavailable),
@@ -488,7 +486,7 @@ internal object HogliteScopedNamespaceRead {
             rowIdStart = node["row_id_start"].nonNegativeLong(::scanUnavailable),
             statsState = node["stats_state"].nonEmptyText(::scanUnavailable),
             beginSnapshot = node["begin_snapshot"].nonNegativeLong(::scanUnavailable),
-            explicitRowIds = explicitRowIds,
+            explicitRowIds = explicitRowIdsNode.booleanValue(),
         )
     }
 

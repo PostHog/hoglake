@@ -7,8 +7,15 @@ import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.configureHoglakeWire
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
+import com.posthog.hoglake.model.ScanFile
+import com.posthog.hoglake.model.StatsState
+import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
@@ -120,7 +127,8 @@ class ScopedNamespaceDispatchTest {
                 "footer_size": 256,
                 "row_id_start": 0,
                 "stats_state": "none",
-                "begin_snapshot": 1
+                "begin_snapshot": 1,
+                "explicit_row_ids": false
               },
               "delete_file": null
             }
@@ -202,6 +210,37 @@ class ScopedNamespaceDispatchTest {
                 when (method.name) {
                     "liveContainment" -> NamespaceContainment("team_id", 42)
                     "getNamespace" -> NamespaceInfo(99, args!![1] as String, NamespaceContainment("team_id", 42))
+                    "getTable" ->
+                        TableInfo(
+                            tableId = 101,
+                            tableUuid = UUID.fromString(tableUuid),
+                            namespace = args!![1] as String,
+                            name = args[2] as String,
+                            columns = listOf(Column(1, 0, ColumnDef("id", ColType.LONG, nullable = false))),
+                            readSnapshotId = 5,
+                            recordCount = 3,
+                            fileCount = 1,
+                            fileSizeBytes = 1024,
+                        )
+                    "planScan" ->
+                        listOf(
+                            ScanFile(
+                                dataFile =
+                                    DataFile(
+                                        dataFileId = 1,
+                                        tableId = 101,
+                                        path = "s3://example-customer/tables/data.parquet",
+                                        fileFormat = "parquet",
+                                        recordCount = 3,
+                                        fileSizeBytes = 1024,
+                                        footerSize = 256,
+                                        rowIdStart = 0,
+                                        statsState = StatsState.PENDING,
+                                        beginSnapshot = 1,
+                                    ),
+                                deleteFile = null,
+                            ),
+                        )
                     else -> error("unexpected legacy method: ${method.name}")
                 }
             } as CatalogStore
@@ -331,17 +370,20 @@ class ScopedNamespaceDispatchTest {
             body = """{"code":"not_found"}"""
             val missing = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
             assertThat(missing.status).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(missing.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
 
             status = 403
             body = """{"code":"forbidden"}"""
             val forbidden = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
             assertThat(forbidden.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(forbidden.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
             assertThat(forbidden.bodyAsText()).doesNotContain("fictional-key", "example-customer")
 
             status = 200
             body = tableSuccess.replace("\"value\": 42", "\"value\": 43")
             val wrongTeam = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
             assertThat(wrongTeam.status).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(wrongTeam.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
             assertThat(wrongTeam.bodyAsText()).doesNotContain("43")
 
             for ((code, peerBody) in listOf(
@@ -358,6 +400,7 @@ class ScopedNamespaceDispatchTest {
                 body = peerBody
                 val response = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
                 assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                assertThat(response.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
                 assertThat(response.bodyAsText()).doesNotContain("peer-secret", "other")
             }
             assertThat(requests).hasSize(10)
@@ -402,11 +445,14 @@ class ScopedNamespaceDispatchTest {
                     (it["rtg"] as ObjectNode).put("t", "fixture_2")
                     (it["grants"][1] as ObjectNode).put("object_key", "root/bf/t/fixture_2/manifest")
                 }
-            assertThat(client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }.status)
-                .isEqualTo(HttpStatusCode.NotFound)
-            assertThat(
-                client.get("$readScanPath$query") { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }.status,
-            ).isEqualTo(HttpStatusCode.NotFound)
+            val wrongTenantTable =
+                client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }
+            assertThat(wrongTenantTable.status).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(wrongTenantTable.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+            val wrongTenantScan =
+                client.get("$readScanPath$query") { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }
+            assertThat(wrongTenantScan.status).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(wrongTenantScan.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
             assertThat(requests).isEmpty()
             assertThat(legacy).isEmpty()
         }
@@ -448,6 +494,43 @@ class ScopedNamespaceDispatchTest {
         }
 
     @Test
+    fun `the public listener keeps ordinary tenant and scoped table and scan reads working`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            application { harness(cfg, guardLegacy = false, readFixture = true, publicListener = true) }
+            val readFields =
+                listOf("profile", "version", "purpose", "primary_catalog", "remote_schemas", "aws", "grants", "rtg")
+            val tenantJwt =
+                signedRead {
+                    it.put("aud", TestTokens.AUDIENCE)
+                    it.put("ten", "tenant")
+                    it.remove(readFields + "prd")
+                }
+            val scopedJwt =
+                signedRead {
+                    it.put("aud", TestTokens.AUDIENCE)
+                    it.put("ten", "scoped")
+                    it.remove(readFields)
+                }
+            for (jwt in listOf(tenantJwt, scopedJwt)) {
+                val tableResp = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(tableResp.status).isEqualTo(HttpStatusCode.OK)
+                val tableTree = mapper.readTree(tableResp.bodyAsText())
+                assertThat(tableTree["name"].asText()).isEqualTo("metrics")
+                assertThat(tableTree["record_count"].asLong()).isEqualTo(3L)
+
+                val scanResp = client.get(readScanPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(scanResp.status).isEqualTo(HttpStatusCode.OK)
+                val scanTree = mapper.readTree(scanResp.bodyAsText())
+                assertThat(scanTree.size()).isEqualTo(1)
+                assertThat(scanTree[0]["data_file"]["path"].asText())
+                    .isEqualTo("s3://example-customer/tables/data.parquet")
+            }
+            assertThat(legacy).contains("getTable", "planScan")
+            assertThat(requests).isEmpty()
+        }
+
+    @Test
     fun `the opted in scan GET forwards exact tokens and returns ScanFileDto with optional DV`() =
         testApplication {
             val cfg = config(withReadSession = true, table = "metrics")
@@ -465,6 +548,7 @@ class ScopedNamespaceDispatchTest {
             assertThat(firstTree.size()).isEqualTo(1)
             assertThat(firstTree[0]["data_file"]["path"].asText())
                 .isEqualTo("s3://example-customer/tables/data.parquet")
+            assertThat(firstTree[0]["data_file"]["explicit_row_ids"].asBoolean()).isFalse()
             assertThat(firstTree[0].has("delete_file")).isFalse()
 
             val prefixJwt =
@@ -484,18 +568,19 @@ class ScopedNamespaceDispatchTest {
                     {
                       "data_file": {
                         "data_file_id": 7,
-                        "path": "s3://example-customer/tables/team_id=42/part-0.parquet",
+                        "path": "s3://example-customer/tables/team_id=42/part(1).parquet",
                         "file_format": "parquet",
                         "record_count": 10,
                         "file_size_bytes": 2048,
                         "footer_size": 128,
-                        "row_id_start": 0,
+                        "row_id_start": 100,
                         "stats_state": "none",
-                        "begin_snapshot": 2
+                        "begin_snapshot": 2,
+                        "explicit_row_ids": true
                       },
                       "delete_file": {
                         "delete_file_id": 9,
-                        "path": "s3://example-customer/tables/team_id=42/dv-1.puffin",
+                        "path": "s3://example-customer/tables/team_id=42/dv(1).puffin",
                         "delete_count": 1,
                         "file_size_bytes": 64,
                         "begin_snapshot": 3
@@ -509,14 +594,18 @@ class ScopedNamespaceDispatchTest {
                     header(HttpHeaders.Authorization, "Bearer $prefixJwt")
                 }
             assertThat(second.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(second.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
             val secondTree = mapper.readTree(second.bodyAsText())
             assertThat(secondTree.size()).isEqualTo(1)
             assertThat(secondTree[0]["data_file"]["data_file_id"].asLong()).isEqualTo(7L)
+            assertThat(secondTree[0]["data_file"]["path"].asText())
+                .isEqualTo("s3://example-customer/tables/team_id=42/part(1).parquet")
+            assertThat(secondTree[0]["data_file"]["explicit_row_ids"].asBoolean()).isTrue()
             assertThat(secondTree[0]["delete_file"]["delete_file_id"].asLong()).isEqualTo(9L)
             assertThat(secondTree[0]["delete_file"]["data_file_id"].asLong()).isEqualTo(7L)
             assertThat(secondTree[0]["delete_file"]["file_format"].asText()).isEqualTo("puffin")
             assertThat(secondTree[0]["delete_file"]["path"].asText())
-                .isEqualTo("s3://example-customer/tables/team_id=42/dv-1.puffin")
+                .isEqualTo("s3://example-customer/tables/team_id=42/dv(1).puffin")
 
             val peer =
                 "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics/scan" +
@@ -590,6 +679,7 @@ class ScopedNamespaceDispatchTest {
                     }
                 val text = response.bodyAsText()
                 assertThat(response.status).describedAs(badPath).isEqualTo(HttpStatusCode.Forbidden)
+                assertThat(response.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
                 assertThat(text).doesNotContain(
                     "example-customer",
                     "other-bucket",
@@ -604,6 +694,30 @@ class ScopedNamespaceDispatchTest {
                 )
             }
 
+            // Prefix grant rejects traversal, empty segments, control characters, and out-of-prefix keys.
+            val prefixJwt =
+                signedRead { claims ->
+                    val grant = claims["grants"][0] as ObjectNode
+                    grant.remove("object_key")
+                    grant.put("prefix", "tables/team_id=42/")
+                }
+            for (badPrefixPath in listOf(
+                "s3://example-customer/tables/team_id=42/../team_id=43/part(1).parquet",
+                "s3://example-customer/tables/team_id=42/./part(1).parquet",
+                "s3://example-customer/tables/team_id=42//part(1).parquet",
+                "s3://example-customer/tables/team_id=42/part\\u0000.parquet",
+                "s3://example-customer/tables/team_id=43/part(1).parquet",
+            )) {
+                body = scanSuccess.replace("s3://example-customer/tables/data.parquet", badPrefixPath)
+                val response =
+                    client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                        header(HttpHeaders.Authorization, "Bearer $prefixJwt")
+                    }
+                assertThat(response.status).describedAs(badPrefixPath).isEqualTo(HttpStatusCode.Forbidden)
+                assertThat(response.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+                assertThat(response.bodyAsText()).doesNotContain("example-customer", "part(1)", "team_id=43")
+            }
+
             // Data file matches grant, but deletion vector lies outside grant.
             body =
                 scanSuccess.replace(
@@ -616,6 +730,7 @@ class ScopedNamespaceDispatchTest {
                     header(HttpHeaders.Authorization, "Bearer $jwt")
                 }
             assertThat(dvRefusal.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(dvRefusal.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
             assertThat(dvRefusal.bodyAsText()).doesNotContain("outside.puffin", "example-customer", "fictional-key")
             assertThat(legacy).isEmpty()
         }
@@ -629,11 +744,12 @@ class ScopedNamespaceDispatchTest {
 
             status = 404
             body = """{"code":"not_found"}"""
-            assertThat(
+            val missing =
                 client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
                     header(HttpHeaders.Authorization, "Bearer $jwt")
-                }.status,
-            ).isEqualTo(HttpStatusCode.NotFound)
+                }
+            assertThat(missing.status).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(missing.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
 
             status = 403
             body = """{"code":"forbidden"}"""
@@ -642,6 +758,7 @@ class ScopedNamespaceDispatchTest {
                     header(HttpHeaders.Authorization, "Bearer $jwt")
                 }
             assertThat(forbidden.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(forbidden.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
             assertThat(forbidden.bodyAsText()).doesNotContain("example-customer", "fictional-key")
 
             for ((code, peerBody) in listOf(
@@ -649,6 +766,8 @@ class ScopedNamespaceDispatchTest {
                 200 to scanSuccess.replace(tableUuid, "22222222-2222-4222-8222-222222222222"),
                 200 to scanSuccess.replace("\"read_snapshot_id\": 5", "\"read_snapshot_id\": 6"),
                 200 to scanSuccess.replace("\"reports\"", "\"other\""),
+                200 to scanSuccess.replace(Regex(",\\s*\"explicit_row_ids\":\\s*false"), ""),
+                200 to scanSuccess.replace("\"explicit_row_ids\": false", "\"explicit_row_ids\": \"false\""),
                 200 to "{not-json",
             )) {
                 status = code
@@ -658,9 +777,10 @@ class ScopedNamespaceDispatchTest {
                         header(HttpHeaders.Authorization, "Bearer $jwt")
                     }
                 assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                assertThat(response.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
                 assertThat(response.bodyAsText()).doesNotContain("peer-secret", "other")
             }
-            assertThat(requests).hasSize(7)
+            assertThat(requests).hasSize(9)
             assertThat(legacy).isEmpty()
         }
 

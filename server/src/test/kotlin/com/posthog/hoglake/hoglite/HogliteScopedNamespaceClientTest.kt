@@ -526,7 +526,8 @@ class HogliteScopedNamespaceClientTest {
         val overCap = empty.padEnd(1024 * 1024 + 1, ' ').toByteArray()
         val oneFile =
             """{"data_file":{"data_file_id":1,"path":"s3://b/k","file_format":"parquet","record_count":1,""" +
-                """"file_size_bytes":10,"row_id_start":0,"stats_state":"none","begin_snapshot":1}}"""
+                """"file_size_bytes":10,"row_id_start":0,"stats_state":"none","begin_snapshot":1,""" +
+                """"explicit_row_ids":false}}"""
         val tooManyFiles =
             (
                 """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,""" +
@@ -537,8 +538,9 @@ class HogliteScopedNamespaceClientTest {
                 """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,""" +
                     """"files":[{"data_file":{"data_file_id":1,"path":"s3://b/k","file_format":"parquet",""" +
                     """"record_count":1,"file_size_bytes":10,"row_id_start":0,"stats_state":"none",""" +
-                    """"begin_snapshot":1},"delete_file":{"delete_file_id":2,"data_file_id":99,"path":"s3://b/d",""" +
-                    """"delete_count":1,"file_size_bytes":10,"begin_snapshot":1}}]}"""
+                    """"begin_snapshot":1,"explicit_row_ids":false},"delete_file":{"delete_file_id":2,""" +
+                    """"data_file_id":99,"path":"s3://b/d","delete_count":1,"file_size_bytes":10,""" +
+                    """"begin_snapshot":1}}]}"""
             ).toByteArray()
         val responses =
             listOf(
@@ -575,6 +577,52 @@ class HogliteScopedNamespaceClientTest {
             assertThatThrownBy {
                 client.readScopedScan("tenant_1", "lake", "reports", "metrics", -1L, tableUuid)
             }.isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        }
+        assertThat(index.get()).isEqualTo(responses.size)
+    }
+
+    @Test
+    fun `scan read preserves explicit_row_ids for compacted files and rejects missing or invalid flags`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+
+        fun payload(explicitField: String): ByteArray =
+            (
+                """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,""" +
+                    """"files":[{"data_file":{"data_file_id":1,"path":"s3://b/compacted.parquet",""" +
+                    """"file_format":"parquet","record_count":10,"file_size_bytes":1024,"row_id_start":100,""" +
+                    """"stats_state":"none","begin_snapshot":4$explicitField}}]}"""
+            ).toByteArray()
+
+        val responses =
+            listOf(
+                payload(""","explicit_row_ids":true"""),
+                payload(""","explicit_row_ids":false"""),
+                payload(""),
+                payload(""","explicit_row_ids":null"""),
+                payload(""","explicit_row_ids":"true""""),
+                payload(""","explicit_row_ids":1"""),
+            )
+        val index = AtomicInteger()
+        val server = serve { reply(it, responses[index.getAndIncrement()]) }
+        HogliteClient(url(server)).use { base ->
+            val client = base.forRequest(TOKEN)
+            val compacted =
+                client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) as
+                    ScopedReadOutcome.Found
+            assertThat(compacted.value.single().dataFile.explicitRowIds).isTrue()
+
+            val positional =
+                client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) as
+                    ScopedReadOutcome.Found
+            assertThat(positional.value.single().dataFile.explicitRowIds).isFalse()
+
+            repeat(4) {
+                assertThatThrownBy {
+                    client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid)
+                }.isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                    .hasMessage("hoglite scoped scan read unavailable")
+                    .hasNoCause()
+            }
         }
         assertThat(index.get()).isEqualTo(responses.size)
     }
