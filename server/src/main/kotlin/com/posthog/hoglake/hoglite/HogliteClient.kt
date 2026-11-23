@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.NamespaceDto
+import com.posthog.hoglake.api.ScanFileDto
 import com.posthog.hoglake.model.HoglakeException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.ConnectException
@@ -218,6 +219,58 @@ class HogliteClient(
         val token = bearerToken
         if (shared == null || token == null) throw HogliteScopedNamespaceRead.unavailable()
         return HogliteScopedNamespaceRead.read(http, standardUrl, token, tenant, catalog, namespace, readTimeoutMs)
+    }
+
+    /**
+     * Read one table through the typed metadata protocol.
+     * This operation does not use SQL, routing pins, retries, or circuit breakers.
+     */
+    internal fun readScopedTable(
+        tenant: String,
+        catalog: String,
+        namespace: String,
+        table: String,
+    ): ScopedReadOutcome<ScopedTableResult> {
+        val token = bearerToken
+        if (shared == null || token == null) throw HogliteScopedNamespaceRead.tableUnavailable()
+        return HogliteScopedNamespaceRead.readTable(
+            http,
+            standardUrl,
+            token,
+            tenant,
+            catalog,
+            namespace,
+            table,
+            readTimeoutMs,
+        )
+    }
+
+    /**
+     * Read one pinned scan through the typed metadata protocol.
+     * This operation does not use SQL, routing pins, retries, or circuit breakers.
+     */
+    internal fun readScopedScan(
+        tenant: String,
+        catalog: String,
+        namespace: String,
+        table: String,
+        snapshot: Long,
+        tableUuid: UUID,
+    ): ScopedReadOutcome<List<ScanFileDto>> {
+        val token = bearerToken
+        if (shared == null || token == null) throw HogliteScopedNamespaceRead.scanUnavailable()
+        return HogliteScopedNamespaceRead.readScan(
+            http,
+            standardUrl,
+            token,
+            tenant,
+            catalog,
+            namespace,
+            table,
+            snapshot,
+            tableUuid,
+            readTimeoutMs,
+        )
     }
 
     /**

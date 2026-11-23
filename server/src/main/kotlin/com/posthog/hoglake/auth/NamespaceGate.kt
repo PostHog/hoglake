@@ -98,7 +98,7 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
                 null
             } else {
                 selector.scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeIf {
-                    it.matches(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
+                    it.matchesNamespace(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
                 }?.let { binding ->
                     ScopedNamespaceRead {
                         val expected = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}"
@@ -120,6 +120,16 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
                 }
             }
         },
+        scopedTableRoute = { call, pending ->
+            val match = call.attributes.getOrNull(RouteMatchKey)
+            val binding = selector.scopedNamespaceBinding(pending.catalog, pending.namespace)
+            binding != null &&
+                (
+                    binding.matchesTable(call.request.httpMethod, match) ||
+                        binding.matchesScan(call.request.httpMethod, match)
+                ) &&
+                call.verifiedBackendAuthority?.readSessionBinding === binding
+        },
     )
 }
 
@@ -135,6 +145,7 @@ private fun Application.installCallNamespaceGate(
     isExport: (ApplicationCall, String) -> Boolean = { _, _ -> false },
     refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
     scopedNamespace: (ApplicationCall, AuthDecision.ByNamespace) -> ScopedNamespaceRead? = { _, _ -> null },
+    scopedTableRoute: (ApplicationCall, AuthDecision.ByNamespace) -> Boolean = { _, _ -> false },
 ) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
@@ -152,6 +163,10 @@ private fun Application.installCallNamespaceGate(
         // This selection precedes isExport: resolve can issue legacy SQL.
         // A selected read always finishes here, including every refusal.
         val selected = scopedNamespace(call, pending)
+        if (selected == null && scopedTableRoute(call, pending)) {
+            // The table and scan routes execute terminal typed reads without legacy SQL.
+            return@intercept
+        }
         if (selected == null && call.verifiedBackendAuthority?.readSessionBinding != null) {
             val refusal = HoglakeException.NotFound("namespace")
             countRefusal(

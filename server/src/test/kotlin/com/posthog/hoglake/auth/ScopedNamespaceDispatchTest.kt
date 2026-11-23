@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping
+import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
@@ -73,7 +74,59 @@ class ScopedNamespaceDispatchTest {
         javaClass.getResourceAsStream("/oauth/read-session-vectors.json").use { mapper.readTree(requireNotNull(it)) }
     private val readVector = vectors["vectors"].single { it["name"].asText() == "complete read session" }
     private val readPath = "/v1/catalogs/example-catalog/namespaces/reports"
+    private val readTablePath = "$readPath/tables/metrics"
+    private val readScanPath = "$readTablePath/scan"
     private val readBackend = UUID.fromString(vectors["config"]["backend_id"].asText())
+    private val tableUuid = "11111111-1111-4111-8111-1111111111aa"
+    private val tableSuccess =
+        """
+        {
+          "namespace_id": 17,
+          "namespace": "reports",
+          "containment": {"field": "team_id", "value": 42},
+          "table_id": 101,
+          "table_uuid": "$tableUuid",
+          "name": "metrics",
+          "read_snapshot_id": 5,
+          "columns": [
+            {"field_id": 1, "ordinal": 0, "name": "id", "type": "long", "nullable": false},
+            {
+              "field_id": 2,
+              "ordinal": 1,
+              "name": "amount",
+              "type": "decimal",
+              "type_params": {"precision": 10, "scale": 2},
+              "nullable": true,
+              "comment": "total amount"
+            }
+          ]
+        }
+        """.trimIndent()
+    private val scanSuccess =
+        """
+        {
+          "namespace_id": 17,
+          "namespace": "reports",
+          "table_uuid": "$tableUuid",
+          "read_snapshot_id": 5,
+          "files": [
+            {
+              "data_file": {
+                "data_file_id": 1,
+                "path": "s3://example-customer/tables/data.parquet",
+                "file_format": "parquet",
+                "record_count": 3,
+                "file_size_bytes": 1024,
+                "footer_size": 256,
+                "row_id_start": 0,
+                "stats_state": "none",
+                "begin_snapshot": 1
+              },
+              "delete_file": null
+            }
+          ]
+        }
+        """.trimIndent()
 
     private fun digest(text: String): String =
         MessageDigest.getInstance("SHA-256").digest(text.toByteArray()).joinToString("") { "%02x".format(it) }
@@ -82,6 +135,7 @@ class ScopedNamespaceDispatchTest {
         enabled: Boolean = true,
         withReadSession: Boolean = false,
         readFixture: Boolean = withReadSession,
+        table: String? = null,
     ): Config {
         val peer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server = peer
@@ -116,6 +170,9 @@ class ScopedNamespaceDispatchTest {
         if (withReadSession) {
             binding.putObject("read_session").put("profile", vectors["config"]["profile"].asText())
                 .set<ObjectNode>("remote_targets", vectors["config"]["remote_targets"])
+        }
+        if (table != null) {
+            binding.put("table", table)
         }
         val bindingFile = Files.writeString(dir.resolve("binding.json"), binding.toString())
         return Config(
@@ -174,6 +231,7 @@ class ScopedNamespaceDispatchTest {
         install(ContentNegotiation) { jackson { configureHoglakeWire() } }
         install(StatusPages) { installErrorMapping() }
         installApiRoutes(selector)
+        installScanRoutes(selector)
     }
 
     private fun claims(
@@ -195,6 +253,416 @@ class ScopedNamespaceDispatchTest {
         val header = mapper.createObjectNode().put("alg", "ES256").put("kid", ContractVectors.KID).put("typ", "JWT")
         return ContractVectors.sign(header, claims)
     }
+
+    @Test
+    fun `the opted in table GET forwards exact tokens and returns TableDto without totals`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            body = tableSuccess
+            application { harness(cfg, readFixture = true) }
+            val first = readVector["token"].asText()
+            val second = signedRead { it.put("usr", "example.bob").put("sub", "example.bob").put("jti", "token-b") }
+            for ((target, jwt) in listOf(
+                readTablePath to first,
+                "$readTablePath?totals=false" to second,
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+                assertThat(response.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+                val tree = mapper.readTree(response.bodyAsText())
+                assertThat(tree["name"].asText()).isEqualTo("metrics")
+                assertThat(tree["namespace"].asText()).isEqualTo("reports")
+                assertThat(tree["table_uuid"].asText()).isEqualTo(tableUuid)
+                assertThat(tree["read_snapshot_id"].asLong()).isEqualTo(5L)
+                assertThat(tree["remote"].asBoolean()).isFalse()
+                assertThat(tree.has("record_count")).isFalse()
+                assertThat(tree.has("file_count")).isFalse()
+                assertThat(tree.has("file_size_bytes")).isFalse()
+                assertThat(tree["columns"].size()).isEqualTo(2)
+                assertThat(tree["columns"][1]["type_params"]["precision"].asInt()).isEqualTo(10)
+            }
+            val peer = "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics"
+            assertThat(requests).containsExactly(peer to null, peer to null)
+            assertThat(sessionDigests).containsExactly(digest("Bearer $first"), digest("Bearer $second"))
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `table GET rejects invalid query parameters noncanonical paths and bodies`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            body = tableSuccess
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            for (target in listOf(
+                "$readTablePath?",
+                "$readTablePath?totals=true",
+                "$readTablePath?totals=FALSE",
+                "$readTablePath?totals=false&totals=false",
+                "$readTablePath?snapshot=5",
+                "$readTablePath?at_timestamp=2026-01-01T00:00:00Z",
+                "$readTablePath?totals=false&snapshot=5",
+                "$readTablePath?extra=1",
+                readTablePath.replace("metrics", "%6detrics"),
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.BadRequest)
+            }
+            val withBody =
+                client.get(readTablePath) {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                    setBody("x")
+                }
+            assertThat(withBody.status).isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `table GET translates Hoglite refusals and malformed bodies without SQL fallback`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+            Metrics.bind(registry)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            status = 404
+            body = """{"code":"not_found"}"""
+            val missing = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(missing.status).isEqualTo(HttpStatusCode.NotFound)
+
+            status = 403
+            body = """{"code":"forbidden"}"""
+            val forbidden = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(forbidden.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(forbidden.bodyAsText()).doesNotContain("fictional-key", "example-customer")
+
+            status = 200
+            body = tableSuccess.replace("\"value\": 42", "\"value\": 43")
+            val wrongTeam = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(wrongTeam.status).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(wrongTeam.bodyAsText()).doesNotContain("43")
+
+            for ((code, peerBody) in listOf(
+                503 to """{"code":"unavailable","detail":"peer-secret"}""",
+                200 to tableSuccess.replace("\"metrics\"", "\"other\""),
+                200 to tableSuccess.replace("\"reports\"", "\"other\""),
+                200 to tableSuccess.replace(tableUuid, tableUuid.uppercase()),
+                200 to tableSuccess.replace("\"read_snapshot_id\": 5", "\"read_snapshot_id\": -1"),
+                200 to tableSuccess.replace("\"columns\": [", "\"record_count\": 1, \"columns\": ["),
+                200 to """{"namespace_id":17,"namespace":"reports","containment":{"field":"team_id","value":42},""" +
+                    """"table_id":101,"table_uuid":"$tableUuid","name":"metrics","read_snapshot_id":5,"columns":[]}""",
+            )) {
+                status = code
+                body = peerBody
+                val response = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                assertThat(response.bodyAsText()).doesNotContain("peer-secret", "other")
+            }
+            assertThat(requests).hasSize(10)
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `unbound tables wrong methods legacy tokens and public listener stay closed`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            body = tableSuccess
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            val query = "?snapshot=5&table_uuid=$tableUuid"
+            for (target in listOf(
+                "$readPath/tables/other",
+                "$readPath/tables/other/scan$query",
+                readTablePath.replace("reports", "other"),
+                readScanPath.replace("example-catalog", "other-catalog") + query,
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.Unauthorized)
+            }
+            assertThat(client.head(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(client.head("$readScanPath$query") { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            val readFields =
+                listOf("profile", "version", "purpose", "primary_catalog", "remote_schemas", "aws", "grants")
+            val metadata =
+                signedRead {
+                    it.putArray("aud").add("hoglake").add("hoglite")
+                    it.remove(readFields)
+                }
+            assertThat(client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $metadata") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(
+                client.get("$readScanPath$query") { header(HttpHeaders.Authorization, "Bearer $metadata") }.status,
+            ).isEqualTo(HttpStatusCode.Unauthorized)
+            val wrongTenant =
+                signedRead {
+                    (it["rtg"] as ObjectNode).put("t", "fixture_2")
+                    (it["grants"][1] as ObjectNode).put("object_key", "root/bf/t/fixture_2/manifest")
+                }
+            assertThat(client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }.status)
+                .isEqualTo(HttpStatusCode.NotFound)
+            assertThat(
+                client.get("$readScanPath$query") { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }.status,
+            ).isEqualTo(HttpStatusCode.NotFound)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `namespace only read session does not opt in table or scan routes`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = null)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            assertThat(client.get(readPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.OK)
+            assertThat(client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                }.status,
+            ).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(requests).hasSize(1)
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the public listener refuses dedicated tokens on bound table and scan routes`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            application { harness(cfg, readFixture = true, publicListener = true) }
+            val jwt = readVector["token"].asText()
+            assertThat(client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                }.status,
+            ).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the opted in scan GET forwards exact tokens and returns ScanFileDto with optional DV`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            application { harness(cfg, readFixture = true) }
+            val exactJwt = readVector["token"].asText()
+            body = scanSuccess
+            val first =
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $exactJwt")
+                }
+            assertThat(first.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(first.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+            val firstTree = mapper.readTree(first.bodyAsText())
+            assertThat(firstTree.isArray).isTrue()
+            assertThat(firstTree.size()).isEqualTo(1)
+            assertThat(firstTree[0]["data_file"]["path"].asText())
+                .isEqualTo("s3://example-customer/tables/data.parquet")
+            assertThat(firstTree[0].has("delete_file")).isFalse()
+
+            val prefixJwt =
+                signedRead { claims ->
+                    val grant = claims["grants"][0] as ObjectNode
+                    grant.remove("object_key")
+                    grant.put("prefix", "tables/team_id=42/")
+                }
+            body =
+                """
+                {
+                  "namespace_id": 17,
+                  "namespace": "reports",
+                  "table_uuid": "$tableUuid",
+                  "read_snapshot_id": 5,
+                  "files": [
+                    {
+                      "data_file": {
+                        "data_file_id": 7,
+                        "path": "s3://example-customer/tables/team_id=42/part-0.parquet",
+                        "file_format": "parquet",
+                        "record_count": 10,
+                        "file_size_bytes": 2048,
+                        "footer_size": 128,
+                        "row_id_start": 0,
+                        "stats_state": "none",
+                        "begin_snapshot": 2
+                      },
+                      "delete_file": {
+                        "delete_file_id": 9,
+                        "path": "s3://example-customer/tables/team_id=42/dv-1.puffin",
+                        "delete_count": 1,
+                        "file_size_bytes": 64,
+                        "begin_snapshot": 3
+                      }
+                    }
+                  ]
+                }
+                """.trimIndent()
+            val second =
+                client.get("$readScanPath?table_uuid=$tableUuid&snapshot=5") {
+                    header(HttpHeaders.Authorization, "Bearer $prefixJwt")
+                }
+            assertThat(second.status).isEqualTo(HttpStatusCode.OK)
+            val secondTree = mapper.readTree(second.bodyAsText())
+            assertThat(secondTree.size()).isEqualTo(1)
+            assertThat(secondTree[0]["data_file"]["data_file_id"].asLong()).isEqualTo(7L)
+            assertThat(secondTree[0]["delete_file"]["delete_file_id"].asLong()).isEqualTo(9L)
+            assertThat(secondTree[0]["delete_file"]["data_file_id"].asLong()).isEqualTo(7L)
+            assertThat(secondTree[0]["delete_file"]["file_format"].asText()).isEqualTo("puffin")
+            assertThat(secondTree[0]["delete_file"]["path"].asText())
+                .isEqualTo("s3://example-customer/tables/team_id=42/dv-1.puffin")
+
+            val peer =
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics/scan" +
+                    "?snapshot=5&table_uuid=$tableUuid"
+            assertThat(requests).containsExactly(peer to null, peer to null)
+            assertThat(sessionDigests).containsExactly(digest("Bearer $exactJwt"), digest("Bearer $prefixJwt"))
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `scan GET rejects missing duplicate invalid or extra query parameters`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            body = scanSuccess
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            for (target in listOf(
+                readScanPath,
+                "$readScanPath?",
+                "$readScanPath?snapshot=5",
+                "$readScanPath?table_uuid=$tableUuid",
+                "$readScanPath?snapshot=-1&table_uuid=$tableUuid",
+                "$readScanPath?snapshot=05&table_uuid=$tableUuid",
+                "$readScanPath?snapshot=+5&table_uuid=$tableUuid",
+                "$readScanPath?snapshot=abc&table_uuid=$tableUuid",
+                "$readScanPath?snapshot=5&table_uuid=${tableUuid.uppercase()}",
+                "$readScanPath?snapshot=5&table_uuid=not-a-uuid",
+                "$readScanPath?snapshot=5&snapshot=5&table_uuid=$tableUuid",
+                "$readScanPath?snapshot=5&table_uuid=$tableUuid&table_uuid=$tableUuid",
+                "$readScanPath?snapshot=5&table_uuid=$tableUuid&at_timestamp=2026-01-01T00:00:00Z",
+                "$readScanPath?snapshot=5&table_uuid=$tableUuid&include=column_stats",
+                "$readScanPath?snapshot=5&table_uuid=$tableUuid&stats_fields=1",
+                "$readScanPath?snapshot=5&table_uuid=$tableUuid&extra=1",
+                readScanPath.replace("metrics", "%6detrics") + "?snapshot=5&table_uuid=$tableUuid",
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.BadRequest)
+            }
+            val withBody =
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                    setBody("x")
+                }
+            assertThat(withBody.status).isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `scan GET refuses out of grant data files and deletion vectors with redacted 403`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            val outOfGrantPaths =
+                listOf(
+                    "s3://example-customer/tables/other.parquet",
+                    "s3://other-bucket/tables/data.parquet",
+                    "s3://example-remote/events/team_id=42/part-0.parquet",
+                    "s3://example-owner/root/2c/t/fixture_3/manifest",
+                    "s3://example-customer/tables/../tables/data.parquet",
+                    "https://example-customer/tables/data.parquet",
+                    "s3://example-customer/tables/data.parquet/",
+                    "",
+                )
+            for (badPath in outOfGrantPaths) {
+                body = scanSuccess.replace("s3://example-customer/tables/data.parquet", badPath)
+                val response =
+                    client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                        header(HttpHeaders.Authorization, "Bearer $jwt")
+                    }
+                val text = response.bodyAsText()
+                assertThat(response.status).describedAs(badPath).isEqualTo(HttpStatusCode.Forbidden)
+                assertThat(text).doesNotContain(
+                    "example-customer",
+                    "other-bucket",
+                    "example-remote",
+                    "example-owner",
+                    "data.parquet",
+                    "other.parquet",
+                    "manifest",
+                    "fictional-key",
+                    "fictional-secret",
+                    "fictional-session",
+                )
+            }
+
+            // Data file matches grant, but deletion vector lies outside grant.
+            body =
+                scanSuccess.replace(
+                    """"delete_file": null""",
+                    """"delete_file": {"delete_file_id": 9, "path": "s3://example-customer/tables/outside.puffin", """ +
+                        """"delete_count": 1, "file_size_bytes": 64, "begin_snapshot": 3}""",
+                )
+            val dvRefusal =
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                }
+            assertThat(dvRefusal.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(dvRefusal.bodyAsText()).doesNotContain("outside.puffin", "example-customer", "fictional-key")
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `scan GET refuses mismatched identity and Hoglite errors without SQL fallback`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            status = 404
+            body = """{"code":"not_found"}"""
+            assertThat(
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                }.status,
+            ).isEqualTo(HttpStatusCode.NotFound)
+
+            status = 403
+            body = """{"code":"forbidden"}"""
+            val forbidden =
+                client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                }
+            assertThat(forbidden.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(forbidden.bodyAsText()).doesNotContain("example-customer", "fictional-key")
+
+            for ((code, peerBody) in listOf(
+                503 to """{"code":"unavailable","detail":"peer-secret"}""",
+                200 to scanSuccess.replace(tableUuid, "22222222-2222-4222-8222-222222222222"),
+                200 to scanSuccess.replace("\"read_snapshot_id\": 5", "\"read_snapshot_id\": 6"),
+                200 to scanSuccess.replace("\"reports\"", "\"other\""),
+                200 to "{not-json",
+            )) {
+                status = code
+                body = peerBody
+                val response =
+                    client.get("$readScanPath?snapshot=5&table_uuid=$tableUuid") {
+                        header(HttpHeaders.Authorization, "Bearer $jwt")
+                    }
+                assertThat(response.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                assertThat(response.bodyAsText()).doesNotContain("peer-secret", "other")
+            }
+            assertThat(requests).hasSize(7)
+            assertThat(legacy).isEmpty()
+        }
 
     @Test
     fun `only the opted in namespace GET forwards two exact dedicated tokens`() =

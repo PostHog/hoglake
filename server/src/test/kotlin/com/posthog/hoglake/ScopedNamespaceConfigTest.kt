@@ -47,6 +47,7 @@ class ScopedNamespaceConfigTest {
         assertThat(found.tenant).isEqualTo("opaque_1")
         assertThat(found.namespace).isEqualTo("reports")
         assertThat(found.readSession).isNull()
+        assertThat(found.table).isNull()
     }
 
     @Test
@@ -56,6 +57,7 @@ class ScopedNamespaceConfigTest {
         fun withSession(value: String) = binding.dropLast(1) + ""","read_session":$value}"""
         val cfg = config(withSession(settings))
         assertThat(cfg.scopedNamespaceBinding?.readSession).isNotNull()
+        assertThat(cfg.scopedNamespaceBinding?.table).isNull()
         assertThatThrownBy { cfg.copy(authPredicateFields = "team_id,project_id") }
             .hasMessageContaining("only the team_id predicate")
         for (invalid in listOf(
@@ -68,6 +70,38 @@ class ScopedNamespaceConfigTest {
         )) {
             assertThatThrownBy { config(withSession(invalid)) }.isInstanceOf(IllegalArgumentException::class.java)
         }
+    }
+
+    @Test
+    fun `scoped table binding requires read session and a canonical table identifier`() {
+        val settings = """{"profile":"example.aws-session","remote_targets":["remote:events","remote:imports"]}"""
+        val withTable = binding.dropLast(1) + ""","read_session":$settings,"table":"metrics_1"}"""
+        val found = config(withTable).scopedNamespaceBinding!!
+        assertThat(found.table).isEqualTo("metrics_1")
+        assertThat(found.readSession).isNotNull()
+
+        assertThatThrownBy { config(binding.dropLast(1) + ""","table":"metrics"}""") }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("read_session")
+
+        for (invalid in listOf(
+            "null",
+            "\"\"",
+            "\"1metrics\"",
+            "\"bad name\"",
+            "\"a/b\"",
+            "\"a%2Fb\"",
+            "123",
+            "\"${"a".repeat(129)}\"",
+        )) {
+            assertThatThrownBy {
+                config(binding.dropLast(1) + ""","read_session":$settings,"table":$invalid}""")
+            }.describedAs(invalid).isInstanceOf(IllegalArgumentException::class.java)
+        }
+
+        assertThatThrownBy {
+            config(withTable.dropLast(1) + ""","extra":true}""")
+        }.isInstanceOf(IllegalArgumentException::class.java)
     }
 
     @Test

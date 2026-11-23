@@ -1,10 +1,13 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.auth.AuthServiceKey
 import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.RouteMatchKey
 import com.posthog.hoglake.auth.Scope
 import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.countRefusal
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.auth.resolveActor
@@ -12,6 +15,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
@@ -23,14 +27,19 @@ import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.ScopedNamespaceBinding
 import com.posthog.hoglake.store.remoteSchemaRefusal
 import com.posthog.hoglake.store.servedNamespaceRefusal
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Parameters
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.request.httpMethod
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveChannel
+import io.ktor.server.request.uri
 import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
 import io.ktor.server.routing.RoutingCall
@@ -41,6 +50,9 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Instant
 import java.time.format.DateTimeParseException
 import java.util.UUID
@@ -372,6 +384,16 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
+                                selector.scopedTableBinding(call.catalog(), call.namespace(), call.table())
+                                    ?.takeIf {
+                                        it.matchesTable(
+                                            call.request.httpMethod,
+                                            call.attributes.getOrNull(RouteMatchKey),
+                                        )
+                                    }?.let { scoped ->
+                                        handleScopedTableGet(call, selector, scoped)
+                                        return@get
+                                    }
                                 when (val binding = selector.resolve(call, call.catalog())) {
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
@@ -829,10 +851,18 @@ private fun ApplicationCall.refuseHiddenTable(
 fun Application.installScanRoutes(selector: CatalogStoreSelector) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
+            selector.scopedTableBinding(call.catalog(), call.namespace(), call.table())
+                ?.takeIf {
+                    it.matchesScan(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
+                }?.let { scoped ->
+                    handleScopedScanGet(call, selector, scoped)
+                    return@get
+                }
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
             // so a repeated `stats_fields=3&stats_fields=7` would silently
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
+
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
             // A remote schema's scan is relayed as it came (plan row 1.3c):
             // the Host parses it, plans the scoped scan and applies its caps.
@@ -1186,3 +1216,134 @@ internal suspend fun ApplicationCall.receiveReplacement(): ReplacementRequestDto
     }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))
+
+private val CANONICAL_SNAPSHOT = Regex("^(0|[1-9][0-9]{0,18})$")
+
+private suspend fun requireEmptyScopedBody(
+    call: ApplicationCall,
+    message: String,
+) {
+    val lengths = call.request.headers.getAll(HttpHeaders.ContentLength)
+    if ((lengths != null && lengths != listOf("0")) ||
+        call.request.headers.getAll(HttpHeaders.TransferEncoding) != null
+    ) {
+        throw BadRequestException(message)
+    }
+    val empty =
+        withTimeoutOrNull(5_000) {
+            call.request.receiveChannel().readAvailable(ByteArray(1), 0, 1) == -1
+        }
+    if (empty != true) throw BadRequestException(message)
+}
+
+private suspend fun handleScopedTableGet(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+    binding: ScopedNamespaceBinding,
+) {
+    val expectedPath = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}/tables/${binding.table}"
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    val rawPath = if (queryIndex == -1) uri else uri.substring(0, queryIndex)
+    val rawQuery = if (queryIndex == -1) null else uri.substring(queryIndex + 1)
+    if (rawPath != expectedPath || (rawQuery != null && rawQuery != "totals=false")) {
+        throw BadRequestException("invalid scoped table request")
+    }
+    requireEmptyScopedBody(call, "invalid scoped table request")
+    val table =
+        try {
+            runInterruptible { selector.readScopedTable(call, binding) }
+        } catch (failure: HoglakeException) {
+            if (failure is HoglakeException.NotFound || failure is HoglakeException.Forbidden) {
+                recordScopedRefusal(call, failure)
+            }
+            throw failure
+        }
+    recordScopedSuccess(call)
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    call.respond(table)
+}
+
+private suspend fun handleScopedScanGet(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+    binding: ScopedNamespaceBinding,
+) {
+    val expectedPath = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}/tables/${binding.table}/scan"
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    if (queryIndex == -1) throw BadRequestException("invalid scoped scan request")
+    val rawPath = uri.substring(0, queryIndex)
+    val rawQuery = uri.substring(queryIndex + 1)
+    if (rawPath != expectedPath || rawQuery.isEmpty()) {
+        throw BadRequestException("invalid scoped scan request")
+    }
+    val (snapshot, tableUuid) = parseScopedScanQuery(rawQuery)
+    requireEmptyScopedBody(call, "invalid scoped scan request")
+    val files =
+        try {
+            runInterruptible { selector.readScopedScan(call, binding, snapshot, tableUuid) }
+        } catch (failure: HoglakeException) {
+            if (failure is HoglakeException.NotFound || failure is HoglakeException.Forbidden) {
+                recordScopedRefusal(call, failure)
+            }
+            throw failure
+        }
+    recordScopedSuccess(call)
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    call.respond(files)
+}
+
+private fun parseScopedScanQuery(rawQuery: String): Pair<Long, UUID> {
+    val parts = rawQuery.split('&')
+    if (parts.size != 2) throw BadRequestException("invalid scoped scan query")
+    var rawSnapshot: String? = null
+    var rawTableUuid: String? = null
+    for (part in parts) {
+        val separator = part.indexOf('=')
+        if (separator <= 0) throw BadRequestException("invalid scoped scan query")
+        val key = part.substring(0, separator)
+        val value = part.substring(separator + 1)
+        when (key) {
+            "snapshot" -> {
+                if (rawSnapshot != null) throw BadRequestException("invalid scoped scan query")
+                rawSnapshot = value
+            }
+            "table_uuid" -> {
+                if (rawTableUuid != null) throw BadRequestException("invalid scoped scan query")
+                rawTableUuid = value
+            }
+            else -> throw BadRequestException("invalid scoped scan query")
+        }
+    }
+    if (rawSnapshot == null || rawTableUuid == null || !CANONICAL_SNAPSHOT.matches(rawSnapshot)) {
+        throw BadRequestException("invalid scoped scan query")
+    }
+    val snapshot = rawSnapshot.toLongOrNull() ?: throw BadRequestException("invalid scoped scan query")
+    val uuid =
+        runCatching { UUID.fromString(rawTableUuid) }.getOrNull()?.takeIf { it.toString() == rawTableUuid }
+            ?: throw BadRequestException("invalid scoped scan query")
+    return snapshot to uuid
+}
+
+private fun recordScopedSuccess(call: ApplicationCall) {
+    call.application.attributes.getOrNull(AuthServiceKey)?.let { service ->
+        Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
+    }
+}
+
+private fun recordScopedRefusal(
+    call: ApplicationCall,
+    failure: HoglakeException,
+) {
+    call.application.attributes.getOrNull(AuthServiceKey)?.let { service ->
+        countRefusal(
+            service,
+            service.clientClass(call),
+            call.hoglakeAuth.callerOrNull,
+            call.attributes.getOrNull(RouteMatchKey),
+            failure,
+            enforced = true,
+        )
+    }
+}
