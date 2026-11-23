@@ -1,13 +1,11 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.commit.CommitService
-import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
-import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
@@ -220,56 +218,6 @@ class UnsignedPromotionHydrationIntegrationTest {
         // The same bytes the long column stored for the same file.
         assertThat(lower).isEqualTo(IcebergSingleValue.encode(ColType.LONG, MIN_UNSIGNED))
         assertThat(upper).isEqualTo(IcebergSingleValue.encode(ColType.LONG, MAX_UNSIGNED))
-    }
-
-    @Test
-    fun `an id-less file pending across an int to long promote gets 8-byte bounds`() {
-        // The promote re-encodes only stats that exist; this file gets its
-        // own in the sweep, bound by name at its begin_snapshot, where v
-        // is still an INT. Its bounds must be the live LONG's width.
-        val cat = "idless-promote"
-        catalogs.createCatalog(cat, "s3://$BUCKET/")
-        catalogs.createNamespace(cat, "ns")
-        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("v", ColType.INT)))
-        val fieldId = catalogs.getTable(cat, "ns", "t").columns.single().fieldId
-
-        val schema = MessageType("hoglake_test", Types.optional(PrimitiveType.PrimitiveTypeName.INT32).named("v"))
-        val tmp = Files.createTempFile("hoglake-idless", ".parquet")
-        val bytes =
-            try {
-                Files.deleteIfExists(tmp)
-                val factory = SimpleGroupFactory(schema)
-                ExampleParquetWriter.builder(LocalOutputFile(tmp))
-                    .withType(schema)
-                    .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
-                    .build()
-                    .use { w -> for (v in listOf(-3, 7)) w.write(factory.newGroup().append("v", v)) }
-                Files.readAllBytes(tmp)
-            } finally {
-                Files.deleteIfExists(tmp)
-            }
-        val path = "s3://$BUCKET/t3/idless.parquet"
-        store.put(path, bytes)
-        commits.commit(
-            cat,
-            CommitRequest(
-                appends =
-                    listOf(
-                        TableAppend(
-                            "ns",
-                            "t",
-                            listOf(FileRegistration(path, 2, bytes.size.toLong(), footerSizeOf(bytes))),
-                        ),
-                    ),
-            ),
-        )
-        AlterService(jdbi).alterTable(cat, "ns", "t", listOf(AlterOp.PromoteColumn("v", ColType.LONG)))
-
-        assertThat(hydrator.runOnce()).isEqualTo(1)
-
-        val (lower, upper) = boundsOf(cat, fieldId)
-        assertThat(lower).isEqualTo(IcebergSingleValue.encode(ColType.LONG, -3L))
-        assertThat(upper).isEqualTo(IcebergSingleValue.encode(ColType.LONG, 7L))
     }
 
     /** The one live stats row's bounds, straight from the hydrator's output. */

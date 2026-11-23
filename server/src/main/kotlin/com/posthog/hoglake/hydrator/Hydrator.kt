@@ -663,14 +663,11 @@ class Hydrator(
         // never live-at-hydration: a drop+add-same-name between commit and
         // this sweep would otherwise land the old incarnation's stats
         // under the NEW field id, poisoning pruning on the new column.
-        // Their TYPES are the live ones ([withLiveTypes]): a promote after
-        // the commit must not leave this file's bounds in the old width.
-        val live = catalogColumns(h, file, at = null)
         val columns =
             if (FooterStats.usesFieldIds(footer.fileMetaData.schema)) {
-                live
+                catalogColumns(h, file, at = null)
             } else {
-                catalogColumns(h, file, at = file.beginSnapshot).withLiveTypes(live)
+                catalogColumns(h, file, at = file.beginSnapshot)
             }
         // FooterStats.aggregate applies StatsSanity before it returns,
         // so these are already checked: a bound the catalog type cannot
