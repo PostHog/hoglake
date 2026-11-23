@@ -87,14 +87,19 @@ class CatalogStoreSelector(
     ): ScopedNamespaceBinding? =
         cfg?.scopedNamespaceBinding?.takeIf { it.catalog == catalog && it.namespace == namespace }
 
-    /** Select only the operator's exact table tuple, without resolving a legacy store. */
+    /** Select the bound table only when the request holds the verified read session. */
     internal fun scopedTableBinding(
+        call: ApplicationCall,
         catalog: String,
         namespace: String,
         table: String,
     ): ScopedNamespaceBinding? =
         cfg?.scopedNamespaceBinding?.takeIf {
-            it.catalog == catalog && it.namespace == namespace && it.table == table && it.readSession != null
+            call.verifiedBackendAuthority?.readSessionBinding === it &&
+                it.catalog == catalog &&
+                it.namespace == namespace &&
+                it.table == table &&
+                it.readSession != null
         }
 
     /** Terminal typed table read. No outcome selects another store or credential. */
