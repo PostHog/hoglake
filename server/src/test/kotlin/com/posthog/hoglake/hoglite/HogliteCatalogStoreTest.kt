@@ -515,6 +515,31 @@ class HogliteCatalogStoreTest {
         assertThat(requests.filter { it.startsWith("DELETE") || it.endsWith("/release") }).isEmpty()
     }
 
+    /** A drop that failed after its fence (release or delete) is resumed by a retry, not refused as "being dropped". */
+    @Test
+    fun `a retried drop of a fenced catalog releases and deletes its tenant`() {
+        seed("t-wh-1", "wh")
+        tenants["t-wh-1"]!!.dropping = true
+
+        assertThat(store.dropCatalog("wh", null, null).name).isEqualTo("wh")
+
+        assertThat(tenants).isEmpty()
+        val writes = requests.filterNot { it.contains("/query") }
+        assertThat(writes).containsExactly(
+            writes[0],
+            "POST /v1/t/t-wh-1/release",
+            "DELETE /v1/tenants/t-wh-1",
+        )
+        assertThat(writes[0]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM namespaces")
+        // The fake passes a guard whose SQL it does not recognise, so
+        // pin the fence: its only statement naming `dropping` is the
+        // UPDATE. Any guard on `dropping` would refuse every retry.
+        val fence = txStatements.single()
+        assertThat(fence.filter { "dropping" in it })
+            .containsExactly("UPDATE meta SET dropping = 1 WHERE id = 1")
+        assertThat(fence.last()).isEqualTo("UPDATE meta SET dropping = 1 WHERE id = 1")
+    }
+
     // ---- namespace containment -------------------------------------------
 
     @ParameterizedTest

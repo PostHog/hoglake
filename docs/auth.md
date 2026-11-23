@@ -144,6 +144,10 @@ Authorization is per catalog. The scope vocabulary is ordered,
 (expire, compact, rehydrate, cleanup, publications) includes `write`, and
 `admin` (drop the catalog) includes everything. A catalog the token does not
 name answers 404, not 403, so a token cannot enumerate catalogs it may not see.
+One exception: dropping a catalog placed on a hoglite backend also needs an
+`operator` token. hoglite deletes a tenant only for an operator
+([below](#backends-that-verify-the-token-themselves)), so a `tenant` token
+with `admin` gets 403 there, before the drop fences anything.
 
 So that standard identity providers can express the same thing, the OAuth
 `scope` claim is accepted as an alternative: a space-separated string whose

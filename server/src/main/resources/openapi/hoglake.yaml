@@ -240,6 +240,12 @@ paths:
         afterwards, and a catalog created under it starts a new snapshot
         clock at 0. No operation receipt: do not retry an unknown outcome
         blindly — a 404 on retry may mean the first attempt succeeded.
+        A Hoglite catalog drop is not one transaction: the preconditions
+        and a write fence commit together, then the tenant is released
+        and deleted. It needs an `operator` token (403 otherwise, before
+        anything is fenced). If it fails after the fence, the catalog
+        stays readable, writes get 404 "being dropped", and retrying the
+        DELETE completes the drop.
       parameters:
         - { $ref: "#/components/parameters/operationAuthor" }
         - { $ref: "#/components/parameters/operationMessage" }
@@ -250,6 +256,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DroppedCatalog" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >
