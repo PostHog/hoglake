@@ -68,6 +68,11 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
+ * - CommitOutcomeUnknown -> 503 `commit_outcome_unknown`, + Retry-After
+ *                          only when the write's blind replay converges
+ *                          (`replaySafe`): a keyless commit or a DDL, whose
+ *                          replay would apply twice or be refused, gets no
+ *                          invitation (#682)
  * - malformed body / unparseable query or path params -> 400. This
  *   includes the receives ktor refuses BEFORE deserialization even
  *   starts (ContentTransformationException): a body sent under a
@@ -199,9 +204,11 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // Retry-After shape, its own code, because the operations
         // response to "the database did not answer" is not the response
         // to "one catalog is hot".
-        // A commit that may have landed: retryable like the arm below,
-        // its own code because "your commit may be durable" is not "the
-        // database did not answer". Before BackendUnavailable: it is one.
+        // A write that may have landed: the same 503, its own code
+        // because "your write may be durable" is not "the database did
+        // not answer". Whether it invites a retry (Retry-After) is the
+        // write's `replaySafe`, decided by the caller. Before
+        // BackendUnavailable: it is one.
         is HoglakeException.CommitOutcomeUnknown ->
             HttpStatusCode.ServiceUnavailable to apiError("commit_outcome_unknown", cause)
         is HoglakeException.BackendUnavailable ->
@@ -265,7 +272,7 @@ fun StatusPagesConfig.installErrorMapping() {
     }
 }
 
-/** Retry-After for 503 commit_queue_timeout: back off a beat, then retry. */
+/** Retry-After for the retryable 503s (commit_queue_timeout and kin): back off a beat, then retry. */
 private const val RETRY_AFTER_SECONDS = "1"
 
 /**
@@ -300,14 +307,26 @@ private suspend fun ApplicationCall.respondHoglakeFailure(cause: HoglakeExceptio
         return
     }
     val (status, body) = errorBody(cause)
-    if (cause is HoglakeException.CommitQueueTimeout ||
-        cause is HoglakeException.BackendUnavailable ||
-        cause is HoglakeException.MountScanTimeout ||
-        cause is HoglakeException.MountScanBusy ||
-        cause is HoglakeException.MountHostUnavailable ||
-        cause is HoglakeException.MountProxyBusy ||
-        cause is PartitionLookupUnavailable
-    ) {
+    val invitesRetry =
+        when (cause) {
+            // Before its BackendUnavailable parent: an unknown outcome
+            // invites a replay only when the replay converges. A keyless
+            // commit's replay registers its files twice and a DDL's applies
+            // twice (truncate) or is refused as already applied, so their
+            // 503 carries no Retry-After, as PostgreSQL's lost COMMIT
+            // acknowledgement carries none (#682).
+            is HoglakeException.CommitOutcomeUnknown -> cause.replaySafe
+            is HoglakeException.CommitQueueTimeout,
+            is HoglakeException.BackendUnavailable,
+            is HoglakeException.MountScanTimeout,
+            is HoglakeException.MountScanBusy,
+            is HoglakeException.MountHostUnavailable,
+            is HoglakeException.MountProxyBusy,
+            is PartitionLookupUnavailable,
+            -> true
+            else -> false
+        }
+    if (invitesRetry) {
         response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
     }
     if (cause is HoglakeException.Unauthenticated) {

@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.model.boundReencodeFor
@@ -285,7 +286,13 @@ internal class HogliteAlters(
                     val readback = tx.add(HogliteSql.READBACK_DDL)
                     val results =
                         try {
-                            store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
+                            store.runTx(
+                                catalog,
+                                HogliteCatalogStore.freshTxid("alter"),
+                                null,
+                                tx,
+                                replay = WriteReplay.DDL,
+                            )
                         } catch (e: HoglakeException.CommitConflict) {
                             if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_FILE_SET_CHANGED) throw e
                             if (attempt == 1 || (e === ALTER_SCHEMA_CHANGED && readSnapshot != null)) {

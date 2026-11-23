@@ -55,7 +55,9 @@ internal class HogliteUploads(
             // The path is a fresh random UUID, so this races nothing;
             // INSERT OR IGNORE makes a retry of the SAME upload_id
             // idempotent, and the identity check below rejects a reuse
-            // that changed the definition.
+            // that changed the definition. Claim, renew and abandon are
+            // replay-safe (runTx's default): each sets a state its replay
+            // re-sets, so an unknown outcome keeps its Retry-After.
             store.runTx(
                 catalog,
                 HogliteCatalogStore.freshTxid("upload-claim"),

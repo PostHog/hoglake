@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.wireObjectMapper
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
@@ -310,6 +311,9 @@ class CommitConflictSpecParityTest {
                     Int::class -> 503
                     java.util.UUID::class -> java.util.UUID.randomUUID()
                     List::class -> listOf("ns.t")
+                    // CommitOutcomeUnknown's replay class: one wire code for
+                    // every class, which decides the Retry-After header only.
+                    WriteReplay::class -> WriteReplay.CONVERGES
                     // CatalogNotEmpty's reason. One wire code for every
                     // reason, by design (see the exception's KDoc).
                     CatalogNotEmptyReason::class -> CatalogNotEmptyReason.entries.first()

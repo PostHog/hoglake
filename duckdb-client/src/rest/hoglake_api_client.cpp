@@ -647,6 +647,17 @@ void HoglakeApiClient::ThrowFor(const Response &response, const string &what, bo
 		                           "snapshot can no longer be read — start a new transaction)",
 		                           message);
 	case 503:
+		// The server says whether a 503 invites a retry: Retry-After
+		// rides the definite ones and the unknown outcomes whose replay
+		// converges, and is withheld from a DDL's commit_outcome_unknown
+		// because a blind replay would apply the DDL twice or be refused
+		// as already applied. Every ThrowFor caller is outside the commit
+		// loop (hoglake_transaction.cpp decides for itself), so that one
+		// gets the same exception with a message that does not call it
+		// retryable.
+		if (error == "commit_outcome_unknown" && response.retry_after_seconds == 0) {
+			throw IOException("%s (the operation may have been applied; read the object before retrying)", message);
+		}
 		throw IOException("%s (retryable commit backpressure)", message);
 	default:
 		throw IOException("%s", message);
