@@ -17,7 +17,11 @@ internal object HogliteSql {
 
     const val FILE_COLUMNS = FILE_PREFIX + "f.stats_json, f.split_offsets_json, f.begin_snapshot"
 
-    /** Changefeed discards payloads; keep the mapper's fifteen positions, including snapshot at14. */
+    /**
+     * For reads that discard payloads (changefeed, partition lookup): the
+     * mapper's fifteen positions, including snapshot at 14, with stats and
+     * split offsets left in the engine.
+     */
     const val CHANGEFEED_FILE_COLUMNS = FILE_PREFIX + "NULL AS stats_json, NULL AS split_offsets_json, f.begin_snapshot"
 
     /**

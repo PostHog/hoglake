@@ -9,6 +9,7 @@ import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.SplitOffsets
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.service.AlterService
@@ -291,4 +292,96 @@ class HogliteScanStatsParityIntegrationTest {
             assertThat(stat.fieldId).isEqualTo(2L)
             assertThat(store.getTable(cat, "ns", "t").columns.last().def.name).isEqualTo("renamed")
         }
+
+    @ParameterizedTest(name = "{displayName} [{index}] {0}")
+    @EnumSource(Backend::class)
+    fun `a wide table's stats are served whole and narrowed by stats_fields before any budget`(backend: Backend) =
+        fixture(backend, (1..1000).map { ColumnDef("c$it", ColType.LONG) }) { store, cat ->
+            val stats = (1..1000L).map { ColumnStats(it, 1, 0, null, null, null, null) }
+            // The precondition: one file's stored stats exceed a scan page's per-row share.
+            assertThat(json.writeValueAsBytes(stats).size).isGreaterThan(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES)
+            store.commit(
+                cat,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf("a", "b", "c").map {
+                                    FileRegistration("s3://hoglake-it/$cat/$it", 1, 100, 50, columnStats = stats)
+                                },
+                            ),
+                        ),
+                ),
+            )
+            queries.clear()
+            val one = store.planScan(cat, "ns", "t", columnStats = ScanService.ColumnStatsRequest(setOf(7)))
+            assertThat(one.map { f -> f.dataFile.columnStats!!.map { it.fieldId } }).allSatisfy {
+                assertThat(it).containsExactly(7L)
+            }
+            if (backend == Backend.HOGLITE) {
+                // Narrowed in the engine: one field fits the page, nothing is read alone.
+                assertThat(queries.none { READ_ALONE in it }).isTrue()
+            }
+            queries.clear()
+            val all = store.planScan(cat, "ns", "t", columnStats = ScanService.ColumnStatsRequest())
+            assertThat(all.map { f -> f.dataFile.columnStats!!.map { it.fieldId } }).allSatisfy {
+                assertThat(it).isEqualTo((1..1000L).toList())
+            }
+            if (backend == Backend.HOGLITE) {
+                // The page's three oversized payloads share one query.
+                assertThat(queries.count { READ_ALONE in it }).isEqualTo(1)
+            }
+            // Narrowed but still past the per-row share: read alone, and narrowed there too.
+            val many = (1..900L).toSet()
+            assertThat(json.writeValueAsBytes(stats.filter { it.fieldId in many }).size)
+                .isGreaterThan(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES)
+            queries.clear()
+            val most = store.planScan(cat, "ns", "t", columnStats = ScanService.ColumnStatsRequest(many))
+            assertThat(most.map { f -> f.dataFile.columnStats!!.map { it.fieldId } }).allSatisfy {
+                assertThat(it).isEqualTo(many.toList())
+            }
+            if (backend == Backend.HOGLITE) {
+                val alone = queries.filter { READ_ALONE in it }
+                assertThat(alone).hasSize(1)
+                assertThat(alone.single()).contains("WITH wanted")
+            }
+        }
+
+    @ParameterizedTest(name = "{displayName} [{index}] {0}")
+    @EnumSource(Backend::class)
+    fun `a file committed with the most split offsets is served by every split_offsets scan`(backend: Backend) =
+        fixture(backend, listOf(ColumnDef("id", ColType.LONG))) { store, cat ->
+            val offsets = (0 until SplitOffsets.MAX_ROW_GROUPS).map { 4L + it * 1_000L }
+            store.commit(
+                cat,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(
+                                    FileRegistration(
+                                        "s3://hoglake-it/$cat/a",
+                                        1,
+                                        200_000_000,
+                                        50,
+                                        splitOffsets = offsets,
+                                    ),
+                                    FileRegistration("s3://hoglake-it/$cat/b", 1, 100, 50, splitOffsets = listOf(4L)),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+            val plan = store.planScan(cat, "ns", "t", splitOffsets = true)
+            assertThat(plan.map { it.dataFile.splitOffsets }).containsExactly(offsets, listOf(4L))
+        }
+
+    private companion object {
+        /** The read-alone query's filter: present only when a payload is read outside its page. */
+        const val READ_ALONE = "WHERE f.id IN (SELECT value FROM json_each(?))"
+    }
 }

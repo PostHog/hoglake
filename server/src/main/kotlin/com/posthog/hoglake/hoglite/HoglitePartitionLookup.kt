@@ -194,10 +194,14 @@ internal class HoglitePartitionLookup(
                 }
             }.joinToString(" AND ")
         args += candidateLimit + 1
+        // Neither the page nor the totals read stats or split offsets, so the
+        // candidates leave them in the engine: up to 10,001 wide files stay
+        // inside hoglited's response cap (#685). Same fifteen positions, so
+        // end_snapshot stays at 15 and the DV flag at 16.
         val candidates =
             store.queryCatalog(
                 catalog,
-                "SELECT ${HogliteSql.FILE_COLUMNS}, f.end_snapshot, " +
+                "SELECT ${HogliteSql.CHANGEFEED_FILE_COLUMNS}, f.end_snapshot, " +
                     "(SELECT CASE WHEN d.end_snapshot IS NULL OR d.end_snapshot > ? THEN 1 ELSE 0 END " +
                     "FROM dvs d WHERE d.data_file_id = f.id AND d.begin_snapshot <= ? " +
                     "ORDER BY d.begin_snapshot DESC, d.delete_file_id DESC LIMIT 1) " +
