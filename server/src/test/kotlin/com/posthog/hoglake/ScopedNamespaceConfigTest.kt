@@ -153,19 +153,33 @@ class ScopedNamespaceConfigTest {
     }
 
     @Test
-    fun `any remote or served configuration prevents activation`() {
+    fun `mount hosts coexist with a local namespace while reserved and served configs stay blocked`() {
         val cfg = config()
         for (match in listOf(
-            """{"type":"namespace","name":"reports"}""",
             """{"type":"namespace","name":"elsewhere"}""",
             """{"type":"namespace_family","family":"team"}""",
         )) {
             val hosts =
                 """{"hosts":[{"id":"$id","match":$match,"kind":"hoglake",""" +
                     """"url":"https://host.invalid","auth":"forward"}]}"""
+            val combined = cfg.copy(mountHostsFile = file("hosts.json", hosts), authSessionProfile = "on")
+            assertThat(combined.scopedNamespaceBinding?.namespace).isEqualTo("reports")
+            assertThat(combined.mountHosts).hasSize(1)
+        }
+        val reportsHost =
+            """{"hosts":[{"id":"$id","match":{"type":"namespace","name":"reports"},"kind":"hoglake",""" +
+                """"url":"https://host.invalid","auth":"forward"}]}"""
+        assertThatThrownBy {
+            cfg.copy(mountHostsFile = file("hosts-reports.json", reportsHost), authSessionProfile = "on")
+        }.hasMessageContaining("reserved namespace")
+        val teamHost =
+            """{"hosts":[{"id":"$id","match":{"type":"namespace_family","family":"team"},"kind":"hoglake",""" +
+                """"url":"https://host.invalid","auth":"forward"}]}"""
+        for (teamNamespace in listOf("team_42", "TEAM_42")) {
             assertThatThrownBy {
-                cfg.copy(mountHostsFile = file("hosts.json", hosts), authSessionProfile = "on")
-            }.isInstanceOf(IllegalArgumentException::class.java)
+                config(binding.replace("\"reports\"", "\"$teamNamespace\""))
+                    .copy(mountHostsFile = file("hosts-team.json", teamHost), authSessionProfile = "on")
+            }.describedAs(teamNamespace).hasMessageContaining("reserved namespace")
         }
         val served =
             """{"families":[{"family":"team","source_catalog":"imports","predicate_field":"team_id"}]}"""

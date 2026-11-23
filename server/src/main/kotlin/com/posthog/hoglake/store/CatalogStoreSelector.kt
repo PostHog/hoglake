@@ -374,6 +374,9 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.RemoteSchema? {
+        if (call.verifiedBackendAuthority?.readSessionBinding != null) {
+            throw HoglakeException.NotFound("namespace")
+        }
         call.requireCatalogEntitlement(catalog)
         return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
     }

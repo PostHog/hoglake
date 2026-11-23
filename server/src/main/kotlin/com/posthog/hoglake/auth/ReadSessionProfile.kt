@@ -2,6 +2,10 @@ package com.posthog.hoglake.auth
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.service.TeamNamespaces
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 /**
@@ -180,14 +184,25 @@ internal class ReadSessionProfile(
             val bucket = remainder.substring(0, slash)
             val key = remainder.substring(slash + 1)
             if (!BUCKET.matches(bucket) || ".." in bucket) return null
-            if (key.isEmpty() || key.length > MAX_KEY_LENGTH ||
-                key.toByteArray(Charsets.UTF_8).size > MAX_KEY_LENGTH ||
-                key.endsWith('/') || key.any { it == '\u0000' || it.isISOControl() }
-            ) {
-                return null
-            }
+            if (key.isEmpty() || key.endsWith('/') || key.any(Char::isISOControl)) return null
+            if (strictUtf8ByteLength(key, MAX_KEY_LENGTH) == null) return null
             if (key.split('/').any { it.isEmpty() || it == "." || it == ".." }) return null
             return bucket to key
+        }
+
+        private fun strictUtf8ByteLength(
+            value: String,
+            maxBytes: Int,
+        ): Int? {
+            val encoder =
+                StandardCharsets.UTF_8
+                    .newEncoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+            val output = ByteBuffer.allocate(maxBytes)
+            val result = encoder.encode(CharBuffer.wrap(value), output, true)
+            if (!result.isUnderflow || !encoder.flush(output).isUnderflow) return null
+            return output.position()
         }
     }
 }

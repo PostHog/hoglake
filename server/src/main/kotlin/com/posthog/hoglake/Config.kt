@@ -1589,9 +1589,9 @@ data class Config(
             require(!reservedNamespaces.isReserved(binding.namespace)) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved namespace"
             }
-            // Remote and served routing can require SQL to establish local placement.
-            require(mountHosts.isEmpty() && servedFamilies.isEmpty()) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot coexist with mount hosts or served namespaces"
+            // Served namespaces require SQL to check local catalog placement.
+            require(servedFamilies.isEmpty()) {
+                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot coexist with served namespaces"
             }
         }
         val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
