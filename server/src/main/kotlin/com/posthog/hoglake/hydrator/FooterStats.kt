@@ -67,6 +67,45 @@ fun List<Column>.asCatalogColumns(): List<CatalogColumn> =
     }
 
 /**
+ * An id-less file's binding: [this] (the columns visible at its
+ * begin_snapshot, which it binds to BY NAME) with each column's type and
+ * scale taken from [live] by field id.
+ *
+ * The names must be the begin_snapshot's, but the bounds must be the
+ * live type's encoding: a reader decodes them under the live type, and a
+ * width-changing promote between the file's commit and its hydration
+ * re-encodes only the stats that existed when it ran. Bound at the old
+ * `int`/`float`, the file's 4-byte bounds would land under a live
+ * `long`/`double` that decodes 8. A promote is the only change that
+ * keeps a field id and changes its type, and [FooterStats] reads the
+ * narrow physical type under the wide catalog type (as it does for an
+ * id-bearing file written before the promote). A field id with no live
+ * column keeps its begin_snapshot type.
+ */
+fun List<CatalogColumn>.withLiveTypes(live: List<CatalogColumn>): List<CatalogColumn> {
+    val byId = HashMap<Long, CatalogColumn>()
+
+    fun index(cols: List<CatalogColumn>) {
+        for (c in cols) {
+            byId[c.fieldId] = c
+            index(c.children)
+        }
+    }
+    index(live)
+
+    fun retype(cols: List<CatalogColumn>): List<CatalogColumn> =
+        cols.map { col ->
+            val now = byId[col.fieldId]
+            col.copy(
+                type = now?.type ?: col.type,
+                decimalScale = if (now != null) now.decimalScale else col.decimalScale,
+                children = retype(col.children),
+            )
+        }
+    return retype(this)
+}
+
+/**
  * Pure footer-to-stats aggregation: takes a parquet footer
  * ([ParquetMetadata], parquet-java — the project's one parquet library)
  * and the table's live catalog columns, and produces per-field
