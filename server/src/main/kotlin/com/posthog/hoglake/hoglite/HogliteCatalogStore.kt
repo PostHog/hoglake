@@ -265,9 +265,12 @@ class HogliteCatalogStore(
                 name,
                 dataPath,
             )
+            // Snapshot 0's ts comes from the engine's clock, like every later
+            // snapshot's ([insertSnapshotRow]), so the clamp never starts
+            // from a pod's time.
             boot.add(
-                "INSERT INTO snapshots(id, ts, author, message, schema_version) VALUES (0, ?, ?, ?, 0)",
-                HogliteSchema.now(),
+                "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
+                    "VALUES (0, ${HogliteSchema.NOW_SQL}, ?, ?, 0)",
                 author,
                 message,
             )
