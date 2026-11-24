@@ -225,6 +225,20 @@ class LocalIssuerTest {
             "scoped_over_lifetime_cap",
             // The session profile (docs/auth.md) is minted by no issuer yet, this one included.
             "tenant_session_profile_disabled",
+            // Tokens hoglake accepts and hoglite refuses (docs/auth.md), and one both refuse.
+            "tenant_routed_third_audience",
+            "tenant_routed_string_iat",
+            "operator_routed_without_org",
+            "operator_routed_empty_sub",
+            "tenant_routed_without_ten",
+            "tenant_routed_extra_rtg_key",
+            "tenant_routed_empty_org",
+            "tenant_routed_empty_jti",
+            "tenant_routed_string_nbf",
+            "tenant_routed_with_scope",
+            "tenant_routed_with_usr",
+            "tenant_routed_with_prd",
+            "operator_routed_without_admin",
         )
     }
 }

@@ -2776,7 +2776,21 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * A 403 is only ever returned for a catalog the caller already knows
      * is its own.
      */
-    class Forbidden(detail: String) : HoglakeException(detail)
+    open class Forbidden(detail: String) : HoglakeException(detail)
+
+    /**
+     * A backend that verifies the token itself (hoglite) answered 401 for a
+     * token hoglake verified and that has not expired -> HTTP 403
+     * `backend_refused_authority`, with no bearer challenge. The two
+     * verifiers' rules differ (docs/auth.md, "Backends that verify the
+     * token themselves"), so a fresh token with the same claims is refused
+     * again: a 401 sent clients into a re-mint loop (#681).
+     *
+     * Subclasses [Forbidden] so audit, metrics and the clients' 403 arm
+     * treat it as a refused credential; its own code tells an operator
+     * that the backend, not hoglake, refused it.
+     */
+    class BackendRefusedAuthority(detail: String) : Forbidden(detail)
 
     class OffsetRegression(detail: String) : HoglakeException(detail)
 
@@ -2928,6 +2942,26 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * answering, which an operator pages on differently.
      */
     open class BackendUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * hoglite refused, with its 401, a token hoglake verified whose `iat` or
+     * `nbf` is more than hoglite's fixed 60 s ahead of hoglake's clock ->
+     * HTTP 503 `backend_unavailable` with [retryAfterSeconds] as the
+     * `Retry-After`. hoglake admits such a token within
+     * `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS`, hoglite within its 60 s, so the
+     * same token passes once the clock catches up (#681).
+     *
+     * It IS a [BackendUnavailable] on the wire: nothing was applied, and a
+     * client that tells a 503 that applied nothing by its code (the DuckDB
+     * extension's commit retry) retries it as one, with the same token, not
+     * a re-mint. Metrics and audit give it its own outcome: the cause is a
+     * caller's clock or hoglake's skew setting, not the database failing to
+     * answer, and an operator pages on the latter.
+     */
+    class BackendTokenNotYetValid(
+        detail: String,
+        val retryAfterSeconds: Long,
+    ) : BackendUnavailable(detail)
 
     /**
      * A commit the backend may or may not have applied -> HTTP 503

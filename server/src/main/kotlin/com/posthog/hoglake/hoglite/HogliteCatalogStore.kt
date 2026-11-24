@@ -1001,6 +1001,9 @@ class HogliteCatalogStore(
             if (System.nanoTime() - deadline > 0) throw unverified(null)
             return try {
                 read()
+            } catch (e: HoglakeException.BackendTokenNotYetValid) {
+                // The caller's token, not the scan: keep its Retry-After.
+                throw e
             } catch (e: HoglakeException.BackendUnavailable) {
                 throw unverified(e)
             }
@@ -3253,7 +3256,7 @@ class HogliteCatalogStore(
         val code = body?.get("code")?.asText()
         val detail = body?.get("error")?.asText() ?: r.body
         return when {
-            r.status == 401 -> HoglakeException.Unauthenticated("invalid_token", "backend refused request authority")
+            r.status == 401 -> client.authorityRefusal()
             r.status == 403 -> HoglakeException.Forbidden("backend refused request authority")
             r.status == 404 -> missingCatalog(catalog)
             code == "result_too_large" ->

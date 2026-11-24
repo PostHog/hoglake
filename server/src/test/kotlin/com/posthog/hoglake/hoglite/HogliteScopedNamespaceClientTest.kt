@@ -6,9 +6,11 @@ import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
@@ -169,6 +171,51 @@ class HogliteScopedNamespaceClientTest {
             assertThat(calls.get()).isEqualTo(1)
         }
         assertThat(redirectedCalls.get()).isZero()
+    }
+
+    /**
+     * hoglite's 401 on a typed read is its own verifier refusing the token
+     * (#681): not an outage, a re-mint only for a token whose `exp` has
+     * passed, and a delayed retry only for one issued more than hoglite's
+     * 60 s ahead of the clock.
+     */
+    @Test
+    fun `an unauthorized refusal on every typed read is the caller's authority answer, not unavailable`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+        val calls = AtomicInteger()
+        val server =
+            serve {
+                calls.incrementAndGet()
+                reply(it, """{"code":"unauthorized"}""".toByteArray(), 401)
+            }
+        val now = System.currentTimeMillis() / 1000
+        HogliteClient(url(server), retryBudgetMs = 50, sleeper = { error("unexpected retry") }).use { base ->
+            for ((token, expected) in listOf(
+                tokenExpiring(now + 3600) to HoglakeException.BackendRefusedAuthority::class.java,
+                TOKEN to HoglakeException.BackendRefusedAuthority::class.java,
+                tokenExpiring(now - 1) to HoglakeException.Unauthenticated::class.java,
+                // An outage's wire code, with the wait for hoglite's clock in place of its one second.
+                tokenIssuedAt(now + 600) to HoglakeException.BackendTokenNotYetValid::class.java,
+                // Inside hoglite's leeway: another rule refused it.
+                tokenIssuedAt(now + 30) to HoglakeException.BackendRefusedAuthority::class.java,
+            )) {
+                val client = base.forRequest(token)
+                val reads =
+                    listOf<() -> Any?>(
+                        { client.readScopedNamespace("tenant_1", "lake", "reports") },
+                        { client.readScopedTable("tenant_1", "lake", "reports", "metrics") },
+                        { client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) },
+                    )
+                for (read in reads) {
+                    val failure = catchThrowable { read() }
+                    assertThat(failure).isExactlyInstanceOf(expected).hasNoCause()
+                    if (failure is HoglakeException.BackendTokenNotYetValid) {
+                        assertThat(failure.retryAfterSeconds).isBetween(1L, 540L)
+                    }
+                }
+            }
+        }
+        assertThat(calls.get()).isEqualTo(15)
     }
 
     @Test
@@ -634,6 +681,18 @@ class HogliteScopedNamespaceClientTest {
         HogliteClient(url(server), connectTimeoutMs = 100, readTimeoutMs = 150).use { base ->
             expectUnavailable(base.forRequest(TOKEN))
         }
+    }
+
+    /** A compact token whose only claim is [exp]; the client reads it, nothing verifies it. */
+    private fun tokenExpiring(exp: Long): String = tokenWith("""{"exp":$exp}""")
+
+    /** An unexpired compact token issued at [iat]; the client reads it, nothing verifies it. */
+    private fun tokenIssuedAt(iat: Long): String = tokenWith("""{"exp":${iat + 3600},"iat":$iat}""")
+
+    private fun tokenWith(claims: String): String {
+        val enc = Base64.getUrlEncoder().withoutPadding()
+        return enc.encodeToString("""{"alg":"ES256"}""".toByteArray()) + "." +
+            enc.encodeToString(claims.toByteArray()) + "." + enc.encodeToString("sig".toByteArray())
     }
 
     companion object {

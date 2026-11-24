@@ -2,7 +2,10 @@ package com.posthog.hoglake.auth
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.api.errorBody
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.store.BackendKind
+import io.ktor.http.HttpStatusCode
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.DynamicTest
@@ -209,12 +212,63 @@ class ContractVectorsTest {
                             rtg["t"].asText(),
                         ),
                     )
-                    assertThat(caller.orgId).isEqualTo(claims["org"].asText())
+                    // A routed operator may omit org, and any routed token may carry an
+                    // empty one; hoglite refuses both (backend_expect).
+                    assertThat(caller.orgId).isEqualTo(claims["org"]?.asText())
                     if (vector["expect"]["kind"].asText() == "operator") {
                         assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
                         assertThat(caller.catalogScopes).isEmpty()
                     }
                 }
+            }
+        }
+
+    @Test
+    fun `every vector hoglake accepts and routes to hoglite states hoglite's verdict, and only those`() {
+        vectors().forEach { vector ->
+            val routed = vector["claims"]["rtg"]?.get("b")?.asText() == "hoglite"
+            val accepted = vector["expect"]["verdict"].asText() == "accept"
+            assertThat(vector.has("backend_expect")).describedAs(vector["name"].asText()).isEqualTo(routed && accepted)
+        }
+        // One per claim rule in docs/auth.md's hoglite table. The header, kid
+        // and clock rows have none: the vectors share one header and key, and
+        // a vector cannot set hoglite's clock. Nor does a tenant token with no
+        // scope hoglite knows: hoglake grants it nothing on the catalog, so it
+        // never reaches hoglite.
+        assertThat(vectors().filter { it["backend_expect"]?.get("verdict")?.asText() == "refuse" })
+            .extracting<String> { it["name"].asText() }
+            .containsExactlyInAnyOrder(
+                "scoped_routed",
+                "tenant_routed_third_audience",
+                "operator_routed_empty_sub",
+                "tenant_routed_empty_jti",
+                "tenant_routed_string_iat",
+                "tenant_routed_string_nbf",
+                "operator_routed_without_org",
+                "tenant_routed_empty_org",
+                "tenant_routed_without_ten",
+                "tenant_routed_with_scope",
+                "tenant_routed_with_usr",
+                "tenant_routed_with_prd",
+                "operator_routed_without_admin",
+            )
+    }
+
+    /** hoglite's 401 is hoglake's 403 `backend_refused_authority` for an unexpired token, its 403 a 403 `forbidden` (#681). */
+    @TestFactory
+    fun `a backend refusal names hoglite's status and the error hoglake answers for it`(): List<DynamicTest> =
+        vectors().filter { it["backend_expect"]?.get("verdict")?.asText() == "refuse" }.map { vector ->
+            DynamicTest.dynamicTest(vector["name"].asText()) {
+                val backend = vector["backend_expect"]
+                val refusal =
+                    when (backend["status"].asInt()) {
+                        401 -> HoglakeException.BackendRefusedAuthority("hoglite refused")
+                        403 -> HoglakeException.Forbidden("backend refused request authority")
+                        else -> error("hoglite refuses authority with 401 or 403, not ${backend["status"]}")
+                    }
+                val (status, body) = errorBody(refusal)
+                assertThat(status).isEqualTo(HttpStatusCode.Forbidden)
+                assertThat(body.error).isEqualTo(backend["error"].asText())
             }
         }
 

@@ -523,8 +523,12 @@ class HogliteCatalogStoreTest {
         seed("t-wh-1", "wh")
         authorityRefusal = "/v1/t/t-wh-1/release" to status
         val expected =
-            if (status == 401) HoglakeException.Unauthenticated::class.java else HoglakeException.Forbidden::class.java
-        assertThat(catchThrowable { store.dropCatalog("wh", null, null) }).isInstanceOf(expected)
+            if (status == 401) {
+                HoglakeException.BackendRefusedAuthority::class.java
+            } else {
+                HoglakeException.Forbidden::class.java
+            }
+        assertThat(catchThrowable { store.dropCatalog("wh", null, null) }).isExactlyInstanceOf(expected)
         assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
     }
 
