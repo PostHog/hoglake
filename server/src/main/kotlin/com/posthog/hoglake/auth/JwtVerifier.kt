@@ -398,7 +398,16 @@ class JwtVerifier(
     internal fun verifyReadSession(
         token: String,
         profile: ReadSessionProfile,
-    ): Caller =
+    ): Caller = verifyReadSessionWithGrants(token, profile).first
+
+    /**
+     * Verify the dedicated read profile and return its caller and storage grants.
+     * This method uses mounted keys and does not retain AWS credentials.
+     */
+    internal fun verifyReadSessionWithGrants(
+        token: String,
+        profile: ReadSessionProfile,
+    ): Pair<Caller, ReadSessionStorageGrants> =
         try {
             if (keys !is JwksSigningKeys || !keys.mountedFile) {
                 throw JwtViolation(JwtViolation.PROFILE_NOT_ENABLED, "read sessions require mounted keys")
@@ -418,17 +427,19 @@ class JwtVerifier(
             if (Jwt.text(claims, "iss") != issuer) {
                 throw JwtViolation(JwtViolation.WRONG_ISSUER, "invalid read session issuer")
             }
-            profile.validate(claims, clock(), skewSeconds)
+            val grants = profile.validate(claims, clock(), skewSeconds)
             val route = routing(claims)
-            scopedCaller(
-                claims,
-                Jwt.text(claims, "sub"),
-                Jwt.text(claims, "jti"),
-                Jwt.textOrNull(claims, "cli"),
-                route,
-                route == null,
-                SessionProfile.Grant(emptySet(), setOf("team")),
-            )
+            val caller =
+                scopedCaller(
+                    claims,
+                    Jwt.text(claims, "sub"),
+                    Jwt.text(claims, "jti"),
+                    Jwt.textOrNull(claims, "cli"),
+                    route,
+                    route == null,
+                    SessionProfile.Grant(emptySet(), setOf("team")),
+                )
+            caller to grants
         } catch (failure: JwtViolation) {
             throw JwtViolation(failure.reason, "read session refused")
         }
