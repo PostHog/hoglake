@@ -4,6 +4,8 @@ import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.auth.AuthServiceKey
 import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.ReadSessionProfile
+import com.posthog.hoglake.auth.ReadSessionTarget
 import com.posthog.hoglake.auth.RouteMatch
 import com.posthog.hoglake.auth.RouteMatchKey
 import com.posthog.hoglake.auth.Scope
@@ -30,7 +32,6 @@ import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
-import com.posthog.hoglake.store.ScopedNamespaceBinding
 import com.posthog.hoglake.store.remoteSchemaRefusal
 import com.posthog.hoglake.store.servedNamespaceRefusal
 import io.ktor.http.HttpHeaders
@@ -99,8 +100,8 @@ fun Application.installApiRoutes(
             handleLocalOnlyNamespaceGet(call, selector)
         }
         get(LOCAL_ONLY_TABLE_ROUTE) {
-            val binding = call.localOnlyBinding(ScopedNamespaceBinding::matchesTable)
-            handleScopedTableGet(call, selector, binding, ScopedNamespaceBinding.LOCAL_ONLY_PREFIX)
+            val target = call.localOnlyTarget(ReadSessionProfile::matchesTable)
+            handleScopedTableGet(call, selector, target, ReadSessionProfile.LOCAL_ONLY_PREFIX)
         }
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -396,16 +397,18 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
-                                selector.scopedTableBinding(call, call.catalog(), call.namespace(), call.table())
-                                    ?.takeIf {
-                                        it.matchesTable(
-                                            call.request.httpMethod,
-                                            call.attributes.getOrNull(RouteMatchKey),
-                                        )
-                                    }?.let { scoped ->
-                                        handleScopedTableGet(call, selector, scoped)
-                                        return@get
-                                    }
+                                val catalog = call.catalog()
+                                val namespace = call.namespace()
+                                val table = call.table()
+                                if (selector.isReadSessionTableRoute(call, catalog, namespace, table) &&
+                                    ReadSessionProfile.matchesTable(
+                                        call.request.httpMethod,
+                                        call.attributes.getOrNull(RouteMatchKey),
+                                    )
+                                ) {
+                                    handleScopedTableGet(call, selector, ReadSessionTarget(catalog, namespace, table))
+                                    return@get
+                                }
                                 when (val binding = selector.resolve(call, call.catalog())) {
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
@@ -864,17 +867,19 @@ fun Application.installScanRoutes(selector: CatalogStoreSelector) {
     routing {
         // The local-only pinned scan: only the typed scan that the auth plugin selected. It never relays.
         get("$LOCAL_ONLY_TABLE_ROUTE/scan") {
-            val binding = call.localOnlyBinding(ScopedNamespaceBinding::matchesScan)
-            handleScopedScanGet(call, selector, binding, ScopedNamespaceBinding.LOCAL_ONLY_PREFIX)
+            val target = call.localOnlyTarget(ReadSessionProfile::matchesScan)
+            handleScopedScanGet(call, selector, target, ReadSessionProfile.LOCAL_ONLY_PREFIX)
         }
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
-            selector.scopedTableBinding(call, call.catalog(), call.namespace(), call.table())
-                ?.takeIf {
-                    it.matchesScan(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
-                }?.let { scoped ->
-                    handleScopedScanGet(call, selector, scoped)
-                    return@get
-                }
+            val catalog = call.catalog()
+            val namespace = call.namespace()
+            val table = call.table()
+            if (selector.isReadSessionTableRoute(call, catalog, namespace, table) &&
+                ReadSessionProfile.matchesScan(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
+            ) {
+                handleScopedScanGet(call, selector, ReadSessionTarget(catalog, namespace, table))
+                return@get
+            }
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
             // so a repeated `stats_fields=3&stats_fields=7` would silently
             // drop field 7's bounds and a second, misspelt `include` would
@@ -1254,25 +1259,22 @@ private suspend fun requireEmptyScopedBody(
 }
 
 private const val LOCAL_ONLY_NAMESPACE_ROUTE =
-    "${ScopedNamespaceBinding.LOCAL_ONLY_PREFIX}/catalogs/{catalog}/namespaces/{namespace}"
+    "${ReadSessionProfile.LOCAL_ONLY_PREFIX}/catalogs/{catalog}/namespaces/{namespace}"
 private const val LOCAL_ONLY_TABLE_ROUTE = "$LOCAL_ONLY_NAMESPACE_ROUTE/tables/{table}"
 
 /**
- * The binding that the auth plugin selected for this local-only route with the
+ * The target that the auth plugin selected for this local-only route with the
  * read-session verifier. Without that proof, or for another route shape, the
  * answer is absence.
  */
-private fun ApplicationCall.localOnlyBinding(
-    shape: ScopedNamespaceBinding.(HttpMethod, RouteMatch?) -> Boolean,
-): ScopedNamespaceBinding {
-    val binding = localOnlySelection?.binding ?: throw HoglakeException.NotFound("namespace")
-    // Explicit invocation: `binding.matches(...)` resolves to the member, which refuses a local-only binding.
-    if (!shape.invoke(binding, request.httpMethod, attributes.getOrNull(RouteMatchKey)) ||
-        verifiedBackendAuthority?.readSessionBinding !== binding
+private fun ApplicationCall.localOnlyTarget(shape: (HttpMethod, RouteMatch?) -> Boolean): ReadSessionTarget {
+    val target = localOnlySelection?.target ?: throw HoglakeException.NotFound("namespace")
+    if (!shape(request.httpMethod, attributes.getOrNull(RouteMatchKey)) ||
+        verifiedBackendAuthority?.isReadSession != true
     ) {
         throw HoglakeException.NotFound("namespace")
     }
-    return binding
+    return target
 }
 
 /** The local-only namespace read: the gate's typed read, on the raw local-only path. */
@@ -1280,15 +1282,15 @@ private suspend fun handleLocalOnlyNamespaceGet(
     call: ApplicationCall,
     selector: CatalogStoreSelector,
 ) {
-    val binding = call.localOnlyBinding(ScopedNamespaceBinding::matchesNamespace)
+    val target = call.localOnlyTarget(ReadSessionProfile::matchesNamespace)
     val required = checkNotNull(call.localOnlySelection).decision.required
     val expected =
-        "${ScopedNamespaceBinding.LOCAL_ONLY_PREFIX}/catalogs/${binding.catalog}/namespaces/${binding.namespace}"
+        "${ReadSessionProfile.LOCAL_ONLY_PREFIX}/catalogs/${target.catalog}/namespaces/${target.namespace}"
     if (call.request.uri != expected) throw BadRequestException("invalid scoped namespace request")
     requireEmptyScopedBody(call, "invalid scoped namespace request")
     val result =
         try {
-            runInterruptible { selector.readScopedNamespace(call, binding) }
+            runInterruptible { selector.readScopedNamespace(call, target) }
         } catch (failure: HoglakeException.NotFound) {
             recordScopedRefusal(call, failure)
             throw failure
@@ -1296,7 +1298,7 @@ private suspend fun handleLocalOnlyNamespaceGet(
     val caller = call.hoglakeAuth.callerOrNull
     val mark = result?.containment
     if (result == null || mark == null || caller == null ||
-        !caller.mayUseContained(binding.catalog, mark.field, mark.value, null, required)
+        !caller.mayUseContained(target.catalog, mark.field, mark.value, null, required)
     ) {
         val refusal = HoglakeException.NotFound("namespace")
         recordScopedRefusal(call, refusal)
@@ -1309,11 +1311,11 @@ private suspend fun handleLocalOnlyNamespaceGet(
 private suspend fun handleScopedTableGet(
     call: ApplicationCall,
     selector: CatalogStoreSelector,
-    binding: ScopedNamespaceBinding,
+    target: ReadSessionTarget,
     prefix: String = "/v1",
 ) {
     call.response.headers.append(HttpHeaders.CacheControl, "no-store")
-    val expectedPath = "$prefix/catalogs/${binding.catalog}/namespaces/${binding.namespace}/tables/${binding.table}"
+    val expectedPath = "$prefix/catalogs/${target.catalog}/namespaces/${target.namespace}/tables/${target.table}"
     val uri = call.request.uri
     val queryIndex = uri.indexOf('?')
     val rawPath = if (queryIndex == -1) uri else uri.substring(0, queryIndex)
@@ -1324,7 +1326,7 @@ private suspend fun handleScopedTableGet(
     requireEmptyScopedBody(call, "invalid scoped table request")
     val table =
         try {
-            runInterruptible { selector.readScopedTable(call, binding) }
+            runInterruptible { selector.readScopedTable(call, target) }
         } catch (failure: HoglakeException) {
             if (failure is HoglakeException.NotFound || failure is HoglakeException.Forbidden) {
                 recordScopedRefusal(call, failure)
@@ -1338,12 +1340,12 @@ private suspend fun handleScopedTableGet(
 private suspend fun handleScopedScanGet(
     call: ApplicationCall,
     selector: CatalogStoreSelector,
-    binding: ScopedNamespaceBinding,
+    target: ReadSessionTarget,
     prefix: String = "/v1",
 ) {
     call.response.headers.append(HttpHeaders.CacheControl, "no-store")
     val expectedPath =
-        "$prefix/catalogs/${binding.catalog}/namespaces/${binding.namespace}/tables/${binding.table}/scan"
+        "$prefix/catalogs/${target.catalog}/namespaces/${target.namespace}/tables/${target.table}/scan"
     val uri = call.request.uri
     val queryIndex = uri.indexOf('?')
     if (queryIndex == -1) throw BadRequestException("invalid scoped scan request")
@@ -1356,7 +1358,9 @@ private suspend fun handleScopedScanGet(
     requireEmptyScopedBody(call, "invalid scoped scan request")
     val files =
         try {
-            runInterruptible { selector.readScopedScan(call, binding, snapshot, tableUuid) }
+            runInterruptible {
+                selector.readScopedScan(call, target, snapshot, tableUuid)
+            }
         } catch (failure: HoglakeException) {
             if (failure is HoglakeException.NotFound || failure is HoglakeException.Forbidden) {
                 recordScopedRefusal(call, failure)

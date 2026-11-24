@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
+import com.posthog.hoglake.auth.ReadSessionProfile
 import com.posthog.hoglake.hoglite.HogliteBackend
 import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
@@ -14,8 +15,6 @@ import com.posthog.hoglake.storage.BrokerUrls
 import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
-import com.posthog.hoglake.store.MountNames
-import com.posthog.hoglake.store.ScopedNamespaceBinding
 import com.posthog.hoglake.store.ServedFamily
 import com.posthog.hoglake.store.ServedStream
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -51,10 +50,15 @@ data class Config(
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
     /**
-     * One exact local namespace binding for the typed scoped read.
-     * Empty disables it. The binding attests tenant-local isolation and owner support.
+     * Profile identifier for dedicated read-session JWT verification.
+     * Empty disables dedicated read sessions.
      */
-    val scopedNamespaceFile: String = env("HOGLAKE_SCOPED_NAMESPACE_FILE", ""),
+    val readSessionProfile: String = env("HOGLAKE_READ_SESSION_PROFILE", ""),
+    /**
+     * Two comma-separated remote storage targets for dedicated read sessions.
+     * Required when [readSessionProfile] is set.
+     */
+    val readSessionRemoteTargets: String = env("HOGLAKE_READ_SESSION_REMOTE_TARGETS", ""),
     /** PostgreSQL is the only default backend. `none` disables fallback and opens PostgreSQL only on a routed request. */
     val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
     /** Optional allowlist id for this process's PostgreSQL backend. */
@@ -1526,20 +1530,8 @@ data class Config(
             teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
         )
 
-    /**
-     * The binding of [scopedNamespaceFile]. A read-session binding can name a
-     * namespace that a configured remote schema relays by that exact name, when
-     * the operator's own reserved names do not include it. That binding is
-     * local-only ([ScopedNamespaceBinding.localOnly]): the relay stays the
-     * answer for every request on an ordinary route. Only the local-only routes select it.
-     */
-    internal val scopedNamespaceBinding: ScopedNamespaceBinding? =
-        ScopedNamespaceBinding.read(scopedNamespaceFile)?.let { binding ->
-            val relayed =
-                mountHosts.any { (it.match as? MountMatch.RemoteSchemaMatch)?.relays(binding.namespace) == true }
-            val operatorReserved = ReservedNamespaces(reservedNamespaceNames).isReserved(binding.namespace)
-            if (binding.readSession != null && relayed && !operatorReserved) binding.copy(localOnly = true) else binding
-        }
+    internal val readSession: ReadSessionProfile? =
+        ReadSessionProfile.fromEnv(readSessionProfile, readSessionRemoteTargets)
 
     /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
     val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
@@ -1577,35 +1569,23 @@ data class Config(
         }
 
     init {
-        scopedNamespaceBinding?.let { binding ->
+        readSession?.let {
             require(AuthMode.parse("HOGLAKE_AUTH_MODE", authMode) == AuthMode.ENFORCE) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_MODE=enforce"
+                "HOGLAKE_READ_SESSION_PROFILE requires HOGLAKE_AUTH_MODE=enforce"
             }
             require(authJwksFile.isNotBlank() && authJwksUrl.isBlank()) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires file JWKS"
+                "HOGLAKE_READ_SESSION_PROFILE requires file JWKS"
             }
-            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS"
+            val fields = authPredicateFields.split(',').map(String::trim).filter(String::isNotEmpty).toSet()
+            require(fields == setOf("team_id")) {
+                "HOGLAKE_READ_SESSION_PROFILE requires only the team_id predicate field"
             }
-            if (binding.readSession != null) {
-                val fields = authPredicateFields.split(',').map(String::trim).filter(String::isNotEmpty).toSet()
-                require(fields == setOf("team_id")) {
-                    "read_session requires only the team_id predicate field"
-                }
-            }
-            require(backendKinds[binding.backendId] == BackendKind.HOGLITE) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires a configured hoglite backend"
-            }
-            require(!MountNames.isReserved(binding.catalog)) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved mount"
-            }
-            // A local-only binding is reserved by design: its name is also a relayed remote schema.
-            require(binding.localOnly || !reservedNamespaces.isReserved(binding.namespace)) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved namespace"
+            require(backendKinds.values.any { kind -> kind == BackendKind.HOGLITE }) {
+                "HOGLAKE_READ_SESSION_PROFILE requires a configured hoglite backend"
             }
             // Served namespaces require SQL to check local catalog placement.
             require(servedFamilies.isEmpty()) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot coexist with served namespaces"
+                "HOGLAKE_READ_SESSION_PROFILE cannot coexist with served namespaces"
             }
         }
         val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
