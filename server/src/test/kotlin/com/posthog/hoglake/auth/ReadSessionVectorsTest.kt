@@ -94,6 +94,7 @@ class ReadSessionVectorsTest {
                         sessionProfile = true,
                     ) { vector["verify_at"].asLong() }
                 val token = vector["token"].asText()
+                assertThat(vector["expect"]["read"].asText()).isEqualTo("accept")
                 val caller = verifier.verifyReadSession(token, profile)
                 val request = vector["request"]
                 val relays = caller.readsRemoteSchema(request["catalog"].asText(), request["namespace"].asText())

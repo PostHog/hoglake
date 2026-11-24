@@ -57,9 +57,9 @@ internal object ReadSessionVectors {
             catalog: String,
             namespace: String,
             relay: String,
-            change: (ObjectNode) -> Unit = {},
         ) {
-            val claims = claims().also(change)
+            // Every case is the same session: only the request differs.
+            val claims = claims()
             val header = mapper.createObjectNode().put("alg", "ES256").put("kid", ContractVectors.KID).put("typ", "JWT")
             vectors.addObject().apply {
                 put("name", name)

@@ -314,7 +314,7 @@ It adds no claim and changes no claim.
 
 - The API listener selects the dedicated read verifier for a token with the dedicated audiences on the four relayed `GET` routes of a namespace that a remote schema entry covers, in a catalog this server holds. The four routes are the namespace, its table list, a table, and a scan.
 - The caller rule is the one of §6.5c, unchanged. The caller is `scoped`. Its `cat` allows `read` on the catalog in the request path, so a session for one catalog never relays a request that names another. It holds the schema through the `team` family entry and its `prd`.
-- Each failure is the `404` of a missing namespace, and nothing is sent to the Host.
+- The catalog is checked first, as on every route: a session whose `cat` does not name the catalog in the path gets that check's `404` for the catalog, and the namespace is never looked at. Every later failure is the `404` of a missing namespace. In both cases nothing is sent to the Host.
 - A verified read session resolves such a namespace to the remote schema only. It never resolves it to a local store, a served namespace, or a mount.
 - The server forwards the original `Authorization` header, as it does for every relayed request. It does not mint, exchange, or retry with another token.
 - Every other route keeps its verifier. The ordinary verifier still refuses the dedicated audiences. The local-only routes still never relay.
@@ -326,12 +326,15 @@ It adds no claim and changes no claim.
 - The listener that receives relayed requests selects the dedicated read verifier for a token with the dedicated audiences on the same four routes of a served namespace, and on no other route. Where that is the public listener, this is the one exception to "the public listener never selects the dedicated verifier".
 - The caller rule is the one of §6.5d, unchanged, in the same order: the catalog, the schema, the namespace's mark with the caller's `org`, then the caller's `prd`.
 - The verifier requires both configured remote targets among the grants, as it does on the Client.
+- Scan `GET` requires canonical `snapshot` and `table_uuid` query parameters for a read session, as the local scan does. The Host checks both against the table it resolves for the scan and answers `404` when either differs. A table that starts to shadow another of the same name between the table lookup and the scan is therefore refused, not read.
 - The Host checks every data file and deletion vector path of a scan answer against the grants of the two remote targets. It refuses an out-of-grant or malformed path with a redacted `403`, as the local scan does for the primary-catalog grants.
+- Table `GET` and the table list omit row totals for a read session, and table `GET` allows only an omitted `totals` or `totals=false`, as the local table route does. Totals are computed before any grant check, so they are not given to a caller whose files are checked.
 - The Host never uses the embedded credentials.
 
 **The reader** opens files with the embedded credentials, so it applies the same path check itself.
 It checks every data file and deletion vector of a scan against the grants of the two remote targets before a split contributes rows or counts.
 A count answered from metadata is included: the check does not wait for a file to be opened.
+The reader derives a count only from the files of a grant-checked scan, never from a table's totals.
 
 Open points, to settle in review of this section:
 
