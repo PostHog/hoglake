@@ -226,18 +226,19 @@ It requires ES256 with mounted keys.
 It requires exactly `trino-session`, `hoglake-session`, and `hoglite-session` in `aud`.
 The ordinary verifier refuses these audiences.
 
-Only an isolated Hoglite fixture can opt in to this verifier.
-Add `read_session` to the binding in `HOGLAKE_SCOPED_NAMESPACE_FILE`.
-The object contains `profile` and a `remote_targets` array of two distinct target IDs.
-Configure `team_id` as the only predicate field.
+Enable this verifier with `HOGLAKE_READ_SESSION_PROFILE` and `HOGLAKE_READ_SESSION_REMOTE_TARGETS`.
+Set `HOGLAKE_READ_SESSION_PROFILE` to the profile identifier.
+Set `HOGLAKE_READ_SESSION_REMOTE_TARGETS` to two distinct comma-separated target IDs.
+Configure `HOGLAKE_AUTH_MODE=enforce`, file JWKS, a Hoglite backend, and `team_id` as the only predicate field.
 
-The API listener then requires a dedicated read token for the exact bound namespace GET.
-Add an optional canonical `table` name with `read_session` to opt in that table GET and pinned scan GET.
-All other requests keep the ordinary verifier.
+The API listener accepts dedicated read tokens on namespace GET, table GET, and pinned scan GET routes.
+It routes any non-reserved catalog, any non-reserved local namespace, and any table from the signed JWT.
+Reserved mounts and reserved namespaces keep the ordinary verifier on ordinary routes.
+Ordinary tokens keep the ordinary verifier on all ordinary routes.
 
 #### Local-only read routes
 
-A dedicated client reads the bound objects through three local-only GET routes:
+A dedicated client reads local objects through three local-only GET routes:
 
 - `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}`
 - `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`
@@ -245,20 +246,20 @@ A dedicated client reads the bound objects through three local-only GET routes:
 
 Each route takes the same query and gives the same body as the ordinary route without the prefix.
 A request on these routes always uses the dedicated read verifier.
-It reads only the bound namespace, table or pinned scan from the configured Hoglite owner.
-It never reaches a remote schema relay, a mount or a legacy store.
+It reads only from the configured Hoglite owner named in the signed JWT.
+It never reaches a remote schema relay, a mount, or a legacy store.
 The server never redirects or rewrites it to an ordinary route.
 
 The routes answer as follows:
 
-- A listener without `read_session` answers `501`. This includes the public listener and `HOGLAKE_AUTH_MODE=off`.
+- A listener without `HOGLAKE_READ_SESSION_PROFILE` answers `501`. This includes the public listener and `HOGLAKE_AUTH_MODE=off`.
 - Another path under `/v1/local-only` answers `422`.
 - Another method on a valid route answers `405` with `Allow: GET`.
 - A missing or refused token answers `401`.
-- A verified session that names a namespace or table outside the binding answers `404`. The server does not call the owner.
-- The bound namespace, table or scan answers as the owner answers. An absent bound object is `404`.
+- A verified session that names an unentitled catalog, a reserved mount, or a reserved namespace (including a remote schema) answers `404`. The server does not call the owner.
+- An eligible local namespace, table, or scan answers as the owner answers. An absent object is `404`.
 
-The `501`, `422` and `405` answers do not carry a marker.
+The `501`, `422`, and `405` answers do not carry a marker.
 Every other answer carries the response header `X-Hoglake-Local-Only: true`.
 A server that predates these routes treats them as unknown paths.
 It cannot match them to an ordinary route, so it cannot relay them.
@@ -266,27 +267,12 @@ Its answer does not carry the marker.
 A client reads a `404` as absence only when the marker is present.
 It must refuse every other answer without the marker.
 
-The binding is the only namespace authority on these routes.
-The dedicated token carries no signed namespace or table name.
-The operator configuration attests exactly one namespace and table tuple.
-The signed remote team-family grant gives no authority over local metadata.
-The storage grants also give no authority over local metadata.
-These routes do not generalize namespace authority to other names.
-
-A `read_session` binding can name a namespace that a remote schema relays by that exact name.
-An example is a canonical `team_<id>` with the `team` family configured.
-`HOGLAKE_RESERVED_NAMESPACES` must not list that name.
-The binding is then local-only.
-Only the local-only routes select it.
-The typed owner read then runs for the bound name, so a local namespace with that name wins.
-Every ordinary request on that namespace keeps the remote schema relay, unchanged.
-Without `read_session`, a binding of a reserved namespace is still refused at boot.
-
 Hoglake sends the original token to the configured Hoglite owner.
-It does not retry with another token or use legacy SQL after a refusal.
+It does not retry with another token after a refusal.
+It does not fall back to legacy SQL after a refusal.
 The public listener never selects the dedicated verifier.
-PostgreSQL catalogs do not support this fixture.
-The fixture requires a Hoglite owner that accepts the dedicated profile on its typed reads.
+PostgreSQL catalogs do not support this path.
+The Hoglite owner must accept the dedicated profile on its typed reads.
 
 Table GET allows omitted `totals` or `totals=false`, sets `Cache-Control: no-store`, and omits totals.
 Scan GET requires canonical `snapshot` and `table_uuid` query parameters.

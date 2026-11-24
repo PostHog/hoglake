@@ -15,6 +15,7 @@ import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
+import com.posthog.hoglake.auth.ReadSessionConfig
 import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.auth.installNamespaceGate
 import com.posthog.hoglake.commit.CommitService
@@ -512,7 +513,10 @@ class App private constructor(
         // resolves no callers, which is precisely today's behaviour. A mis-set
         // `enforce` (no issuer, no key source) fails here, at boot, naming the
         // variable — not with a fleet-wide 401 (see [auth]).
-        app.installAuth(auth, cfg.scopedNamespaceBinding?.takeUnless { auth.tenantOnly })
+        app.installAuth(
+            auth,
+            cfg.readSession?.takeUnless { auth.tenantOnly }?.let { ReadSessionConfig(it, cfg.reservedNamespaces) },
+        )
 
         // Then, and once: every handler installed below this line runs
         // its blocking database/object-store work on requestDispatcher

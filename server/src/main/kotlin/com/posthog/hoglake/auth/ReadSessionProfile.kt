@@ -1,7 +1,11 @@
 package com.posthog.hoglake.auth
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.TeamNamespaces
+import com.posthog.hoglake.store.MountNames
+import io.ktor.http.HttpMethod
 import java.nio.ByteBuffer
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
@@ -169,12 +173,107 @@ internal class ReadSessionProfile(
 
     companion object {
         val AUDIENCES = setOf("trino-session", "hoglake-session", "hoglite-session")
+        const val LOCAL_ONLY_PREFIX = "/v1/local-only"
+        const val LOCAL_ONLY_MARKER = "X-Hoglake-Local-Only"
+        const val LOCAL_ONLY_MARKER_VALUE = "true"
+        internal const val NAMESPACE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}"
+        internal const val TABLE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}"
+        internal const val SCAN_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan"
+        val LOCAL_ONLY_PATTERNS = setOf(NAMESPACE_PATTERN, TABLE_PATTERN, SCAN_PATTERN)
+        private const val MAX_PROFILE_LENGTH = 256
         private const val S3_PREFIX = "s3://"
         private const val MAX_KEY_LENGTH = 1024
+        private val CATALOG_NAME_REGEX = Regex(Identifiers.CATALOG_NAME_PATTERN)
+        private val IDENTIFIER_REGEX = Regex(Identifiers.PATTERN)
         private val POSITIVE_INTEGER = Regex("[1-9][0-9]*")
         private val ROUTED_TENANT = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,125}_[1-9][0-9]*")
         internal val BUCKET = Regex("[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
         internal val SEGMENT = Regex("[A-Za-z0-9_.=-]+")
+
+        /** Parse HOGLAKE_READ_SESSION_PROFILE and HOGLAKE_READ_SESSION_REMOTE_TARGETS. */
+        internal fun fromEnv(
+            profile: String,
+            remoteTargetsCsv: String,
+        ): ReadSessionProfile? {
+            if (profile.isBlank() && remoteTargetsCsv.isBlank()) return null
+            require(profile.isNotBlank() && remoteTargetsCsv.isNotBlank()) {
+                "HOGLAKE_READ_SESSION_PROFILE and HOGLAKE_READ_SESSION_REMOTE_TARGETS must both be set"
+            }
+            require(profile.trim() == profile && profile.length <= MAX_PROFILE_LENGTH && profile != SessionProfile.ID) {
+                "HOGLAKE_READ_SESSION_PROFILE is invalid"
+            }
+            val rawTargets = remoteTargetsCsv.split(',')
+            require(
+                rawTargets.size == 2 &&
+                    rawTargets.all { it.isNotBlank() && it.trim() == it } &&
+                    rawTargets[0] != rawTargets[1],
+            ) {
+                "HOGLAKE_READ_SESSION_REMOTE_TARGETS requires two distinct non-blank targets"
+            }
+            return ReadSessionProfile(profile, rawTargets.toSet())
+        }
+
+        /** Return true when [path] is under [LOCAL_ONLY_PREFIX]. */
+        fun isLocalOnlyPath(path: String): Boolean = path == LOCAL_ONLY_PREFIX || path.startsWith("$LOCAL_ONLY_PREFIX/")
+
+        /** Return the ordinary path that a local-only [path] names, or null. */
+        fun canonicalLocalOnlyPath(path: String): String? =
+            if (path.startsWith("$LOCAL_ONLY_PREFIX/catalogs/")) "/v1" + path.removePrefix(LOCAL_ONLY_PREFIX) else null
+
+        internal fun matchesNamespace(
+            method: HttpMethod,
+            route: RouteMatch?,
+        ): Boolean = method == HttpMethod.Get && route?.pattern == NAMESPACE_PATTERN
+
+        internal fun matchesTable(
+            method: HttpMethod,
+            route: RouteMatch?,
+        ): Boolean = method == HttpMethod.Get && route?.pattern == TABLE_PATTERN
+
+        internal fun matchesScan(
+            method: HttpMethod,
+            route: RouteMatch?,
+        ): Boolean = method == HttpMethod.Get && route?.pattern == SCAN_PATTERN
+
+        internal fun isCanonicalRoute(
+            catalog: String,
+            namespace: String,
+            table: String? = null,
+        ): Boolean =
+            CATALOG_NAME_REGEX.matches(catalog) &&
+                IDENTIFIER_REGEX.matches(namespace) &&
+                (table == null || IDENTIFIER_REGEX.matches(table))
+
+        internal fun isEligibleRoute(
+            method: HttpMethod,
+            route: RouteMatch?,
+            reservedNamespaces: ReservedNamespaces,
+        ): Boolean {
+            if (!matchesNamespace(method, route) && !matchesTable(method, route) && !matchesScan(method, route)) {
+                return false
+            }
+            val catalog = route?.catalog ?: return false
+            val namespace = route.namespace ?: return false
+            val table = if (route.pattern == NAMESPACE_PATTERN) null else route.table ?: return false
+            if (MountNames.isReserved(catalog) || reservedNamespaces.isReserved(namespace)) return false
+            return isCanonicalRoute(catalog, namespace, table)
+        }
+
+        /** Return true when the unverified JWT carries any dedicated read-session audience. */
+        internal fun hasDedicatedAudience(token: String): Boolean {
+            if (token.length > 65_536 || token.indexOf('.') !in 1..10_923) return false
+            val aud =
+                try {
+                    Jwt.parse(token).claims.get("aud")
+                } catch (_: JwtViolation) {
+                    return false
+                } ?: return false
+            return when {
+                aud.isTextual -> aud.asText() in AUDIENCES
+                aud.isArray -> aud.any { it.isTextual && it.asText() in AUDIENCES }
+                else -> false
+            }
+        }
 
         internal fun parseS3ObjectUri(path: String): Pair<String, String>? {
             if (!path.startsWith(S3_PREFIX)) return null
@@ -242,3 +341,16 @@ internal class ReadSessionStorageGrants(
 
     override fun toString(): String = "ReadSessionStorageGrants(redacted)"
 }
+
+/** Listener configuration for dedicated read-session JWT verification. */
+internal data class ReadSessionConfig(
+    val profile: ReadSessionProfile,
+    val reservedNamespaces: ReservedNamespaces,
+)
+
+/** Verified route target for a dedicated read-session call. */
+internal data class ReadSessionTarget(
+    val catalog: String,
+    val namespace: String,
+    val table: String? = null,
+)
