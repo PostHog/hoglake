@@ -69,4 +69,40 @@ class ReadSessionVectorsTest {
             }
         }
     }
+
+    /** PROPOSED: the caller rule of a remote schema, for a verified read session. */
+    @TestFactory
+    fun `a read session relays only the team schema of its own catalog`(): List<DynamicTest> {
+        val config = root["config"]
+        val file = directory.resolve("relay-jwks.json")
+        Files.write(file, mapper.writeValueAsBytes(root["jwks"]))
+        val keys = JwksSigningKeys.fromFile(file)
+        val profile =
+            ReadSessionProfile(
+                config["profile"].asText(),
+                config["remote_targets"].map { it.asText() }.toSet(),
+            )
+        return root["relay"].map { vector ->
+            DynamicTest.dynamicTest(vector["name"].asText()) {
+                val verifier =
+                    JwtVerifier(
+                        root["issuer"].asText(),
+                        ContractVectors.AUDIENCE,
+                        keys,
+                        predicateFields = setOf(config["predicate_field"].asText()),
+                        backends = mapOf(UUID.fromString(config["backend_id"].asText()) to BackendKind.HOGLITE),
+                        sessionProfile = true,
+                    ) { vector["verify_at"].asLong() }
+                val token = vector["token"].asText()
+                assertThat(vector["expect"]["read"].asText()).isEqualTo("accept")
+                val caller = verifier.verifyReadSession(token, profile)
+                val request = vector["request"]
+                val relays = caller.readsRemoteSchema(request["catalog"].asText(), request["namespace"].asText())
+                assertThat(if (relays) "relay" else "not_found").isEqualTo(vector["expect"]["relay"].asText())
+                assertThatThrownBy { verifier.verify(token) }.isInstanceOfSatisfying(JwtViolation::class.java) {
+                    assertThat(it.reason).isEqualTo(JwtViolation.WRONG_AUDIENCE)
+                }
+            }
+        }
+    }
 }

@@ -1086,6 +1086,9 @@ serve from a source catalog (§6.5d, the imports) and, when configured, the
 published stream tables beside them. The Host verifies the relayed token
 itself, so it must accept the session profile too. Nothing turns this on in
 any deployment.
+A Client with `HOGLAKE_READ_SESSION_RELAY=on` also relays a dedicated read session,
+by the same caller rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
@@ -1308,6 +1311,9 @@ relayed requests (§6.5c). The path's catalog is the customer's own, which this
 server does not hold; the data is a namespace of a source catalog in this
 server's PostgreSQL, such as the imports. One pattern covers every team, so no
 per-team entry is needed.
+
+A dedicated read session on these routes is PROPOSED, not built:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id"}]}
