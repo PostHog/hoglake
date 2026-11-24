@@ -243,6 +243,8 @@ class VerifiedBackendAuthority internal constructor(
     internal val token: String,
     internal val readSessionBinding: ScopedNamespaceBinding? = null,
     internal val storageGrants: ReadSessionStorageGrants? = null,
+    /** When the token verified, in epoch seconds on the verifier's clock ([JwtVerifier.now]). */
+    internal val verifiedAt: Long,
 ) {
     override fun toString(): String = "VerifiedBackendAuthority(redacted)"
 }
@@ -390,7 +392,9 @@ val HoglakeAuth =
                 caller?.let {
                     AuthState.Authenticated(
                         it,
-                        token?.let { jwt -> VerifiedBackendAuthority(jwt, readBinding, storageGrants) },
+                        token?.let { jwt ->
+                            VerifiedBackendAuthority(jwt, readBinding, storageGrants, service.verifier!!.now())
+                        },
                     )
                 } ?: AuthState.Anonymous,
             )

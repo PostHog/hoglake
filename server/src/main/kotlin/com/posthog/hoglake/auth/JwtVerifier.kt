@@ -348,6 +348,9 @@ class JwtVerifier(
         }
     }
 
+    /** This verifier's clock, in epoch seconds: what a verified token's `exp` is read against. */
+    internal fun now(): Long = clock()
+
     /**
      * Verify [token] and return the caller it asserts.
      *

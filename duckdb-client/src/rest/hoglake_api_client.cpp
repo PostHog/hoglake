@@ -441,7 +441,7 @@ string HoglakeApiClient::TravelQuery(const HoglakeTravel &travel) {
 }
 
 //! A 401 is retried ONCE with a freshly minted token, which is safe for
-//! writes too: hoglake decides authentication before any handler runs, so a
+//! writes too: hoglake answers 401 only before any catalog work starts, so a
 //! 401 means the request did nothing. A fixed TOKEN cannot be refreshed, so
 //! its 401 is final.
 HoglakeApiClient::Response HoglakeApiClient::TryRequest(const string &method, const string &path,

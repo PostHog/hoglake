@@ -143,7 +143,9 @@ class HogliteRejected(
  * token it cannot verify, an expired one included, and 403 only for a
  * verified token whose authority never covers the call (a tenant
  * mismatch, a non-operator on an operator route), which a retry cannot
- * change, so a 403 stays a refusal.
+ * change, so a 403 stays a refusal. This is the fallback: a long-running
+ * route refuses up front a token with too little lifetime left
+ * (`CatalogStoreSelector.requireTokenLifetime`), before anything is sent.
  *
  * ## Circuit breaking
  *
@@ -1067,6 +1069,12 @@ class HogliteClient(
     }
 
     companion object {
+        /**
+         * How long past its `exp` hoglited still accepts a token: hoglite's
+         * fixed leeway, not configurable here. See "Request authority".
+         */
+        const val TOKEN_LEEWAY_SECONDS = 60L
+
         fun fromConfig(backend: HogliteBackend): HogliteClient =
             HogliteClient(
                 standardUrl = backend.url,

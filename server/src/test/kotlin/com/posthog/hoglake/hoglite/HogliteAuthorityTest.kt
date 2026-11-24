@@ -330,7 +330,7 @@ class HogliteAuthorityTest {
                     tokenId = "jti",
                     clientName = null,
                 ),
-                VerifiedBackendAuthority("synthetic-secret"),
+                VerifiedBackendAuthority("synthetic-secret", verifiedAt = 0),
             )
         assertThat(state.toString()).doesNotContain("synthetic-secret")
     }

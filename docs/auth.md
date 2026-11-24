@@ -82,6 +82,7 @@ under `local` and 404s otherwise.
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
 | `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
+| `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` | the least lifetime a token must have left at a hoglite backend for a long-running route there; default 300, 0 disables. See [below](#backends-that-verify-the-token-themselves) |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_SESSION_PROFILE` | `off` (default) or `on`: whether tokens carrying the [session profile](#session-profile-with-embedded-storage-credentials) are accepted. Off, such a token is refused as `profile_not_enabled`, never read as a plain metadata token |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
@@ -182,6 +183,32 @@ there; only a catalog-bound `operator` request provisions or deletes. An
 issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
+
+hoglite verifies the token on every call, where hoglake checks it once
+when the request starts, and accepts it until 60 seconds past `exp`. A
+request that makes many calls can outlive its token there and fail
+partway, after some of its transactions applied (#680). Two rules cover
+that:
+
+- **Refused up front.** On a hoglite catalog, a long-running route
+  answers 401 `token_expired`, with `WWW-Authenticate: Bearer
+  error="token_expired"`, before any backend call, when `exp + 60 - now`
+  is under `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` (default 300; 0
+  disables it). `now` is when hoglake verified the token. The routes are
+  `POST .../maintenance/expire`, `.../cleanup`, `.../compact` and
+  `.../rehydrate`, `DELETE /v1/catalogs/{catalog}` and `POST
+  .../uploads/schedule-expired`; every other route runs at most one
+  transaction. Nothing ran, so the 401 is safe to answer with a fresh
+  token, which pyhoglake's `ClientCredentials` and the DuckDB extension
+  do on any 401. An issuer whose tokens live less than the minimum minus
+  60 seconds makes these routes always refuse: lower the minimum, or
+  mint longer-lived tokens for maintenance.
+- **Failed midway anyway.** A 401 from hoglite after one of the
+  request's transactions applied, or may have, answers 503
+  `commit_outcome_unknown` naming that transaction, never 401: a client
+  must not re-mint and replay a request that partly ran.
+
+PostgreSQL catalogs are unaffected by both.
 
 #### Typed scoped namespace read
 

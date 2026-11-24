@@ -50,6 +50,7 @@ import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.TeamNamespaces
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
+import io.ktor.http.HttpMethod
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
@@ -816,6 +817,8 @@ class CatalogStoreSelector(
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${routing.catalog}'")
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
+                    // Before the store exists, so before any backend call.
+                    requireTokenLifetime(call)
                     hogliteStore(
                         routing,
                         client(routing.backendId).forRequest(call.verifiedBackendToken),
@@ -823,6 +826,33 @@ class CatalogStoreSelector(
                     )
                 }
         }
+
+    /**
+     * Refuse a hoglite request on a long-running route ([LONG_RUNNING_ROUTES])
+     * whose token has less than [Config.hogliteMinTokenLifetimeSeconds] left
+     * by hoglite's reckoning: `exp` plus hoglite's leeway, from when it
+     * verified here. hoglite verifies the token on every call, so one that
+     * lapses midway fails the request after some of its transactions applied
+     * (#680). Nothing has been sent yet, so this is the 401 `token_expired` a
+     * client re-mints its token and retries on; a request that fails midway
+     * anyway is `commit_outcome_unknown` (HogliteClient, "Request authority").
+     */
+    private fun requireTokenLifetime(call: ApplicationCall) {
+        val minimum = cfg?.hogliteMinTokenLifetimeSeconds ?: return
+        if (minimum <= 0) return
+        val route = AuthPolicy.match(call.request.httpMethod, call.request.path()) ?: return
+        if (call.request.httpMethod to route.pattern !in LONG_RUNNING_ROUTES) return
+        val authority = call.verifiedBackendAuthority ?: return
+        val expiry = Jwt.seconds(Jwt.parse(authority.token).claims, "exp")
+        val left = expiry + HogliteClient.TOKEN_LEEWAY_SECONDS - authority.verifiedAt
+        if (left < minimum) {
+            throw HoglakeException.Unauthenticated(
+                JwtViolation.EXPIRED,
+                "the token has ${left}s left at the hoglite backend, under the ${minimum}s this operation " +
+                    "requires; nothing ran: retry with a fresh token",
+            )
+        }
+    }
 
     /**
      * Build a store from trusted placement. This method does not discover
@@ -905,4 +935,25 @@ class CatalogStoreSelector(
         /** Only PostgreSQL catalogs can use the PostgreSQL sampler's name-keyed totals. */
         val usePostgresTotals: Boolean,
     )
+
+    private companion object {
+        /**
+         * The routes whose hoglite request runs many transactions under one
+         * token, by method and AuthPolicy pattern, for [requireTokenLifetime]:
+         * expiry (floor, purge pages), cleanup (claims, drains, ledger
+         * purges), compaction (claims, publishes), rehydrate (the requeue,
+         * then its run row; every maintenance run adds one), the catalog
+         * drop (fence, release, delete) and the upload sweep (a fence per
+         * claim). Every other route runs at most one transaction.
+         */
+        val LONG_RUNNING_ROUTES =
+            setOf(
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/expire",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/cleanup",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/compact",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/rehydrate",
+                HttpMethod.Delete to "/v1/catalogs/{catalog}",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/uploads/schedule-expired",
+            )
+    }
 }

@@ -59,7 +59,12 @@ info:
     - **401** (`error`: `invalid_request`, `invalid_token`,
       `token_expired`, `invalid_signature`, …) with a
       `WWW-Authenticate: Bearer error="…"` challenge: no credential, or
-      one that does not verify. Renew and retry.
+      one that does not verify. Renew and retry. On a Hoglite catalog,
+      the long-running routes (maintenance expire, cleanup, compact and
+      rehydrate, the catalog drop, the upload sweep) also answer
+      `token_expired` for a token with less lifetime left than the
+      operation needs (`HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS`,
+      default 300), before anything runs.
     - **403** `forbidden`: the credential verifies and the catalog is
       the caller's own, but it is short of the scope this route needs.
     - **404** — NOT 403 — for a catalog the caller is not entitled to.
@@ -3748,6 +3753,14 @@ components:
         `not_yet_valid`, `invalid_signature`, `unknown_signing_key`,
         `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`, `unknown_backend`),
         and the same value appears in the `WWW-Authenticate` challenge.
+        Hoglite verifies the forwarded token on every backend call, so on
+        a Hoglite catalog a long-running route (maintenance expire,
+        cleanup, compact and rehydrate, the catalog drop, the upload
+        sweep) answers `token_expired`, before any backend call, for a
+        token with less than the configured minimum left
+        (`HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS`, default 300 s,
+        counting Hoglite's 60 s leeway past `exp`). Nothing ran: a fresh
+        token fixes it.
       headers:
         WWW-Authenticate:
           schema: { type: string }

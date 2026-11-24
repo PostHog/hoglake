@@ -316,6 +316,127 @@ class HogliteJwtIntegrationTest {
         }
     }
 
+    /**
+     * The other half of #680: a long-running route refuses up front, as the
+     * 401 a client re-mints for, a token that could lapse midway at hoglite.
+     * Nothing runs: no run row, the catalog still there. A fresh token runs.
+     */
+    @Test
+    fun `a long-running route refuses a token too short-lived for it before anything runs`() {
+        val pair = TestTokens.keyPair()
+        val id = "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa"
+        val jwks = dir.resolve("public.json")
+        Files.writeString(jwks, TestTokens.jwks(pair))
+        HogliteConformanceEngine(
+            listOf(
+                "-auth-mode",
+                "enforce",
+                "-auth-issuer",
+                TestTokens.ISSUER,
+                "-auth-backend-id",
+                id,
+                "-auth-jwks-file",
+                jwks.toString(),
+            ),
+        ).use { engine ->
+            val backends = dir.resolve("backends.json")
+            Files.writeString(
+                backends,
+                """{"backends":[{"id":"$id","kind":"hoglite","url":"${engine.url()}"}]}""",
+            )
+            val cfg =
+                Config(
+                    defaultBackend = "none",
+                    backendsFile = backends.toString(),
+                    authMode = "enforce",
+                    jdbcUrl = "jdbc:no-driver:must-not-open",
+                    dbUser = "",
+                    dbPassword = "",
+                    hogliteMinTokenLifetimeSeconds = 300,
+                )
+            val auth =
+                AuthService(
+                    AuthMode.ENFORCE,
+                    JwtVerifier(
+                        TestTokens.ISSUER,
+                        "hoglake",
+                        StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
+                        backends = cfg.backendKinds,
+                    ),
+                )
+            val now = Instant.now().epochSecond
+
+            fun operator(exp: Long): String =
+                TestTokens.mint(
+                    pair,
+                    """{"iss":"${TestTokens.ISSUER}","aud":["hoglake","hoglite"],"sub":"test-client",""" +
+                        """"jti":"test-operator-$exp","ten":"operator","org":"org-not-the-tid",""" +
+                        """"cat":{"lake":["admin"]},"iat":$now,"nbf":$now,"exp":$exp,""" +
+                        """"rtg":{"b":"hoglite","be":"$id","t":"opaque_1"}}""",
+                )
+            val fresh = operator(now + 900)
+            // Valid at hoglite for 120 + its leeway = 180 s, under the 300 s minimum.
+            val short = operator(now + 120)
+            testApplication {
+                App.build(cfg).use { app ->
+                    application { app.module(this, auth) }
+                    assertThat(
+                        client.post("/v1/catalogs") {
+                            header(HttpHeaders.Authorization, "Bearer $fresh")
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"lake","data_path":"s3://hoglake-it/lake"}""")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.Created)
+
+                    val json = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+
+                    suspend fun expiryRuns(): Int {
+                        val runs =
+                            client.get("/v1/catalogs/lake/maintenance/runs?task=expiry") {
+                                header(HttpHeaders.Authorization, "Bearer $fresh")
+                            }
+                        assertThat(runs.status).isEqualTo(HttpStatusCode.OK)
+                        return json.readTree(runs.bodyAsText())["runs"].size()
+                    }
+
+                    val refused =
+                        client.post("/v1/catalogs/lake/maintenance/expire") {
+                            header(HttpHeaders.Authorization, "Bearer $short")
+                        }
+                    assertThat(refused.status).isEqualTo(HttpStatusCode.Unauthorized)
+                    assertThat(refused.headers[HttpHeaders.WWWAuthenticate]).isEqualTo("Bearer error=\"token_expired\"")
+                    assertThat(expiryRuns()).isZero()
+                    // A short-lived token still serves a route that runs one transaction.
+                    assertThat(
+                        client.get("/v1/catalogs/lake") { header(HttpHeaders.Authorization, "Bearer $short") }.status,
+                    ).isEqualTo(HttpStatusCode.OK)
+
+                    assertThat(
+                        client.post("/v1/catalogs/lake/maintenance/expire") {
+                            header(HttpHeaders.Authorization, "Bearer $fresh")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.OK)
+                    assertThat(expiryRuns()).isEqualTo(1)
+
+                    val drop =
+                        client.delete("/v1/catalogs/lake?message=drop") {
+                            header(HttpHeaders.Authorization, "Bearer $short")
+                        }
+                    assertThat(drop.status).isEqualTo(HttpStatusCode.Unauthorized)
+                    assertThat(drop.bodyAsText()).contains("\"token_expired\"")
+                    assertThat(
+                        client.get("/v1/catalogs/lake") { header(HttpHeaders.Authorization, "Bearer $fresh") }.status,
+                    ).isEqualTo(HttpStatusCode.OK)
+                    assertThat(
+                        client.delete("/v1/catalogs/lake?message=drop") {
+                            header(HttpHeaders.Authorization, "Bearer $fresh")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.OK)
+                }
+            }
+        }
+    }
+
     private companion object {
         const val HOGLITED_LEEWAY_SECONDS = 60L
 

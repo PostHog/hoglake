@@ -51,6 +51,17 @@ data class Config(
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
     /**
+     * The least lifetime, in seconds, a token must have left at hoglite
+     * (its `exp` plus hoglite's leeway) for a hoglite request on a
+     * long-running route: a maintenance run, a catalog drop, an upload
+     * sweep. hoglite verifies the forwarded token on every call, so one
+     * that lapses midway fails the request after some of its
+     * transactions applied (#680). Refused as 401 `token_expired` before
+     * any backend call; 0 disables the check. PostgreSQL checks the token
+     * once, when the request starts, and is unaffected.
+     */
+    val hogliteMinTokenLifetimeSeconds: Long = env("HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS", "300").toLong(),
+    /**
      * One exact local namespace binding for the typed scoped read.
      * Empty disables it. The binding attests tenant-local isolation and owner support.
      */
@@ -1739,6 +1750,10 @@ data class Config(
                 "HOGLAKE_AUTH_SIGNING_KEY is read only under HOGLAKE_AUTH_MODE=local (it is set, and the mode is " +
                     "'${authMode.trim()}'): unset it, or set the mode"
             }
+        }
+        require(hogliteMinTokenLifetimeSeconds >= 0) {
+            "HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS=$hogliteMinTokenLifetimeSeconds must not be negative " +
+                "(0 disables the check)"
         }
         require(postgresBackendId.isEmpty() || canonicalBackendId(postgresBackendId) !in hogliteBackends) {
             "HOGLAKE_POSTGRES_BACKEND_ID duplicates a hoglite backend id"
