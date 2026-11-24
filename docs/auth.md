@@ -299,6 +299,48 @@ give the expected verdict for each verifier.
 Their keys and credentials are fictional.
 Run `just server contract-vectors` to regenerate the file.
 
+#### Read sessions on a remote schema
+
+**Status: PROPOSED. Nothing routes a read session to a remote schema yet.**
+Today a dedicated read token reads local objects only.
+On every route that names a remote schema the ordinary verifier refuses its audiences, and the local-only routes answer `404`.
+This section is the contract for the change; the `relay` list in the read session vectors pins the caller rule.
+
+A read session already names the read-only `team` family in `remote_schemas` and one team in `prd`.
+This section lets it read that team schema through the relay, with the same bytes.
+It adds no claim and changes no claim.
+
+**On the Client** ([auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client)):
+
+- The API listener selects the dedicated read verifier for a token with the dedicated audiences on the four relayed `GET` routes of a namespace that a remote schema entry covers, in a catalog this server holds. The four routes are the namespace, its table list, a table, and a scan.
+- The caller rule is the one of §6.5c, unchanged. The caller is `scoped`. Its `cat` allows `read` on the catalog in the request path, so a session for one catalog never relays a request that names another. It holds the schema through the `team` family entry and its `prd`.
+- Each failure is the `404` of a missing namespace, and nothing is sent to the Host.
+- A verified read session resolves such a namespace to the remote schema only. It never resolves it to a local store, a served namespace, or a mount.
+- The server forwards the original `Authorization` header, as it does for every relayed request. It does not mint, exchange, or retry with another token.
+- Every other route keeps its verifier. The ordinary verifier still refuses the dedicated audiences. The local-only routes still never relay.
+
+**On the Host** ([auth-tenancy.md §6.5d](auth-tenancy.md#65d-served-namespaces-on-the-host)):
+
+- A server with served namespaces may enable the dedicated read verifier. This lifts the boot refusal that keeps the two apart.
+- A server that only serves namespaces enables it without a Hoglite backend. It ignores `rtg` on a served route, as it does for a `storage-session` token.
+- The listener that receives relayed requests selects the dedicated read verifier for a token with the dedicated audiences on the same four routes of a served namespace, and on no other route. Where that is the public listener, this is the one exception to "the public listener never selects the dedicated verifier".
+- The caller rule is the one of §6.5d, unchanged, in the same order: the catalog, the schema, the namespace's mark with the caller's `org`, then the caller's `prd`.
+- The verifier requires both configured remote targets among the grants, as it does on the Client.
+- The Host checks every data file and deletion vector path of a scan answer against the grants of the two remote targets. It refuses an out-of-grant or malformed path with a redacted `403`, as the local scan does for the primary-catalog grants.
+- The Host never uses the embedded credentials.
+
+**The reader** opens files with the embedded credentials, so it applies the same path check itself.
+It checks every data file and deletion vector of a scan against the grants of the two remote targets before a split contributes rows or counts.
+A count answered from metadata is included: the check does not wait for a file to be opened.
+
+Open points, to settle in review of this section:
+
+- Whether the Host path check above is required, or whether the reader's check and the storage policy are enough. This section requires it.
+- A Host that serves published tables beside a source catalog needs one remote target for each storage root. The verifier takes exactly two targets today.
+
+The `relay` list of the [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json) gives one verified session, a requested catalog and namespace, and the answer of the caller rule: `relay` or `not_found`.
+It covers the held team, another team, another catalog with the same organization and team, non-canonical spellings, and names outside the family.
+
 #### Experimental profile
 
 **Status: PROPOSED, experimental, off by default.** A query engine that runs
