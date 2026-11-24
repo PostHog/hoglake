@@ -122,6 +122,10 @@ class HogliteExtendedGuardRaceIntegrationTest {
                     ex.close()
                     return@createContext
                 }
+                // The tenant's trusted data_path rides on a header (#668); a relay must carry it.
+                resp.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                    ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                }
                 respond(answer.first, answer.second)
             } catch (e: Throwable) {
                 ex.sendResponseHeaders(599, -1)

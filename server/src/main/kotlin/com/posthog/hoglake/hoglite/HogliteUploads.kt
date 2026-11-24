@@ -41,8 +41,10 @@ internal class HogliteUploads(
         store.catalogOperation(catalog) {
             if (kind !in setOf("data", "delete")) throw HoglakeException.Validation("invalid upload file_kind")
             val normalized = prefix.trimEnd('/')
-            // meta read: the catalog 404 and the data_path the prefix must stay under.
-            val dataPath = store.meta(catalog).dataPath
+            // meta read: the catalog 404 and the data_path the prefix must
+            // stay under — the TRUSTED one, since a claim is a licence to
+            // write there (#668).
+            val dataPath = store.trustedDataPath(catalog, store.meta(catalog))
             val path = "$normalized/trino-upload/${UUID.randomUUID()}.${if (kind == "data") "parquet" else "puffin"}"
             val root = dataPath.trimEnd('/') + "/"
             if (!path.startsWith(root) || path.any { it.isWhitespace() || it.isISOControl() } ||
@@ -138,6 +140,9 @@ internal class HogliteUploads(
     ): Int =
         store.catalogOperation(catalog) {
             if (limit !in 1..10000) throw HoglakeException.Validation("limit must be between 1 and 10000")
+            // No trusted-data_path gate: the sweep only QUEUES removal rows
+            // (cleanup, gated, is what deletes; #668). The claim above is
+            // gated, because a claim licenses a write.
             store.meta(catalog)
             val now = HogliteSchema.now()
             val restBefore = HogliteSchema.fmt(Instant.now().minusSeconds(ledgerRetentionSeconds))

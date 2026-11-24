@@ -109,6 +109,10 @@ class HogliteCreationIntegrationTest {
                             .method(exchange.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body)).build(),
                         HttpResponse.BodyHandlers.ofByteArray(),
                     )
+                // The tenant's trusted data_path rides on a header (#668); a relay must carry it.
+                response.headers().allValues(HogliteClient.DATA_PATH_HEADER).forEach {
+                    exchange.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it)
+                }
                 exchange.sendResponseHeaders(response.statusCode(), response.body().size.toLong())
                 exchange.responseBody.use { it.write(response.body()) }
             } finally {

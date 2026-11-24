@@ -91,7 +91,10 @@ internal class HogliteCleanup(
         }
         val m = store.meta(catalog)
         val worker = "$workerIdPrefix:${UUID.randomUUID()}"
-        val objects = removalStore.forCatalog(catalog, m.dataPath)
+        // The view is bounded to the TRUSTED prefix (the tenant manifest's,
+        // never the meta row's): a removal row naming another prefix's
+        // object fails per key and stays queued (#668).
+        val objects = removalStore.forCatalog(catalog, store.trustedDataPath(catalog, m))
         val handled = mutableSetOf<Long>()
         var total = Tally()
         // ONE BUDGET PER ARM — CleanupService.drainWorker's rule.

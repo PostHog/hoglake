@@ -225,15 +225,14 @@ class HogliteRefusalMappingTest {
                                 selected.listCatalogs(setOf("first", "second"))
                             }
                         }
-                    if (status == 409 && mode == "create") {
-                        // Creation's idempotent 409 proceeds to its existing bootstrap guard classification.
-                        assertThat(failure).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
-                    } else {
-                        assertThat(failure).isExactlyInstanceOf(HogliteRejected::class.java)
-                        val refused = failure as HogliteRejected
-                        assertThat(refused.status).isEqualTo(status)
-                        assertThat(refused.body).isEqualTo(body)
-                    }
+                    // A create's first request is the probe read of the tenant;
+                    // a 404 that is not hoglite's "tenant does not exist", or
+                    // any other refusal of it, surfaces as the client raised
+                    // it, like the list's.
+                    assertThat(failure).isExactlyInstanceOf(HogliteRejected::class.java)
+                    val refused = failure as HogliteRejected
+                    assertThat(refused.status).isEqualTo(status)
+                    assertThat(refused.body).isEqualTo(body)
                 }
             } finally {
                 server.stop(0)

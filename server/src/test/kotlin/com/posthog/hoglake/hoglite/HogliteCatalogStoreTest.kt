@@ -3,12 +3,20 @@ package com.posthog.hoglake.hoglite
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.api.toDto
+import com.posthog.hoglake.compaction.CompactionConfig
+import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.CatalogNotEmptyReason
+import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.NamespaceContainment
+import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.service.RemovalStore
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.assertj.core.api.Assertions.catchThrowable
 import org.assertj.core.api.Assertions.entry
 import org.junit.jupiter.api.AfterEach
@@ -16,6 +24,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -43,6 +52,12 @@ class HogliteCatalogStoreTest {
     private class Tenant {
         var name: String? = null
         var dataPath: String? = null
+
+        /** The manifest's data_path, served in X-Hoglite-Data-Path; null is a legacy tenant. */
+        var manifestDataPath: String? = null
+
+        /** The `meta` table exists but its row was deleted with raw SQL (with [name] null). */
+        var metaRowDeleted = false
         var dropping = false
         val namespaces = mutableListOf<Ns>()
 
@@ -123,8 +138,44 @@ class HogliteCatalogStoreTest {
                 path == authorityRefusal?.first ->
                     authorityRefusal!!.second to mapOf("code" to "refused", "error" to "authority refused")
                 ex.requestMethod == "PUT" -> {
-                    tenants.putIfAbsent(tenantId, Tenant())
-                    200 to mapOf("ok" to true)
+                    // hoglite's create: the body's data_path is stored in the
+                    // manifest on a fresh tenant, must equal the stored one on
+                    // an existing tenant (a legacy tenant holds none, so any
+                    // claim mismatches), and is omitted when echoHeader is off
+                    // (an engine that predates the field). The answer never
+                    // says `existing`: hoglite omits it when the receiving
+                    // pod holds the tenant itself, so a duplicate create of
+                    // a live catalog looks exactly like a fresh one, and the
+                    // store must not read anything into its absence.
+                    beforePut?.let {
+                        beforePut = null
+                        it()
+                    }
+                    val claimed = body?.get("data_path")?.asText()
+                    val existing = tenants[tenantId]
+                    if (claimed != null && claimed == invalidDataPath) {
+                        400 to
+                            mapOf(
+                                "code" to "invalid_data_path",
+                                "error" to "data_path \"$claimed\" lies inside hoglite's own storage root",
+                            )
+                    } else if (echoHeader && existing != null && claimed != null &&
+                        existing.manifestDataPath != claimed
+                    ) {
+                        409 to mapOf("code" to "data_path_mismatch", "error" to "tenant holds another data_path")
+                    } else if (existing == null && claimed != null && overlapWith != null) {
+                        409 to
+                            mapOf(
+                                "code" to "data_path_overlap",
+                                "error" to
+                                    "tenant $tenantId cannot take data_path \"$claimed\": it overlaps tenant " +
+                                    "t-other-1 (data_path \"$overlapWith\"); tenant data_paths must be disjoint",
+                            )
+                    } else {
+                        val t = tenants.computeIfAbsent(tenantId) { Tenant() }
+                        if (existing == null && echoHeader) t.manifestDataPath = claimed
+                        200 to mapOf("tenant" to tenantId, "owner" to "pod-1")
+                    }
                 }
                 ex.requestMethod == "DELETE" -> {
                     tenants.remove(tenantId)
@@ -151,9 +202,25 @@ class HogliteCatalogStoreTest {
                 else -> 400 to mapOf("error" to "unexpected $path")
             }
         val bytes = json.writeValueAsBytes(answer)
+        // Every tenant-scoped answer repeats the manifest's data_path, as hoglite does.
+        if (path != "/v1/query-batch") {
+            tenants[tenantId]?.manifestDataPath?.let { ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, it) }
+        }
         ex.sendResponseHeaders(status, bytes.size.toLong())
         ex.responseBody.use { it.write(bytes) }
     }
+
+    /** False fakes an engine that predates the manifest data_path: no header, nothing stored. */
+    private var echoHeader = true
+
+    /** When set, a create of a NEW tenant with a data_path is refused as overlapping tenant `t-other-1`'s. */
+    private var overlapWith: String? = null
+
+    /** A data_path hoglite's own validation refuses (400 `invalid_data_path`). */
+    private var invalidDataPath: String? = null
+
+    /** Runs once, before the next tenant PUT is handled: a racing create that lands between the probe and the PUT. */
+    private var beforePut: (() -> Unit)? = null
 
     private fun result(vararg rows: List<Any?>): Map<String, Any?> =
         mapOf("cols" to List(rows.firstOrNull()?.size ?: 0) { "c$it" }, "rows" to rows.toList(), "affected" to 0)
@@ -177,6 +244,8 @@ class HogliteCatalogStoreTest {
     ): Map<String, Any?> =
         when {
             sql == HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL -> result(listOf(foreignKeys))
+            sql == HogliteCatalogStore.META_TABLE_EXISTS_SQL ->
+                result(listOf(if (t.name == null && !t.metaRowDeleted) 0 else 1))
             sql.startsWith("SELECT name, data_path,") -> if (t.name == null) result() else result(metaRow(t))
             sql == HogliteCatalogStore.STORAGE_USAGE_SQL -> result(usage)
             sql.startsWith("SELECT id, name, contained_field, contained_value FROM namespaces WHERE name = ?") ->
@@ -217,7 +286,11 @@ class HogliteCatalogStoreTest {
         val t =
             tenants[q["tenant"].asText()]
                 ?: return mapOf("status" to 404, "body" to mapOf("error" to "tenant does not exist"))
-        return mapOf("status" to 200, "body" to query(t, q["sql"].asText()))
+        return buildMap {
+            put("status", 200)
+            put("body", query(t, q["sql"].asText()))
+            t.manifestDataPath?.let { put("data_path", it) }
+        }
     }
 
     /** The value a guard's COUNT(*) returns on [t]. */
@@ -292,11 +365,14 @@ class HogliteCatalogStoreTest {
         tenantId: String,
         name: String,
         dataPath: String = "s3://bucket/$name",
+        /** The manifest's value; defaults to the row's. Null seeds a legacy tenant. */
+        manifestDataPath: String? = dataPath,
     ) {
         tenants[tenantId] =
             Tenant().apply {
                 this.name = name
                 this.dataPath = dataPath
+                this.manifestDataPath = manifestDataPath
             }
     }
 
@@ -308,11 +384,15 @@ class HogliteCatalogStoreTest {
         assertThat(info.dataPath).isEqualTo("s3://bucket/wh")
         assertThat(info.headSnapshotId).isZero()
         assertThat(tenants.keys).containsExactly("t-wh-1")
-        assertThat(requests[0]).isEqualTo("PUT /v1/tenants/t-wh-1")
+        // The tenant is probed (absent: this call's PUT makes it) before the create.
+        assertThat(requests[0]).isEqualTo("POST /v1/t/t-wh-1/query")
+        assertThat(requests[1]).isEqualTo("PUT /v1/tenants/t-wh-1")
+        // The tenant create carries the data_path, so hoglite holds the trusted copy.
+        assertThat(tenants["t-wh-1"]!!.manifestDataPath).isEqualTo("s3://bucket/wh")
         // The enforcement probe reads the new tenant before anything is written to it.
-        assertThat(requests[1]).isEqualTo("POST /v1/t/t-wh-1/query")
+        assertThat(requests[2]).isEqualTo("POST /v1/t/t-wh-1/query")
         // The duplicate guard is statement 0, before any DDL.
-        assertThat(requests[2]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
+        assertThat(requests[3]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
         // The enforcement probe is statement 1, still before any DDL.
         assertThat(txStatements.single()[1]).isEqualTo(HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL)
         // The read-back of the new catalog reuses the operation's binding.
@@ -383,8 +463,452 @@ class HogliteCatalogStoreTest {
 
         val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/new", null, null) }
 
-        assertThat(failure).isInstanceOf(HoglakeException.AlreadyExists::class.java).hasMessageContaining("'wh'")
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+            .hasMessageContaining("'wh'")
+            .hasMessageContaining("set at create")
         assertThat(tenants["t-wh-1"]!!.dataPath).isEqualTo("s3://bucket/old")
+        // Decided from the tenant's own schema: no PUT, no bootstrap statement.
+        assertThat(requests).containsExactly("POST /v1/t/t-wh-1/query")
+
+        // The same path is the plain duplicate.
+        requests.clear()
+        assertThatThrownBy { store.createCatalog("wh", "s3://bucket/old", null, null) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+            .hasMessage("catalog 'wh' already exists")
+        assertThat(requests).containsExactly("POST /v1/t/t-wh-1/query")
+    }
+
+    @Test
+    fun `a duplicate create of a live catalog leaves it intact whatever shape hoglite's answer has`() {
+        // The tenant is absent at the probe and a racing create bootstraps
+        // it before this call's PUT, which hoglite then answers exactly as
+        // it answers a fresh create (no `existing`: the pod holds the
+        // tenant). The bootstrap guard, not the answer, says AlreadyExists,
+        // and the live catalog is never deleted.
+        beforePut = { seed("t-wh-1", "wh") }
+
+        assertThatThrownBy { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly(
+                "POST /v1/t/t-wh-1/query",
+                "PUT /v1/tenants/t-wh-1",
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/tx",
+            )
+        assertThat(tenants["t-wh-1"]!!.name).isEqualTo("wh")
+        assertThat(tenants["t-wh-1"]!!.dataPath).isEqualTo("s3://bucket/wh")
+    }
+
+    @Test
+    fun `a create on an engine that does not record the data_path fails before bootstrapping and keeps its tenant`() {
+        echoHeader = false
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining(HogliteClient.DATA_PATH_HEADER)
+        // Nothing is bootstrapped and nothing is deleted: hoglite's answer
+        // cannot prove this call made the tenant, so an operator removes it.
+        assertThat(
+            requests,
+        ).containsExactly("POST /v1/t/t-wh-1/query", "PUT /v1/tenants/t-wh-1", "POST /v1/t/t-wh-1/query")
+        assertThat(tenants).containsKey("t-wh-1")
+        assertThat(tenants["t-wh-1"]!!.name).isNull()
+
+        // A tenant the call FOUND (the probe saw it) is not its to delete,
+        // whatever hoglite's answer says.
+        tenants["t-wh-1"] = Tenant()
+        requests.clear()
+        assertThatThrownBy { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        assertThat(
+            requests,
+        ).containsExactly("POST /v1/t/t-wh-1/query", "PUT /v1/tenants/t-wh-1", "POST /v1/t/t-wh-1/query")
+        assertThat(tenants).containsKey("t-wh-1")
+    }
+
+    @Test
+    fun `a create whose bootstrap fails never deletes the tenant, and a retry completes it`() {
+        authorityRefusal = "/v1/t/t-wh-1/tx" to 403
+
+        assertThatThrownBy { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+            .isInstanceOf(HoglakeException.Forbidden::class.java)
+        // MUTATION: delete the tenant after a failed bootstrap and this
+        // request list grows a DELETE and the tenant is gone.
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly(
+                "POST /v1/t/t-wh-1/query",
+                "PUT /v1/tenants/t-wh-1",
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/tx",
+            )
+        assertThat(tenants).containsKey("t-wh-1")
+        assertThat(tenants["t-wh-1"]!!.name).isNull()
+
+        // The same create again completes it: the probe finds no catalog,
+        // the PUT is idempotent, and the bootstrap runs.
+        authorityRefusal = null
+        requests.clear()
+        assertThat(store.createCatalog("wh", "s3://bucket/wh", null, null).name).isEqualTo("wh")
+        assertThat(tenants["t-wh-1"]!!.name).isEqualTo("wh")
+
+        // AlreadyExists from the bootstrap guard: a racing create's catalog
+        // landed after the PUT, and it stays.
+        tenants.clear()
+        beforeWrite = { t ->
+            t.name = "wh"
+            t.dataPath = "s3://bucket/wh"
+        }
+        requests.clear()
+        assertThatThrownBy { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly(
+                "POST /v1/t/t-wh-1/query",
+                "PUT /v1/tenants/t-wh-1",
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/tx",
+            )
+        assertThat(tenants["t-wh-1"]!!.name).isEqualTo("wh")
+    }
+
+    @Test
+    fun `a failed bootstrap on a tenant that holds a catalog by then leaves the catalog`() {
+        // Absent at the probe; a racing create bootstraps it before the PUT
+        // (hoglite's 200 says nothing of it); this call's bootstrap then
+        // fails for a reason other than the guard. Nothing is deleted and
+        // the failure surfaces as it is.
+        beforePut = { seed("t-wh-1", "wh") }
+        authorityRefusal = "/v1/t/t-wh-1/tx" to 403
+
+        assertThatThrownBy { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+            .isInstanceOf(HoglakeException.Forbidden::class.java)
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly(
+                "POST /v1/t/t-wh-1/query",
+                "PUT /v1/tenants/t-wh-1",
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/tx",
+            )
+        assertThat(tenants["t-wh-1"]!!.name).isEqualTo("wh")
+    }
+
+    @Test
+    fun `hoglite's overlap refusal is the 422 PostgreSQL answers for the same condition`() {
+        overlapWith = "s3://bucket"
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("overlaps another catalog's")
+            .hasMessageContaining("catalog data_paths must be disjoint")
+            .hasMessageContaining("t-other-1")
+        // Nothing was created, so nothing is deleted.
+        assertThat(requests).containsExactly("POST /v1/t/t-wh-1/query", "PUT /v1/tenants/t-wh-1")
+        assertThat(tenants).isEmpty()
+    }
+
+    @Test
+    fun `hoglite's own data_path refusal is a 422 in its words, not a 500`() {
+        invalidDataPath = "s3://bucket/wh"
+
+        val failure = catchThrowable { store.createCatalog("wh", "s3://bucket/wh", null, null) }
+
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("'wh'")
+            .hasMessageContaining("lies inside hoglite's own storage root")
+        assertThat(requests).containsExactly("POST /v1/t/t-wh-1/query", "PUT /v1/tenants/t-wh-1")
+        assertThat(tenants).isEmpty()
+    }
+
+    @Test
+    fun `a drop removes a tenant whose catalog never bootstrapped`() {
+        // The create failed between the tenant PUT and its one transaction
+        // (and its clean-up failed too): a tenant with the manifest's
+        // data_path and no schema, which locks the name and the prefix.
+        tenants["t-wh-1"] = Tenant().apply { manifestDataPath = "s3://bucket/wh" }
+
+        val dropped = store.dropCatalog("wh", null, null)
+
+        assertThat(dropped.dataPath).isEqualTo("s3://bucket/wh")
+        // No fence transaction: there is no catalog to prove empty.
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly("POST /v1/t/t-wh-1/query", "POST /v1/t/t-wh-1/release", "DELETE /v1/tenants/t-wh-1")
+        assertThat(tenants).isEmpty()
+        // The name is free: a create now bootstraps a fresh catalog.
+        assertThat(store.createCatalog("wh", "s3://bucket/elsewhere", null, null).dataPath)
+            .isEqualTo("s3://bucket/elsewhere")
+
+        // A tenant with no data_path at all (an older engine's) drops too,
+        // and reports no prefix.
+        tenants["t-x-1"] = Tenant()
+        assertThat(store.dropCatalog("x", null, null).dataPath).isEmpty()
+        assertThat(tenants).doesNotContainKey("t-x-1")
+
+        // A `meta` table WITHOUT its row is not an unbootstrapped tenant: the
+        // bootstrap writes both at once, so only raw SQL leaves this shape.
+        // Refused as damage; the tenant stays, with no fence and no delete.
+        tenants["t-y-1"] = Tenant().apply { metaRowDeleted = true }
+        requests.clear()
+        assertThatThrownBy { store.dropCatalog("y", null, null) }
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("no metadata row")
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly("POST /v1/t/t-y-1/query", "POST /v1/t/t-y-1/query")
+        assertThat(tenants).containsKey("t-y-1")
+    }
+
+    @Test
+    fun `a drop that finds a tenant with no catalog waits for the create that is bootstrapping it`() {
+        // The tenant is absent at the create's probe. Between its PUT and
+        // its bootstrap a drop starts on another thread: it would find a
+        // tenant with no catalog in it and delete it, after the bootstrap
+        // landed, with no fence and no emptiness proof, while the create
+        // answered success. The drop's probe-and-delete takes the create
+        // lock, so it blocks on it until the create (read-back included)
+        // has left, then finds a bootstrapped catalog and drops THAT, the
+        // fenced way.
+        val lock = client.createLock
+        var drop: Thread? = null
+        var dropped: DroppedCatalog? = null
+        beforePut = {
+            drop =
+                Thread { dropped = store.dropCatalog("wh", null, null) }.apply {
+                    isDaemon = true
+                    start()
+                }
+            awaitBlockedOn(drop!!, lock)
+        }
+
+        val created = store.createCatalog("wh", "s3://bucket/wh", null, null)
+        drop!!.join(10_000)
+
+        assertThat(created.dataPath).isEqualTo("s3://bucket/wh")
+        assertThat(dropped?.dataPath).isEqualTo("s3://bucket/wh")
+        assertThat(requests.map { it.substringBefore(" ::") })
+            .containsExactly(
+                // The create, whole, under the lock.
+                "POST /v1/t/t-wh-1/query",
+                "PUT /v1/tenants/t-wh-1",
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/tx",
+                "POST /v1/t/t-wh-1/query",
+                // Then the drop: a bootstrapped catalog, so fenced before deleted.
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/query",
+                "POST /v1/t/t-wh-1/tx",
+                "POST /v1/t/t-wh-1/release",
+                "DELETE /v1/tenants/t-wh-1",
+            )
+        assertThat(txStatements.last()).contains("UPDATE meta SET dropping = 1 WHERE id = 1")
+        assertThat(tenants).isEmpty()
+    }
+
+    /**
+     * Spin until [thread] is blocked entering [monitor] (not merely some
+     * monitor), or has ended (it never blocked: the caller's assertions
+     * say so), or fail after ten seconds.
+     */
+    private fun awaitBlockedOn(
+        thread: Thread,
+        monitor: Any,
+    ) {
+        val threads = java.lang.management.ManagementFactory.getThreadMXBean()
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (thread.isAlive && System.nanoTime() < deadline) {
+            val info = threads.getThreadInfo(thread.threadId())
+            if (info?.threadState == Thread.State.BLOCKED &&
+                info.lockInfo?.identityHashCode == System.identityHashCode(monitor)
+            ) {
+                return
+            }
+            Thread.sleep(1)
+        }
+        throw AssertionError("the drop never blocked on the create lock")
+    }
+
+    @Test
+    fun `a drop refused for undrained removals says when a legacy catalog can never drain them`() {
+        seed("t-wh-1", "wh", manifestDataPath = null)
+        nonEmpty = "FROM removals" to 2L
+
+        val failure = catchThrowable { store.dropCatalog("wh", null, null) }
+
+        assertThat(failure).isInstanceOf(HoglakeException.CatalogNotEmpty::class.java)
+        assertThat((failure as HoglakeException.CatalogNotEmpty).reason)
+            .isEqualTo(CatalogNotEmptyReason.REMOVALS_PENDING)
+        assertThat(failure)
+            .hasMessageContaining("2 removal(s) are not drained and never will be")
+            .hasMessageContaining("predates the trusted data_path")
+            .hasMessageContaining("create the catalog again")
+        assertThat(tenants["t-wh-1"]!!.dropping).isFalse()
+        assertThat(requests.filter { it.startsWith("DELETE") || it.endsWith("/release") }).isEmpty()
+
+        // A catalog with a trusted path gets the plain reason: cleanup drains it.
+        seed("t-ok-1", "ok")
+        assertThat(catchThrowable { store.dropCatalog("ok", null, null) })
+            .hasMessageContaining("2 removal(s) are not drained")
+            .hasMessageNotContaining("never will be")
+    }
+
+    @Test
+    fun `an answer drops and counts each file outside the trusted prefix, and a legacy tenant drops none`() {
+        val trusted =
+            HogliteCatalogStore.MetaRow("wh", "s3://bucket/wh", 1, 1, 0, null, null, false, dataPathTrusted = true)
+        val legacy =
+            HogliteCatalogStore.MetaRow("wh", "s3://bucket/wh", 1, 1, 0, null, null, false, dataPathTrusted = false)
+        val inside = listOf("s3://bucket/wh/data/a.parquet", "s3://bucket/wh/data/b.parquet")
+        val outside = listOf("s3://victim/x.parquet", "s3://bucket/wh2/y.parquet", "s3://bucket/wh/../z.parquet")
+        val meters = SimpleMeterRegistry()
+        Metrics.bind(meters)
+        try {
+            for (surface in listOf("scan", "files", "changes")) {
+                assertThat(store.underTrustedPrefix("wh", trusted, surface, inside + outside) { listOf(it) })
+                    .describedAs(surface)
+                    .containsExactlyElementsOf(inside)
+                assertThat(
+                    meters.find("hoglake_path_outside_data_path_total")
+                        .tags("catalog", "wh", "surface", surface).counter()?.count(),
+                ).describedAs(surface).isEqualTo(3.0)
+            }
+            // An item is judged on EVERY path it carries (a file and its DV):
+            // one outside takes the item with it.
+            val pairs = listOf(inside[0] to inside[1], inside[0] to outside[0])
+            assertThat(
+                store.underTrustedPrefix("wh", trusted.dataPath, "compaction", pairs) { listOf(it.first, it.second) },
+            ).containsExactly(pairs[0])
+            assertThat(
+                meters.find("hoglake_path_outside_data_path_total")
+                    .tags("catalog", "wh", "surface", "compaction").counter()?.count(),
+            ).isEqualTo(1.0)
+            // A legacy tenant's only prefix is the row's own: nothing is judged.
+            assertThat(store.underTrustedPrefix("wh", legacy, "scan", inside + outside) { listOf(it) })
+                .containsExactlyElementsOf(inside + outside)
+            assertThat(
+                meters.find("hoglake_path_outside_data_path_total").tags("catalog", "wh", "surface", "scan")
+                    .counter()?.count(),
+            ).isEqualTo(3.0)
+        } finally {
+            Metrics.clear()
+            meters.close()
+        }
+    }
+
+    @Test
+    fun `reads answer with the manifest data_path and audit a meta row that differs`() {
+        seed("t-wh-1", "wh", dataPath = "s3://victim/x", manifestDataPath = "s3://bucket/wh")
+        val meters = SimpleMeterRegistry()
+        Metrics.bind(meters)
+        try {
+            assertThat(store.getCatalog("wh").dataPath).isEqualTo("s3://bucket/wh")
+            assertThat(store.listCatalogs(setOf("wh")).single().dataPath).isEqualTo("s3://bucket/wh")
+            assertThat(store.dropCatalog("wh", null, null).dataPath).isEqualTo("s3://bucket/wh")
+            assertThat(
+                meters.find("hoglake_hoglite_data_path_mismatch_total").tag("catalog", "wh").counter()?.count(),
+            ).isEqualTo(3.0)
+        } finally {
+            Metrics.clear()
+            meters.close()
+        }
+    }
+
+    @Test
+    fun `a legacy tenant is readable and refuses every storage-acting path`() {
+        seed("t-wh-1", "wh", manifestDataPath = null)
+        val meters = SimpleMeterRegistry()
+        Metrics.bind(meters)
+        try {
+            assertThat(store.getCatalog("wh").dataPath).isEqualTo("s3://bucket/wh")
+            assertThat(meters.find("hoglake_hoglite_data_path_mismatch_total").counter()).isNull()
+            val refused =
+                catchThrowable {
+                    store.uploads.claim("wh", UUID.randomUUID(), UUID.randomUUID(), "s3://bucket/wh/up", "data")
+                }
+            assertThat(refused)
+                .isInstanceOf(HoglakeException.DataPathUnverified::class.java)
+                .hasMessageContaining("no trusted data_path")
+            // Refused before the claim could be written.
+            assertThat(requests.filter { it.startsWith("POST /v1/t/t-wh-1/tx") }).isEmpty()
+
+            // Every other storage-acting job refuses at its gate, before any
+            // row it would queue, claim or rewrite. The stores point at a
+            // closed port: a job that got past the gate would fail with a
+            // connect error, not the typed refusal.
+            val cfg =
+                com.posthog.hoglake.Config(
+                    s3Endpoint = "http://127.0.0.1:9",
+                    s3Region = "us-east-1",
+                    s3AccessKey = "k",
+                    s3SecretKey = "s",
+                    s3PathStyle = true,
+                )
+            val gates =
+                mapOf<String, () -> Any>(
+                    "cleanup" to {
+                        RemovalStore(cfg).use {
+                            HogliteCleanup(cfg, store, it).runOnce("wh", 10, MaintenanceTrigger.MANUAL)
+                        }
+                    },
+                    "compaction" to {
+                        ObjectStore(cfg).use {
+                            HogliteCompaction(
+                                store,
+                                it,
+                                CompactionConfig(
+                                    targetBytes = 1L shl 30,
+                                    minInputFiles = 2,
+                                    maxInputFiles = 2,
+                                    maxFanIn = 2,
+                                    maxGroupsPerRun = 10,
+                                ),
+                            ).runOnce("wh", null, MaintenanceTrigger.MANUAL)
+                        }
+                    },
+                )
+            for ((name, run) in gates) {
+                assertThat(catchThrowable { run() })
+                    .describedAs(name)
+                    .isInstanceOf(HoglakeException.DataPathUnverified::class.java)
+                    .hasMessageContaining("no trusted data_path")
+            }
+            assertThat(txStatements.flatten())
+                .describedAs("no job wrote what it would have acted on")
+                .noneMatch {
+                    it.startsWith("INSERT INTO removals") || it.startsWith("INSERT INTO compaction_claims") ||
+                        it.startsWith("UPDATE uploads") || it.startsWith("UPDATE files")
+                }
+
+            // Expiry, retirement and the expired-upload sweep only QUEUE
+            // removal rows (cleanup, gated above, is what deletes), so they
+            // are not gated: a legacy catalog must still be able to satisfy
+            // its drop guards. Each gets past the meta read to the tenant
+            // (whatever this fake then makes of its SQL); the live class
+            // runs them to completion.
+            val ungated =
+                mapOf<String, () -> Any>(
+                    "expiry" to { store.expiry.runOnce("wh", 10, MaintenanceTrigger.MANUAL) },
+                    "retirement" to { store.retirement.runOnce("wh", MaintenanceTrigger.MANUAL) },
+                    "upload sweep" to { store.uploads.scheduleExpired("wh", 10) },
+                )
+            for ((name, run) in ungated) {
+                requests.clear()
+                val outcome = catchThrowable { run() }
+                if (outcome != null) {
+                    assertThat(outcome)
+                        .describedAs(name)
+                        .isNotInstanceOf(HoglakeException.DataPathUnverified::class.java)
+                }
+                assertThat(requests.size).describedAs("$name reached the tenant past the meta read").isGreaterThan(1)
+            }
+        } finally {
+            Metrics.clear()
+            meters.close()
+        }
     }
 
     @Test

@@ -2997,4 +2997,17 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * `containment_unverified`: the namespace is left unmarked.
      */
     class ContainmentUnverified(detail: String) : HoglakeException(detail)
+
+    /**
+     * A Hoglite catalog whose tenant manifest records no `data_path`
+     * (created before hoglite held the trusted copy) asked for work that
+     * acts on object storage: cleanup, compaction or an upload claim. 409
+     * `data_path_unverified`: the catalog's row is the only source of its
+     * prefix and the row is writable by any tenant writer (#668), so
+     * nothing deletes or writes under it until the catalog is recreated.
+     * Reads, commits, expiry, retirement and the expired-upload sweep
+     * (which only queue removal rows) are unaffected, so the catalog can
+     * still be emptied and dropped.
+     */
+    class DataPathUnverified(detail: String) : HoglakeException(detail)
 }

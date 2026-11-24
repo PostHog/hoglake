@@ -120,6 +120,8 @@ class HogliteSubBackendsTest {
                         }
                     }
                 val bytes = json.writeValueAsBytes(answer)
+                // The tenant manifest's data_path, as hoglite serves it beside every answer.
+                ex.responseHeaders.add(HogliteClient.DATA_PATH_HEADER, "s3://bucket/cat")
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
             }

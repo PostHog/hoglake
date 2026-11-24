@@ -350,6 +350,39 @@ object Metrics {
     }
 
     /**
+     * hoglake_hoglite_data_path_mismatch_total{catalog} — a Hoglite
+     * catalog whose `meta.data_path` row differs from the data_path its
+     * tenant manifest holds (the operator-set copy hoglite serves in
+     * `X-Hoglite-Data-Path`, #668). The row is writable by any tenant
+     * writer and the manifest is not, so a nonzero rate is a tenant
+     * steering hoglake at another prefix, or a bug in a create path.
+     * hoglake acts on the manifest's value and answers with it; the row
+     * is ignored. Counted once per read of the row, so the rate is the
+     * catalog's read rate for as long as the row stays wrong.
+     */
+    fun hogliteDataPathMismatch(catalog: String) {
+        increment("hoglake_hoglite_data_path_mismatch_total", 1.0, "catalog", catalog)
+    }
+
+    /**
+     * hoglake_path_outside_data_path_total{catalog,surface} — an object
+     * path of [catalog] that does not lie under its data_path, by where
+     * it was caught: `object_store` and `removal_store` (a catalog storage
+     * view refused the IO before any S3 call), `scan`, `files` and
+     * `changes` (a Hoglite read dropped the row from its answer) and
+     * `compaction` (Hoglite's planning skipped the file as an input). On
+     * PostgreSQL the commit's containment check keeps such rows out, so
+     * every count is either a Hoglite tenant row written around hoglake
+     * (#668) or a bug; both deserve a look.
+     */
+    fun pathOutsideDataPath(
+        catalog: String,
+        surface: String,
+    ) {
+        increment("hoglake_path_outside_data_path_total", 1.0, "catalog", catalog, "surface", surface)
+    }
+
+    /**
      * hoglake_commit_receipt_purge_failures_total{catalog} — pages of
      * the commit-receipt retention purge that threw (#240, V24).
      *

@@ -38,7 +38,8 @@ class HogliteTimestampResolveTest {
 
     private val client = HogliteClient("http://127.0.0.1:${server.address.port}", sleeper = {})
     private val store = HogliteCatalogStore(client, { "t-$it" })
-    private val meta = HogliteCatalogStore.MetaRow("wh", "s3://b/wh", 9, 1, 2, null, null, false)
+    private val meta =
+        HogliteCatalogStore.MetaRow("wh", "s3://b/wh", 9, 1, 2, null, null, false, dataPathTrusted = true)
 
     @AfterEach
     fun stop() {

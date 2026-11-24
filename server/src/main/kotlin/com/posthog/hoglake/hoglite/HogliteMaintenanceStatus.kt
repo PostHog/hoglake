@@ -84,7 +84,7 @@ internal class HogliteMaintenanceStatus(
             }
             // Every value uses the same read snapshot and the same tenant binding.
             val results = store.readCatalog(catalog, statements).iterator()
-            val meta = store.metaRow(results.next().firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+            val meta = store.metaRow(catalog, results.next())
             if (meta.name != catalog) throw HoglakeException.NotFound("catalog '$catalog'")
             val hydration = if ("files_live_stats" in indexes) results.next().firstRow() else null
             val removals = if ("removals_queued_at" in indexes) results.next().firstRow() else null

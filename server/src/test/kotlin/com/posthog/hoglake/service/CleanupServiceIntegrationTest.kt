@@ -749,11 +749,19 @@ class CleanupServiceIntegrationTest {
         // round trips differ. Those round trips are the lock hold, which
         // is the change.
         //
-        // 1,500 keys in one bucket + 10 in another, in ONE sub-batch:
-        // two requests for the first bucket (S3 caps a request at 1,000
-        // keys) and one for the second. The objects are deliberately not
-        // uploaded — DeleteObjects does not care, and this test is about
-        // request count, not bytes.
+        // 1,500 keys in the catalog's bucket + 10 in another, in ONE
+        // sub-batch: two requests for the first bucket (S3 caps a request
+        // at 1,000 keys) and NONE for the second. The catalog's removal
+        // view is bounded to its data_path (#668), and on PostgreSQL a row
+        // outside it is never legitimate: the commit refuses a file path
+        // outside the data_path, the data_path never changes, and every
+        // writer of hog_file_removal (expiry, retirement, compaction's
+        // staging tickets, the upload sweep) takes its paths from rows
+        // that passed that check — so the ten rows are a corrupt queue,
+        // left queued with `attempts + 1` and deleting nothing. (Before
+        // the bound, these rows were only a convenient second bucket
+        // chunk.) The objects are deliberately not uploaded — DeleteObjects
+        // does not care, and this test is about request count, not bytes.
         val catalogId = seedCatalog("cl-chunks")
         objects.createBucket(SECOND_BUCKET)
         val many = (1..1_500).map { "s3://$BUCKET/cl-chunks/f$it.parquet" }
@@ -784,10 +792,21 @@ class CleanupServiceIntegrationTest {
             CleanupService(jdbi, counting, subBatchSize = 2_000)
                 .runOnce("cl-chunks", batchSize = 2_000)
 
-        assertThat(result.removed).isEqualTo(1_510)
+        assertThat(result.removed).isEqualTo(1_500)
         assertThat(requests)
-            .describedAs("one request per bucket, per %d-key chunk", RemovalStore.MAX_KEYS_PER_DELETE)
-            .containsExactlyInAnyOrder(BUCKET to 1_000, BUCKET to 500, SECOND_BUCKET to 10)
+            .describedAs(
+                "one request per %d-key chunk of the catalog's bucket, none for another bucket",
+                RemovalStore.MAX_KEYS_PER_DELETE,
+            )
+            .containsExactlyInAnyOrder(BUCKET to 1_000, BUCKET to 500)
+        // The foreign rows were refused per key, before any S3 call, and
+        // stay queued as a failed attempt: the operator's signal.
+        assertThat(queuedPaths(catalogId)).containsExactlyInAnyOrderElementsOf(few)
+        assertThat(ledgerRows(catalogId).filter { it.path in few })
+            .allSatisfy {
+                assertThat(it.attempts).isEqualTo(1)
+                assertThat(it.drainedAt).isNull()
+            }
     }
 
     @Test
@@ -1587,37 +1606,58 @@ class CleanupServiceIntegrationTest {
         // `DeleteObjects` reports a key that was never there exactly like
         // one it removed, so the whole sub-batch settles 'deleted' with no
         // failure and no attempts bump.
+        //
+        // The two chunks come from ONE bucket, 1,500 keys split 1,000 and
+        // 500: the catalog's removal view is bounded to its data_path
+        // (#668), so a second bucket's rows would be refused per key before
+        // any call and never form a chunk. Every 50th object exists (30 in
+        // all, so whatever the claim's row order, both chunks hold some);
+        // `DeleteObjects` does not care about the rest.
         val catalogId = seedCatalog("cl-crash-partial")
-        objects.createBucket(SECOND_BUCKET)
-        val first = (1..3).map { "s3://$BUCKET/cl-crash-partial/f$it.parquet" }
-        val second = (1..3).map { "s3://$SECOND_BUCKET/cl-crash-partial/g$it.parquet" }
-        (first + second).forEach {
-            putObject(it)
-            queue(catalogId, it)
+        val all = (1..1_500).map { "s3://$BUCKET/cl-crash-partial/f$it.parquet" }
+        val present = all.filterIndexed { i, _ -> i % 50 == 0 }
+        present.forEach { putObject(it) }
+        jdbi.useHandleUnchecked { h ->
+            val batch =
+                h.prepareBatch(
+                    "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason) " +
+                        "VALUES (:c, :p, 'data', 'snapshot_expiry')",
+                )
+            all.forEach { batch.bind("c", catalogId).bind("p", it).add() }
+            batch.execute()
         }
-        val chunks = java.util.concurrent.atomic.AtomicInteger()
+        // Which keys form the first chunk is the claim's row order, which
+        // nothing pins: the override records them, and the assertions below
+        // read against that record rather than guess.
+        val firstChunk = java.util.concurrent.CopyOnWriteArrayList<String>()
         val killed =
             object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
                 override fun deleteChunk(
                     bucket: String,
                     chunk: List<Pair<String, String>>,
                 ): Map<String, String> {
-                    if (chunks.incrementAndGet() > 1) {
+                    if (firstChunk.isNotEmpty()) {
                         throw IllegalStateException("the pod went away between two chunks")
                     }
+                    firstChunk += chunk.map { it.second }
                     return super.deleteChunk(bucket, chunk)
                 }
             }
 
         assertThatThrownBy {
-            CleanupService(jdbi, killed, workerIdPrefix = "doomed").runOnce("cl-crash-partial", 100)
+            CleanupService(jdbi, killed, workerIdPrefix = "doomed", subBatchSize = 2_000)
+                .runOnce("cl-crash-partial", 2_000)
         }
             .isInstanceOf(IllegalStateException::class.java)
 
-        val gone = (first + second).filter { !removals.exists(it) }
-        assertThat(gone)
-            .describedAs("exactly one bucket's chunk went; the other never was attempted")
-            .hasSize(3)
+        assertThat(firstChunk)
+            .describedAs("a full chunk went before the throw")
+            .hasSize(RemovalStore.MAX_KEYS_PER_DELETE)
+        val (inFirst, inSecond) = present.partition { it in firstChunk }
+        assertThat(inSecond).describedAs("the mix this test is about: an object in each chunk").isNotEmpty()
+        assertThat(present.filter { !removals.exists(it) })
+            .describedAs("exactly the first chunk went; the second never was attempted")
+            .containsExactlyInAnyOrderElementsOf(inFirst)
         assertThat(ledgerRows(catalogId)).allSatisfy {
             assertThat(it.drainedAt).describedAs("nothing settled").isNull()
             assertThat(it.claimedBy).describedAs("every row is still the dead worker's").startsWith("doomed")
@@ -1634,15 +1674,16 @@ class CleanupServiceIntegrationTest {
                 catalogId,
             )
         }
-        val reclaimed = CleanupService(jdbi, removals).runOnce("cl-crash-partial", 100)
-        assertThat(reclaimed.removed).isEqualTo(6)
+        val reclaimed =
+            CleanupService(jdbi, removals, subBatchSize = 2_000).runOnce("cl-crash-partial", 2_000)
+        assertThat(reclaimed.removed).isEqualTo(1_500)
         assertThat(reclaimed.settledElsewhere).isZero()
         assertThat(queuedPaths(catalogId)).isEmpty()
         assertThat(ledgerRows(catalogId)).allSatisfy {
             assertThat(it.drainedOutcome).isEqualTo("deleted")
             assertThat(it.attempts).describedAs("a re-drain over a mixed batch is not a failure").isZero()
         }
-        (first + second).forEach { assertThat(removals.exists(it)).isFalse() }
+        present.forEach { assertThat(removals.exists(it)).isFalse() }
     }
 
     @Test
