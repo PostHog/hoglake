@@ -142,7 +142,7 @@ internal class ReadSessionProfile(
             parsed.add(ReadSessionStorageGrant(catalog, target, bucket, region, key, prefix))
         }
         if (seen != targets) invalid()
-        return ReadSessionStorageGrants(region, parsed)
+        return ReadSessionStorageGrants(region, parsed, remoteTargets)
     }
 
     private fun requireSingleRead(
@@ -280,6 +280,22 @@ internal class ReadSessionProfile(
             return !MountNames.isReserved(catalog) && CATALOG_NAME_REGEX.matches(catalog) && relays(namespace)
         }
 
+        /**
+         * A relayed `GET` route of a served namespace ([serves]), as a Host
+         * receives it. A read session is verified here so that the served
+         * rule can admit it, and for nothing else.
+         */
+        internal fun isServedRoute(
+            method: HttpMethod,
+            route: RouteMatch?,
+            serves: (String) -> Boolean,
+        ): Boolean {
+            if (method != HttpMethod.Get || route?.pattern !in RELAY_PATTERNS) return false
+            val catalog = route?.catalog ?: return false
+            val namespace = route.namespace ?: return false
+            return !MountNames.isReserved(catalog) && CATALOG_NAME_REGEX.matches(catalog) && serves(namespace)
+        }
+
         /** Return true when the unverified JWT carries any dedicated read-session audience. */
         internal fun hasDedicatedAudience(token: String): Boolean {
             if (token.length > 65_536 || token.indexOf('.') !in 1..10_923) return false
@@ -348,7 +364,14 @@ internal data class ReadSessionStorageGrant(
 internal class ReadSessionStorageGrants(
     val region: String,
     private val grants: List<ReadSessionStorageGrant>,
+    private val remoteTargets: Set<String> = emptySet(),
 ) {
+    /** Return true when a signed grant of one of the configured remote targets allows the S3 object URI. */
+    fun allowsRemoteTargetObject(path: String): Boolean {
+        val (bucket, key) = ReadSessionProfile.parseS3ObjectUri(path) ?: return false
+        return grants.any { it.target in remoteTargets && it.region == region && it.covers(bucket, key) }
+    }
+
     /** Return true when a signed primary-catalog grant allows the S3 object URI. */
     fun allowsPrimaryCatalogObject(
         catalog: String,
@@ -369,6 +392,10 @@ internal data class ReadSessionConfig(
     val reservedNamespaces: ReservedNamespaces,
     /** Whether a namespace name is a remote schema of this server: such a route relays a read session. */
     val relays: (String) -> Boolean = { false },
+    /** Whether a namespace name is one this server serves as a Host: such a route admits a read session. */
+    val serves: (String) -> Boolean = { false },
+    /** The public listener: only [serves] selects the verifier. No local read, no relay, no local-only route. */
+    val servedOnly: Boolean = false,
 )
 
 /** Verified route target for a dedicated read-session call. */

@@ -515,8 +515,25 @@ class App private constructor(
         // variable — not with a fleet-wide 401 (see [auth]).
         app.installAuth(
             auth,
-            cfg.readSession?.takeUnless { auth.tenantOnly }?.let {
-                ReadSessionConfig(it, cfg.reservedNamespaces, relays = catalogSelector::relaysReadSession)
+            cfg.readSession?.let {
+                when {
+                    !auth.tenantOnly ->
+                        ReadSessionConfig(
+                            it,
+                            cfg.reservedNamespaces,
+                            relays = catalogSelector::relaysReadSession,
+                            serves = catalogSelector::servesReadSession,
+                        )
+                    // The public listener receives relayed requests for a served namespace, and nothing else.
+                    cfg.servedFamilies.isNotEmpty() ->
+                        ReadSessionConfig(
+                            it,
+                            cfg.reservedNamespaces,
+                            serves = catalogSelector::servesReadSession,
+                            servedOnly = true,
+                        )
+                    else -> null
+                }
             },
         )
 

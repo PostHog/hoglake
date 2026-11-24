@@ -89,6 +89,8 @@ class CatalogStoreSelector(
         val currentCfg = cfg ?: return false
         if (currentCfg.readSession == null) return false
         if (MountNames.isReserved(catalog) || currentCfg.reservedNamespaces.isReserved(namespace)) return false
+        // A served family's names are never a local read: the served rule answers for them.
+        if (servedTeams != null && TeamNamespaces.hasShape(namespace)) return false
         return ReadSessionProfile.isCanonicalRoute(catalog, namespace, table)
     }
 
@@ -266,7 +268,7 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding {
         if (call.verifiedBackendAuthority?.isReadSession == true) {
-            return readSessionRemoteSchema(call, catalog)
+            return readSessionBinding(call, catalog)
         }
         call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
         // Before any binding: a name resolves only when the caller's token allows it.
@@ -359,15 +361,45 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding.RemoteSchema? {
         if (call.verifiedBackendAuthority?.isReadSession == true) {
-            return readSessionRemoteSchema(call, catalog)
+            return readSessionBinding(call, catalog) as? CatalogBinding.RemoteSchema
         }
         call.requireCatalogEntitlement(catalog)
         return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
     }
 
     /**
-     * The only binding a dedicated read session gets from this selector: the
-     * remote schema its request path names (docs/auth.md, "Read sessions on a
+     * The only two bindings a dedicated read session gets from this selector
+     * (docs/auth.md, "Read sessions on a remote schema"): on a Client, the
+     * remote schema its path names; on a Host, the served namespace its path
+     * names, under the unchanged rule of [servedBinding]. Never a local
+     * store or a mount, and nothing is cached for the call. The catalog check
+     * comes first and answers for the catalog; every later failure is a
+     * missing namespace.
+     */
+    private fun readSessionBinding(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding {
+        call.requireCatalogEntitlement(catalog)
+        if (cfg?.readSessionRelayEnabled == true && namedSchema(call, catalog) != null) {
+            return readSessionRemoteSchema(call, catalog)
+        }
+        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+        val authority = call.verifiedBackendAuthority
+        if (authority?.storageGrants == null ||
+            !ReadSessionProfile.isServedRoute(call.request.httpMethod, match, ::servesReadSession)
+        ) {
+            throw HoglakeException.NotFound("namespace")
+        }
+        return servedBinding(call, catalog) ?: throw HoglakeException.NotFound("namespace")
+    }
+
+    /** Whether [namespace] is a canonical name of a family this server serves to a dedicated read session. */
+    fun servesReadSession(namespace: String): Boolean =
+        cfg?.readSession != null && servedTeams != null && TeamNamespaces.id(namespace) != null
+
+    /**
+     * The remote schema a dedicated read session's request path names (docs/auth.md, "Read sessions on a
      * remote schema"). Never a local store, a served namespace or a mount, and
      * nothing is cached for the call. The catalog check comes first and
      * answers for the catalog; every later failure is a missing namespace.

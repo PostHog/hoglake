@@ -1599,12 +1599,10 @@ data class Config(
             require(fields == setOf("team_id")) {
                 "HOGLAKE_READ_SESSION_PROFILE requires only the team_id predicate field"
             }
-            require(backendKinds.values.any { kind -> kind == BackendKind.HOGLITE }) {
-                "HOGLAKE_READ_SESSION_PROFILE requires a configured hoglite backend"
-            }
-            // Served namespaces require SQL to check local catalog placement.
-            require(servedFamilies.isEmpty()) {
-                "HOGLAKE_READ_SESSION_PROFILE cannot coexist with served namespaces"
+            // A local read needs a hoglite backend. A server that serves namespaces reads its
+            // own store for a read session instead (docs/auth.md, "Read sessions on a remote schema").
+            require(backendKinds.values.any { kind -> kind == BackendKind.HOGLITE } || servedFamilies.isNotEmpty()) {
+                "HOGLAKE_READ_SESSION_PROFILE requires a configured hoglite backend or served namespaces"
             }
         }
         val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
