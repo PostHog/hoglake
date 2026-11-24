@@ -272,18 +272,22 @@ class HogliteCatalogStore(
                 author,
                 message,
             )
-            try {
-                client.tx(tenantId, freshTxid("create-catalog"), null, boot.statements())
-            } catch (g: HogliteGuardFailure) {
-                throw boot.classify(g)
-            } catch (r: HogliteRejected) {
-                throw mapRejected(name, r)
-            } catch (u: HoglakeException.CommitOutcomeUnknown) {
-                // A DDL like the ones runTx classifies: a replay meets the
-                // meta guard above and reads as its own 409 (#682).
-                throw u.withReplay(WriteReplay.DDL)
-            }
-            return getCatalog(name)
+            // The answer is read IN the transaction: a read after it could
+            // fail although the create applied, and invite its replay (#682).
+            val created = boot.add(metaSql)
+            val results =
+                try {
+                    client.tx(tenantId, freshTxid("create-catalog"), null, boot.statements())
+                } catch (g: HogliteGuardFailure) {
+                    throw boot.classify(g)
+                } catch (r: HogliteRejected) {
+                    throw mapRejected(name, r)
+                } catch (u: HoglakeException.CommitOutcomeUnknown) {
+                    // A DDL like the ones runTx classifies: a replay meets the
+                    // meta guard above and reads as its own 409 (#682).
+                    throw u.withReplay(WriteReplay.DDL)
+                }
+            return metaRow(results[created].firstRow()!!).toCatalogInfo()
         }
 
     override fun getCatalog(name: String): CatalogInfo =

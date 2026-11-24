@@ -1518,60 +1518,48 @@ class HogliteExtendedGuardRaceIntegrationTest {
     }
 
     @Test
-    fun `alter aggregate failure never replans and a later writer cannot change its returned snapshot`() {
-        for (fail in listOf(false, true)) {
-            val (c, _) = setup()
-            val before = head(c)
-            val aggregate =
-                Hook(
-                    { m, p, b -> m == "POST" && p.endsWith("/query") && "SUM(record_count)" in b },
-                    remaining = if (fail) Int.MAX_VALUE else 1,
-                    shortCircuit = if (fail) 503 else null,
-                    before = {
-                        if (!fail) {
-                            store.alters.alterTable(
-                                c,
-                                "ns",
-                                "t",
-                                listOf(AlterOp.AddColumn(ColumnDef("later", ColType.LONG))),
-                            )
-                            store.commit(c, appendReq(c, "later.parquet"))
-                        }
-                    },
-                )
-            val stale =
-                Hook(::isAlterTx, before = {
-                    store.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("winner", ColType.LONG))))
-                })
-            hooks += stale
-            hooks += aggregate
-            val start = seen.size
-            try {
-                if (fail) {
-                    assertThatThrownBy {
-                        pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
-                    }.isInstanceOf(HoglakeException.BackendUnavailable::class.java)
-                } else {
-                    val result =
-                        pstore.alters.alterTable(
-                            c,
-                            "ns",
-                            "t",
-                            listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))),
-                        )
-                    assertThat(result.readSnapshotId).isEqualTo(before + 2)
-                    assertThat(result.columns.map { it.def.name }).containsExactly("id", "winner", "b")
-                    assertThat(result.recordCount).isZero()
-                    assertThat(result.fileCount).isZero()
-                    assertThat(result.fileSizeBytes).isZero()
-                    assertThat(store.getTable(c, "ns", "t").recordCount).isEqualTo(10)
+    fun `alter answers from its own tx so a later writer or a failing read cannot change its returned snapshot`() {
+        val (c, _) = setup()
+        val before = head(c)
+        // Every read after the applied alter tx fails: an answer read after the
+        // commit would surface as backend_unavailable for an alter that applied (#682).
+        val unreadable =
+            Hook({ m, p, _ -> m == "POST" && p.endsWith("/query") }, remaining = 0, shortCircuit = 503)
+        val applied = java.util.concurrent.atomic.AtomicInteger(-1)
+        val stale =
+            Hook(::isAlterTx, before = {
+                store.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("winner", ColType.LONG))))
+            })
+        val later =
+            Hook(::isAlterTx, after = {
+                store.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("later", ColType.LONG))))
+                store.commit(c, appendReq(c, "later.parquet"))
+                synchronized(hooks) {
+                    applied.set(seen.size)
+                    unreadable.remaining = Int.MAX_VALUE
                 }
-                assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(2)
-                assertThat(head(c)).isEqualTo(before + if (fail) 2 else 4)
-            } finally {
-                hooks.remove(stale)
-                hooks.remove(aggregate)
-            }
+            })
+        hooks += stale
+        hooks += later
+        hooks += unreadable
+        val start = seen.size
+        try {
+            val result = pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+            assertThat(result.readSnapshotId).isEqualTo(before + 2)
+            assertThat(result.columns.map { it.def.name }).containsExactly("id", "winner", "b")
+            assertThat(result.recordCount).isZero()
+            assertThat(result.fileCount).isZero()
+            assertThat(result.fileSizeBytes).isZero()
+            assertThat(later.remaining).isZero()
+            val reads = seen.drop(applied.get()).map { it.substringAfter(' ').substringBefore(' ') }
+            assertThat(reads.filter { it.endsWith("/query") }).isEmpty()
+            assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(2)
+            assertThat(head(c)).isEqualTo(before + 4)
+            assertThat(store.getTable(c, "ns", "t").recordCount).isEqualTo(10)
+        } finally {
+            hooks.remove(stale)
+            hooks.remove(later)
+            hooks.remove(unreadable)
         }
     }
 

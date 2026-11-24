@@ -28,6 +28,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -39,7 +40,9 @@ import java.util.concurrent.atomic.AtomicReference
  * keyless commit and the DDL, whose replay would apply twice or be
  * refused, do not, and the replay itself is run here to show what the
  * invitation would have met. The catalog drop is the DDL that converges,
- * and has its own case.
+ * and has its own case. The relay can also let a DDL's answer through
+ * and then fail every read after it, so a DDL that read its answer after
+ * the commit would fail for a read that spent its retry budget.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -58,6 +61,8 @@ class HogliteWriteReplayIntegrationTest {
         val store: HogliteCatalogStore,
         val catalog: String,
         private val lose: AtomicReference<String?>,
+        private val downAfter: AtomicReference<String?>,
+        private val down: AtomicBoolean,
     ) {
         /**
          * Runs [write] with the answer of its first `prefix:` transaction
@@ -75,6 +80,27 @@ class HogliteWriteReplayIntegrationTest {
             val unknown = thrown as HoglakeException.CommitOutcomeUnknown
             assertThat(unknown.txid).startsWith("$prefix:")
             return unknown
+        }
+
+        /**
+         * Runs [write] with every request after its first `prefix:`
+         * transaction answered 503 `not_applied`, so the transaction
+         * commits and any read after it spends its retry budget, and
+         * returns what [write] answered.
+         */
+        fun <T> readsFailingAfter(
+            prefix: String,
+            write: () -> T,
+        ): T {
+            downAfter.set(prefix)
+            try {
+                val answered = write()
+                assertThat(downAfter.get()).describedAs("a '$prefix' transaction committed").isNull()
+                return answered
+            } finally {
+                downAfter.set(null)
+                down.set(false)
+            }
         }
 
         /** Rows straight from the engine, past the relay. */
@@ -110,10 +136,19 @@ class HogliteWriteReplayIntegrationTest {
         val running = engine
         started = true
         val lose = AtomicReference<String?>(null)
+        val downAfter = AtomicReference<String?>(null)
+        val down = AtomicBoolean(false)
         val upstream = HttpClient.newHttpClient()
         val relay = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         relay.createContext("/") { ex ->
             val raw = ex.requestBody.readBytes()
+            if (down.get()) {
+                // Retried by the client as not applied until its budget is spent.
+                val bytes = "{\"code\":\"not_applied\",\"error\":\"reads down\"}".toByteArray()
+                ex.sendResponseHeaders(503, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+                return@createContext
+            }
             val txid = if (raw.isEmpty()) "" else json.readTree(raw)["txid"]?.asText().orEmpty()
             val prefix = lose.get()
             val losing = prefix != null && txid.startsWith("$prefix:") && lose.compareAndSet(prefix, null)
@@ -130,6 +165,12 @@ class HogliteWriteReplayIntegrationTest {
             // the dedup table, which is the server's own exactly-once and
             // not what this test is about).
             if (losing) check(answer.statusCode() == 200) { "the lost write must have applied: ${answer.statusCode()}" }
+            val after = downAfter.get()
+            if (after != null && txid.startsWith("$after:") && answer.statusCode() == 200 &&
+                downAfter.compareAndSet(after, null)
+            ) {
+                down.set(true)
+            }
             val bytes = if (losing) "{\"error\":\"lost applied response\"}".toByteArray() else answer.body()
             ex.sendResponseHeaders(
                 if (losing) 422 else answer.statusCode(),
@@ -143,7 +184,7 @@ class HogliteWriteReplayIntegrationTest {
         try {
             val catalog = HogliteConformanceEngine.uniqueName("replay")
             store.createCatalog(catalog, "s3://hoglake-it/$catalog")
-            body(Fixture(store, catalog, lose))
+            body(Fixture(store, catalog, lose, downAfter, down))
         } finally {
             client.close()
             relay.stop(0)
@@ -291,6 +332,37 @@ class HogliteWriteReplayIntegrationTest {
                     assertThat(f.store.listFiles(c, "ns", "t", snapshot = between.snapshotId)).hasSize(1)
                 }
             }
+        }
+
+    /**
+     * A DDL answers from its own transaction, as PostgreSQL's alter does:
+     * every read after the commit fails here, and a DDL that read its
+     * answer after the commit would fail with BackendUnavailable (503 with
+     * Retry-After) for a write that applied.
+     */
+    @Test
+    fun `a DDL answers from its own transaction when every read after it fails`() =
+        fixture { f ->
+            val c = f.catalog
+            val c2 = HogliteConformanceEngine.uniqueName("replay")
+            f.store.createNamespace(c, "ns")
+            val t = f.store.createTable(c, "ns", "t", listOf(id))
+            f.append("a.parquet")
+
+            val created = f.readsFailingAfter("create-catalog") { f.store.createCatalog(c2, "s3://hoglake-it/$c2") }
+            assertThat(created).isEqualTo(f.store.getCatalog(c2))
+            assertThat(created.name).isEqualTo(c2)
+            assertThat(created.headSnapshotId).isEqualTo(0L)
+
+            val altered =
+                f.readsFailingAfter("alter") {
+                    f.store.alters.alterTable(c, "ns", "t", widen, t.tableUuid, null, "test", "widen")
+                }
+            // Exact for the alter's own snapshot: the file landed before it.
+            assertThat(altered.snapshotId).isEqualTo(f.store.getCatalog(c).headSnapshotId)
+            assertThat(listOf(altered.recordCount, altered.fileCount, altered.fileSizeBytes))
+                .isEqualTo(listOf(10L, 1L, 100L))
+            assertThat(altered.columns.map { it.def.name }).containsExactly("id", "c2")
         }
 
     /**

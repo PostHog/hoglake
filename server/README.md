@@ -182,7 +182,11 @@ tasks, and the one DDL whose replay converges: a catalog drop, whose
 fence transaction opts out of the fence, so a replay of a drop that lost
 its answer passes the same emptiness guards (nothing can write past the
 fence), sets `dropping = 1` again, and goes on to the release and delete,
-which are idempotent. PostgreSQL's lost acknowledgement is a 500 and
+which are idempotent. Every DDL reads its answer IN its transaction (an
+alter's totals and a catalog create's meta row included), as
+PostgreSQL's `AlterService` does: a read after the commit could spend
+its retry budget and answer `backend_unavailable` with `Retry-After` for
+a DDL that applied. PostgreSQL's lost acknowledgement is a 500 and
 invites nothing either. Neither backend accepts an idempotency key on a
 DDL route, so this is part of #682, not all of it: withholding the
 header protects only a client that honours it, and a truncate whose
