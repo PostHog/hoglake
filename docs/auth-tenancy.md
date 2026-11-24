@@ -1312,7 +1312,8 @@ server does not hold; the data is a namespace of a source catalog in this
 server's PostgreSQL, such as the imports. One pattern covers every team, so no
 per-team entry is needed.
 
-A dedicated read session on these routes is PROPOSED, not built:
+A Host with the read session profile also admits a dedicated read session on
+the four relayed `GET` routes, by the same rule:
 [auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json

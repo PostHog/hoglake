@@ -1589,8 +1589,15 @@ data class Config(
             }
         }
         readSession?.let {
-            require(AuthMode.parse("HOGLAKE_AUTH_MODE", authMode) == AuthMode.ENFORCE) {
-                "HOGLAKE_READ_SESSION_PROFILE requires HOGLAKE_AUTH_MODE=enforce"
+            // The read verifier runs only on an enforcing listener. A Host whose API listener
+            // still warns has one: the public listener, which always enforces (docs/auth.md).
+            val mode = AuthMode.parse("HOGLAKE_AUTH_MODE", authMode)
+            val hostOnPublicListener =
+                mode == AuthMode.WARN && publicPort > 0 && servedFamilies.isNotEmpty() &&
+                    backendKinds.values.none { kind -> kind == BackendKind.HOGLITE } && !readSessionRelayEnabled
+            require(mode == AuthMode.ENFORCE || hostOnPublicListener) {
+                "HOGLAKE_READ_SESSION_PROFILE requires HOGLAKE_AUTH_MODE=enforce, or warn on a server that " +
+                    "only serves namespaces and has HOGLAKE_PUBLIC_PORT"
             }
             require(authJwksFile.isNotBlank() && authJwksUrl.isBlank()) {
                 "HOGLAKE_READ_SESSION_PROFILE requires file JWKS"
@@ -1599,12 +1606,10 @@ data class Config(
             require(fields == setOf("team_id")) {
                 "HOGLAKE_READ_SESSION_PROFILE requires only the team_id predicate field"
             }
-            require(backendKinds.values.any { kind -> kind == BackendKind.HOGLITE }) {
-                "HOGLAKE_READ_SESSION_PROFILE requires a configured hoglite backend"
-            }
-            // Served namespaces require SQL to check local catalog placement.
-            require(servedFamilies.isEmpty()) {
-                "HOGLAKE_READ_SESSION_PROFILE cannot coexist with served namespaces"
+            // A local read needs a hoglite backend. A server that serves namespaces reads its
+            // own store for a read session instead (docs/auth.md, "Read sessions on a remote schema").
+            require(backendKinds.values.any { kind -> kind == BackendKind.HOGLITE } || servedFamilies.isNotEmpty()) {
+                "HOGLAKE_READ_SESSION_PROFILE requires a configured hoglite backend or served namespaces"
             }
         }
         val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()

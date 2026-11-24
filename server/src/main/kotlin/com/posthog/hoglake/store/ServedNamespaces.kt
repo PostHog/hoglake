@@ -160,11 +160,13 @@ class ServedNamespaceReader(
         table: String,
         snapshot: Long?,
         atTimestamp: Instant?,
+        /** False skips an import table's file aggregate: for a caller that is not given the totals. */
+        totals: Boolean = true,
     ): TableInfo =
         translated(tableMissing(table)) {
             val half = streamFor(table)
             if (half == null) {
-                store.getTable(sourceCatalog, namespace, table, snapshot, atTimestamp)
+                store.getTable(sourceCatalog, namespace, table, snapshot, atTimestamp, totals)
             } else {
                 // The served name, never the stream's own namespace.
                 half.service.streamTable(half, table, snapshot, atTimestamp).copy(namespace = namespace)

@@ -130,7 +130,7 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
                 ) &&
                 selector.allowsReadSessionRoute(pending.catalog, pending.namespace, match?.table)
         },
-        relaysReadSession = selector::relaysReadSession,
+        relaysReadSession = { selector.relaysReadSession(it) || selector.servesReadSession(it) },
     )
 }
 
@@ -169,8 +169,8 @@ private fun Application.installCallNamespaceGate(
             // The table and scan routes execute terminal typed reads without legacy SQL.
             return@intercept
         }
-        // A read session on a remote schema goes on to isExport, which hands
-        // it the remote schema or the 404 of a missing namespace.
+        // A read session on a remote schema or a served namespace goes on to
+        // isExport, which hands it that binding or the 404 of a missing namespace.
         if (selected == null && call.verifiedBackendAuthority?.isReadSession == true &&
             !relaysReadSession(pending.namespace)
         ) {
