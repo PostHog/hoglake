@@ -515,7 +515,9 @@ class App private constructor(
         // variable — not with a fleet-wide 401 (see [auth]).
         app.installAuth(
             auth,
-            cfg.readSession?.takeUnless { auth.tenantOnly }?.let { ReadSessionConfig(it, cfg.reservedNamespaces) },
+            cfg.readSession?.takeUnless { auth.tenantOnly }?.let {
+                ReadSessionConfig(it, cfg.reservedNamespaces, relays = catalogSelector::relaysReadSession)
+            },
         )
 
         // Then, and once: every handler installed below this line runs

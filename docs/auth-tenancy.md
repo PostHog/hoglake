@@ -1086,7 +1086,8 @@ serve from a source catalog (§6.5d, the imports) and, when configured, the
 published stream tables beside them. The Host verifies the relayed token
 itself, so it must accept the session profile too. Nothing turns this on in
 any deployment.
-A dedicated read session on the relay is PROPOSED, not built:
+A Client with `HOGLAKE_READ_SESSION_RELAY=on` also relays a dedicated read session,
+by the same caller rule:
 [auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json

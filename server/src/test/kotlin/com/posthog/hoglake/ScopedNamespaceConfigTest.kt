@@ -101,4 +101,27 @@ class ScopedNamespaceConfigTest {
             cfg.copy(servedNamespacesFile = file("served.json", served), authSessionProfile = "on")
         }.hasMessageContaining("cannot coexist")
     }
+
+    @Test
+    fun `the read session relay is off by default and needs the profile and a remote schema`() {
+        val hosts =
+            """{"hosts":[{"id":"$id","match":{"type":"namespace_family","family":"team"},"kind":"hoglake",""" +
+                """"url":"https://host.invalid","auth":"forward"}]}"""
+        val client = config().copy(mountHostsFile = file("hosts.json", hosts), authSessionProfile = "on")
+        assertThat(client.readSessionRelayEnabled).isFalse()
+        assertThat(client.copy(readSessionRelay = " ON ").readSessionRelayEnabled).isTrue()
+
+        assertThatThrownBy { client.copy(readSessionRelay = "true") }.hasMessageContaining("must be on or off")
+        assertThatThrownBy { config().copy(readSessionRelay = "on") }.hasMessageContaining("requires a remote schema")
+        assertThatThrownBy {
+            Config(
+                mountHostsFile = file("hosts.json", hosts),
+                authSessionProfile = "on",
+                authMode = "enforce",
+                authJwksFile = "mounted-public-jwks.json",
+                authPredicateFields = "team_id",
+                readSessionRelay = "on",
+            )
+        }.hasMessageContaining("requires HOGLAKE_READ_SESSION_PROFILE")
+    }
 }
