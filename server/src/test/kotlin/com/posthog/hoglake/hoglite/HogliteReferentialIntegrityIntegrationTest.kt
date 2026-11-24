@@ -54,6 +54,20 @@ class HogliteReferentialIntegrityIntegrationTest {
         store.runTx(cat, HogliteCatalogStore.freshTxid("fixture"), null, HogliteTx().apply { add(sql, *args) })
     }
 
+    /** Renames the catalog's meta row; unfenced, since the name guard would refuse the renamed tenant. */
+    private fun rename(
+        cat: String,
+        name: String,
+    ) = store.catalogOperation(cat) {
+        store.runTx(
+            cat,
+            HogliteCatalogStore.freshTxid("fixture"),
+            null,
+            HogliteTx().apply { add("UPDATE meta SET name = ? WHERE id = 1", name) },
+            fenced = false,
+        )
+    }
+
     private fun query(
         cat: String,
         sql: String,
@@ -307,10 +321,10 @@ class HogliteReferentialIntegrityIntegrationTest {
         }
         assertThat(count(cat, "SELECT COUNT(*) FROM namespaces WHERE id = 999")).isZero()
 
-        write(cat, "UPDATE meta SET name = ? WHERE id = 1", "a".repeat(63))
-        assertThat(catchThrowable { write(cat, "UPDATE meta SET name = ? WHERE id = 1", "a".repeat(64)) })
+        rename(cat, "a".repeat(63))
+        assertThat(catchThrowable { rename(cat, "a".repeat(64)) })
             .isExactlyInstanceOf(HoglakeException.Validation::class.java)
-        write(cat, "UPDATE meta SET name = ? WHERE id = 1", cat)
+        rename(cat, cat)
 
         val upper = "UPDATE namespaces SET contained_field = 'Team', contained_value = 1 WHERE id = 100"
         assertThat(catchThrowable { write(cat, upper) }).isExactlyInstanceOf(HoglakeException.Validation::class.java)

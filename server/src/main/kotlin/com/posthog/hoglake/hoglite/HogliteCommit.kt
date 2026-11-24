@@ -59,8 +59,8 @@ import java.util.UUID
  *
  * Application receipts control client-key replay for their retention lifetime.
  * A receipt guard precedes state guards inside the transaction. Its private
- * rollback marker permits a bound receipt lookup. A missing receipt shares
- * the schema fence's single replan slot.
+ * rollback marker permits a bound receipt lookup. A missing receipt has one
+ * replan of its own, apart from the schema fence's [MAX_SCHEMA_REPLANS].
 
  */
 
@@ -82,6 +82,9 @@ internal object HogliteCommit {
 
     private const val CONTENT_KINDS = "('table_created','table_inserted_into','table_deleted_from','table_replaced')"
     private const val DDL_KINDS = "('table_dropped','table_altered')"
+
+    /** Schema-fence replans per commit, apart from the one receipt-recovery replan. */
+    internal const val MAX_SCHEMA_REPLANS = 3
 
     fun commit(
         store: HogliteCatalogStore,
@@ -105,23 +108,29 @@ internal object HogliteCommit {
         ) {
             throw HoglakeException.Validation("pending delete targets require /commit/transaction")
         }
-        // Schema changes and receipts removed during recovery share one replan.
-        // Both private markers prove that the materialized write rolls back.
-        return try {
-            doCommit(store, catalog, request)
-        } catch (e: HoglakeException.CommitConflict) {
-            if (e !== SCHEMA_CHANGED && e !== RECEIPT_CHANGED) throw e
+        // Schema changes and receipts removed during recovery replan on
+        // separate budgets, so one never spends the other's: PostgreSQL
+        // serializes the commit behind its lock and refuses neither. Both
+        // private markers prove that the materialized write rolls back. The
+        // bound keeps continuous DDL on the table from livelocking a commit.
+        var schemaReplans = 0
+        var receiptReplans = 0
+        while (true) {
             try {
-                doCommit(store, catalog, request)
-            } catch (e2: HoglakeException.CommitConflict) {
-                if (e2 !== SCHEMA_CHANGED && e2 !== RECEIPT_CHANGED) throw e2
-                throw HoglakeException.CommitConflict(
-                    if (e2 === SCHEMA_CHANGED) {
-                        "concurrent DDL changed the schema twice while this commit was being planned; retry"
-                    } else {
-                        "receipt changed during publication; retry"
-                    },
-                )
+                return doCommit(store, catalog, request)
+            } catch (e: HoglakeException.CommitConflict) {
+                when {
+                    e === SCHEMA_CHANGED && schemaReplans < MAX_SCHEMA_REPLANS -> schemaReplans++
+                    e === RECEIPT_CHANGED && receiptReplans < 1 -> receiptReplans++
+                    e === SCHEMA_CHANGED ->
+                        throw HoglakeException.CommitConflict(
+                            "concurrent DDL changed the schema ${MAX_SCHEMA_REPLANS + 1} times while this " +
+                                "commit was being planned; retry",
+                        )
+                    e === RECEIPT_CHANGED ->
+                        throw HoglakeException.CommitConflict("receipt changed during publication; retry")
+                    else -> throw e
+                }
             }
         }
     }
@@ -654,8 +663,8 @@ internal object HogliteCommit {
         // blind append). Per-table — not the catalog-wide
         // meta.schema_version — so a createTable or an ALTER of an
         // UNRELATED table never replans (or worse, falsely 409s) a blind
-        // append in a busy catalog. Failure replans once via the
-        // commit() wrapper.
+        // append in a busy catalog. Failure replans via the commit()
+        // wrapper, up to MAX_SCHEMA_REPLANS times.
         for (t in resolved.values) {
             tx.expectScalar(
                 t.schemaVersion,
@@ -1175,7 +1184,7 @@ internal object HogliteCommit {
                         key.toString(),
                     ).firstRow()
                 if (existing != null) return replayedReceipt(store, catalog, key, fingerprintBytes, existing)
-                // Cleanup removed the receipt. Only the shared budget permits a replan.
+                // Cleanup removed the receipt. Only the receipt budget permits a replan.
                 throw e
             }
         try {
@@ -1355,9 +1364,10 @@ internal object HogliteCommit {
             return statements.size - 1
         }
 
-        /** The catalog's meta row; a missing one is the missing catalog, as [HogliteCatalogStore.meta]. */
+        /** The catalog's meta row; a missing or foreign one is the missing catalog, as [HogliteCatalogStore.meta]. */
         fun meta(): HogliteCatalogStore.MetaRow =
             store.metaRow(
+                catalog,
                 results[metaAt].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"),
             )
 

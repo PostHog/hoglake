@@ -52,9 +52,11 @@ void HoglakeCatalog::Initialize(bool load_builtin) {
 		}
 		auto created = api_client->CreateCatalog(options.data_path);
 		data_path = created.data_path;
+		capabilities.insert(created.capabilities.begin(), created.capabilities.end());
 		return;
 	}
 	data_path = info->data_path;
+	capabilities.insert(info->capabilities.begin(), info->capabilities.end());
 }
 
 optional_ptr<CatalogEntry> HoglakeCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {

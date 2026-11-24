@@ -1,10 +1,12 @@
 #include "storage/hoglake_transaction.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/client_context.hpp"
 #include <chrono>
 #include <thread>
@@ -317,6 +319,48 @@ void HoglakeTransaction::RequireDDLAllowed(const string &ns, const string &table
 //! same discrimination as pyhoglake.
 static constexpr const char *RECREATED_MARKER = "the table was recreated";
 
+//! Catalog capability under which the server honors `idempotency_key`
+//! on /commit and serves GET /commit/receipts/{key}. Without it the key
+//! is ignored and a retry of an unknown outcome is blind.
+static constexpr const char *IDEMPOTENT_APPEND = "idempotent-append-v1";
+
+//! The terminal commit error's suffix once ANY attempt's outcome was
+//! unknown. It REPLACES the definite-outcome suffix (a 409's "re-run the
+//! statement", "retries exhausted", the deadline) so the error carries
+//! one instruction: `ended` says how the loop ended (empty when the
+//! unknown answer itself ended it) and `new_transaction` that the last
+//! answer needs one. What the server contract guarantees (openapi
+//! getCommitReceipt): a receipt answers 200 with the snapshot once the
+//! commit published; a 404 proves nothing either way — an attempt may
+//! still be in flight, and the server names NO time after which one has
+//! surely stopped — and receipts are purged after
+//! HOGLAKE_RECEIPT_RETENTION_SECONDS. The safe recovery is a retry under
+//! the SAME key, which this extension cannot do (the key is minted per
+//! commit, never caller-chosen), so the advice is the receipt lookup
+//! and, on a 404, the table's contents.
+static string UnknownOutcomeAdvice(HoglakeApiClient &api, idx_t attempts, const string &ended, bool new_transaction,
+                                   const string &key) {
+	auto lead = StringUtil::Format("%s%safter %llu attempt(s) the commit MAY be durable", ended, ended.empty() ? "" : "; ",
+	                               attempts);
+	auto rerun = new_transaction ? "re-running the statement in a new transaction" : "re-running the statement";
+	if (key.empty()) {
+		return StringUtil::Format(
+		    " (%s: an attempt got no definite answer, so the server may have published it or may still be publishing "
+		    "it. This server does not advertise %s, so the extension sent no idempotency_key, did not retry — a blind "
+		    "retry could register the files twice — and has no receipt to point at. Do not re-run the statement blind: "
+		    "check the table's contents or the catalog's newest snapshots (hoglake_snapshots) for this commit before %s)",
+		    lead, IDEMPOTENT_APPEND, rerun);
+	}
+	return StringUtil::Format(
+	    " (%s: an attempt got no definite answer, so the server may have published it or may still be publishing it. "
+	    "Do not re-run the statement blind — the files would register twice — and this extension cannot retry under "
+	    "the same idempotency_key. Look up the receipt first: GET %s/v1/catalogs/%s/commit/receipts/%s answers 200 "
+	    "with the snapshot once the commit published. A 404 is not proof either way: an attempt may still be in "
+	    "flight, and receipts are purged after HOGLAKE_RECEIPT_RETENTION_SECONDS (7 days by default). On a 404, check "
+	    "the table's contents or hoglake_snapshots for this commit before %s)",
+	    lead, api.GetEndpoint(), HoglakeApiClient::EncodeSegment(api.GetCatalogName()), key, rerun);
+}
+
 template <class T>
 static T GetSettingOrDefault(ClientContext &context, const char *name, T default_value) {
 	Value value;
@@ -348,6 +392,27 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 			}
 		}
 	}
+	// One key for every attempt below, when the server honors one. A 503
+	// can mean the commit never reached the catalog (commit_queue_timeout,
+	// backend_unavailable) or that it may be durable
+	// (commit_outcome_unknown — Hoglite's lost acknowledgement); the
+	// client cannot tell which, and a blind retry of the second registers
+	// the same parquet twice (duplicate paths are legal) and reports
+	// success. The same holds when the answer is lost in transport (a
+	// reset connection, the read timeout, a proxy's 502/504) and for the
+	// server's catch-all 500: on the PostgreSQL backend a COMMIT whose
+	// acknowledgement the database connection lost is durable yet
+	// surfaces as a generic 500 (only Hoglite raises
+	// commit_outcome_unknown). Keyed, the server replays the receipt of a
+	// commit it published, so every retry is exactly-once. A server that
+	// does not advertise idempotent-append-v1 ignores the key, so against
+	// one no key is sent and the unknown outcomes are not retried (below):
+	// the pre-key behavior for a lost answer, the safe one for
+	// commit_outcome_unknown. The definite 503s retry either way.
+	auto keyed = hoglake_catalog.HasCapability(IDEMPOTENT_APPEND);
+	if (keyed) {
+		request.idempotency_key = UUID::ToString(UUID::GenerateRandomUUID());
+	}
 
 	// clamp the retry knobs: they are user settings and the arithmetic
 	// below must never hit float->unsigned UB or absurd sleeps
@@ -358,43 +423,150 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 		backoff = 1.5;
 	}
 	static constexpr double MAX_WAIT_MS = 600000.0;
+	// how long one attempt waits for the server's answer: above the
+	// server's commit-lock wait (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, 30 s by
+	// default) or a queued commit's clean 503 commit_queue_timeout turns
+	// into a lost answer, an unknown outcome
+	auto commit_timeout_ms = MaxValue<uint64_t>(
+	    MinValue<uint64_t>(GetSettingOrDefault<uint64_t>(context, "hoglake_commit_timeout_ms",
+	                                                     HoglakeApiClient::DEFAULT_COMMIT_TIMEOUT_MS),
+	                       3600000),
+	    1000);
+	// the whole loop's wall-time budget, attempts and backoff included:
+	// retried read timeouts at commit_timeout_ms each would otherwise
+	// hold COMMIT for max_retries × commit_timeout_ms (~22 min at the
+	// defaults) against a hung server. No attempt waits past it, and no
+	// attempt starts that could not end before it.
+	// It is also the window in which a keyed retry is exactly-once, so it
+	// stays under the server's minimum receipt retention
+	// (MAX_COMMIT_DEADLINE_MS).
+	auto deadline_ms = MaxValue<uint64_t>(
+	    MinValue<uint64_t>(GetSettingOrDefault<uint64_t>(context, "hoglake_commit_deadline_ms",
+	                                                     DEFAULT_COMMIT_DEADLINE_MS),
+	                       MAX_COMMIT_DEADLINE_MS),
+	    1000);
+	auto started = std::chrono::steady_clock::now();
+	auto elapsed_ms = [&started]() {
+		auto elapsed = std::chrono::steady_clock::now() - started;
+		return NumericCast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+	};
 
+	// Sticky across attempts: once ANY attempt's outcome is unknown the
+	// commit may be durable whatever the later attempts said. A definite
+	// failure on a retry does not prove the earlier attempt dead — it may
+	// still be queued on the server's commit lock and publish after the
+	// retry's answer — so the terminal error must never read as "nothing
+	// applied" once this is set.
+	bool outcome_unknown = false;
 	double current_wait = static_cast<double>(wait_ms);
 	for (idx_t attempt = 0;; attempt++) {
-		auto outcome = Api().TryCommit(request);
+		// the check before each sleep leaves time on the clock here
+		auto remaining_ms = deadline_ms - MinValue<uint64_t>(elapsed_ms(), deadline_ms - 1);
+		HoglakeCommitOutcome outcome;
+		try {
+			outcome = Api().TryCommit(request, MinValue<uint64_t>(commit_timeout_ms, remaining_ms));
+		} catch (std::exception &e) {
+			// an attempt that throws before the server answers (a token
+			// re-mint that fails) settles nothing; after an earlier unknown
+			// outcome the error must still carry the advice and the key
+			if (!outcome_unknown) {
+				throw;
+			}
+			ErrorData error(e);
+			throw TransactionException(
+			    "hoglake: commit failed: %s%s", error.RawMessage(),
+			    UnknownOutcomeAdvice(Api(), attempt + 1,
+			                         StringUtil::Format("attempt %llu failed without a usable answer", attempt + 1),
+			                         false, request.idempotency_key));
+		}
 		if (outcome.success) {
 			return;
 		}
 		auto message = StringUtil::Format("hoglake: commit failed: %s%s%s", outcome.error,
 		                                  outcome.detail.empty() ? "" : " — ", outcome.detail);
 		bool retryable = false;
+		// set when this attempt's answer ends the commit on its own,
+		// whatever the retry budget says: the suffix when every attempt
+		// got a definite answer
+		string stop;
+		// how the loop ended, for the unknown-outcome advice that replaces
+		// `stop` once an attempt got no definite answer
+		string ended;
+		bool new_transaction = false;
 		idx_t sleep_ms = 0;
 		if (outcome.status == 409) {
 			auto text = StringUtil::Lower(outcome.error + " " + outcome.detail);
 			if (outcome.error != "commit_conflict" || StringUtil::Contains(text, RECREATED_MARKER)) {
-				throw TransactionException("%s (start a new transaction and re-run the statement)",
-				                           message);
+				stop = " (start a new transaction and re-run the statement)";
+				ended = "this refusal needs a new transaction and ended the retries";
+				new_transaction = true;
+			} else if (has_deletes) {
+				stop = " (a conflicting commit superseded this transaction's deletion vectors; re-run the statement)";
+				ended = "a conflicting commit superseded this transaction's deletion vectors and ended the retries";
+			} else {
+				retryable = true;
 			}
-			if (has_deletes) {
-				throw TransactionException("%s (a conflicting commit superseded this transaction's deletion "
-				                           "vectors; re-run the statement)",
-				                           message);
-			}
-			retryable = true;
 		} else if (outcome.status == 503) {
-			// explicit commit backpressure; honor Retry-After
-			retryable = true;
+			// Only the server's own backpressure (commit_queue_timeout) and
+			// a backend that did not answer (backend_unavailable) applied
+			// nothing and retry as they are. Every other 503 may have
+			// published: commit_outcome_unknown, and a proxy's untyped 503
+			// (its body is not the API's JSON, so error reads "HTTP 503")
+			// sent after it forwarded the commit and lost the answer. Those
+			// retry only under a key the server honors (see above). Honor
+			// Retry-After.
+			if (outcome.error == "commit_queue_timeout" || outcome.error == "backend_unavailable") {
+				retryable = true;
+			} else {
+				outcome_unknown = true;
+				retryable = keyed;
+			}
 			if (outcome.retry_after_seconds > 0) {
 				sleep_ms = MinValue<idx_t>(outcome.retry_after_seconds, 600) * 1000;
 			}
-		}
-		if (!retryable || attempt >= max_retries) {
-			throw TransactionException("%s%s", message, retryable ? " (retries exhausted)" : "");
+		} else if (outcome.status == 0 || outcome.status == 500 || outcome.status == 502 || outcome.status == 504) {
+			// the acknowledgement was lost: no answer at all (status 0:
+			// connection reset, read timeout), a proxy in front of the
+			// server gave up on the request (502/504), or the server's
+			// catch-all 500 — on PostgreSQL a lost COMMIT acknowledgement
+			// is a durable commit reported as internal_error (server
+			// ErrorMapping, the Throwable arm). The server may have
+			// published; only the keyed retry is exactly-once.
+			outcome_unknown = true;
+			retryable = keyed;
+			if (outcome.retry_after_seconds > 0) {
+				sleep_ms = MinValue<idx_t>(outcome.retry_after_seconds, 600) * 1000;
+			}
 		}
 		if (sleep_ms == 0) {
 			current_wait = MinValue<double>(current_wait, MAX_WAIT_MS);
 			sleep_ms = static_cast<idx_t>(current_wait);
 			current_wait = MinValue<double>(current_wait * backoff, MAX_WAIT_MS);
+		}
+		// An attempt left with less than the server's commit-lock wait (or
+		// the whole commit timeout, if shorter) turns a queued commit's clean
+		// 503 into a timeout, an unknown outcome: do not start one.
+		auto min_attempt_ms = MinValue<uint64_t>(commit_timeout_ms, MIN_COMMIT_ATTEMPT_MS);
+		if (stop.empty() && retryable && attempt < max_retries &&
+		    elapsed_ms() + sleep_ms + min_attempt_ms > deadline_ms) {
+			// the next attempt could not get a useful wait before the deadline
+			stop = StringUtil::Format(" (hoglake_commit_deadline_ms=%llu passed)", deadline_ms);
+			ended = StringUtil::Format("the commit deadline (hoglake_commit_deadline_ms=%llu) passed", deadline_ms);
+		}
+		if (!stop.empty() || !retryable || attempt >= max_retries) {
+			if (stop.empty() && retryable) {
+				stop = " (retries exhausted)";
+				ended = "retries exhausted";
+			}
+			// once any attempt was unknown the user must not re-run the
+			// statement blind: the files may already be registered. The
+			// advice replaces `stop` so the error gives one instruction
+			if (outcome_unknown) {
+				throw TransactionException(
+				    "%s%s", message,
+				    UnknownOutcomeAdvice(Api(), attempt + 1, ended, new_transaction, request.idempotency_key));
+			}
+			throw TransactionException("%s%s", message, stop);
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 	}

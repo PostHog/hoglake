@@ -24,11 +24,21 @@ class HogliteTimestampResolveTest {
     /** The snapshot id the fake answers, or null for no row. */
     @Volatile private var answer: Long? = 4
 
+    /** The ts the fake's snapshot row carries: what the engine stamped, as stored. */
+    private val storedTs = "2026-11-04T11:59:58.250Z"
+
     private val server: HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex ->
-                sqls += json.readTree(ex.requestBody.readBytes())["sql"]?.asText().orEmpty()
-                val rows = listOfNotNull(answer?.let { listOf(it) })
+                val sql = json.readTree(ex.requestBody.readBytes())["sql"]?.asText().orEmpty()
+                sqls += sql
+                val rows =
+                    when {
+                        sql.startsWith("SELECT ts FROM snapshots") -> listOf(listOf(storedTs))
+                        sql.startsWith("SELECT name, data_path,") ->
+                            listOf(listOf("wh", "s3://b/wh", 9, 1, 2, null, null, 0))
+                        else -> listOfNotNull(answer?.let { listOf(it) })
+                    }
                 val bytes = json.writeValueAsBytes(mapOf("cols" to listOf("id"), "rows" to rows, "affected" to 0))
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
@@ -55,6 +65,25 @@ class HogliteTimestampResolveTest {
 
         assertThat(at).isEqualTo(4)
         assertThat(sqls.single()).isEqualTo("SELECT id FROM snapshots WHERE ts <= ? ORDER BY id DESC LIMIT 1")
+    }
+
+    /**
+     * The resolution reports the ts the engine stamped on the row, read back
+     * from the tenant — never a time this JVM computed. With the row stamped
+     * inside the transaction (#672), the stored value is the only one that
+     * says when the snapshot became visible.
+     */
+    @Test
+    fun `snapshot resolution answers with the stamped time read from the tenant`() {
+        val resolution = store.resolveSnapshot("wh", Instant.parse("2026-11-04T12:00:00Z"))
+
+        assertThat(resolution.snapshotId).isEqualTo(4)
+        assertThat(resolution.snapshotTime).isEqualTo(Instant.parse(storedTs))
+        assertThat(sqls).containsExactly(
+            store.metaSql,
+            "SELECT id FROM snapshots WHERE ts <= ? ORDER BY id DESC LIMIT 1",
+            "SELECT ts FROM snapshots WHERE id = ?",
+        )
     }
 
     @Test
