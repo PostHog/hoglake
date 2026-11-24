@@ -3,6 +3,7 @@ package com.posthog.hoglake.hoglite
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.api.toDto
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
@@ -395,6 +396,33 @@ class HogliteCatalogStoreTest {
                 .isInstanceOf(HoglakeException.Validation::class.java)
         }
         assertThat(requests).isEmpty()
+    }
+
+    @Test
+    fun `create refuses a data_path overlapping another backend's catalog before any request`() {
+        // The selector's view of the other backend: one PostgreSQL catalog.
+        val peers = listOf(CatalogInfo(7, "pg", "s3://bucket/pg", 0, 0))
+        val checked = HogliteCatalogStore(client, { "t-$it-1" }, peerCatalogs = { peers })
+
+        // Equal, trailing-slash, nested-under and parent-of, as the
+        // PostgreSQL check refuses them (CatalogServiceIntegrationTest).
+        for (bad in listOf("s3://bucket/pg", "s3://bucket/pg/", "s3://bucket/pg/deeper", "s3://bucket")) {
+            assertThat(catchThrowable { checked.createCatalog("wh", bad, null, null) })
+                .`as`(bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining("overlaps catalog 'pg'")
+        }
+        // A same-name catalog on the other backend is another catalog, not a recreate.
+        assertThat(catchThrowable { checked.createCatalog("pg", "s3://bucket/pg", null, null) })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("overlaps catalog 'pg'")
+        // Refused before the tenant PUT: no tenant to clean up.
+        assertThat(requests).isEmpty()
+        assertThat(tenants).isEmpty()
+
+        // The string-prefix sibling stays legal.
+        assertThat(checked.createCatalog("wh", "s3://bucket/pg2", null, null).dataPath).isEqualTo("s3://bucket/pg2")
+        assertThat(tenants.keys).containsExactly("t-wh-1")
     }
 
     @Test

@@ -103,6 +103,24 @@ This is the single most important existing building block:
   prefix-overlaps **any** existing catalog's, in both directions, because
   cleanup's drain-time liveness check is per-catalog — two catalogs sharing a
   prefix would let A's drain physically delete an object B still references.
+  A create routed to Hoglite (`HogliteCatalogStore.createCatalog`) runs the
+  same check against the PostgreSQL catalogs of the same server (#666), before
+  the tenant is made; the list is the configured PostgreSQL backend's, the
+  default one or the lazily opened one of `HOGLAKE_DEFAULT_BACKEND=none` with
+  `HOGLAKE_POSTGRES_BACKEND_ID`, which the create opens when no request has;
+  an open that fails is the create's 503 `backend_unavailable`, not an
+  unchecked create. The reverse is NOT checked: a PostgreSQL create is
+  compared with PostgreSQL catalogs only, because hoglake keeps no list of
+  Hoglite tenants and hoglite offers nothing that enumerates them, so a
+  PostgreSQL catalog created on a Hoglite catalog's prefix (the #666 scenario
+  with the roles swapped) is refused by nothing on the server. Disjointness
+  between Hoglite catalogs on one backend lands with #668, when
+  `HogliteCatalogStore.createCatalog` sends the `data_path` on
+  `PUT /v1/tenants/{tenant}` and hoglite checks it against the other tenants'
+  manifests; today the PUT carries no body and a 409/422 reads as "tenant
+  exists". Until then, and for a PostgreSQL create against Hoglite catalogs,
+  for another server's PostgreSQL catalogs, and across Hoglite backends,
+  disjointness is the operator's responsibility.
 - `validateDataPath` bounds length (512), refuses whitespace/control chars and
   dot segments, and requires an `s3://` URI.
 

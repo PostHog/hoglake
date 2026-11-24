@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -45,6 +46,29 @@ class HogliteCatalogLifecycleIntegrationTest {
 
         // The name is free again after the drop.
         assertThat(store.createCatalog(c, "s3://hoglake-it/$c", null, null).headSnapshotId).isZero()
+    }
+
+    @Test
+    fun `a create whose data_path overlaps another backend's catalog is refused and makes no tenant`() {
+        val c = HogliteConformanceEngine.uniqueName("ovl")
+        val peer = HogliteConformanceEngine.uniqueName("pg")
+        // The selector's view of the other backend, as it hands it to the store.
+        val peers = listOf(CatalogInfo(1, peer, "s3://hoglake-it/$peer", 0, 0))
+        val checked = HogliteCatalogStore(engine.client, HogliteConformanceEngine.TENANTS, peerCatalogs = { peers })
+
+        // Equal, trailing-slash, nested-under and parent-of (bucket root).
+        val theirs = "s3://hoglake-it/$peer"
+        for (bad in listOf(theirs, "$theirs/", "$theirs/x", "s3://hoglake-it")) {
+            assertThatThrownBy { checked.createCatalog(c, bad, null, null) }
+                .`as`(bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining("overlaps catalog '$peer'")
+        }
+        // Refused before the tenant PUT: the name resolves to nothing on the engine.
+        assertThatThrownBy { checked.getCatalog(c) }.isInstanceOf(HoglakeException.NotFound::class.java)
+
+        // A disjoint data_path creates as before.
+        assertThat(checked.createCatalog(c, "s3://hoglake-it/$c", null, null).dataPath).isEqualTo("s3://hoglake-it/$c")
     }
 
     @Test

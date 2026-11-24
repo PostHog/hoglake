@@ -1,0 +1,5 @@
+---
+hoglake: patch (Server)
+---
+
+A catalog create routed to Hoglite refuses a `data_path` that overlaps a PostgreSQL catalog of the same server in either direction, with the 422 PostgreSQL's own check gives, and before any tenant is made (#666). The PostgreSQL catalogs checked are those of the server's configured PostgreSQL backend, the default one or the lazily opened one of `HOGLAKE_DEFAULT_BACKEND=none` with `HOGLAKE_POSTGRES_BACKEND_ID`, which the create opens if no request has yet; an open that fails is the create's 503 `backend_unavailable`, not an unchecked create. The reverse is not checked: a PostgreSQL create is compared with PostgreSQL catalogs only, because the server keeps no list of Hoglite tenants, so a PostgreSQL catalog on a Hoglite catalog's prefix is refused by nothing on the server. Disjointness between Hoglite catalogs on one backend lands with #668 (the tenant create will carry the `data_path` for hoglite to check; today it carries none). Until then, and for a PostgreSQL create against Hoglite catalogs, for another server's PostgreSQL catalogs, and across Hoglite backends, disjointness is the operator's responsibility.
