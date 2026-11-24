@@ -266,7 +266,7 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding {
         if (call.verifiedBackendAuthority?.isReadSession == true) {
-            throw HoglakeException.NotFound("namespace")
+            return readSessionRemoteSchema(call, catalog)
         }
         call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
         // Before any binding: a name resolves only when the caller's token allows it.
@@ -359,10 +359,33 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding.RemoteSchema? {
         if (call.verifiedBackendAuthority?.isReadSession == true) {
-            throw HoglakeException.NotFound("namespace")
+            return readSessionRemoteSchema(call, catalog)
         }
         call.requireCatalogEntitlement(catalog)
         return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
+    }
+
+    /**
+     * The only binding a dedicated read session gets from this selector: the
+     * remote schema its request path names (docs/auth.md, "Read sessions on a
+     * remote schema"). Never a local store, a served namespace or a mount, and
+     * nothing is cached for the call. The catalog check comes first and
+     * answers for the catalog; every later failure is a missing namespace.
+     * The session's verified Hoglite placement proves this server holds the
+     * catalog, so no store is read, and the caller rule of §6.5c is the one
+     * [pathSchema] applies to every caller.
+     */
+    private fun readSessionRemoteSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.RemoteSchema {
+        call.requireCatalogEntitlement(catalog)
+        if (cfg?.readSessionRelayEnabled != true) throw HoglakeException.NotFound("namespace")
+        val (schema, namespace) = namedSchema(call, catalog) ?: throw HoglakeException.NotFound("namespace")
+        resolveReadSessionRouting(call, catalog, "namespace")
+        val name = schema.match.schemaFor(namespace)
+        call.requireRemoteSchemaEntitlement(catalog, name, namespace, schema.remoteNameFor(name), schema.name)
+        return CatalogBinding.RemoteSchema(catalog, name, schema.host, schema.name)
     }
 
     /** The configured remote schema the path's `{namespace}` is, or is a case variant of; the namespace as named. */
@@ -412,6 +435,10 @@ class CatalogStoreSelector(
 
     /** Whether this server configures any remote schema. */
     val hasRemoteSchemas: Boolean get() = mountHosts.remoteSchemas().isNotEmpty()
+
+    /** Whether a dedicated read session's request for [namespace] is one this server relays: off unless configured. */
+    fun relaysReadSession(namespace: String): Boolean =
+        cfg?.readSessionRelayEnabled == true && isRemoteSchema(namespace)
 
     /** Whether [namespace] is a configured remote schema's name or a case variant: never a local namespace here. */
     fun isRemoteSchema(namespace: String): Boolean = mountHosts.remoteSchemas().any { it.match.covers(namespace) }

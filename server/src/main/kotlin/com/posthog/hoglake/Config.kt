@@ -59,6 +59,13 @@ data class Config(
      * Required when [readSessionProfile] is set.
      */
     val readSessionRemoteTargets: String = env("HOGLAKE_READ_SESSION_REMOTE_TARGETS", ""),
+    /**
+     * `on` lets a dedicated read session read a remote schema through the
+     * relay (docs/auth.md, "Read sessions on a remote schema"). `off`, the
+     * default, keeps such a route on the ordinary verifier. Requires
+     * [readSessionProfile] and a remote schema in the mount hosts file.
+     */
+    val readSessionRelay: String = env("HOGLAKE_READ_SESSION_RELAY", "off"),
     /** PostgreSQL is the only default backend. `none` disables fallback and opens PostgreSQL only on a routed request. */
     val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
     /** Optional allowlist id for this process's PostgreSQL backend. */
@@ -1533,6 +1540,9 @@ data class Config(
     internal val readSession: ReadSessionProfile? =
         ReadSessionProfile.fromEnv(readSessionProfile, readSessionRemoteTargets)
 
+    /** Whether a dedicated read session may read a remote schema through the relay. */
+    internal val readSessionRelayEnabled: Boolean = readSessionRelay.trim().lowercase() == "on"
+
     /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
     val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
 
@@ -1569,6 +1579,15 @@ data class Config(
         }
 
     init {
+        require(readSessionRelay.trim().lowercase() in setOf("on", "off")) {
+            "HOGLAKE_READ_SESSION_RELAY must be on or off"
+        }
+        if (readSessionRelayEnabled) {
+            require(readSession != null) { "HOGLAKE_READ_SESSION_RELAY requires HOGLAKE_READ_SESSION_PROFILE" }
+            require(mountHosts.any { it.match is MountMatch.RemoteSchemaMatch }) {
+                "HOGLAKE_READ_SESSION_RELAY requires a remote schema in HOGLAKE_MOUNT_HOSTS_FILE"
+            }
+        }
         readSession?.let {
             require(AuthMode.parse("HOGLAKE_AUTH_MODE", authMode) == AuthMode.ENFORCE) {
                 "HOGLAKE_READ_SESSION_PROFILE requires HOGLAKE_AUTH_MODE=enforce"

@@ -24,6 +24,7 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountHostResolver
 import com.posthog.hoglake.store.StaticMountHosts
 import com.sun.net.httpserver.HttpServer
+import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.head
 import io.ktor.client.request.header
@@ -71,6 +72,7 @@ class ScopedNamespaceDispatchTest {
     private var server: HttpServer? = null
     private var remoteServer: HttpServer? = null
     private var mountHosts: StaticMountHosts? = null
+    private val remoteAuthorizations = CopyOnWriteArrayList<String>()
 
     @Volatile
     private var status = 200
@@ -154,6 +156,7 @@ class ScopedNamespaceDispatchTest {
         readFixture: Boolean = true,
         mountHostsJson: String? = null,
         reservedNamespaceNames: Set<String> = emptySet(),
+        relay: Boolean = false,
     ): Config {
         val peer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server = peer
@@ -184,6 +187,7 @@ class ScopedNamespaceDispatchTest {
             backendsFile = backendsFile.toString(),
             readSessionProfile = if (withReadSession) vectors["config"]["profile"].asText() else "",
             readSessionRemoteTargets = if (withReadSession) targets else "",
+            readSessionRelay = if (relay) "on" else "off",
             mountHostsFile = hostsFile,
             reservedNamespaceNames = reservedNamespaceNames,
             postgresBackendId = postgresId.toString(),
@@ -272,7 +276,16 @@ class ScopedNamespaceDispatchTest {
         if (publicListener) {
             installAuth(service.forPublicListener())
         } else {
-            installAuth(service, cfg.readSession?.let { ReadSessionConfig(it, cfg.reservedNamespaces) })
+            installAuth(
+                service,
+                cfg.readSession?.let {
+                    ReadSessionConfig(
+                        it,
+                        cfg.reservedNamespaces,
+                        relays = selector::relaysReadSession,
+                    )
+                },
+            )
         }
         installNamespaceGate(selector)
         install(ContentNegotiation) { jackson { configureHoglakeWire() } }
@@ -1023,6 +1036,7 @@ class ScopedNamespaceDispatchTest {
                 "/v1/catalogs/example-catalog/namespaces/team_42/tables/events",
                 "/v1/catalogs/example-catalog/namespaces/team_42/tables/events/scan$query",
             )) {
+                // The relay is off by default: the ordinary verifier refuses the dedicated audiences.
                 val response = client.get(remoteTarget) { header(HttpHeaders.Authorization, "Bearer $jwt") }
                 assertThat(response.status).describedAs(remoteTarget).isEqualTo(HttpStatusCode.Unauthorized)
             }
@@ -1046,6 +1060,7 @@ class ScopedNamespaceDispatchTest {
         remote.createContext("/") { exchange ->
             exchange.requestBody.readBytes()
             remoteRequests.add("${exchange.requestMethod} ${exchange.requestURI}")
+            remoteAuthorizations.addAll(exchange.requestHeaders["Authorization"].orEmpty())
             exchange.responseHeaders.set("Content-Type", "application/json")
             val bytes = relayed.toByteArray()
             exchange.sendResponseHeaders(200, bytes.size.toLong())
@@ -1120,6 +1135,105 @@ class ScopedNamespaceDispatchTest {
             assertThat(remoteRequests[2]).endsWith("/tables/metrics/scan?snapshot=5&table_uuid=$tableUuid")
             assertThat(requests).isEmpty()
             assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `a read session relays the four routes of its own team schema with its exact token`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(withReadSession = true, mountHostsJson = teamRelay(remoteRequests), relay = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            for (target in listOf(teamPath, "$teamPath/tables", teamTablePath, teamScanPath)) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.OK)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+            }
+            assertThat(remoteRequests).containsExactly(
+                "GET /v1/catalogs/example-catalog/namespaces/team_42",
+                "GET /v1/catalogs/example-catalog/namespaces/team_42/tables",
+                "GET /v1/catalogs/example-catalog/namespaces/team_42/tables/metrics",
+                "GET $teamScanPath",
+            )
+            assertThat(remoteAuthorizations).containsOnly("Bearer $jwt")
+            // Nothing local ran: no Hoglite owner request and no legacy store read.
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `a read session reaches the relay only for its own catalog and team, on GET`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(withReadSession = true, mountHostsJson = teamRelay(remoteRequests), relay = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            // The relay vectors: another team, another catalog with the same
+            // organization and team, and the non-canonical spellings.
+            for (vector in vectors["relay"].filter { it["expect"]["relay"].asText() == "not_found" }) {
+                val request = vector["request"]
+                val namespace = request["namespace"].asText()
+                if (!namespace.lowercase().startsWith("team_")) continue
+                val base = "/v1/catalogs/${request["catalog"].asText()}/namespaces/$namespace"
+                for (target in listOf(base, "$base/tables", "$base/tables/metrics", "$base/tables/metrics/scan")) {
+                    val response =
+                        client.get(target) { header(HttpHeaders.Authorization, "Bearer ${vector["token"].asText()}") }
+                    assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+                }
+            }
+            // A write on the team schema is not a relayed route: the ordinary verifier refuses the audiences.
+            val write = client.delete(teamTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(write.status).isEqualTo(HttpStatusCode.Unauthorized)
+            // A second bearer header and a changed signature never reach the Host.
+            val twice =
+                client.get(teamPath) {
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                    header(HttpHeaders.Authorization, "Bearer $jwt")
+                }
+            assertThat(twice.status).isEqualTo(HttpStatusCode.Unauthorized)
+            val tampered = client.get(teamPath) { header(HttpHeaders.Authorization, "Bearer ${jwt.dropLast(2)}xx") }
+            assertThat(tampered.status).isEqualTo(HttpStatusCode.Unauthorized)
+
+            assertThat(remoteRequests).isEmpty()
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `with the relay on the local-only routes still refuse the session's own team schema`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(withReadSession = true, mountHostsJson = teamRelay(remoteRequests), relay = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+            }
+            assertThat(remoteRequests).isEmpty()
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+
+            // The same token relays on the shared route, so the 404 above is the route's and not the token's.
+            val shared = client.get(teamPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(shared.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(remoteRequests).hasSize(1)
+        }
+
+    @Test
+    fun `without a read session profile the relay still refuses the dedicated audiences`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(withReadSession = false, readFixture = true, mountHostsJson = teamRelay(remoteRequests))
+            application { harness(cfg, readFixture = true) }
+            val response =
+                client.get(teamPath) { header(HttpHeaders.Authorization, "Bearer ${readVector["token"].asText()}") }
+            assertThat(response.status).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(remoteRequests).isEmpty()
         }
 
     @Test

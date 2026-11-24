@@ -355,7 +355,8 @@ val HoglakeAuth =
             match?.let { call.attributes.put(RouteMatchKey, it) }
             val readConfig =
                 configured?.takeIf {
-                    ReadSessionProfile.isEligibleRoute(method, match, it.reservedNamespaces)
+                    ReadSessionProfile.isEligibleRoute(method, match, it.reservedNamespaces) ||
+                        ReadSessionProfile.isRelayRoute(method, match, it.relays)
                 }
             val rawToken = bearerToken(call)
             val useReadSession =

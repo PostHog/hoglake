@@ -234,6 +234,7 @@ Configure `HOGLAKE_AUTH_MODE=enforce`, file JWKS, a Hoglite backend, and `team_i
 The API listener accepts dedicated read tokens on namespace GET, table GET, and pinned scan GET routes.
 It routes any non-reserved catalog, any non-reserved local namespace, and any table from the signed JWT.
 Reserved mounts and reserved namespaces keep the ordinary verifier on ordinary routes.
+The one exception is a remote schema's four relayed routes, described in "Read sessions on a remote schema".
 Ordinary tokens keep the ordinary verifier on all ordinary routes.
 
 #### Local-only read routes
@@ -301,10 +302,11 @@ Run `just server contract-vectors` to regenerate the file.
 
 #### Read sessions on a remote schema
 
-**Status: PROPOSED. Nothing routes a read session to a remote schema yet.**
-Today a dedicated read token reads local objects only.
-On every route that names a remote schema the ordinary verifier refuses its audiences, and the local-only routes answer `404`.
-This section is the contract for the change; the `relay` list in the read session vectors pins the caller rule.
+**Status: the Client side is built. The Host side and the reader's check are PROPOSED.**
+A Client with `HOGLAKE_READ_SESSION_PROFILE` and `HOGLAKE_READ_SESSION_RELAY=on` relays a dedicated read session as described below.
+`HOGLAKE_READ_SESSION_RELAY` is `off` by default; `on` needs the profile and a remote schema in `HOGLAKE_MOUNT_HOSTS_FILE`, or the server does not start.
+No Host accepts one yet, so a relayed request is refused by the Host's ordinary verifier until the Host side is built.
+The `relay` list in the read session vectors pins the caller rule.
 
 A read session already names the read-only `team` family in `remote_schemas` and one team in `prd`.
 This section lets it read that team schema through the relay, with the same bytes.
@@ -318,6 +320,8 @@ It adds no claim and changes no claim.
 - A verified read session resolves such a namespace to the remote schema only. It never resolves it to a local store, a served namespace, or a mount.
 - The server forwards the original `Authorization` header, as it does for every relayed request. It does not mint, exchange, or retry with another token.
 - Every other route keeps its verifier. The ordinary verifier still refuses the dedicated audiences. The local-only routes still never relay.
+- A request with more than one `Authorization` header is refused before it is verified, as on the local read routes.
+- A Client with the relay `off` is unchanged: the ordinary verifier refuses the token on these routes.
 
 **On the Host** ([auth-tenancy.md §6.5d](auth-tenancy.md#65d-served-namespaces-on-the-host)):
 

@@ -130,6 +130,7 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
                 ) &&
                 selector.allowsReadSessionRoute(pending.catalog, pending.namespace, match?.table)
         },
+        relaysReadSession = selector::relaysReadSession,
     )
 }
 
@@ -146,6 +147,7 @@ private fun Application.installCallNamespaceGate(
     refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
     scopedNamespace: (ApplicationCall, AuthDecision.ByNamespace) -> ScopedNamespaceRead? = { _, _ -> null },
     scopedTableRoute: (ApplicationCall, AuthDecision.ByNamespace) -> Boolean = { _, _ -> false },
+    relaysReadSession: (String) -> Boolean = { false },
 ) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
@@ -167,7 +169,11 @@ private fun Application.installCallNamespaceGate(
             // The table and scan routes execute terminal typed reads without legacy SQL.
             return@intercept
         }
-        if (selected == null && call.verifiedBackendAuthority?.isReadSession == true) {
+        // A read session on a remote schema goes on to isExport, which hands
+        // it the remote schema or the 404 of a missing namespace.
+        if (selected == null && call.verifiedBackendAuthority?.isReadSession == true &&
+            !relaysReadSession(pending.namespace)
+        ) {
             val refusal = HoglakeException.NotFound("namespace")
             countRefusal(
                 service,

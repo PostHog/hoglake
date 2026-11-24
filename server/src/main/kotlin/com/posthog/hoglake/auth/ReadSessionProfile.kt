@@ -180,6 +180,10 @@ internal class ReadSessionProfile(
         internal const val TABLE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}"
         internal const val SCAN_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan"
         val LOCAL_ONLY_PATTERNS = setOf(NAMESPACE_PATTERN, TABLE_PATTERN, SCAN_PATTERN)
+        internal const val TABLES_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables"
+
+        /** The four routes a remote schema relays (docs/auth-tenancy.md §6.5c). */
+        private val RELAY_PATTERNS = setOf(NAMESPACE_PATTERN, TABLES_PATTERN, TABLE_PATTERN, SCAN_PATTERN)
         private const val MAX_PROFILE_LENGTH = 256
         private const val S3_PREFIX = "s3://"
         private const val MAX_KEY_LENGTH = 1024
@@ -257,6 +261,23 @@ internal class ReadSessionProfile(
             val table = if (route.pattern == NAMESPACE_PATTERN) null else route.table ?: return false
             if (MountNames.isReserved(catalog) || reservedNamespaces.isReserved(namespace)) return false
             return isCanonicalRoute(catalog, namespace, table)
+        }
+
+        /**
+         * A relayed `GET` route whose namespace a remote schema covers
+         * ([relays]), in a catalog that is not a mount. A read session is
+         * verified here so that it can be relayed, and for nothing else: the
+         * store selector hands it the remote schema or a 404.
+         */
+        internal fun isRelayRoute(
+            method: HttpMethod,
+            route: RouteMatch?,
+            relays: (String) -> Boolean,
+        ): Boolean {
+            if (method != HttpMethod.Get || route?.pattern !in RELAY_PATTERNS) return false
+            val catalog = route?.catalog ?: return false
+            val namespace = route.namespace ?: return false
+            return !MountNames.isReserved(catalog) && CATALOG_NAME_REGEX.matches(catalog) && relays(namespace)
         }
 
         /** Return true when the unverified JWT carries any dedicated read-session audience. */
@@ -346,6 +367,8 @@ internal class ReadSessionStorageGrants(
 internal data class ReadSessionConfig(
     val profile: ReadSessionProfile,
     val reservedNamespaces: ReservedNamespaces,
+    /** Whether a namespace name is a remote schema of this server: such a route relays a read session. */
+    val relays: (String) -> Boolean = { false },
 )
 
 /** Verified route target for a dedicated read-session call. */
