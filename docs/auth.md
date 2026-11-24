@@ -230,6 +230,7 @@ Enable this verifier with `HOGLAKE_READ_SESSION_PROFILE` and `HOGLAKE_READ_SESSI
 Set `HOGLAKE_READ_SESSION_PROFILE` to the profile identifier.
 Set `HOGLAKE_READ_SESSION_REMOTE_TARGETS` to two distinct comma-separated target IDs.
 Configure `HOGLAKE_AUTH_MODE=enforce`, file JWKS, and `team_id` as the only predicate field.
+One server may keep `warn`: a Host with `HOGLAKE_PUBLIC_PORT`, no Hoglite backend and the relay `off`. Its API listener then never selects the read verifier; only its public listener does, which always enforces.
 The server also needs a Hoglite backend, or served namespaces (a Host, see "Read sessions on a remote schema").
 
 The API listener accepts dedicated read tokens on namespace GET, table GET, and pinned scan GET routes.

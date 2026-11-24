@@ -118,6 +118,17 @@ class ScopedNamespaceConfigTest {
             )
         assertThat(host.readSession).isNotNull()
         assertThat(host.backendKinds).isEmpty()
+        // A Host may keep a warning API listener when it has the public listener, which always enforces.
+        assertThat(host.copy(authMode = "warn", publicPort = 8443).readSession).isNotNull()
+        assertThatThrownBy { host.copy(authMode = "warn") }.hasMessageContaining("HOGLAKE_PUBLIC_PORT")
+        assertThatThrownBy {
+            config().copy(
+                authMode = "warn",
+                publicPort = 8443,
+                servedNamespacesFile = served,
+                authSessionProfile = "on",
+            )
+        }.hasMessageContaining("HOGLAKE_PUBLIC_PORT")
         assertThatThrownBy {
             Config(
                 readSessionProfile = "example.aws-session",

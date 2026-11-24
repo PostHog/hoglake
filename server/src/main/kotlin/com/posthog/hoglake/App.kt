@@ -15,6 +15,7 @@ import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
+import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.ReadSessionConfig
 import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.auth.installNamespaceGate
@@ -517,13 +518,14 @@ class App private constructor(
             auth,
             cfg.readSession?.let {
                 when {
+                    // A warning API listener never verifies a read session (Config allows it only on a Host).
                     !auth.tenantOnly ->
                         ReadSessionConfig(
                             it,
                             cfg.reservedNamespaces,
                             relays = catalogSelector::relaysReadSession,
                             serves = catalogSelector::servesReadSession,
-                        )
+                        ).takeIf { auth.mode == AuthMode.ENFORCE }
                     // The public listener receives relayed requests for a served namespace, and nothing else.
                     cfg.servedFamilies.isNotEmpty() ->
                         ReadSessionConfig(

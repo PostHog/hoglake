@@ -38,7 +38,23 @@ import java.nio.file.Files
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class ServedReadSessionIntegrationTest {
+class ServedReadSessionIntegrationTest : ServedReadSessionCases("enforce")
+
+/** The same Host with a warning API listener: only its public listener, which always enforces, admits a read session. */
+@Tag("integration")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+class ServedReadSessionWarnIntegrationTest : ServedReadSessionCases("warn") {
+    @Test
+    fun `the warning API listener does not admit a read session`() {
+        for (path in listOf(ns, "$ns/tables", "$ns/tables/events", scanPath())) {
+            val response = send(apiPort, path, session())
+            assertThat(response.statusCode()).describedAs("%s: %s", path, response.body()).isEqualTo(404)
+            assertThat(response.body()).doesNotContain("a.parquet", "team_id=42")
+        }
+    }
+}
+
+abstract class ServedReadSessionCases(authMode: String) {
     private val db = PgTestSupport.freshDatabase()
     private val catalogs = CatalogService(db.jdbi)
     private val commits = CommitService(db.jdbi)
@@ -54,14 +70,17 @@ class ServedReadSessionIntegrationTest {
 
     // The customer's own Hoglite backend: this server has no backends file.
     private val hogliteId = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
-    private val ns = "/v1/catalogs/$cust/namespaces/team_42"
+    protected val ns = "/v1/catalogs/$cust/namespaces/team_42"
     private val importsPrefix = "$source/org_id=$orgA/team_id=42/"
     private val filePath = "s3://bucket/${importsPrefix}events/a.parquet"
     private val api: io.ktor.server.engine.EmbeddedServer<*, *>
     private val public: io.ktor.server.engine.EmbeddedServer<*, *>
     private val app: App
-    private val apiPort: Int
+    protected val apiPort: Int
     private val publicPort: Int
+
+    /** The listeners that admit a read session. */
+    private val ports: List<Int>
 
     init {
         catalogs.createCatalog(source, "s3://bucket/$source")
@@ -91,7 +110,8 @@ class ServedReadSessionIntegrationTest {
             }
         val cfg =
             Config(port = 0, hydratorIntervalMs = 0).copy(
-                authMode = "enforce",
+                authMode = authMode,
+                publicPort = 8443,
                 authIssuer = TestTokens.ISSUER,
                 authJwksFile = keyFile.toString(),
                 authPredicateFields = "team_id",
@@ -110,6 +130,7 @@ class ServedReadSessionIntegrationTest {
             }
         public.start(wait = false)
         publicPort = runBlocking { public.engine.resolvedConnectors().first().port }
+        ports = if (authMode == "enforce") listOf(apiPort, publicPort) else listOf(publicPort)
     }
 
     @AfterAll
@@ -123,7 +144,7 @@ class ServedReadSessionIntegrationTest {
     }
 
     /** A dedicated read session as the issuer shapes it, valid now. The customer's backend is unknown here. */
-    private fun session(
+    protected fun session(
         org: String = orgA,
         team: Int = 42,
         catalog: String = cust,
@@ -152,7 +173,7 @@ class ServedReadSessionIntegrationTest {
         )
     }
 
-    private fun send(
+    protected fun send(
         port: Int,
         path: String,
         token: String,
@@ -170,7 +191,7 @@ class ServedReadSessionIntegrationTest {
 
     private fun tableUuid(): String = catalogs.getTable(source, "team_42", "events").tableUuid.toString()
 
-    private fun scanPath(
+    protected fun scanPath(
         snapshot: Long = head(),
         uuid: String = tableUuid(),
     ) = "$ns/tables/events/scan?snapshot=$snapshot&table_uuid=$uuid"
@@ -185,7 +206,7 @@ class ServedReadSessionIntegrationTest {
 
     @Test
     fun `both listeners serve the four routes to the session's own team, without totals`() {
-        for (port in listOf(apiPort, publicPort)) {
+        for (port in ports) {
             val namespace = send(port, ns, session())
             assertThat(namespace.statusCode()).describedAs(namespace.body()).isEqualTo(200)
             assertThat(mapper.readTree(namespace.body())["name"].asText()).isEqualTo("team_42")
@@ -226,7 +247,7 @@ class ServedReadSessionIntegrationTest {
 
     @Test
     fun `the scan needs the pinned snapshot and the table's own uuid`() {
-        for (port in listOf(apiPort, publicPort)) {
+        for (port in ports) {
             for (bad in listOf(
                 "$ns/tables/events/scan",
                 "$ns/tables/events/scan?snapshot=${head()}",
@@ -250,7 +271,7 @@ class ServedReadSessionIntegrationTest {
 
     @Test
     fun `a file outside the two remote grants refuses the whole scan without its path`() {
-        for (port in listOf(apiPort, publicPort)) {
+        for (port in ports) {
             for (imports in listOf("$source/org_id=$orgA/team_id=420/", "$source/org_id=$orgB/team_id=42/")) {
                 val scan = send(port, scanPath(), session(imports = imports))
                 assertThat(scan.statusCode()).describedAs(scan.body()).isEqualTo(403)
@@ -261,7 +282,7 @@ class ServedReadSessionIntegrationTest {
 
     @Test
     fun `the served caller rule is unchanged for a read session`() {
-        for (port in listOf(apiPort, publicPort)) {
+        for (port in ports) {
             for (suffix in listOf(
                 "",
                 "/tables",
@@ -287,7 +308,7 @@ class ServedReadSessionIntegrationTest {
 
     @Test
     fun `no other route selects the read verifier`() {
-        for (port in listOf(apiPort, publicPort)) {
+        for (port in ports) {
             for ((method, path) in listOf(
                 "GET" to "/v1/catalogs/$cust/namespaces",
                 "GET" to "/v1/catalogs/$cust",
