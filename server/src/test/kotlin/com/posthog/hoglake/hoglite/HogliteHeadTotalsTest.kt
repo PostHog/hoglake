@@ -48,12 +48,14 @@ class HogliteHeadTotalsTest {
                 listOf(7, uuid, 1, "ns", "t", null, "{}", 10, 0, 6, 0, 0, 0)
             sql.startsWith("SELECT t.id, t.table_uuid, v.namespace_id") ->
                 listOf(7, uuid, 1, "ns", "t", null, "{}", 10, 0)
-            // The pinned listing: totals aggregated at the snapshot.
-            sql.startsWith("SELECT t.id, t.table_uuid, v.name") && sql.contains("SUM(f.record_count)") ->
-                listOf(7, uuid, "t", null, 10, 1, 100, 1, 1, 6)
+            // The pinned listing's page: totals are read per page, below.
+            sql.startsWith("SELECT t.id, t.table_uuid, v.name") && sql.contains("NULL, NULL, NULL") ->
+                listOf(7, uuid, "t", null, null, null, null, 1, 1, 6)
             // The head listing: table_totals at 6, after the truncate.
             sql.startsWith("SELECT t.id, t.table_uuid, v.name") -> listOf(7, uuid, "t", null, 0, 0, 0, 1, 1, 6)
-            sql.contains("FROM files WHERE table_id = ?") -> listOf(10, 1, 100)
+            // The pinned getTable's and listing's totals aggregated at the
+            // snapshot, one range (the range-end read answers no row).
+            sql.startsWith("SELECT r.table_id, COALESCE(SUM(r.record_count),0)") -> listOf(7, 10, 1, 100)
             else -> null
         }
 
@@ -102,7 +104,7 @@ class HogliteHeadTotalsTest {
         }
         assertThat(requests).noneMatch { !it.tx && it.sqls.single().startsWith("SELECT name, data_path,") }
         assertThat(requests.flatMap { it.sqls })
-            .noneMatch { it.contains("FROM files WHERE table_id = ?") || it.contains("SUM(f.record_count)") }
+            .noneMatch { it.contains("FROM files WHERE table_id = ?") || it.contains("SUM(r.record_count)") }
     }
 
     @Test

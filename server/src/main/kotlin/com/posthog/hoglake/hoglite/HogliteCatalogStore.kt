@@ -341,6 +341,21 @@ class HogliteCatalogStore(
     /** Catalogs per `/v1/query-batch` request; a test hook, so a test can force several. */
     internal var listBatchSize: Int = LIST_BATCH_SIZE
 
+    /** Files per range of a pinned getTable's or listTables's totals; a test hook, so a test can force several. */
+    internal var totalsRangeSize: Int = TOTALS_RANGE_SIZE
+
+    /** Files per range of [partitionValues] and the partition reports; a test hook, so a test can force several. */
+    internal var partitionRangeSize: Int = PARTITION_RANGE_SIZE
+
+    /** Rows per page of [listConsumers] and [listOffsets]; a test hook, so a test can force several. */
+    internal var offsetPageSize: Int = LISTING_PAGE_SIZE
+
+    /** Distinct values of a field that [partitionValues] counts; a test hook, so a test can stop it early. */
+    internal var partitionValuesCounted: Int = PARTITION_VALUES_COUNTED
+
+    /** Rows per range of [storageUsage]; a test hook, so a test can force several. */
+    internal var storageRangeSize: Int = STORAGE_RANGE_SIZE
+
     /**
      * The meta row of each (name, tenant) in [bound], in order: the row,
      * or null when that tenant does not exist (404) or has no meta row.
@@ -573,11 +588,29 @@ class HogliteCatalogStore(
     override fun storageUsage(catalog: String): StorageUsage =
         catalogOperation(catalog) {
             meta(catalog)
-            val row = queryCatalog(catalog, STORAGE_USAGE_SQL).firstRow()!!
-            return StorageUsage(
-                trackedBytes = Math.addExact(row[0].asLong(), row[1].asLong()),
-                pendingDeleteFiles = row[2].asLong(),
-            )
+            // It sums [storageRangeSize] files and DVs at a time, in id
+            // order: one sum over every row scans the manifest and crosses
+            // hoglited's 5 s query timeout at a few million files (#686).
+            // A range is that many rows, not ids: expiry deletes ended rows
+            // and the allocator never reuses an id, so after long churn
+            // most of the id space is empty. The ranges are separate reads,
+            // so a commit or an expiry between two of them shows in the
+            // ranges read after it, as any footprint sampled while the
+            // catalog changes does.
+            val pending = queryCatalog(catalog, STORAGE_USAGE_SQL).firstRow()!![0].asLong()
+            val size = storageRangeSize.toLong()
+            var tracked = 0L
+            var file = 0L
+            var dv = 0L
+            while (true) {
+                val sums = queryCatalog(catalog, STORAGE_RANGE_SQL, file, size, dv, size).firstRow()!!
+                tracked = Math.addExact(tracked, Math.addExact(sums[1].asLong(), sums[4].asLong()))
+                if (sums[2].asLong() < size && sums[5].asLong() < size) break
+                // A side that is done reads no rows (a NULL last id) and keeps its place.
+                file = sums[0].asLongOrNull() ?: file
+                dv = sums[3].asLongOrNull() ?: dv
+            }
+            return StorageUsage(trackedBytes = tracked, pendingDeleteFiles = pending)
         }
 
     // ==================== namespaces =======================================
@@ -629,27 +662,63 @@ class HogliteCatalogStore(
         atTimestamp: Instant?,
     ): List<NamespaceInfo> =
         catalogOperation(catalog) {
-            val m = meta(catalog)
-            val rows =
-                if (snapshot == null && atTimestamp == null) {
-                    queryCatalog(
-                        catalog,
-                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE dropped_snapshot IS NULL ORDER BY name",
-                    )
-                } else {
-                    val at = resolveRead(catalog, m, snapshot, atTimestamp)
-                    // The containment columns are not versioned: a pinned
-                    // read gets the current containment, as on Postgres.
-                    queryCatalog(
-                        catalog,
-                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE created_snapshot <= ? " +
-                            "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?) ORDER BY name",
-                        at,
-                        at,
-                    )
-                }
-            return rows.rows.map { namespaceInfo(it) }
+            val headRead = snapshot == null && atTimestamp == null
+            return headRetried(headRead) {
+                val m = meta(catalog)
+                val at = resolveRead(catalog, m, snapshot, atTimestamp)
+                retainedRead(catalog, at) { namespacesAt(catalog, at) }
+            }
         }
+
+    /**
+     * The namespaces live at [at], in keyset pages under hoglited's row
+     * cap (#686), all at [at]: a head read pins the head it resolved, so
+     * a namespace created or dropped between two pages is not
+     * half-listed. The containment columns are not versioned: a pinned
+     * read gets the current containment, as on Postgres.
+     *
+     * Two reads, so a page is an index walk, never a scan of every
+     * namespace: the namespaces live now walk namespaces_live (live
+     * names are unique), and those dropped after [at] are one scan, read
+     * after the live pages so that a namespace dropped between a live
+     * page and that scan is in one of them (a namespace in both is
+     * listed once). At head the scan finds only the drops since the
+     * first page; a pinned read at an old snapshot pages it, a scan per
+     * page of 1,000 namespaces dropped since. Names are ASCII
+     * identifiers, so String order is SQLite's BINARY order.
+     */
+    private fun namespacesAt(
+        catalog: String,
+        at: Long,
+    ): List<NamespaceInfo> {
+        val live =
+            keysetPages(null) { last ->
+                queryCatalog(
+                    catalog,
+                    "SELECT $NAMESPACE_COLUMNS FROM namespaces INDEXED BY namespaces_live " +
+                        "WHERE dropped_snapshot IS NULL AND created_snapshot <= ?" +
+                        (if (last == null) "" else " AND name > ?") +
+                        " ORDER BY name LIMIT $LISTING_PAGE_SIZE",
+                    at,
+                    *(last?.let { arrayOf(it[1]) } ?: emptyArray()),
+                ).rows
+            }
+        val dropped =
+            keysetPages(null) { last ->
+                queryCatalog(
+                    catalog,
+                    "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE dropped_snapshot > ? AND created_snapshot <= ?" +
+                        (if (last == null) "" else " AND (name, id) > (?, ?)") +
+                        " ORDER BY name, id LIMIT $LISTING_PAGE_SIZE",
+                    at,
+                    at,
+                    *(last?.let { arrayOf(it[1], it[0]) } ?: emptyArray()),
+                ).rows
+            }
+        return (live + dropped).map { namespaceInfo(it) }
+            .distinctBy { it.namespaceId }
+            .sortedWith(compareBy({ it.name }, { it.namespaceId }))
+    }
 
     override fun getNamespace(
         catalog: String,
@@ -1226,22 +1295,7 @@ class HogliteCatalogStore(
                 val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
                 // table_totals is exact at head only, so a pinned read
                 // aggregates the files visible at `at`.
-                val counts =
-                    if (totals) {
-                        val row =
-                            queryCatalog(
-                                catalog,
-                                "SELECT COALESCE(SUM(record_count),0), COUNT(*), COALESCE(SUM(file_size_bytes),0) " +
-                                    "FROM files WHERE table_id = ? AND begin_snapshot <= ? " +
-                                    "AND (end_snapshot IS NULL OR end_snapshot > ?)",
-                                t.tableId,
-                                at,
-                                at,
-                            ).firstRow()!!
-                        listOf(row[0].asLong(), row[1].asLong(), row[2].asLong())
-                    } else {
-                        null
-                    }
+                val counts = if (totals) totalsAt(catalog, listOf(t.tableId), at).getValue(t.tableId) else null
                 return tableInfo(catalog, namespace, table, t, at, counts)
             }
         }
@@ -1392,68 +1446,63 @@ class HogliteCatalogStore(
         atTimestamp: Instant?,
     ): List<TableSummaryInfo> =
         catalogOperation(catalog) {
-            if (snapshot == null && atTimestamp == null) return headListing(catalog, namespace)
+            if (snapshot == null && atTimestamp == null) return headRetried(true) { headListing(catalog, namespace) }
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
             return retainedRead(catalog, at) {
                 // A pinned listing resolves the namespace incarnation at its snapshot.
                 val ns = namespaceAt(catalog, namespace, at)
-                // Totals are the files visible at `at`, as Postgres's listing
-                // rolls them up at its snapshot: a PINNED listing aggregates the
-                // manifest at `at` per table, never the head counters
-                // (table_totals is exact at head only, see headListing).
-                val visible =
-                    "FROM files f WHERE f.table_id = t.id AND f.begin_snapshot <= ? " +
-                        "AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)"
-                val totalsSql =
-                    "(SELECT COALESCE(SUM(f.record_count),0) $visible), (SELECT COUNT(*) $visible), " +
-                        "(SELECT COALESCE(SUM(f.file_size_bytes),0) $visible)"
                 // snapshotCount/earliestSnapshotId count RETAINED change rows, so
                 // the window opens at the expiry floor — read from meta so the
                 // day expiry lands the read is already right.
                 // Object ids overlap across tables, namespaces, and views.
                 val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
                 val kindParams = tableKinds.joinToString(",") { "?" }
-                // Column 9 (the head) and the table_totals join are unused here.
-                // They keep the pinned statement as it was before the head
-                // listing moved to its own transaction (#537).
-                val rows =
-                    queryCatalog(
-                        catalog,
-                        """SELECT t.id, t.table_uuid, v.name, v.comment, $totalsSql,
-                                  (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
-                                    WHERE c.object_id = t.id AND c.kind IN ($kindParams)
-                                      AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
-                                  (SELECT MIN(c.snapshot_id) FROM changes c
-                                    WHERE c.object_id = t.id AND c.kind IN ($kindParams)
-                                      AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
-                                  ${HogliteSchema.HEAD_SQL}
-                             FROM tables t
-                             JOIN table_versions v ON v.table_id = t.id
-                              AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?)
-                             LEFT JOIN table_totals tt ON tt.table_id = t.id
-                            WHERE v.namespace_id = ?
-                              AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
-                            ORDER BY v.name""",
-                        at,
-                        at,
-                        at,
-                        at,
-                        at,
-                        at,
-                        *tableKinds,
-                        m.earliestSnapshotId,
-                        at,
-                        *tableKinds,
-                        m.earliestSnapshotId,
-                        at,
-                        at,
-                        at,
-                        ns.namespaceId,
-                        at,
-                        at,
-                    )
-                return rows.rows.map { tableSummaryOf(it) }
+                // Columns 4-6 (the totals) are filled per page below, and
+                // column 9 (the head) and the table_totals join are unused
+                // here. They keep the pinned statement as it was before the
+                // head listing moved to its own transaction (#537). Keyset
+                // pages under hoglited's row cap (#686), all pinned at `at`.
+                return keysetPages(null) { last ->
+                    val page =
+                        queryCatalog(
+                            catalog,
+                            """SELECT t.id, t.table_uuid, v.name, v.comment, NULL, NULL, NULL,
+                                      (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
+                                        WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                          AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
+                                      (SELECT MIN(c.snapshot_id) FROM changes c
+                                        WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                          AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
+                                      ${HogliteSchema.HEAD_SQL}
+                                 FROM tables t
+                                 JOIN table_versions v ON v.table_id = t.id
+                                  AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?)
+                                 LEFT JOIN table_totals tt ON tt.table_id = t.id
+                                WHERE v.namespace_id = ?
+                                  AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
+                                  ${if (last == null) "" else "AND (v.name, t.id) > (?, ?)"}
+                                ORDER BY v.name, t.id LIMIT $LISTING_PAGE_SIZE""",
+                            *tableKinds,
+                            m.earliestSnapshotId,
+                            at,
+                            *tableKinds,
+                            m.earliestSnapshotId,
+                            at,
+                            at,
+                            at,
+                            ns.namespaceId,
+                            at,
+                            at,
+                            *(last?.let { arrayOf(it[2], it[0]) } ?: emptyArray()),
+                        ).rows
+                    // Totals are the files visible at `at`, as Postgres's
+                    // listing rolls them up at its snapshot: a PINNED listing
+                    // aggregates the manifest at `at`, never the head counters
+                    // (table_totals is exact at head only, see headListing).
+                    val totals = totalsAt(catalog, page.map { it[0].asLong() }, at)
+                    page.map { r -> r.take(4) + totals.getValue(r[0].asLong()) + r.drop(7) }
+                }.map { tableSummaryOf(it) }
             }
         }
 
@@ -1466,6 +1515,11 @@ class HogliteCatalogStore(
      * the listing, so no argument carries a value from another snapshot.
      * The namespace statement tells a missing namespace (NotFound) from
      * an empty one (no rows).
+     *
+     * That transaction reads the first page; hoglited caps a read at 100k
+     * rows (#686), so a larger namespace continues in [headListingPages].
+     * Expiry can pass the first page's head before the last page, and
+     * [listTables] then lists again from the new head ([headRetried]).
      */
     private fun headListing(
         catalog: String,
@@ -1501,19 +1555,303 @@ class HogliteCatalogStore(
                              LEFT JOIN table_totals tt ON tt.table_id = t.id
                             WHERE v.namespace_id = $LIVE_NAMESPACE_ID_SQL
                               AND t.created_snapshot <= $head AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > $head)
-                            ORDER BY v.name""",
+                            ORDER BY v.name, t.id LIMIT $LISTING_PAGE_SIZE""",
                         tableKinds + tableKinds + namespace,
                     ),
                 ),
             )
         val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
-        nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+        val ns =
+            nsResult.firstRow()?.let { namespaceInfo(it) }
+                ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
         // One transaction is one engine snapshot, so a statement head that
         // differs from the meta row is an engine defect, never a race.
         check(listing.rows.all { it[9].asLong() == m.head }) {
             "head listing saw a head other than meta head ${m.head} in one transaction"
         }
-        return listing.rows.map { tableSummaryOf(it) }
+        if (listing.rows.size < LISTING_PAGE_SIZE) return listing.rows.map { tableSummaryOf(it) }
+        return (listing.rows + headListingPages(catalog, m, ns.namespaceId, listing.rows.last()))
+            .map { tableSummaryOf(it) }
+    }
+
+    /**
+     * The pages of a head listing after its first, pinned at the first
+     * page's head [m], so a listing never mixes two heads (#537). Each
+     * page is one statement. table_totals is exact at the CURRENT head
+     * only, so a page takes it back to `at` by the files that began after
+     * `at` and are live now (subtracted) and the files live at `at` that
+     * ended since (added back). Both sets are the commits since the first
+     * page, never a table's whole manifest: the aggregate over `files`
+     * the pinned listing runs is what #537 keeps off head reads.
+     *
+     * snapshotCount and earliestSnapshotId count the change rows each
+     * page reads: an expiry sweep deletes the change rows below its new
+     * floor in the transaction that raises it, so a sweep between two
+     * pages that does not pass `at` (which [retainedRead] catches) leaves
+     * the later pages fewer retained snapshots to count. Re-reading the
+     * floor per page would not change that, since the rows are gone; the
+     * first page's [m] floor only bounds rows that still exist.
+     */
+    private fun headListingPages(
+        catalog: String,
+        m: MetaRow,
+        namespaceId: Long,
+        after: List<Any?>,
+    ): List<List<Any?>> {
+        val at = m.head
+        val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
+        val kindParams = tableKinds.joinToString(",") { "?" }
+        val begun = "FROM files f WHERE f.table_id = t.id AND f.begin_snapshot > ? AND f.end_snapshot IS NULL"
+        return retainedRead(catalog, at) {
+            keysetPages(after) { last ->
+                queryCatalog(
+                    catalog,
+                    // `ended` reads only the files ended since `at`, once
+                    // per page, through the partial files_ended index
+                    // (`end_snapshot > ?` implies its NOT NULL). INDEXED BY
+                    // because hoglited keeps no sqlite_stat1: without it
+                    // the planner scans the catalog's whole manifest
+                    // through files_table, for its GROUP BY order.
+                    """WITH ended AS MATERIALIZED (
+                              SELECT table_id, SUM(record_count) AS records, COUNT(*) AS files,
+                                     SUM(file_size_bytes) AS bytes
+                                FROM files INDEXED BY files_ended
+                               WHERE end_snapshot > ? AND begin_snapshot <= ? GROUP BY table_id)
+                       SELECT t.id, t.table_uuid, v.name, v.comment,
+                              COALESCE(tt.record_count,0) + COALESCE(e.records,0)
+                                - (SELECT COALESCE(SUM(f.record_count),0) $begun),
+                              COALESCE(tt.file_count,0) + COALESCE(e.files,0) - (SELECT COUNT(*) $begun),
+                              COALESCE(tt.file_size_bytes,0) + COALESCE(e.bytes,0)
+                                - (SELECT COALESCE(SUM(f.file_size_bytes),0) $begun),
+                              (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
+                                WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                  AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
+                              (SELECT MIN(c.snapshot_id) FROM changes c
+                                WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                  AND c.snapshot_id >= ? AND c.snapshot_id <= ?)
+                         FROM tables t
+                         JOIN table_versions v ON v.table_id = t.id
+                          AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?)
+                         LEFT JOIN table_totals tt ON tt.table_id = t.id
+                         LEFT JOIN ended e ON e.table_id = t.id
+                        WHERE v.namespace_id = ?
+                          AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
+                          AND (v.name, t.id) > (?, ?)
+                        ORDER BY v.name, t.id LIMIT $LISTING_PAGE_SIZE""",
+                    at,
+                    at,
+                    at,
+                    at,
+                    at,
+                    *tableKinds,
+                    m.earliestSnapshotId,
+                    at,
+                    *tableKinds,
+                    m.earliestSnapshotId,
+                    at,
+                    at,
+                    at,
+                    namespaceId,
+                    at,
+                    at,
+                    last!![2],
+                    last[0],
+                ).rows
+            }
+        }
+    }
+
+    /**
+     * Every row of a keyset-paged read. [page] gets the last row of the
+     * page before ([after] for the first call) and returns at most
+     * [pageSize] rows; a shorter page is the last.
+     */
+    internal inline fun keysetPages(
+        after: List<Any?>?,
+        pageSize: Int = LISTING_PAGE_SIZE,
+        page: (List<Any?>?) -> List<List<Any?>>,
+    ): List<List<Any?>> {
+        val rows = mutableListOf<List<Any?>>()
+        var last = after
+        while (true) {
+            val next = page(last)
+            rows.addAll(next)
+            if (next.size < pageSize) return rows
+            last = next.last()
+        }
+    }
+
+    /** A file's place in files_table's (table_id, begin_snapshot, id) order. */
+    private data class FileKey(
+        val tableId: Long,
+        val begin: Long,
+        val id: Long,
+    ) : Comparable<FileKey> {
+        override fun compareTo(other: FileKey) =
+            compareValuesBy(this, other, FileKey::tableId, FileKey::begin, FileKey::id)
+    }
+
+    /**
+     * Calls [read] once per range of at most [size] files of [tableIds]
+     * that began by [at], in files_table's (table_id, begin_snapshot, id)
+     * order, so each statement over a large manifest stays under
+     * hoglited's 5 s query timeout and 100k-row cap (#686). A range of
+     * several small tables is one range: a page of 1,000 tables with a few
+     * files each is two statements, not two per table.
+     *
+     * [read] gets the range as arms: conditions on `files f`, each with
+     * its arguments, that partition the range and that [filesIn] joins
+     * into one statement. Each arm is an equality or a range on a prefix
+     * of files_table, which the planner seeks on, where a row value
+     * `(begin_snapshot, id) > (?, ?)` seeks on begin_snapshot only and
+     * walks every file of a snapshot that a large commit wrote.
+     *
+     * The ranges cut the key space into consecutive intervals, each ended
+     * by the key [size] files into it, so every file is in exactly one
+     * range even when expiry deletes rows between two of them. No file
+     * begins by [at] after [at] is resolved, so the ranges hold one
+     * snapshot's files as long as [at] does not expire, which the
+     * caller's [retainedRead] checks afterwards.
+     *
+     * [done] is asked before each range: true stops the walk, for a
+     * caller whose answer the files after it can no longer change. A
+     * range end that does not pass the one before is an engine or query
+     * defect, and fails the read rather than walk the same range forever.
+     */
+    internal fun fileRanges(
+        catalog: String,
+        tableIds: Collection<Long>,
+        at: Long,
+        size: Int,
+        done: () -> Boolean = { false },
+        read: (List<Pair<String, List<Any?>>>) -> Unit,
+    ) {
+        val ids = tableIds.distinct().sorted()
+        var lo: FileKey? = null
+        while (!done()) {
+            val rest = fileArms(ids, at, lo, null)
+            if (rest.isEmpty()) return
+            // An index-only walk of files_table to the range's last key:
+            // the arms are in key order, which the compound's merge keeps.
+            val (sql, args) = filesIn(rest, "f.table_id, f.begin_snapshot, f.id", indexed = true)
+            val hi =
+                queryCatalog(catalog, "$sql ORDER BY 1, 2, 3 LIMIT 1 OFFSET ${size - 1}", *args)
+                    .firstRow()?.let { FileKey(it[0].asLong(), it[1].asLong(), it[2].asLong()) }
+            if (hi == null) return read(rest)
+            check(lo == null || hi > lo) {
+                "file range end $hi in catalog '$catalog' does not pass the range start $lo"
+            }
+            read(fileArms(ids, at, lo, hi))
+            lo = hi
+        }
+    }
+
+    /** The files of [ids] that began by [at] with a key in ([lo], [hi]], as [fileRanges]'s arms. */
+    private fun fileArms(
+        ids: List<Long>,
+        at: Long,
+        lo: FileKey?,
+        hi: FileKey?,
+    ): List<Pair<String, List<Any?>>> {
+        val tie = "f.table_id = ? AND f.begin_snapshot = ?"
+        if (lo != null && hi != null && lo.tableId == hi.tableId) {
+            if (lo.begin == hi.begin) {
+                return listOf("$tie AND f.id > ? AND f.id <= ?" to listOf(lo.tableId, lo.begin, lo.id, hi.id))
+            }
+            return listOf(
+                "$tie AND f.id > ?" to listOf(lo.tableId, lo.begin, lo.id),
+                "f.table_id = ? AND f.begin_snapshot > ? AND f.begin_snapshot < ?" to
+                    listOf(lo.tableId, lo.begin, hi.begin),
+                "$tie AND f.id <= ?" to listOf(hi.tableId, hi.begin, hi.id),
+            )
+        }
+        val arms = mutableListOf<Pair<String, List<Any?>>>()
+        if (lo != null) {
+            arms += "$tie AND f.id > ?" to listOf(lo.tableId, lo.begin, lo.id)
+            arms += "f.table_id = ? AND f.begin_snapshot > ? AND f.begin_snapshot <= ?" to
+                listOf(lo.tableId, lo.begin, at)
+        }
+        val whole = ids.filter { (lo == null || it > lo.tableId) && (hi == null || it < hi.tableId) }
+        if (whole.isNotEmpty()) {
+            arms += "f.table_id IN (${whole.joinToString(",") { "?" }}) AND f.begin_snapshot <= ?" to whole + at
+        }
+        if (hi != null) {
+            arms += "f.table_id = ? AND f.begin_snapshot < ?" to listOf(hi.tableId, hi.begin)
+            arms += "$tie AND f.id <= ?" to listOf(hi.tableId, hi.begin, hi.id)
+        }
+        return arms
+    }
+
+    /**
+     * [arms] as one statement: a `SELECT [columns]` from `files f` per
+     * arm, each with [where] and its [whereArgs] appended, joined by
+     * UNION ALL. [indexed] names files_table, for the index-only walk.
+     */
+    internal fun filesIn(
+        arms: List<Pair<String, List<Any?>>>,
+        columns: String,
+        where: String = "",
+        whereArgs: List<Any?> = emptyList(),
+        indexed: Boolean = false,
+    ): Pair<String, Array<Any?>> {
+        val from = if (indexed) "files f INDEXED BY files_table" else "files f"
+        return arms.joinToString(" UNION ALL ") { "SELECT $columns FROM $from WHERE ${it.first}$where" } to
+            arms.flatMap { it.second + whereArgs }.toTypedArray()
+    }
+
+    /**
+     * Record, file and byte totals of the files of each of [tableIds]
+     * visible at [at], summed a [fileRanges] range at a time: the
+     * aggregate a pinned getTable or listTables runs, which as one
+     * statement crosses hoglited's 5 s query timeout at a few million
+     * files (#686).
+     */
+    private fun totalsAt(
+        catalog: String,
+        tableIds: Collection<Long>,
+        at: Long,
+    ): Map<Long, List<Long>> {
+        val sums = tableIds.associateWith { LongArray(3) }
+        fileRanges(catalog, tableIds, at, totalsRangeSize) { arms ->
+            val (sql, args) =
+                filesIn(
+                    arms,
+                    "f.table_id, f.record_count, f.file_size_bytes",
+                    " AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)",
+                    listOf(at),
+                )
+            queryCatalog(
+                catalog,
+                "SELECT r.table_id, COALESCE(SUM(r.record_count),0), COUNT(*), " +
+                    "COALESCE(SUM(r.file_size_bytes),0) FROM ($sql) r GROUP BY r.table_id",
+                *args,
+            ).rows.forEach { r ->
+                val total = sums.getValue(r[0].asLong())
+                for (i in total.indices) total[i] += r[i + 1].asLong()
+            }
+        }
+        return sums.mapValues { it.value.toList() }
+    }
+
+    /**
+     * SQLite's BINARY order of two strings, for a sort that must agree
+     * with an `ORDER BY` of TEXT: UTF-8 byte order, which is code point
+     * order, where [String.compareTo] compares UTF-16 units.
+     */
+    private fun binaryOrder(
+        a: String,
+        b: String,
+    ): Int {
+        var i = 0
+        var j = 0
+        while (i < a.length && j < b.length) {
+            val x = a.codePointAt(i)
+            val y = b.codePointAt(j)
+            if (x != y) return x.compareTo(y)
+            i += Character.charCount(x)
+            j += Character.charCount(y)
+        }
+        return (i < a.length).compareTo(j < b.length)
     }
 
     /** One listing row: columns 0-8 of the head and the pinned listing alike. */
@@ -1770,41 +2108,85 @@ class HogliteCatalogStore(
         atTimestamp: Instant?,
     ): PartitionValues =
         catalogOperation(catalog) {
-            val m = meta(catalog)
-            val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            return retainedRead(catalog, at) {
-                val ns = namespaceForRead(catalog, namespace, at, headRead = snapshot == null && atTimestamp == null)
-                val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
-                val spec = specAt(catalog, t.tableId, at) ?: return PartitionValues(-1, emptyList())
-                val fields =
-                    spec.fields.mapIndexed { keyIndex, field ->
-                        val cap = PartitionValues.PARTITION_VALUES_CAP
-                        // One past the cap, so "there are more" is
-                        // distinguishable from "exactly cap values".
-                        val rows =
-                            queryCatalog(
-                                catalog,
-                                "SELECT pv.value, COUNT(*) AS n FROM files f, json_each(f.partition_values_json) pv " +
-                                    "WHERE f.table_id = ? AND f.begin_snapshot <= ? " +
-                                    "AND (f.end_snapshot IS NULL OR f.end_snapshot > ?) " +
-                                    "AND pv.key = ? GROUP BY pv.value ORDER BY n DESC, pv.value LIMIT ?",
-                                t.tableId,
-                                at,
-                                at,
-                                keyIndex,
-                                cap + 1,
-                            )
-                        PartitionFieldValues(
-                            sourceFieldId = field.sourceFieldId,
-                            transform = field.transform,
-                            transformParam = field.transformParam,
-                            values = rows.rows.take(cap).map { it[0] as? String },
-                            truncated = rows.rows.size > cap,
+            val headRead = snapshot == null && atTimestamp == null
+            return headRetried(headRead) { partitionValuesAt(catalog, namespace, table, snapshot, atTimestamp) }
+        }
+
+    /**
+     * [partitionValues] at one snapshot, counted a [fileRanges] range of
+     * files at a time under hoglited's 5 s query timeout (#686) and
+     * merged here. One statement per range counts up to
+     * [PARTITION_FIELDS_PER_READ] fields: a range of [partitionRangeSize]
+     * files has at most that many values per field, 40k rows under the
+     * 100k-row cap, and the 64 MiB cap holds while its values average
+     * under 1.6 KiB.
+     *
+     * The merge holds every distinct value of a field in this request's
+     * heap, where the single statement held them in hoglited's. A field
+     * that passes [partitionValuesCounted] distinct values stops
+     * counting there, which bounds that heap: it is truncated as any
+     * field over the cap is, and its values are the most frequent in the
+     * ranges counted until then, not in every file (Postgres counts every
+     * file). Once every field has stopped, the walk stops.
+     */
+    private fun partitionValuesAt(
+        catalog: String,
+        namespace: String,
+        table: String,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+    ): PartitionValues {
+        val m = meta(catalog)
+        val at = resolveRead(catalog, m, snapshot, atTimestamp)
+        return retainedRead(catalog, at) {
+            val ns = namespaceForRead(catalog, namespace, at, headRead = snapshot == null && atTimestamp == null)
+            val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
+            val spec = specAt(catalog, t.tableId, at) ?: return PartitionValues(-1, emptyList())
+            val counts = spec.fields.map { HashMap<String?, Long>() }
+            val counting = { counts.indices.filter { counts[it].size <= partitionValuesCounted } }
+            fileRanges(catalog, listOf(t.tableId), at, partitionRangeSize, { counting().isEmpty() }) { arms ->
+                val (sql, args) =
+                    filesIn(
+                        arms,
+                        "f.partition_values_json",
+                        " AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)",
+                        listOf(at),
+                    )
+                for (keys in counting().chunked(PARTITION_FIELDS_PER_READ)) {
+                    queryCatalog(
+                        catalog,
+                        "SELECT pv.key, pv.value, COUNT(*) FROM ($sql) r, json_each(r.partition_values_json) pv " +
+                            "WHERE pv.key IN (${keys.joinToString(",") { "?" }}) GROUP BY pv.key, pv.value",
+                        *args,
+                        *keys.toTypedArray(),
+                    ).rows.forEach {
+                        counts[it[0].asLong().toInt()].merge(
+                            it[1] as? String,
+                            it[2].asLong(),
+                            Long::plus,
                         )
                     }
-                return PartitionValues(spec.specId, fields)
+                }
             }
+            // The order the single statement's `ORDER BY n DESC,
+            // pv.value` gave: NULL first, then BINARY.
+            val order =
+                compareByDescending<Map.Entry<String?, Long>> { it.value }
+                    .thenBy(nullsFirst(Comparator(::binaryOrder))) { it.key }
+            val cap = PartitionValues.PARTITION_VALUES_CAP
+            val fields =
+                spec.fields.zip(counts) { field, byValue ->
+                    PartitionFieldValues(
+                        sourceFieldId = field.sourceFieldId,
+                        transform = field.transform,
+                        transformParam = field.transformParam,
+                        values = byValue.entries.sortedWith(order).take(cap).map { it.key },
+                        truncated = byValue.size > cap,
+                    )
+                }
+            PartitionValues(spec.specId, fields)
         }
+    }
 
     override fun fileStats(
         catalog: String,
@@ -2228,23 +2610,47 @@ class HogliteCatalogStore(
     override fun listConsumers(catalog: String): List<ConsumerTableOffset> =
         catalogOperation(catalog) {
             meta(catalog)
-            return queryCatalog(
-                catalog,
-                """SELECT o.consumer_id, o.table_uuid, o.committed_snapshot, o.updated_at,
-                      t.namespace, t.name, CASE WHEN t.dropped_snapshot IS NULL THEN 0 ELSE 1 END
-                 FROM offsets o LEFT JOIN tables t ON t.table_uuid = o.table_uuid
-                ORDER BY o.consumer_id, t.namespace NULLS LAST, t.name NULLS LAST, o.table_uuid""",
-            ).rows.map { r ->
-                ConsumerTableOffset(
-                    consumerId = r[0].asString(),
-                    tableUuid = UUID.fromString(r[1].asString()),
-                    committedSnapshot = r[2].asLong(),
-                    updatedAt = HogliteSchema.parse(r[3].asString()),
-                    namespace = r[4] as? String,
-                    tableName = r[5] as? String,
-                    tableDropped = r[6].asLongOrNull() == 1L,
-                )
-            }
+            // Keyset pages under hoglited's row cap (#686) on the offsets
+            // primary key, sorted into the listing's order here. A key with
+            // the table's namespace and name would follow a rename or a
+            // purge between pages, and skip or repeat that offset; the key
+            // here cannot change, and each page is a walk of its index.
+            // Offsets are not versioned, so as on any page boundary a commit
+            // between pages shows in the pages read after it.
+            val size = offsetPageSize
+            val rows =
+                keysetPages(null, size) { last ->
+                    queryCatalog(
+                        catalog,
+                        """SELECT o.consumer_id, o.table_uuid, o.committed_snapshot, o.updated_at,
+                              t.namespace, t.name, CASE WHEN t.dropped_snapshot IS NULL THEN 0 ELSE 1 END
+                         FROM offsets o LEFT JOIN tables t ON t.table_uuid = o.table_uuid
+                        ${if (last == null) "" else "WHERE (o.consumer_id, o.table_uuid) > (?, ?)"}
+                        ORDER BY o.consumer_id, o.table_uuid
+                        LIMIT $size""",
+                        *(last?.let { arrayOf(it[0], it[1]) } ?: emptyArray()),
+                    ).rows
+                }.map { r ->
+                    ConsumerTableOffset(
+                        consumerId = r[0].asString(),
+                        tableUuid = UUID.fromString(r[1].asString()),
+                        committedSnapshot = r[2].asLong(),
+                        updatedAt = HogliteSchema.parse(r[3].asString()),
+                        namespace = r[4] as? String,
+                        tableName = r[5] as? String,
+                        tableDropped = r[6].asLongOrNull() == 1L,
+                    )
+                }
+            // The order the single statement's `ORDER BY o.consumer_id,
+            // t.namespace NULLS LAST, t.name NULLS LAST, o.table_uuid` gave:
+            // BINARY, an offset with no table last.
+            val binary = Comparator(::binaryOrder)
+            return rows.sortedWith(
+                compareBy(binary, ConsumerTableOffset::consumerId)
+                    .thenBy(nullsLast(binary), ConsumerTableOffset::namespace)
+                    .thenBy(nullsLast(binary), ConsumerTableOffset::tableName)
+                    .thenBy(binary) { it.tableUuid.toString() },
+            )
         }
 
     override fun listOffsets(
@@ -2253,12 +2659,18 @@ class HogliteCatalogStore(
     ): List<ConsumerOffset> =
         catalogOperation(catalog) {
             meta(catalog)
-            return queryCatalog(
-                catalog,
-                "SELECT consumer_id, table_uuid, committed_snapshot, updated_at FROM offsets " +
-                    "WHERE consumer_id = ? ORDER BY table_uuid",
-                consumerId,
-            ).rows.map { r ->
+            // Keyset pages under hoglited's row cap (#686).
+            val size = offsetPageSize
+            return keysetPages(null, size) { last ->
+                queryCatalog(
+                    catalog,
+                    "SELECT consumer_id, table_uuid, committed_snapshot, updated_at FROM offsets " +
+                        "WHERE consumer_id = ?" + (if (last == null) "" else " AND table_uuid > ?") +
+                        " ORDER BY table_uuid LIMIT $size",
+                    consumerId,
+                    *(last?.let { arrayOf(it[1]) } ?: emptyArray()),
+                ).rows
+            }.map { r ->
                 ConsumerOffset(
                     consumerId = r[0].asString(),
                     tableUuid = UUID.fromString(r[1].asString()),
@@ -2411,8 +2823,12 @@ class HogliteCatalogStore(
 
     // ==================== shared internals =================================
 
-    /** Recheck retention after all dependent reads, including reads that fail after expiry removes their rows. */
-    private inline fun <T> retainedRead(
+    /**
+     * Recheck retention after all dependent reads, including reads that
+     * fail after expiry removes their rows. It detects an expiry that
+     * passed [at] during [body]; nothing keeps [at] from expiring.
+     */
+    internal inline fun <T> retainedRead(
         catalog: String,
         at: Long,
         body: () -> T,
@@ -2427,6 +2843,31 @@ class HogliteCatalogStore(
                 throw HoglakeException.Expired("snapshot $at expired while reading metadata")
             }
         }
+
+    /**
+     * [read], once more from the new head when a [headRead] of several
+     * statements ends [HoglakeException.Expired], at most
+     * [HEAD_READ_ATTEMPTS] times (#686). Such a read pins the head its
+     * first statement saw, and a commit plus an expiry sweep before its
+     * last statement can move the floor past that head: on Postgres the
+     * same listing is one statement and cannot expire. A pinned read's
+     * Expired is final. The last attempt's Expired is too, which takes a
+     * retention shorter than the read.
+     */
+    internal inline fun <T> headRetried(
+        headRead: Boolean,
+        read: () -> T,
+    ): T {
+        var attempt = 1
+        while (true) {
+            try {
+                return read()
+            } catch (e: HoglakeException.Expired) {
+                if (!headRead || attempt == HEAD_READ_ATTEMPTS) throw e
+                attempt++
+            }
+        }
+    }
 
     /** The one meta row of a catalog tenant. */
     internal class MetaRow(
@@ -3337,6 +3778,52 @@ class HogliteCatalogStore(
         internal const val SCAN_MAX_ROW_JSON_BYTES = 64 * 1024
         internal const val SCAN_MAX_METADATA_BYTES = 64L * 1024 * 1024
 
+        /**
+         * Rows per page of a listing ([listNamespaces], [listTables],
+         * [listConsumers], [listOffsets]). hoglited refuses a read of more
+         * than 100k rows or 64 MiB (#686). A table row is the largest, at
+         * about 50 KB with a 16,384-character comment, so a page stays
+         * under both caps.
+         */
+        internal const val LISTING_PAGE_SIZE = 1_000
+
+        /**
+         * Files per statement of a pinned getTable's or listTables's
+         * totals. A statement over every file of a table crosses
+         * hoglited's 5 s query timeout at a few million files (#686);
+         * 100k files sum in a fraction of a second.
+         */
+        internal const val TOTALS_RANGE_SIZE = 100_000
+
+        /**
+         * Files per statement of [partitionValues] and of the partition
+         * reports' manifest read ([HoglitePartitions]), each returning up
+         * to one row per file: a tenth of hoglited's 100k-row cap.
+         */
+        internal const val PARTITION_RANGE_SIZE = 10_000
+
+        /**
+         * Distinct values of one field that [partitionValues] counts
+         * before it stops counting that field, which bounds the request's
+         * heap: 200 times the 500 it returns.
+         */
+        internal const val PARTITION_VALUES_COUNTED = 100_000
+
+        /**
+         * Partition fields per statement of [partitionValues]: one
+         * statement per range for a spec of up to this many fields.
+         */
+        internal const val PARTITION_FIELDS_PER_READ = 4
+
+        /** Attempts of a head read that expiry outruns ([headRetried]). */
+        internal const val HEAD_READ_ATTEMPTS = 3
+
+        /**
+         * Rows per statement of [storageUsage]'s sums: up to this many
+         * `files` and this many `dvs` in rowid order, each a rowid seek.
+         */
+        internal const val STORAGE_RANGE_SIZE = 100_000
+
         private val CATALOG_NAME_REGEX = Regex(Identifiers.CATALOG_NAME_PATTERN)
 
         /** The namespace columns [namespaceInfo] reads, in its order. */
@@ -3362,11 +3849,20 @@ class HogliteCatalogStore(
          */
         internal const val CONTAINMENT_SCAN_PAGE = 256
 
-        /** [storageUsage]'s read: no live-row predicate on files or DVs. */
-        internal const val STORAGE_USAGE_SQL =
-            "SELECT (SELECT COALESCE(SUM(file_size_bytes),0) FROM files), " +
-                "(SELECT COALESCE(SUM(file_size_bytes),0) FROM dvs), " +
-                "(SELECT COUNT(*) FROM removals WHERE drained_at IS NULL)"
+        /** [storageUsage]'s first read: the undrained removals. */
+        internal const val STORAGE_USAGE_SQL = "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL"
+
+        /**
+         * [storageUsage]'s sum of one range: for the files after an id and
+         * the DVs after a rowid, at most a limit of each, the last id, the
+         * bytes and the rows read. No live-row predicate on files or DVs.
+         */
+        internal const val STORAGE_RANGE_SQL =
+            "SELECT * FROM " +
+                "(SELECT MAX(r.k), COALESCE(SUM(r.b),0), COUNT(*) FROM " +
+                "(SELECT id AS k, file_size_bytes AS b FROM files WHERE id > ? ORDER BY id LIMIT ?) r), " +
+                "(SELECT MAX(r.k), COALESCE(SUM(r.b),0), COUNT(*) FROM " +
+                "(SELECT rowid AS k, file_size_bytes AS b FROM dvs WHERE rowid > ? ORDER BY rowid LIMIT ?) r)"
 
         /** Catalogs per `/v1/query-batch` request in [listCatalogs]. */
         const val LIST_BATCH_SIZE = 250

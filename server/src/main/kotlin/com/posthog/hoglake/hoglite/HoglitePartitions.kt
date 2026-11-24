@@ -94,13 +94,30 @@ internal class HoglitePartitions(
         }
     }
 
-    /** The live-manifest group read for one catalog, optionally one table. */
+    /**
+     * The live-manifest group read for one catalog, optionally one table,
+     * at the head it reads first. Under hoglited's 100k-row, 64 MiB and
+     * 5 s caps (#686) it reads the tables a keyset page at a time and
+     * their files a [HogliteCatalogStore.fileRanges] range at a time, all
+     * pinned at that head, so a commit between two reads neither counts
+     * a file twice nor drops one.
+     */
     private fun groups(
         catalog: String,
         namespace: String?,
         table: String?,
+    ): List<Group> =
+        store.headRetried(true) {
+            val head = store.meta(catalog).head
+            store.retainedRead(catalog, head) { groupsAt(catalog, namespace, table, head) }
+        }
+
+    private fun groupsAt(
+        catalog: String,
+        namespace: String?,
+        table: String?,
+        at: Long,
     ): List<Group> {
-        val m = store.meta(catalog)
         val nsFilter = if (namespace != null) "AND v.namespace = ?" else ""
         val tFilter = if (table != null) "AND v.name = ?" else ""
         val args =
@@ -108,39 +125,70 @@ internal class HoglitePartitions(
                 if (namespace != null) add(namespace)
                 if (table != null) add(table)
             }
-        val rows =
-            store.queryCatalog(
-                catalog,
-                "SELECT t.id, v.namespace, v.name, t.table_uuid, f.spec_id, f.partition_values_json, " +
-                    "f.file_size_bytes, f.record_count, f.begin_snapshot, " +
-                    "(SELECT COUNT(*) FROM dvs d WHERE d.data_file_id = f.id AND d.end_snapshot IS NULL) " +
-                    "FROM files f " +
-                    "JOIN tables t ON t.id = f.table_id AND t.dropped_snapshot IS NULL " +
-                    "JOIN table_versions v ON v.table_id = t.id AND v.end_snapshot IS NULL " +
-                    "WHERE f.end_snapshot IS NULL $nsFilter $tFilter",
-                *args.toTypedArray(),
-            ).rows
+        val visible = " AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)"
         val byKey = linkedMapOf<List<Any?>, Group>()
-        for (r in rows) {
-            val values =
-                (r[5] as? String)?.let {
-                    store.json.readValue(it, Array<String?>::class.java).toList()
-                }
-            val key = listOf(r[0].asLong(), r[4].asLongOrNull(), values)
-            val g =
-                byKey.getOrPut(key) {
-                    Group(
-                        tableId = r[0].asLong(),
-                        namespace = r[1].asString(),
-                        table = r[2].asString(),
-                        tableUuid = r[3].asString(),
-                        specId = r[4].asLongOrNull(),
-                        values = values,
-                        thresholdBytes = smallFileThresholdBytes,
+        store.keysetPages(null) { last ->
+            val page =
+                store.queryCatalog(
+                    catalog,
+                    "SELECT t.id, v.namespace, v.name, t.table_uuid FROM tables t " +
+                        "JOIN table_versions v ON v.table_id = t.id " +
+                        "AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?) " +
+                        "WHERE t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?) " +
+                        "$nsFilter $tFilter" + (if (last == null) "" else " AND t.id > ?") +
+                        " ORDER BY t.id LIMIT ${HogliteCatalogStore.LISTING_PAGE_SIZE}",
+                    at,
+                    at,
+                    at,
+                    at,
+                    *args.toTypedArray(),
+                    *(last?.let { arrayOf(it[0]) } ?: emptyArray()),
+                ).rows
+            val tables = page.associateBy { it[0].asLong() }
+            store.fileRanges(catalog, tables.keys, at, store.partitionRangeSize) { arms ->
+                val (files, fileArgs) =
+                    store.filesIn(
+                        arms,
+                        "f.id, f.table_id, f.spec_id, f.partition_values_json, f.file_size_bytes, " +
+                            "f.record_count, f.begin_snapshot",
+                        visible,
+                        listOf(at),
                     )
+                val rows =
+                    store.queryCatalog(
+                        catalog,
+                        "SELECT r.table_id, r.spec_id, r.partition_values_json, r.file_size_bytes, " +
+                            "r.record_count, r.begin_snapshot, " +
+                            "(SELECT COUNT(*) FROM dvs d WHERE d.data_file_id = r.id AND d.begin_snapshot <= ? " +
+                            "AND (d.end_snapshot IS NULL OR d.end_snapshot > ?)) FROM ($files) r",
+                        at,
+                        at,
+                        *fileArgs,
+                    ).rows
+                for (r in rows) {
+                    val t = tables.getValue(r[0].asLong())
+                    val values =
+                        (r[2] as? String)?.let {
+                            store.json.readValue(it, Array<String?>::class.java).toList()
+                        }
+                    val key = listOf(r[0].asLong(), r[1].asLongOrNull(), values)
+                    val g =
+                        byKey.getOrPut(key) {
+                            Group(
+                                tableId = r[0].asLong(),
+                                namespace = t[1].asString(),
+                                table = t[2].asString(),
+                                tableUuid = t[3].asString(),
+                                specId = r[1].asLongOrNull(),
+                                values = values,
+                                thresholdBytes = smallFileThresholdBytes,
+                            )
+                        }
+                    g.files += FileEntry(r[3].asLong(), r[4].asLong(), r[5].asLong())
+                    g.dvCount += r[6].asLong()
                 }
-            g.files += FileEntry(r[6].asLong(), r[7].asLong(), r[8].asLong())
-            g.dvCount += r[9].asLong()
+            }
+            page
         }
         return byKey.values.toList()
     }

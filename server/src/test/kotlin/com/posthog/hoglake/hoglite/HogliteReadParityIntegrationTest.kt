@@ -260,38 +260,56 @@ class HogliteReadParityIntegrationTest {
             for (consumer in listOf("z-reader", "a-reader")) {
                 for (n in listOf(1, 2, 3, 9, 8)) store.commitOffset(cat, consumer, uuid(n), 0)
                 // Missing metadata is a deliberately seeded orphan, not a normal API operation.
-                write(
-                    lite,
-                    cat,
-                    "INSERT INTO offsets(consumer_id, table_uuid, committed_snapshot, updated_at) " +
-                        "VALUES ('$consumer', '${uuid(0)}', 0, '2026-01-01T00:00:00Z')",
-                    "INSERT INTO hog_consumer_offset(catalog_id, consumer_id, table_uuid, committed_snapshot) " +
-                        "VALUES (:cat, '$consumer', '${uuid(0)}', 0)",
-                )
+                // Two of them, so a page boundary can fall inside the run of NULL names.
+                for (n in listOf(0, 4)) {
+                    write(
+                        lite,
+                        cat,
+                        "INSERT INTO offsets(consumer_id, table_uuid, committed_snapshot, updated_at) " +
+                            "VALUES ('$consumer', '${uuid(n)}', 0, '2026-01-01T00:00:00Z')",
+                        "INSERT INTO hog_consumer_offset(catalog_id, consumer_id, table_uuid, committed_snapshot) " +
+                            "VALUES (:cat, '$consumer', '${uuid(n)}', 0)",
+                    )
+                }
             }
-            val expected = listOf(8, 9, 3, 2, 1, 0).map(::uuid)
+            val expected = listOf(8, 9, 3, 2, 1, 0, 4).map(::uuid)
             issued.clear()
             val rows = store.listConsumers(cat)
             assertThat(
                 rows.map { it.consumerId },
-            ).containsExactlyElementsOf(List(6) { "a-reader" } + List(6) { "z-reader" })
+            ).containsExactlyElementsOf(List(7) { "a-reader" } + List(7) { "z-reader" })
             for (consumer in listOf("a-reader", "z-reader")) {
                 val offsets = rows.filter { it.consumerId == consumer }
                 assertThat(offsets.map { it.tableUuid }).containsExactlyElementsOf(expected)
-                assertThat(offsets.map { it.namespace }).containsExactly("ans", "ans", "ans", "ans", "zns", null)
-                assertThat(offsets.map { it.tableName }).containsExactly("a", "a", "c", "z", "a", null)
-                assertThat(offsets.map { it.tableDropped }).containsExactly(false, true, false, false, false, false)
+                assertThat(offsets.map { it.namespace }).containsExactly("ans", "ans", "ans", "ans", "zns", null, null)
+                assertThat(offsets.map { it.tableName }).containsExactly("a", "a", "c", "z", "a", null, null)
+                assertThat(
+                    offsets.map { it.tableDropped },
+                ).containsExactly(false, true, false, false, false, false, false)
                 assertThat(
                     store.listOffsets(cat, consumer).map {
                         it.tableUuid
                     },
-                ).containsExactlyElementsOf((0..3).map(::uuid) + listOf(uuid(8), uuid(9)))
+                ).containsExactlyElementsOf((0..4).map(::uuid) + listOf(uuid(8), uuid(9)))
             }
             if (lite) {
                 val query = issued.single { it["sql"].asText().contains("FROM offsets o LEFT JOIN") }
                 println("CONSUMER_SQL_CAPTURE $query")
-                assertThat(query["sql"].asText().trim().replace(Regex("\\s+"), " "))
-                    .endsWith("ORDER BY o.consumer_id, t.namespace NULLS LAST, t.name NULLS LAST, o.table_uuid")
+                assertThat(query["sql"].asText().trim().replace(Regex("\\s+"), " ")).endsWith(
+                    "ORDER BY o.consumer_id, o.table_uuid LIMIT ${HogliteCatalogStore.LISTING_PAGE_SIZE}",
+                )
+                // Keyset pages (#686) on the primary key, of every size up to
+                // the listing: each boundary gives the one statement's order,
+                // which the listing sorts into after the last page.
+                val lister = store as HogliteCatalogStore
+                val offsets = listOf("a-reader", "z-reader").associateWith { store.listOffsets(cat, it) }
+                for (size in 1..rows.size) {
+                    lister.offsetPageSize = size
+                    assertThat(store.listConsumers(cat)).describedAs("page size $size").isEqualTo(rows)
+                    for ((consumer, all) in offsets) {
+                        assertThat(store.listOffsets(cat, consumer)).describedAs("page size $size").isEqualTo(all)
+                    }
+                }
             }
             val empty = "$cat-empty"
             store.createCatalog(empty, "s3://hoglake-it/$empty")
