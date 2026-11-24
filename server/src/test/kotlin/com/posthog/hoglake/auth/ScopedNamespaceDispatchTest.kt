@@ -1202,6 +1202,29 @@ class ScopedNamespaceDispatchTest {
         }
 
     @Test
+    fun `with the relay on the local-only routes still refuse the session's own team schema`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(withReadSession = true, mountHostsJson = teamRelay(remoteRequests), relay = true)
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+            }
+            assertThat(remoteRequests).isEmpty()
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+
+            // The same token relays on the shared route, so the 404 above is the route's and not the token's.
+            val shared = client.get(teamPath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(shared.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(remoteRequests).hasSize(1)
+        }
+
+    @Test
     fun `without a read session profile the relay still refuses the dedicated audiences`() =
         testApplication {
             val remoteRequests = CopyOnWriteArrayList<String>()
