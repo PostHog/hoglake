@@ -1,17 +1,26 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.auth.AuthServiceKey
 import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.ReadSessionProfile
+import com.posthog.hoglake.auth.ReadSessionTarget
+import com.posthog.hoglake.auth.RouteMatch
+import com.posthog.hoglake.auth.RouteMatchKey
 import com.posthog.hoglake.auth.Scope
 import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.countRefusal
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.localOnlySelection
 import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.auth.resolveActor
+import com.posthog.hoglake.auth.verifiedBackendAuthority
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
@@ -25,12 +34,17 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.remoteSchemaRefusal
 import com.posthog.hoglake.store.servedNamespaceRefusal
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Parameters
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.request.httpMethod
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveChannel
+import io.ktor.server.request.uri
 import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
 import io.ktor.server.routing.RoutingCall
@@ -41,6 +55,9 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Instant
 import java.time.format.DateTimeParseException
 import java.util.UUID
@@ -78,6 +95,14 @@ fun Application.installApiRoutes(
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
     // sites by these names. Both names refer to the one CatalogStore.
     routing {
+        // The local-only reads serve only the typed reads that the auth plugin selected. They never relay.
+        get(LOCAL_ONLY_NAMESPACE_ROUTE) {
+            handleLocalOnlyNamespaceGet(call, selector)
+        }
+        get(LOCAL_ONLY_TABLE_ROUTE) {
+            val target = call.localOnlyTarget(ReadSessionProfile::matchesTable)
+            handleScopedTableGet(call, selector, target, ReadSessionProfile.LOCAL_ONLY_PREFIX)
+        }
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
             // computed here (a live-manifest sum per request would tax
@@ -277,7 +302,10 @@ fun Application.installApiRoutes(
                     get("/{namespace}") {
                         when (val binding = selector.resolve(call, call.catalog())) {
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
-                            is CatalogBinding.Served ->
+                            is CatalogBinding.Served -> {
+                                if (call.isReadSession) {
+                                    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+                                }
                                 call.respond(
                                     // No id: it is a counter of the shared source catalog.
                                     NamespaceDto(
@@ -289,6 +317,7 @@ fun Application.installApiRoutes(
                                             ).name,
                                     ),
                                 )
+                            }
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -336,13 +365,20 @@ fun Application.installApiRoutes(
                         get {
                             when (val binding = selector.resolve(call, call.catalog())) {
                                 is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
-                                is CatalogBinding.Served ->
-                                    call.respond(
+                                is CatalogBinding.Served -> {
+                                    val tables =
                                         binding.reader.tables(
                                             call.longQuery("snapshot"),
                                             call.instantQuery("at_timestamp"),
-                                        ).map { it.toDto() },
-                                    )
+                                        )
+                                    if (call.isReadSession) {
+                                        // No totals: they are not computed from grant-checked files.
+                                        call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+                                        call.respond(tables.map { it.toReadSessionDto() })
+                                    } else {
+                                        call.respond(tables.map { it.toDto() })
+                                    }
+                                }
                                 is CatalogBinding.Local ->
                                     call.respond(
                                         binding.store.listTables(
@@ -372,19 +408,35 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
+                                val catalog = call.catalog()
+                                val namespace = call.namespace()
+                                val table = call.table()
+                                if (selector.isReadSessionTableRoute(call, catalog, namespace, table) &&
+                                    ReadSessionProfile.matchesTable(
+                                        call.request.httpMethod,
+                                        call.attributes.getOrNull(RouteMatchKey),
+                                    )
+                                ) {
+                                    handleScopedTableGet(call, selector, ReadSessionTarget(catalog, namespace, table))
+                                    return@get
+                                }
                                 when (val binding = selector.resolve(call, call.catalog())) {
                                     is CatalogBinding.RemoteSchema ->
                                         binding.host.schemaTable(call, binding, call.table())
                                     // The one table answer that says remote: its
                                     // read_snapshot_id is the holding catalog's.
-                                    is CatalogBinding.Served ->
-                                        call.respond(
+                                    is CatalogBinding.Served -> {
+                                        val readSession = call.isReadSession
+                                        if (readSession) requireReadSessionTableQuery(call)
+                                        val served =
                                             binding.reader.table(
                                                 call.table(),
                                                 call.longQuery("snapshot"),
                                                 call.instantQuery("at_timestamp"),
-                                            ).toDto().copy(remote = true),
-                                        )
+                                                totals = !readSession,
+                                            ).toDto().copy(remote = true)
+                                        call.respond(if (readSession) served.withoutTotals() else served)
+                                    }
                                     is CatalogBinding.Local ->
                                         call.respond(
                                             binding.store.getTable(
@@ -828,16 +880,35 @@ private fun ApplicationCall.refuseHiddenTable(
  */
 fun Application.installScanRoutes(selector: CatalogStoreSelector) {
     routing {
+        // The local-only pinned scan: only the typed scan that the auth plugin selected. It never relays.
+        get("$LOCAL_ONLY_TABLE_ROUTE/scan") {
+            val target = call.localOnlyTarget(ReadSessionProfile::matchesScan)
+            handleScopedScanGet(call, selector, target, ReadSessionProfile.LOCAL_ONLY_PREFIX)
+        }
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
+            val catalog = call.catalog()
+            val namespace = call.namespace()
+            val table = call.table()
+            if (selector.isReadSessionTableRoute(call, catalog, namespace, table) &&
+                ReadSessionProfile.matchesScan(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
+            ) {
+                handleScopedScanGet(call, selector, ReadSessionTarget(catalog, namespace, table))
+                return@get
+            }
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
             // so a repeated `stats_fields=3&stats_fields=7` would silently
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
+
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
             // A remote schema's scan is relayed as it came (plan row 1.3c):
             // the Host parses it, plans the scoped scan and applies its caps.
             selector.remoteSchema(call, call.catalog())?.let { schema ->
                 return@get schema.host.schemaScan(call, schema, call.table())
+            }
+            if (call.isReadSession) {
+                handleServedReadSessionScan(call, selector)
+                return@get
             }
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
             val files =
@@ -1186,3 +1257,258 @@ internal suspend fun ApplicationCall.receiveReplacement(): ReplacementRequestDto
     }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))
+
+private val CANONICAL_SNAPSHOT = Regex("^(0|[1-9][0-9]{0,18})$")
+
+private suspend fun requireEmptyScopedBody(
+    call: ApplicationCall,
+    message: String,
+) {
+    val lengths = call.request.headers.getAll(HttpHeaders.ContentLength)
+    if ((lengths != null && lengths != listOf("0")) ||
+        call.request.headers.getAll(HttpHeaders.TransferEncoding) != null
+    ) {
+        throw BadRequestException(message)
+    }
+    val empty =
+        withTimeoutOrNull(5_000) {
+            call.request.receiveChannel().readAvailable(ByteArray(1), 0, 1) == -1
+        }
+    if (empty != true) throw BadRequestException(message)
+}
+
+private const val LOCAL_ONLY_NAMESPACE_ROUTE =
+    "${ReadSessionProfile.LOCAL_ONLY_PREFIX}/catalogs/{catalog}/namespaces/{namespace}"
+private const val LOCAL_ONLY_TABLE_ROUTE = "$LOCAL_ONLY_NAMESPACE_ROUTE/tables/{table}"
+
+/**
+ * The target that the auth plugin selected for this local-only route with the
+ * read-session verifier. Without that proof, or for another route shape, the
+ * answer is absence.
+ */
+private fun ApplicationCall.localOnlyTarget(shape: (HttpMethod, RouteMatch?) -> Boolean): ReadSessionTarget {
+    val target = localOnlySelection?.target ?: throw HoglakeException.NotFound("namespace")
+    if (!shape(request.httpMethod, attributes.getOrNull(RouteMatchKey)) ||
+        verifiedBackendAuthority?.isReadSession != true
+    ) {
+        throw HoglakeException.NotFound("namespace")
+    }
+    return target
+}
+
+/** The local-only namespace read: the gate's typed read, on the raw local-only path. */
+private suspend fun handleLocalOnlyNamespaceGet(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+) {
+    val target = call.localOnlyTarget(ReadSessionProfile::matchesNamespace)
+    val required = checkNotNull(call.localOnlySelection).decision.required
+    val expected =
+        "${ReadSessionProfile.LOCAL_ONLY_PREFIX}/catalogs/${target.catalog}/namespaces/${target.namespace}"
+    if (call.request.uri != expected) throw BadRequestException("invalid scoped namespace request")
+    requireEmptyScopedBody(call, "invalid scoped namespace request")
+    val result =
+        try {
+            runInterruptible { selector.readScopedNamespace(call, target) }
+        } catch (failure: HoglakeException.NotFound) {
+            recordScopedRefusal(call, failure)
+            throw failure
+        }
+    val caller = call.hoglakeAuth.callerOrNull
+    val mark = result?.containment
+    if (result == null || mark == null || caller == null ||
+        !caller.mayUseContained(target.catalog, mark.field, mark.value, null, required)
+    ) {
+        val refusal = HoglakeException.NotFound("namespace")
+        recordScopedRefusal(call, refusal)
+        throw refusal
+    }
+    recordScopedSuccess(call)
+    call.respond(result)
+}
+
+private suspend fun handleScopedTableGet(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+    target: ReadSessionTarget,
+    prefix: String = "/v1",
+) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    val expectedPath = "$prefix/catalogs/${target.catalog}/namespaces/${target.namespace}/tables/${target.table}"
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    val rawPath = if (queryIndex == -1) uri else uri.substring(0, queryIndex)
+    val rawQuery = if (queryIndex == -1) null else uri.substring(queryIndex + 1)
+    if (rawPath != expectedPath || (rawQuery != null && rawQuery != "totals=false")) {
+        throw BadRequestException("invalid scoped table request")
+    }
+    requireEmptyScopedBody(call, "invalid scoped table request")
+    val table =
+        try {
+            runInterruptible { selector.readScopedTable(call, target) }
+        } catch (failure: HoglakeException) {
+            if (failure is HoglakeException.NotFound || failure is HoglakeException.Forbidden) {
+                recordScopedRefusal(call, failure)
+            }
+            throw failure
+        }
+    recordScopedSuccess(call)
+    call.respond(table)
+}
+
+private suspend fun handleScopedScanGet(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+    target: ReadSessionTarget,
+    prefix: String = "/v1",
+) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    val expectedPath =
+        "$prefix/catalogs/${target.catalog}/namespaces/${target.namespace}/tables/${target.table}/scan"
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    if (queryIndex == -1) throw BadRequestException("invalid scoped scan request")
+    val rawPath = uri.substring(0, queryIndex)
+    val rawQuery = uri.substring(queryIndex + 1)
+    if (rawPath != expectedPath || rawQuery.isEmpty()) {
+        throw BadRequestException("invalid scoped scan request")
+    }
+    val (snapshot, tableUuid) = parseScopedScanQuery(rawQuery)
+    requireEmptyScopedBody(call, "invalid scoped scan request")
+    val files =
+        try {
+            runInterruptible {
+                selector.readScopedScan(call, target, snapshot, tableUuid)
+            }
+        } catch (failure: HoglakeException) {
+            if (failure is HoglakeException.NotFound || failure is HoglakeException.Forbidden) {
+                recordScopedRefusal(call, failure)
+            }
+            throw failure
+        }
+    recordScopedSuccess(call)
+    call.respond(files)
+}
+
+/** Whether the request holds a verified dedicated read session. */
+private val ApplicationCall.isReadSession: Boolean
+    get() = verifiedBackendAuthority?.isReadSession == true
+
+/** A read session's table list entry: the identity fields, and no totals. */
+private data class ReadSessionTableSummaryDto(
+    val name: String,
+    val tableUuid: UUID,
+    val comment: String? = null,
+    val earliestSnapshotId: Long? = null,
+)
+
+private fun com.posthog.hoglake.model.TableSummaryInfo.toReadSessionDto() =
+    ReadSessionTableSummaryDto(
+        name,
+        tableUuid,
+        comment,
+        earliestSnapshotId,
+    )
+
+private fun TableDto.withoutTotals() =
+    copy(recordCount = null, fileCount = null, fileSizeBytes = null, totalsSnapshotId = null, totalsAsOf = null)
+
+/** A read session's table `GET` on a served namespace: no query, or exactly `totals=false`. */
+private fun requireReadSessionTableQuery(call: ApplicationCall) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    if (queryIndex != -1 && uri.substring(queryIndex + 1) != "totals=false") {
+        throw BadRequestException("invalid scoped table request")
+    }
+}
+
+/**
+ * A read session's scan of a served namespace (docs/auth.md, "Read sessions
+ * on a remote schema"). The query is exactly a canonical `snapshot` and
+ * `table_uuid`. The table this server resolves at that snapshot must have
+ * that UUID, or the answer is the 404 of a missing table. Every data file
+ * and deletion vector must be inside a grant of the two remote targets, or
+ * the whole answer is a redacted 403.
+ */
+private suspend fun handleServedReadSessionScan(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    if (queryIndex == -1) throw BadRequestException("invalid scoped scan request")
+    val (snapshot, tableUuid) = parseScopedScanQuery(uri.substring(queryIndex + 1))
+    requireEmptyScopedBody(call, "invalid scoped scan request")
+    val catalog = call.catalog()
+    val table = call.table()
+    val missing = HoglakeException.NotFound("table '${call.namespace()}.$table' in catalog '$catalog'")
+    val grants = call.verifiedBackendAuthority?.storageGrants ?: throw missing
+    val binding = selector.resolve(call, catalog) as? CatalogBinding.Served ?: throw missing
+    if (binding.reader.table(table, snapshot, null, totals = false).tableUuid != tableUuid) throw missing
+    val files = binding.reader.scan(table, snapshot, null, columnStats = null, splitOffsets = false)
+    for (file in files) {
+        val vector = file.deleteFile
+        if (!grants.allowsRemoteTargetObject(file.dataFile.path) ||
+            (vector != null && !grants.allowsRemoteTargetObject(vector.path))
+        ) {
+            throw HoglakeException.Forbidden("access denied")
+        }
+    }
+    call.respond(files.map { it.toDto() })
+}
+
+private fun parseScopedScanQuery(rawQuery: String): Pair<Long, UUID> {
+    val parts = rawQuery.split('&')
+    if (parts.size != 2) throw BadRequestException("invalid scoped scan query")
+    var rawSnapshot: String? = null
+    var rawTableUuid: String? = null
+    for (part in parts) {
+        val separator = part.indexOf('=')
+        if (separator <= 0) throw BadRequestException("invalid scoped scan query")
+        val key = part.substring(0, separator)
+        val value = part.substring(separator + 1)
+        when (key) {
+            "snapshot" -> {
+                if (rawSnapshot != null) throw BadRequestException("invalid scoped scan query")
+                rawSnapshot = value
+            }
+            "table_uuid" -> {
+                if (rawTableUuid != null) throw BadRequestException("invalid scoped scan query")
+                rawTableUuid = value
+            }
+            else -> throw BadRequestException("invalid scoped scan query")
+        }
+    }
+    if (rawSnapshot == null || rawTableUuid == null || !CANONICAL_SNAPSHOT.matches(rawSnapshot)) {
+        throw BadRequestException("invalid scoped scan query")
+    }
+    val snapshot = rawSnapshot.toLongOrNull() ?: throw BadRequestException("invalid scoped scan query")
+    val uuid =
+        runCatching { UUID.fromString(rawTableUuid) }.getOrNull()?.takeIf { it.toString() == rawTableUuid }
+            ?: throw BadRequestException("invalid scoped scan query")
+    return snapshot to uuid
+}
+
+private fun recordScopedSuccess(call: ApplicationCall) {
+    call.application.attributes.getOrNull(AuthServiceKey)?.let { service ->
+        Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
+    }
+}
+
+private fun recordScopedRefusal(
+    call: ApplicationCall,
+    failure: HoglakeException,
+) {
+    call.application.attributes.getOrNull(AuthServiceKey)?.let { service ->
+        countRefusal(
+            service,
+            service.clientClass(call),
+            call.hoglakeAuth.callerOrNull,
+            call.attributes.getOrNull(RouteMatchKey),
+            failure,
+            enforced = true,
+        )
+    }
+}

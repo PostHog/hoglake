@@ -20,6 +20,9 @@ struct HoglakeCatalogInfo {
 	int64_t schema_version = 0;
 	//! null when expiry never advanced the floor
 	string earliest_snapshot_time;
+	//! Catalog.capabilities: each gates a write the server supports
+	//! (idempotent-append-v1 is the one the commit loop consults)
+	vector<string> capabilities;
 };
 
 //! Column (wire): ColumnDef + field_id + ordinal.
@@ -226,6 +229,10 @@ struct HoglakeTableDeletes {
 
 //! CommitRequest (client -> server). The extension guards both appends and deletes.
 struct HoglakeCommitRequest {
+	//! UUID minted once per commit and fixed across its retries: the
+	//! server answers a retry of a commit it already published from the
+	//! receipt instead of registering the files a second time
+	string idempotency_key;
 	//! invalid = blind append (no conflict window)
 	optional_idx read_snapshot;
 	vector<HoglakeTableAppend> appends;

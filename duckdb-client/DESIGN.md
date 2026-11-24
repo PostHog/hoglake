@@ -77,9 +77,60 @@ the server now sends the typed code `table_recreated`, so the text grep
 is a fallback for an older server and switching to the code is client
 work),
 410 expired (below the expiry floor; surfaced with the floor detail),
-422 validation (never retried), 503 `commit_queue_timeout` (retryable
-backpressure; honors `Retry-After`). Retries: commit-loop only, default
-max 10 / 100 ms / backoff 1.5 with jitter (DuckLake's numbers), settings
+422 validation (never retried), 503 `commit_queue_timeout` /
+`backend_unavailable` / `commit_outcome_unknown` (retryable; honors
+`Retry-After`). When the catalog advertises `idempotent-append-v1`
+every commit carries an `idempotency_key` minted once and fixed across
+its retries, so a retry of a commit the server did publish —
+`commit_outcome_unknown` is Hoglite's lost acknowledgement — replays
+the receipt instead of registering the files a second time. A commit
+whose acknowledgement is lost in transport (connection reset, the
+commit read timeout, a proxy's 502/504) is the same case and retries
+under the same key; the other requests still surface those as
+`IOException`. So is a 500 on `/commit`: the server's commit is one
+PostgreSQL transaction (`CommitService.commit`, `jdbi.inTransaction`),
+and a COMMIT whose acknowledgement the database connection lost is
+durable yet raises a driver exception that no arm of `ErrorMapping`
+names, so the Throwable catch-all answers 500 `internal_error`; only
+Hoglite raises `commit_outcome_unknown`. A 500 is therefore treated as
+an unknown outcome, not a definite failure. Without the capability the
+server ignores the key, so none is sent and these unknown outcomes are
+not retried at all (the definite 503s still are): a blind retry could
+register the files twice. "Unknown" is sticky across a commit's
+attempts: once any attempt got no definite answer, the terminal error
+— whatever the last attempt said — states the commit MAY be durable,
+names the key and `GET /commit/receipts/{key}`, and says what that
+route guarantees: 200 with the snapshot once the commit published; a
+404 is not proof either way (an attempt may still be in flight, and the
+server guarantees no time after which one has stopped; receipts are
+purged after `HOGLAKE_RECEIPT_RETENTION_SECONDS`), so on a 404 the
+table's contents or `hoglake_snapshots` decide before the statement is
+re-run. That advice replaces the definite-outcome suffix (a 409's
+"start a new transaction and re-run the statement", "retries
+exhausted"), so the error gives one instruction: the 409's reason
+leads, the advice follows and says the re-run needs a new transaction.
+The safe recovery, a retry under the SAME key, is one the extension
+cannot run (keys are never caller-chosen), which the error says. A
+commit attempt waits `hoglake_commit_timeout_ms` (default 120 s) for
+its answer, deliberately above the server's 30 s commit-lock wait so a
+queued commit's clean 503 `commit_queue_timeout` is heard rather than
+timed out into an unknown outcome; every other request keeps the 30 s
+read timeout. The whole loop — attempts and backoff — is bounded by
+`hoglake_commit_deadline_ms` (default 300 s, capped at 30 min: half the
+server's one-hour floor on `HOGLAKE_RECEIPT_RETENTION_SECONDS`, so a
+retry under the key never outlives its receipt and publishes the files
+again): without it retried read
+timeouts could hold COMMIT for max retries × 120 s (~22 min) against a
+hung server. No attempt waits past the deadline (its connect, write, read and
+token-mint timeouts are clamped to the time left) and no attempt starts
+with less than the server's commit-lock wait plus a margin (35 s, or the
+whole `hoglake_commit_timeout_ms` if shorter) left before it; the commit then stops, with the unknown-outcome advice when
+an attempt timed out. Only `commit_queue_timeout` and
+`backend_unavailable` are definite 503s; any other 503 (a proxy's
+untyped one included) is an unknown outcome, retried only under a key.
+An attempt that throws before the server answers (a failed token
+re-mint) after an earlier unknown outcome still ends with the advice. Retries: commit-loop only, default
+max 10 / 100 ms / backoff 1.5, no jitter (DuckLake's numbers), settings
 `hoglake_max_retry_count` / `hoglake_retry_wait_ms` /
 `hoglake_retry_backoff`.
 
@@ -143,8 +194,12 @@ the server refuses blind partitioned appends.
 `409 ddl_since_read_snapshot` and `409 table_recreated` require a new
 transaction and a fresh INSERT; replaying prepared files cannot resolve
 them. Other 409s also stop unless the server names `commit_conflict`
-on an append-only request. That conflict and 503 backpressure retry with
-backoff, using the same request. A 409 with deletes never retries: the
+on an append-only request. That conflict, any 503 and a lost answer
+(no response, 500, 502, 504) retry with backoff, using the same request
+under the same `idempotency_key`, within `hoglake_commit_deadline_ms`;
+a retry of a commit that did land (`commit_outcome_unknown`, a 500 for
+a lost database acknowledgement, or an answer lost in transport) is
+answered from its receipt. A 409 with deletes never retries: the
 deletion vectors must be rebuilt. Long transactions can also fail with
 410 when the preparation snapshot expires. ROLLBACK drops the
 registrations; uploaded parquet/puffin is

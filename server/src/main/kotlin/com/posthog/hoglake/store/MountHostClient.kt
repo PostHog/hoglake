@@ -3,6 +3,7 @@ package com.posthog.hoglake.store
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.auth.verifiedBackendAuthority
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.REQUEST_ID_HEADER
@@ -205,6 +206,10 @@ class MountHostClient(
         rewrite: NamespaceFieldRewrite? = null,
     ) {
         val mounts = subject.labels
+        // The answer is rebuilt here, so the Host's header is set again: a read session's answer is never stored.
+        if (call.verifiedBackendAuthority?.isReadSession == true) {
+            call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+        }
         exchange(call, subject, URI.create(base + path + query(call))) { body, deadline ->
             val head = read(body, prebufferBytes, mounts, deadline)
             if (head.size > maxResponseBytes) throw tooLarge(mounts)
