@@ -339,7 +339,7 @@ It adds no claim and changes no claim.
 - The scan query is exactly those two parameters. `include` and every other parameter is refused with `400`.
 - Table `GET` and the table list omit row totals for a read session, and table `GET` allows only an omitted `totals` or `totals=false`, as the local table route does. Totals are computed before any grant check, so they are not given to a caller whose files are checked.
 - A table list entry for a read session carries `name`, `table_uuid`, and `comment` and `earliest_snapshot_id` when set. It has none of the count and size fields.
-- The four answers carry `Cache-Control: no-store`.
+- The four answers carry `Cache-Control: no-store`. A Client sets the header again on the answer it relays to a read session.
 - The Host never uses the embedded credentials.
 
 **The reader** opens files with the embedded credentials, so it applies the same path check itself.

@@ -302,7 +302,10 @@ fun Application.installApiRoutes(
                     get("/{namespace}") {
                         when (val binding = selector.resolve(call, call.catalog())) {
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
-                            is CatalogBinding.Served ->
+                            is CatalogBinding.Served -> {
+                                if (call.isReadSession) {
+                                    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+                                }
                                 call.respond(
                                     // No id: it is a counter of the shared source catalog.
                                     NamespaceDto(
@@ -314,6 +317,7 @@ fun Application.installApiRoutes(
                                             ).name,
                                     ),
                                 )
+                            }
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -429,6 +433,7 @@ fun Application.installApiRoutes(
                                                 call.table(),
                                                 call.longQuery("snapshot"),
                                                 call.instantQuery("at_timestamp"),
+                                                totals = !readSession,
                                             ).toDto().copy(remote = true)
                                         call.respond(if (readSession) served.withoutTotals() else served)
                                     }
@@ -1441,7 +1446,7 @@ private suspend fun handleServedReadSessionScan(
     val missing = HoglakeException.NotFound("table '${call.namespace()}.$table' in catalog '$catalog'")
     val grants = call.verifiedBackendAuthority?.storageGrants ?: throw missing
     val binding = selector.resolve(call, catalog) as? CatalogBinding.Served ?: throw missing
-    if (binding.reader.table(table, snapshot, null).tableUuid != tableUuid) throw missing
+    if (binding.reader.table(table, snapshot, null, totals = false).tableUuid != tableUuid) throw missing
     val files = binding.reader.scan(table, snapshot, null, columnStats = null, splitOffsets = false)
     for (file in files) {
         val vector = file.deleteFile

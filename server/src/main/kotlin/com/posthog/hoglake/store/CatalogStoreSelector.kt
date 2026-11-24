@@ -372,7 +372,7 @@ class CatalogStoreSelector(
      * (docs/auth.md, "Read sessions on a remote schema"): on a Client, the
      * remote schema its path names; on a Host, the served namespace its path
      * names, under the unchanged rule of [servedBinding]. Never a local
-     * store or a mount, and nothing is cached for the call. The catalog check
+     * store or a mount. The catalog check
      * comes first and answers for the catalog; every later failure is a
      * missing namespace.
      */
@@ -391,7 +391,12 @@ class CatalogStoreSelector(
         ) {
             throw HoglakeException.NotFound("namespace")
         }
-        return servedBinding(call, catalog) ?: throw HoglakeException.NotFound("namespace")
+        // The gate and the handler both ask: the admitted binding is kept for the call, so the
+        // placement and the namespace's mark are read once.
+        call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
+        val served = servedBinding(call, catalog) ?: throw HoglakeException.NotFound("namespace")
+        call.attributes.put(boundCatalog, catalog to Handed(served))
+        return served
     }
 
     /** Whether [namespace] is a canonical name of a family this server serves to a dedicated read session. */

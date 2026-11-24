@@ -1149,6 +1149,7 @@ class ScopedNamespaceDispatchTest {
                 val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
                 assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.OK)
                 assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+                assertThat(response.headers[HttpHeaders.CacheControl]).describedAs(target).isEqualTo("no-store")
             }
             assertThat(remoteRequests).containsExactly(
                 "GET /v1/catalogs/example-catalog/namespaces/team_42",

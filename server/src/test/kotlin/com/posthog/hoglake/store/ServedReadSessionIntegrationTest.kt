@@ -8,9 +8,11 @@ import com.posthog.hoglake.configureApiListener
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.wireObjectMapper
@@ -97,6 +99,25 @@ abstract class ServedReadSessionCases(authMode: String) {
                 appends =
                     listOf(
                         TableAppend("team_42", "events", listOf(FileRegistration(filePath, 10, 1_000, 20, null, null))),
+                    ),
+            ),
+        )
+        // A deletion vector on that file, under the team's prefix but outside its `events/` folder.
+        val dataFileId =
+            db.jdbi.withHandle<Long, Exception> { h ->
+                h.createQuery("SELECT data_file_id FROM hog_data_file").mapTo(Long::class.java).one()
+            }
+        commits.commit(
+            source,
+            CommitRequest(
+                readSnapshot = catalogs.getCatalog(source).headSnapshotId,
+                deletes =
+                    listOf(
+                        TableDeletes(
+                            "team_42",
+                            "events",
+                            listOf(DeleteFileRegistration(dataFileId, "s3://bucket/${importsPrefix}dv/a.dv", 2, 16)),
+                        ),
                     ),
             ),
         )
@@ -210,6 +231,7 @@ abstract class ServedReadSessionCases(authMode: String) {
             val namespace = send(port, ns, session())
             assertThat(namespace.statusCode()).describedAs(namespace.body()).isEqualTo(200)
             assertThat(mapper.readTree(namespace.body())["name"].asText()).isEqualTo("team_42")
+            assertThat(namespace.headers().firstValue("Cache-Control")).hasValue("no-store")
 
             val tables = send(port, "$ns/tables", session())
             assertThat(tables.statusCode()).describedAs(tables.body()).isEqualTo(200)
@@ -241,6 +263,7 @@ abstract class ServedReadSessionCases(authMode: String) {
             assertThat(scan.statusCode()).describedAs(scan.body()).isEqualTo(200)
             val files = mapper.readTree(scan.body())
             assertThat(files.map { it["data_file"]["path"].asText() }).containsExactly(filePath)
+            assertThat(files[0]["delete_file"]["path"].asText()).endsWith("/dv/a.dv")
             assertThat(scan.headers().firstValue("Cache-Control")).hasValue("no-store")
         }
     }
@@ -272,10 +295,15 @@ abstract class ServedReadSessionCases(authMode: String) {
     @Test
     fun `a file outside the two remote grants refuses the whole scan without its path`() {
         for (port in ports) {
-            for (imports in listOf("$source/org_id=$orgA/team_id=420/", "$source/org_id=$orgB/team_id=42/")) {
+            for (imports in listOf(
+                "$source/org_id=$orgA/team_id=420/",
+                "$source/org_id=$orgB/team_id=42/",
+                // The data file is inside this grant; its deletion vector is not.
+                "${importsPrefix}events/",
+            )) {
                 val scan = send(port, scanPath(), session(imports = imports))
                 assertThat(scan.statusCode()).describedAs(scan.body()).isEqualTo(403)
-                assertThat(scan.body()).doesNotContain("a.parquet", "bucket", source, orgA)
+                assertThat(scan.body()).doesNotContain("a.parquet", "a.dv", "bucket", source, orgA)
             }
         }
     }
