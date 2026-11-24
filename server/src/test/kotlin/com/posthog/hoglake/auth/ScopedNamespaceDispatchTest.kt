@@ -20,14 +20,19 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountHostResolver
+import com.posthog.hoglake.store.ScopedNamespaceBinding
+import com.posthog.hoglake.store.ScopedNamespaceBinding.Companion.LOCAL_ONLY_MARKER
+import com.posthog.hoglake.store.ScopedNamespaceBinding.Companion.LOCAL_ONLY_PREFIX
 import com.posthog.hoglake.store.StaticMountHosts
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.head
 import io.ktor.client.request.header
+import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.jackson.jackson
 import io.ktor.server.application.Application
@@ -151,6 +156,7 @@ class ScopedNamespaceDispatchTest {
         readFixture: Boolean = withReadSession,
         table: String? = null,
         mountHostsJson: String? = null,
+        namespace: String = "reports",
     ): Config {
         val peer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server = peer
@@ -181,7 +187,7 @@ class ScopedNamespaceDispatchTest {
                 .put("backend", "hoglite")
                 .put("backend_id", (if (readFixture) readBackend else id).toString())
                 .put("tenant", if (readFixture) "fixture_3" else "opaque_1")
-                .put("namespace", "reports")
+                .put("namespace", namespace)
         if (withReadSession) {
             binding.putObject("read_session").put("profile", vectors["config"]["profile"].asText())
                 .set<ObjectNode>("remote_targets", vectors["config"]["remote_targets"])
@@ -1170,6 +1176,369 @@ class ScopedNamespaceDispatchTest {
             val response = client.get(path) { header(HttpHeaders.Authorization, "Bearer $jwt") }
             assertThat(response.status).isEqualTo(HttpStatusCode.OK)
             assertThat(requests.single().second).isEqualTo("Bearer $jwt")
+            assertThat(legacy).isEmpty()
+        }
+
+    /** The body that the team-family relay host answers. Its namespace id is not the local one. */
+    private val relayed = """{"namespace_id":900,"name":"team_42","remote":true}"""
+
+    /** A team-family relay host that records every request it gets and answers each one with [relayed]. */
+    private fun teamRelay(remoteRequests: MutableList<String>): String {
+        val remote = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        remoteServer = remote
+        remote.createContext("/") { exchange ->
+            exchange.requestBody.readBytes()
+            remoteRequests.add("${exchange.requestMethod} ${exchange.requestURI}")
+            exchange.responseHeaders.set("Content-Type", "application/json")
+            val bytes = relayed.toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        remote.start()
+        return """{"hosts":[{"id":"$id","match":{"type":"namespace_family","family":"team"},""" +
+            """"kind":"hoglake","url":"http://127.0.0.1:${remote.address.port}","auth":"forward",""" +
+            """"allow_insecure_http":true}]}"""
+    }
+
+    /** A shared-catalog session token for the same principal: the ordinary audience and profile. */
+    private fun sharedSession(): String =
+        signedRead {
+            it.put("aud", TestTokens.AUDIENCE)
+            it.put("profile", "storage-session")
+        }
+
+    /** The local-only route of an ordinary `/v1/catalogs/...` target. The query stays as it is. */
+    private fun localOnly(target: String): String {
+        check(target.startsWith("/v1/catalogs/"))
+        return LOCAL_ONLY_PREFIX + target.removePrefix("/v1")
+    }
+
+    private val teamPath = "/v1/catalogs/example-catalog/namespaces/team_42"
+    private val teamTablePath = "$teamPath/tables/metrics"
+    private val teamScanPath = "$teamTablePath/scan?snapshot=5&table_uuid=$tableUuid"
+
+    @Test
+    fun `a local-only read of a bound team namespace wins over the relay and the shared path still relays`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg =
+                config(
+                    withReadSession = true,
+                    table = "metrics",
+                    mountHostsJson = teamRelay(remoteRequests),
+                    namespace = "team_42",
+                )
+            assertThat(cfg.scopedNamespaceBinding?.localOnly).isTrue()
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            // Metadata and the pinned read on the local-only routes: the local namespace wins.
+            body = success.replace("\"reports\"", "\"team_42\"")
+            val namespace = client.get(localOnly(teamPath)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(namespace.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(namespace.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+            val namespaceTree = mapper.readTree(namespace.bodyAsText())
+            assertThat(namespaceTree["name"].asText()).isEqualTo("team_42")
+            assertThat(namespaceTree["namespace_id"].asLong()).isEqualTo(17L)
+
+            body = tableSuccess.replace("\"reports\"", "\"team_42\"")
+            val table = client.get(localOnly(teamTablePath)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(table.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(table.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+            assertThat(table.headers[HttpHeaders.CacheControl]).isEqualTo("no-store")
+            val tableTree = mapper.readTree(table.bodyAsText())
+            assertThat(tableTree["table_uuid"].asText()).isEqualTo(tableUuid)
+            assertThat(tableTree["remote"].asBoolean()).isFalse()
+
+            body = scanSuccess.replace("\"reports\"", "\"team_42\"")
+            val scan = client.get(localOnly(teamScanPath)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(scan.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(scan.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+            assertThat(mapper.readTree(scan.bodyAsText())[0]["data_file"]["path"].asText())
+                .isEqualTo("s3://example-customer/tables/data.parquet")
+
+            val local = "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/team_42"
+            assertThat(requests.map { it.first }).containsExactly(
+                local,
+                "$local/tables/metrics",
+                "$local/tables/metrics/scan?snapshot=5&table_uuid=$tableUuid",
+            )
+            assertThat(remoteRequests).isEmpty()
+
+            // The ordinary routes never select a local-only binding: the dedicated credential stays refused there.
+            for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.Unauthorized)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+            }
+            assertThat(remoteRequests).isEmpty()
+
+            // The unmodified shared path on the same name keeps the team relay and its answer.
+            val shared = client.get(teamPath) { header(HttpHeaders.Authorization, "Bearer ${sharedSession()}") }
+            assertThat(shared.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(shared.headers[LOCAL_ONLY_MARKER]).isNull()
+            assertThat(mapper.readTree(shared.bodyAsText())["namespace_id"].asLong()).isEqualTo(900L)
+            for (target in listOf(teamTablePath, teamScanPath)) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer ${sharedSession()}") }
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+            }
+            assertThat(remoteRequests).hasSize(3)
+            for (relay in remoteRequests) {
+                assertThat(relay).startsWith("GET ").contains("/namespaces/team_42")
+            }
+            assertThat(remoteRequests[2]).endsWith("/tables/metrics/scan?snapshot=5&table_uuid=$tableUuid")
+            assertThat(requests).hasSize(3)
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `an authorized local-only lookup of an absent name is ordinary absence with zero relay calls`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg =
+                config(
+                    withReadSession = true,
+                    table = "metrics",
+                    mountHostsJson = teamRelay(remoteRequests),
+                    namespace = "team_42",
+                )
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            val query = "?snapshot=5&table_uuid=$tableUuid"
+
+            // Names outside the static binding: relayed team names, other local names and other tables.
+            // Ordinary absence, with no owner traffic and no relay.
+            for (target in listOf(
+                "/v1/catalogs/example-catalog/namespaces/team_7",
+                "/v1/catalogs/example-catalog/namespaces/team_7/tables/events",
+                "/v1/catalogs/example-catalog/namespaces/team_7/tables/events/scan$query",
+                "/v1/catalogs/example-catalog/namespaces/reports",
+                "$teamPath/tables/other",
+                "$teamPath/tables/other/scan$query",
+                "/v1/catalogs/other-catalog/namespaces/team_42",
+            )) {
+                val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+            }
+            assertThat(requests).isEmpty()
+
+            // The bound namespace and table, absent in the local warehouse: one local read each, then absence.
+            status = 404
+            body = """{"code":"not_found"}"""
+            for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+            }
+            assertThat(requests).hasSize(3)
+            assertThat(remoteRequests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `an unbound local-only route is ordinary absence with zero owner and relay calls`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(withReadSession = true, table = "metrics", mountHostsJson = teamRelay(remoteRequests))
+            assertThat(cfg.scopedNamespaceBinding?.localOnly).isFalse()
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+            }
+            assertThat(requests).isEmpty()
+            assertThat(remoteRequests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the local-only routes keep token failures and principal checks and cannot bypass the relay policy`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg =
+                config(
+                    withReadSession = true,
+                    table = "metrics",
+                    mountHostsJson = teamRelay(remoteRequests),
+                    namespace = "team_42",
+                )
+            application { harness(cfg, readFixture = true) }
+
+            // No token, a malformed token, or a broader ordinary token: unauthenticated, never absence.
+            val unbound = "/v1/catalogs/example-catalog/namespaces/team_7"
+            for (target in listOf(teamPath, teamTablePath, teamScanPath, unbound)) {
+                val anonymous = client.get(localOnly(target))
+                assertThat(anonymous.status).describedAs(target).isEqualTo(HttpStatusCode.Unauthorized)
+                assertThat(anonymous.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+                for (bad in listOf("not.a.jwt", sharedSession())) {
+                    val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $bad") }
+                    assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.Unauthorized)
+                }
+            }
+            // Two credentials are refused as no credential.
+            val doubled =
+                client.get(localOnly(teamPath)) {
+                    header(HttpHeaders.Authorization, "Bearer ${readVector["token"].asText()}")
+                    header(HttpHeaders.Authorization, "Bearer ${readVector["token"].asText()}")
+                }
+            assertThat(doubled.status).isEqualTo(HttpStatusCode.Unauthorized)
+
+            // A verified session for another tenant of the same backend: the selector refuses it, as before.
+            val wrongTenant =
+                signedRead {
+                    (it["rtg"] as ObjectNode).put("t", "fixture_2")
+                    (it["grants"][1] as ObjectNode).put("object_key", "root/bf/t/fixture_2/manifest")
+                }
+            for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                val response =
+                    client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $wrongTenant") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotFound)
+            }
+
+            assertThat(requests).isEmpty()
+            assertThat(remoteRequests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `malformed local-only routes, methods and queries fail closed before any read`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg =
+                config(
+                    withReadSession = true,
+                    table = "metrics",
+                    mountHostsJson = teamRelay(remoteRequests),
+                    namespace = "team_42",
+                )
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+
+            // Paths under the prefix that are not one of the three read routes: 422, no marker.
+            for (target in listOf(
+                LOCAL_ONLY_PREFIX,
+                "$LOCAL_ONLY_PREFIX/",
+                "$LOCAL_ONLY_PREFIX/catalogs/example-catalog",
+                "$LOCAL_ONLY_PREFIX/catalogs/example-catalog/namespaces",
+                "$LOCAL_ONLY_PREFIX//catalogs/example-catalog/namespaces/team_42",
+                localOnly("$teamPath/tables"),
+                localOnly("$teamTablePath/files"),
+                "$LOCAL_ONLY_PREFIX/namespaces/team_42",
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+            }
+
+            // Another method on a read route: 405, no marker.
+            for (target in listOf(teamPath, teamTablePath)) {
+                val posted =
+                    client.post(localOnly(target)) {
+                        header(HttpHeaders.Authorization, "Bearer $jwt")
+                        setBody("{}")
+                    }
+                assertThat(posted.status).describedAs(target).isEqualTo(HttpStatusCode.MethodNotAllowed)
+                assertThat(posted.headers[HttpHeaders.Allow]).isEqualTo("GET")
+                assertThat(posted.headers[LOCAL_ONLY_MARKER]).isNull()
+                val head = client.head(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(head.status).describedAs(target).isEqualTo(HttpStatusCode.MethodNotAllowed)
+            }
+
+            // A bound route with a malformed query: 400 with the marker, never absence.
+            for (target in listOf(
+                localOnly("$teamPath?snapshot=5"),
+                localOnly("$teamTablePath?totals=true"),
+                localOnly("$teamTablePath?totals=false&totals=false"),
+                localOnly("$teamTablePath/scan"),
+                localOnly("$teamTablePath/scan?snapshot=5"),
+                localOnly("$teamTablePath/scan?snapshot=5&snapshot=5&table_uuid=$tableUuid"),
+                localOnly("$teamTablePath/scan?snapshot=05&table_uuid=$tableUuid"),
+                localOnly("$teamTablePath/scan?snapshot=5&table_uuid=${tableUuid.uppercase()}"),
+                localOnly("$teamTablePath/scan?snapshot=5&table_uuid=$tableUuid&include=column_stats"),
+            )) {
+                val response = client.get(target) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.BadRequest)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isEqualTo("true")
+            }
+
+            assertThat(requests).isEmpty()
+            assertThat(remoteRequests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `a server without the routes cannot match a local-only path to an ordinary route`() {
+        // The policy table is the one an older server also has: no entry matches any local-only path.
+        for (target in listOf(teamPath, teamTablePath, "$teamTablePath/scan")) {
+            assertThat(AuthPolicy.match(HttpMethod.Get, localOnly(target))).describedAs(target).isNull()
+            assertThat(ScopedNamespaceBinding.canonicalLocalOnlyPath(localOnly(target))).isEqualTo(target)
+        }
+        assertThat(ScopedNamespaceBinding.canonicalLocalOnlyPath(teamPath)).isNull()
+        assertThat(ScopedNamespaceBinding.isLocalOnlyPath("/v1/local-onlyx/catalogs/example-catalog")).isFalse()
+    }
+
+    @Test
+    fun `a listener without a read session refuses the local-only routes without the marker`() =
+        testApplication {
+            val remoteRequests = CopyOnWriteArrayList<String>()
+            val cfg = config(enabled = false, readFixture = true, mountHostsJson = teamRelay(remoteRequests))
+            application { harness(cfg, readFixture = true) }
+            for (jwt in listOf(readVector["token"].asText(), sharedSession())) {
+                for (target in listOf(teamPath, teamTablePath, teamScanPath)) {
+                    val response = client.get(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+                    assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotImplemented)
+                    assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+                }
+            }
+            assertThat(requests).isEmpty()
+            assertThat(remoteRequests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the public listener refuses the local-only routes`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            application { harness(cfg, readFixture = true, publicListener = true) }
+            for (target in listOf(readPath, readTablePath, "$readScanPath?snapshot=5&table_uuid=$tableUuid")) {
+                val response =
+                    client.get(localOnly(target)) {
+                        header(HttpHeaders.Authorization, "Bearer ${readVector["token"].asText()}")
+                    }
+                assertThat(response.status).describedAs(target).isEqualTo(HttpStatusCode.NotImplemented)
+                assertThat(response.headers[LOCAL_ONLY_MARKER]).describedAs(target).isNull()
+            }
+            assertThat(requests).isEmpty()
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `the local-only routes read an ordinary bound namespace and table as the plain routes do`() =
+        testApplication {
+            val cfg = config(withReadSession = true, table = "metrics")
+            assertThat(cfg.scopedNamespaceBinding?.localOnly).isFalse()
+            application { harness(cfg, readFixture = true) }
+            val jwt = readVector["token"].asText()
+            body = success
+            val namespace = client.get(localOnly(readPath)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(namespace.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(namespace.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+            body = tableSuccess
+            val table = client.get(localOnly(readTablePath)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(table.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(table.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+            // The plain route is unchanged for a client that predates the routes, and carries no marker.
+            val plain = client.get(readTablePath) { header(HttpHeaders.Authorization, "Bearer $jwt") }
+            assertThat(plain.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(plain.headers[LOCAL_ONLY_MARKER]).isNull()
+            assertThat(requests.map { it.first }).containsExactly(
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports",
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics",
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics",
+            )
             assertThat(legacy).isEmpty()
         }
 }

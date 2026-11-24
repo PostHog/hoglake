@@ -85,7 +85,9 @@ class CatalogStoreSelector(
         catalog: String,
         namespace: String,
     ): ScopedNamespaceBinding? =
-        cfg?.scopedNamespaceBinding?.takeIf { it.catalog == catalog && it.namespace == namespace }
+        cfg?.scopedNamespaceBinding?.takeIf {
+            it.catalog == catalog && it.namespace == namespace
+        }
 
     /** Select the bound table only when the request holds the verified read session. */
     internal fun scopedTableBinding(
@@ -95,7 +97,8 @@ class CatalogStoreSelector(
         table: String,
     ): ScopedNamespaceBinding? =
         cfg?.scopedNamespaceBinding?.takeIf {
-            call.verifiedBackendAuthority?.readSessionBinding === it &&
+            !it.localOnly &&
+                call.verifiedBackendAuthority?.readSessionBinding === it &&
                 it.catalog == catalog &&
                 it.namespace == namespace &&
                 it.table == table &&

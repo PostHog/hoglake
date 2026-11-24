@@ -187,4 +187,43 @@ class ScopedNamespaceConfigTest {
             cfg.copy(servedNamespacesFile = file("served.json", served), authSessionProfile = "on")
         }.hasMessageContaining("cannot coexist")
     }
+
+    @Test
+    fun `a read session binding of an exactly relayed name is local only and other reserved names stay blocked`() {
+        val settings = """{"profile":"example.aws-session","remote_targets":["remote:events","remote:imports"]}"""
+        val teamHost =
+            """{"hosts":[{"id":"$id","match":{"type":"namespace_family","family":"team"},"kind":"hoglake",""" +
+                """"url":"https://host.invalid","auth":"forward"}]}"""
+        val reportsHost =
+            """{"hosts":[{"id":"$id","match":{"type":"namespace","name":"reports"},"kind":"hoglake",""" +
+                """"url":"https://host.invalid","auth":"forward"}]}"""
+
+        fun session(namespace: String) =
+            binding.replace("\"reports\"", "\"$namespace\"").dropLast(1) +
+                ""","read_session":$settings,"table":"metrics"}"""
+
+        fun withHosts(
+            text: String,
+            hosts: String,
+        ): Config = config(text).copy(mountHostsFile = file("hosts.json", hosts), authSessionProfile = "on")
+
+        // Canonical team name under the team family, and an exact namespace entry: local only.
+        val team = withHosts(session("team_42"), teamHost)
+        assertThat(team.scopedNamespaceBinding?.namespace).isEqualTo("team_42")
+        assertThat(team.scopedNamespaceBinding?.localOnly).isTrue()
+        assertThat(withHosts(session("reports"), reportsHost).scopedNamespaceBinding?.localOnly).isTrue()
+
+        // No relay for the name: an ordinary binding, exactly as before.
+        assertThat(config(session("reports")).scopedNamespaceBinding?.localOnly).isFalse()
+        assertThat(config(session("team_42")).scopedNamespaceBinding?.localOnly).isFalse()
+
+        // A covered name that is not relayed, an operator-reserved name, and a binding without a session stay refused.
+        assertThatThrownBy { withHosts(session("TEAM_42"), teamHost) }.hasMessageContaining("reserved namespace")
+        assertThatThrownBy {
+            withHosts(session("team_42"), teamHost).copy(reservedNamespaceNames = setOf("team_42"))
+        }.hasMessageContaining("reserved namespace")
+        assertThatThrownBy {
+            withHosts(binding.replace("\"reports\"", "\"team_42\""), teamHost)
+        }.hasMessageContaining("reserved namespace")
+    }
 }

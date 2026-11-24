@@ -1526,7 +1526,20 @@ data class Config(
             teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
         )
 
-    internal val scopedNamespaceBinding: ScopedNamespaceBinding? = ScopedNamespaceBinding.read(scopedNamespaceFile)
+    /**
+     * The binding of [scopedNamespaceFile]. A read-session binding can name a
+     * namespace that a configured remote schema relays by that exact name, when
+     * the operator's own reserved names do not include it. That binding is
+     * local-only ([ScopedNamespaceBinding.localOnly]): the relay stays the
+     * answer for every request on an ordinary route. Only the local-only routes select it.
+     */
+    internal val scopedNamespaceBinding: ScopedNamespaceBinding? =
+        ScopedNamespaceBinding.read(scopedNamespaceFile)?.let { binding ->
+            val relayed =
+                mountHosts.any { (it.match as? MountMatch.RemoteSchemaMatch)?.relays(binding.namespace) == true }
+            val operatorReserved = ReservedNamespaces(reservedNamespaceNames).isReserved(binding.namespace)
+            if (binding.readSession != null && relayed && !operatorReserved) binding.copy(localOnly = true) else binding
+        }
 
     /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
     val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
@@ -1586,7 +1599,8 @@ data class Config(
             require(!MountNames.isReserved(binding.catalog)) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved mount"
             }
-            require(!reservedNamespaces.isReserved(binding.namespace)) {
+            // A local-only binding is reserved by design: its name is also a relayed remote schema.
+            require(binding.localOnly || !reservedNamespaces.isReserved(binding.namespace)) {
                 "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved namespace"
             }
             // Served namespaces require SQL to check local catalog placement.

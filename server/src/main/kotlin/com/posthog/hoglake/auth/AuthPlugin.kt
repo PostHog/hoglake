@@ -337,6 +337,13 @@ val HoglakeAuth =
                 call.application.attributes.getOrNull(AuthServiceKey)
                     ?: throw IllegalStateException("HoglakeAuth installed without an AuthService: this is a wiring bug")
 
+            val configured = call.application.attributes.getOrNull(ReadSessionBindingKey)
+            // Before the mode check: a local-only path never reaches a handler without the read-session verifier.
+            if (ScopedNamespaceBinding.isLocalOnlyPath(call.request.path())) {
+                selectLocalOnly(call, service, configured)
+                return@onCall
+            }
+
             if (!service.mode.resolvesCallers) return@onCall
 
             val method = call.request.httpMethod
@@ -344,10 +351,7 @@ val HoglakeAuth =
             val match = AuthPolicy.match(method, path)
             // Kept for the store's check (StoreEntitlement.kt), which asks for what this route demands.
             match?.let { call.attributes.put(RouteMatchKey, it) }
-            val readBinding =
-                call.application.attributes.getOrNull(ReadSessionBindingKey)?.takeIf {
-                    it.matches(method, match)
-                }
+            val readBinding = configured?.takeIf { it.matches(method, match) }
             val readProfile = readBinding?.readSession
             val token =
                 bearerToken(call)?.takeIf {
@@ -472,6 +476,118 @@ val HoglakeAuth =
             call.attributes.put(RefusalCountedKey, Unit)
         }
     }
+
+/**
+ * Proof that the auth plugin selected this local-only request for [binding]
+ * with the read-session verifier. Only [selectLocalOnly] constructs it. A
+ * local-only route serves nothing without it.
+ */
+internal class LocalOnlySelection private constructor(
+    val binding: ScopedNamespaceBinding,
+    val decision: AuthDecision.ByNamespace,
+) {
+    internal companion object {
+        fun of(
+            binding: ScopedNamespaceBinding,
+            decision: AuthDecision.ByNamespace,
+        ) = LocalOnlySelection(binding, decision)
+    }
+}
+
+private val LocalOnlySelectionKey = AttributeKey<LocalOnlySelection>("HoglakeLocalOnlySelection")
+
+/** The plugin's selection of this local-only request, or null when it selected none. */
+internal val ApplicationCall.localOnlySelection: LocalOnlySelection?
+    get() = attributes.getOrNull(LocalOnlySelectionKey)
+
+/**
+ * Decide a request on a local-only path ([ScopedNamespaceBinding.LOCAL_ONLY_PREFIX]).
+ * It either answers the request or records a [LocalOnlySelection] for the
+ * route. Every listener without a read-session binding answers 501, in every
+ * auth mode. A path that is not one of the three read routes answers 422, and
+ * another method answers 405. These answers do not carry the marker. Every
+ * later answer carries [ScopedNamespaceBinding.LOCAL_ONLY_MARKER]. A token
+ * failure stays a 401. A verified session that names anything but the bound
+ * read gets ordinary absence.
+ */
+private suspend fun selectLocalOnly(
+    call: ApplicationCall,
+    service: AuthService,
+    configured: ScopedNamespaceBinding?,
+) {
+    val profile = configured?.readSession
+    val verifier = service.verifier
+    if (profile == null || !service.mode.resolvesCallers || verifier == null) {
+        call.respondRefusal(HoglakeException.NotSupported("local-only reads are not configured on this listener"))
+        return
+    }
+    // The ordinary pattern, for the policy match only. The route still matches the raw path.
+    val match =
+        ScopedNamespaceBinding.canonicalLocalOnlyPath(call.request.path())
+            ?.let { AuthPolicy.match(HttpMethod.Get, it) }
+            ?.takeIf { it.pattern in ScopedNamespaceBinding.LOCAL_ONLY_PATTERNS }
+    if (match == null) {
+        call.respondRefusal(HoglakeException.Validation("invalid local-only request"))
+        return
+    }
+    if (call.request.httpMethod != HttpMethod.Get) {
+        call.response.header(HttpHeaders.Allow, HttpMethod.Get.value)
+        call.respond(
+            HttpStatusCode.MethodNotAllowed,
+            ApiErrorDto(
+                error = "method_not_allowed",
+                detail = "${call.request.httpMethod.value} is not served on this path",
+            ),
+        )
+        return
+    }
+    call.response.headers.append(
+        ScopedNamespaceBinding.LOCAL_ONLY_MARKER,
+        ScopedNamespaceBinding.LOCAL_ONLY_MARKER_VALUE,
+    )
+    call.attributes.put(RouteMatchKey, match)
+
+    val token = bearerToken(call)?.takeIf { call.request.headers.getAll(HttpHeaders.Authorization)?.size == 1 }
+    var caller: Caller? = null
+    var grants: ReadSessionStorageGrants? = null
+    var failure: HoglakeException? = null
+    if (token != null) {
+        try {
+            val (verifiedCaller, verifiedGrants) = verifier.verifyReadSessionWithGrants(token, profile)
+            caller = verifiedCaller
+            grants = verifiedGrants
+        } catch (v: JwtViolation) {
+            AuthLog.debug(v) { "token refused for ${call.request.path()}" }
+            failure = HoglakeException.Unauthenticated(v.reason, "token refused")
+        }
+    }
+    if (caller == null || token == null) {
+        call.attributes.put(AuthStateKey, AuthState.Anonymous)
+        val refusal = failure ?: HoglakeException.Unauthenticated(JwtViolation.NO_TOKEN, "a bearer token is required")
+        countRefusal(service, service.clientClass(call), null, match, refusal, enforced = true)
+        call.respondRefusal(refusal)
+        return
+    }
+    val binding = configured.takeIf { it.matches(HttpMethod.Get, match, localOnlyRequest = true) }
+    call.attributes.put(
+        AuthStateKey,
+        AuthState.Authenticated(caller, VerifiedBackendAuthority(token, binding, grants)),
+    )
+    val decision = AuthPolicy.authorize(caller, match)
+    if (binding == null || decision !is AuthDecision.ByNamespace) {
+        // A verified session gets ordinary absence for an unbound name. Any other denial keeps its own answer.
+        val refusal =
+            if (binding == null) {
+                HoglakeException.NotFound("namespace")
+            } else {
+                failureFor(decision, match) ?: HoglakeException.NotFound("namespace")
+            }
+        countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
+        call.respondRefusal(refusal)
+        return
+    }
+    call.attributes.put(LocalOnlySelectionKey, LocalOnlySelection.of(binding, decision))
+}
 
 internal suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
     val (status, body) = errorBody(failure)

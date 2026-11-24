@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.ScopedNamespaceBinding
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.server.application.Application
@@ -97,7 +98,7 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
             if (call.request.httpMethod != HttpMethod.Get) {
                 null
             } else {
-                selector.scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeIf {
+                selector.ordinaryScopedBinding(pending)?.takeIf {
                     it.matchesNamespace(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
                 }?.let { binding ->
                     ScopedNamespaceRead {
@@ -122,7 +123,7 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         },
         scopedTableRoute = { call, pending ->
             val match = call.attributes.getOrNull(RouteMatchKey)
-            val binding = selector.scopedNamespaceBinding(pending.catalog, pending.namespace)
+            val binding = selector.ordinaryScopedBinding(pending)
             binding != null &&
                 (
                     binding.matchesTable(call.request.httpMethod, match) ||
@@ -132,6 +133,14 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         },
     )
 }
+
+/**
+ * The exact tuple binding for the ordinary routes. The ordinary routes never
+ * select a local-only binding: only the local-only routes read it, so every
+ * ordinary request keeps the relay.
+ */
+private fun CatalogStoreSelector.ordinaryScopedBinding(pending: AuthDecision.ByNamespace): ScopedNamespaceBinding? =
+    scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeUnless { it.localOnly }
 
 private fun Application.installCallNamespaceGate(
     dataPath: (ApplicationCall, String) -> String?,
