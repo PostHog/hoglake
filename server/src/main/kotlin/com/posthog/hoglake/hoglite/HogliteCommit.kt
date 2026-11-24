@@ -1364,9 +1364,10 @@ internal object HogliteCommit {
             return statements.size - 1
         }
 
-        /** The catalog's meta row; a missing one is the missing catalog, as [HogliteCatalogStore.meta]. */
+        /** The catalog's meta row; a missing or foreign one is the missing catalog, as [HogliteCatalogStore.meta]. */
         fun meta(): HogliteCatalogStore.MetaRow =
             store.metaRow(
+                catalog,
                 results[metaAt].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"),
             )
 

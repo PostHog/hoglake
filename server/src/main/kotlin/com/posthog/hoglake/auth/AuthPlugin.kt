@@ -342,7 +342,7 @@ val HoglakeAuth =
             val configured = call.application.attributes.getOrNull(ReadSessionConfigKey)
             // Before the mode check: a local-only path never reaches a handler without the read-session verifier.
             if (ReadSessionProfile.isLocalOnlyPath(call.request.path())) {
-                selectLocalOnly(call, service, configured)
+                selectLocalOnly(call, service, configured?.takeUnless { it.servedOnly })
                 return@onCall
             }
 
@@ -355,8 +355,14 @@ val HoglakeAuth =
             match?.let { call.attributes.put(RouteMatchKey, it) }
             val readConfig =
                 configured?.takeIf {
-                    ReadSessionProfile.isEligibleRoute(method, match, it.reservedNamespaces) ||
-                        ReadSessionProfile.isRelayRoute(method, match, it.relays)
+                    ReadSessionProfile.isServedRoute(method, match, it.serves) ||
+                        (
+                            !it.servedOnly &&
+                                (
+                                    ReadSessionProfile.isEligibleRoute(method, match, it.reservedNamespaces) ||
+                                        ReadSessionProfile.isRelayRoute(method, match, it.relays)
+                                )
+                        )
                 }
             val rawToken = bearerToken(call)
             val useReadSession =
@@ -822,8 +828,8 @@ internal fun Application.installAuth(
     readSessionConfig: ReadSessionConfig?,
 ) {
     if (readSessionConfig != null) {
-        require(service.mode == AuthMode.ENFORCE && !service.tenantOnly) {
-            "read session requires the enforcing API listener"
+        require(service.mode == AuthMode.ENFORCE && (!service.tenantOnly || readSessionConfig.servedOnly)) {
+            "read session requires the enforcing API listener, or served routes only on the public listener"
         }
         attributes.put(ReadSessionConfigKey, readSessionConfig)
     }
