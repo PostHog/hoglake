@@ -44,6 +44,11 @@ public:
 	const string &DataPath() const {
 		return data_path;
 	}
+	//! The server advertised this capability for the catalog at attach
+	//! (Catalog.capabilities; each gates a write).
+	bool HasCapability(const string &capability) const {
+		return capabilities.find(capability) != capabilities.end();
+	}
 	//! Attach-scoped pin: valid when SNAPSHOT_VERSION was given.
 	optional_idx AttachSnapshotVersion() const {
 		return options.snapshot_version;
@@ -85,6 +90,8 @@ private:
 	unique_ptr<HoglakeApiClient> api_client;
 	//! catalog data_path as recorded on the server (fetched at attach)
 	string data_path;
+	//! Catalog.capabilities as advertised at attach
+	set<string> capabilities;
 };
 
 } // namespace duckdb
