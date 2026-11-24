@@ -563,7 +563,12 @@ private suspend fun selectLocalOnly(
     }
     if (caller == null || token == null) {
         call.attributes.put(AuthStateKey, AuthState.Anonymous)
-        val refusal = failure ?: HoglakeException.Unauthenticated(JwtViolation.NO_TOKEN, "a bearer token is required")
+        val refusal =
+            if (failure != null) {
+                failure
+            } else {
+                HoglakeException.Unauthenticated(JwtViolation.NO_TOKEN, "a bearer token is required")
+            }
         countRefusal(service, service.clientClass(call), null, match, refusal, enforced = true)
         call.respondRefusal(refusal)
         return
@@ -580,7 +585,8 @@ private suspend fun selectLocalOnly(
             if (binding == null) {
                 HoglakeException.NotFound("namespace")
             } else {
-                failureFor(decision, match) ?: HoglakeException.NotFound("namespace")
+                val denied = failureFor(decision, match)
+                if (denied != null) denied else HoglakeException.NotFound("namespace")
             }
         countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
         call.respondRefusal(refusal)
