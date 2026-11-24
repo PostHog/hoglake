@@ -39,6 +39,7 @@ import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.StorageUsage
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.TableSummaryInfo
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
@@ -271,14 +272,22 @@ class HogliteCatalogStore(
                 author,
                 message,
             )
-            try {
-                client.tx(tenantId, freshTxid("create-catalog"), null, boot.statements())
-            } catch (g: HogliteGuardFailure) {
-                throw boot.classify(g)
-            } catch (r: HogliteRejected) {
-                throw mapRejected(name, r)
-            }
-            return getCatalog(name)
+            // The answer is read IN the transaction: a read after it could
+            // fail although the create applied, and invite its replay (#682).
+            val created = boot.add(metaSql)
+            val results =
+                try {
+                    client.tx(tenantId, freshTxid("create-catalog"), null, boot.statements())
+                } catch (g: HogliteGuardFailure) {
+                    throw boot.classify(g)
+                } catch (r: HogliteRejected) {
+                    throw mapRejected(name, r)
+                } catch (u: HoglakeException.CommitOutcomeUnknown) {
+                    // A DDL like the ones runTx classifies: a replay meets the
+                    // meta guard above and reads as its own 409 (#682).
+                    throw u.withReplay(WriteReplay.DDL)
+                }
+            return metaRow(results[created].firstRow()!!).toCatalogInfo()
         }
 
     override fun getCatalog(name: String): CatalogInfo =
@@ -525,6 +534,12 @@ class HogliteCatalogStore(
                 "or wait out their expiry window)"
         }
         fence.add("UPDATE meta SET dropping = 1 WHERE id = 1")
+        // Replay-safe (the client's default), unlike the other DDLs: a
+        // lost answer leaves the catalog fenced but present, and a replay
+        // passes the same guards (nothing can write past the fence), sets
+        // `dropping = 1` again, and goes on to the release and delete
+        // below, which are idempotent. So the 503 keeps its Retry-After
+        // and no CommitOutcomeUnknown catch reclassifies it (#682).
         try {
             client.tx(tenantId, freshTxid("drop-fence"), null, fence.statements())
         } catch (g: HogliteGuardFailure) {
@@ -618,7 +633,7 @@ class HogliteCatalogStore(
                     "(SELECT next_namespace_id - 1 FROM meta WHERE id = 1))",
             )
             val readback = tx.add(HogliteSql.READBACK_DDL)
-            val results = runTx(catalog, freshTxid("create-ns"), null, tx)
+            val results = runTx(catalog, freshTxid("create-ns"), null, tx, replay = WriteReplay.DDL)
             val row = results[readback].firstRow()!!
             return NamespaceInfo(namespaceId = row[3].asLong(), name = name)
         }
@@ -730,7 +745,7 @@ class HogliteCatalogStore(
                 ns.namespaceId,
             )
             val readback = tx.add(HogliteSql.READBACK_DDL)
-            val results = runTx(catalog, freshTxid("drop-ns"), null, tx)
+            val results = runTx(catalog, freshTxid("drop-ns"), null, tx, replay = WriteReplay.DDL)
             val row = results[readback].firstRow()!!
             return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
         }
@@ -930,6 +945,9 @@ class HogliteCatalogStore(
                 containment?.value,
                 ns.namespaceId,
             ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
+            // Replay-safe (runTx's default): marking again with the same
+            // value, or clearing an already clear namespace, passes every
+            // guard and lands the same row.
             runTx(catalog, freshTxid("ns-containment"), null, tx)
             return ns.copy(containment = containment)
         }
@@ -1188,7 +1206,7 @@ class HogliteCatalogStore(
                     "(SELECT next_table_id - 1 FROM meta WHERE id = 1))",
             )
             val readback = tx.add(HogliteSql.READBACK_DDL)
-            val results = runTx(catalog, freshTxid("create-table"), null, tx)
+            val results = runTx(catalog, freshTxid("create-table"), null, tx, replay = WriteReplay.DDL)
             val row = results[readback].firstRow()!!
             val snapshotId = row[0].asLong()
             return TableInfo(
@@ -1581,7 +1599,7 @@ class HogliteCatalogStore(
                 t.tableId,
             )
             val readback = tx.add(HogliteSql.READBACK_DDL)
-            val results = runTx(catalog, freshTxid("drop-table"), null, tx)
+            val results = runTx(catalog, freshTxid("drop-table"), null, tx, replay = WriteReplay.DDL)
             val row = results[readback].firstRow()!!
             return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
         }
@@ -1655,7 +1673,7 @@ class HogliteCatalogStore(
                 t.tableId,
             )
             val readback = tx.add(HogliteSql.READBACK_DDL)
-            val results = runTx(catalog, freshTxid("truncate"), null, tx)
+            val results = runTx(catalog, freshTxid("truncate"), null, tx, replay = WriteReplay.DDL)
             val row = results[readback].firstRow()!!
             return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
         }
@@ -2334,7 +2352,9 @@ class HogliteCatalogStore(
             // Monotonic: never move BACKWARDS. An EQUAL re-commit is the
             // Postgres upsert's `<= EXCLUDED` arm — accepted, a no-op — which
             // is what makes a client retry of a timed-out-but-applied call
-            // safe (each call carries a fresh txid).
+            // safe (each call carries a fresh txid, and runTx's default
+            // WriteReplay.CONVERGES keeps the Retry-After on an unknown
+            // outcome).
             // The expiry floor, re-asserted IN the transaction: the preflight
             // read is a separate request, and a sweep that advanced the floor
             // in between must not let this offset land below it.
@@ -3104,6 +3124,19 @@ class HogliteCatalogStore(
      * statement is what stops any later write (namespace create, commit)
      * from landing between those checks and the tenant's
      * deletion. Bootstrap opts out (it is what CREATES the meta row).
+     *
+     * [txid] is fresh per call, so a transaction whose answer was lost
+     * surfaces as [HoglakeException.CommitOutcomeUnknown] and the API
+     * caller's retry is a NEW transaction. [replay] says what that retry
+     * does (#682), and so whether the 503 invites one with `Retry-After`:
+     * the default, [WriteReplay.CONVERGES], when a blind replay reaches
+     * the same state and answers 200; [WriteReplay.KEYLESS_COMMIT] or
+     * [WriteReplay.DDL] when it would apply a second time or be refused
+     * as already applied. The client raises every unknown outcome as a
+     * converging one; the other classes re-raise it with the write's own
+     * (same txid and detail, the client's as cause), so the 503 carries
+     * no `Retry-After` and its detail says to read before deciding, as a
+     * lost COMMIT acknowledgement on PostgreSQL (a 500) invites nothing.
      */
     internal fun runTx(
         catalog: String,
@@ -3111,6 +3144,7 @@ class HogliteCatalogStore(
         fp: String?,
         tx: HogliteTx,
         fenced: Boolean = true,
+        replay: WriteReplay = WriteReplay.CONVERGES,
     ): List<HogliteQueryResult> =
         try {
             val statements =
@@ -3140,6 +3174,9 @@ class HogliteCatalogStore(
             throw tx.classify(g)
         } catch (r: HogliteRejected) {
             throw mapRejected(catalog, r)
+        } catch (u: HoglakeException.CommitOutcomeUnknown) {
+            if (replay == WriteReplay.CONVERGES) throw u
+            throw u.withReplay(replay)
         }
 
     internal fun queryCatalog(

@@ -157,6 +157,43 @@ store bug, never a client error. Tenants have no migrations, so a schema
 change (this one included) means dropping and recreating every
 development tenant.
 
+Every hoglite write is one engine transaction under a fresh txid, and
+one whose answer is lost after it may have applied surfaces as 503
+`commit_outcome_unknown` (`HogliteClient` KDoc, "Retry taxonomy"). The
+server itself retries that txid exactly-once within its budget; an API
+caller's retry is a new transaction, so whether the 503 invites one with
+`Retry-After` is decided per write at its `runTx` call (`WriteReplay`,
+#682). The rule: a write is replay-safe by default, and names itself
+replay-unsafe when a blind replay would not converge. Replay-unsafe, so
+no `Retry-After` and a detail that says to read before deciding: a
+commit WITHOUT an `idempotency_key` (duplicate paths are legal, so a
+replay registers the same files a second time; the detail says to send a
+key next time), and every DDL but one, whose replay applies a second
+time (a truncate ends the files committed in between, a sort-order
+change re-applies) or is refused as already applied (a create 409, a
+drop 404, an add-column 422 "already exists"): a catalog create,
+namespace, table and view create and drop, truncate, alter. Everything
+else keeps the header: a commit under its `idempotency_key` (the receipt
+is replayed), an offset commit (an equal re-commit is a no-op), an
+options patch, a containment mark or clear, an upload claim (keyed by
+its upload id), renewal, abandonment or sweep, a table creation's
+prepare, publish or abort (keyed by its operation id), the maintenance
+tasks, and the one DDL whose replay converges: a catalog drop, whose
+fence transaction opts out of the fence, so a replay of a drop that lost
+its answer passes the same emptiness guards (nothing can write past the
+fence), sets `dropping = 1` again, and goes on to the release and delete,
+which are idempotent. Every DDL reads its answer IN its transaction (an
+alter's totals and a catalog create's meta row included), as
+PostgreSQL's `AlterService` does: a read after the commit could spend
+its retry budget and answer `backend_unavailable` with `Retry-After` for
+a DDL that applied. PostgreSQL's lost acknowledgement is a 500 and
+invites nothing either. Neither backend accepts an idempotency key on a
+DDL route, so this is part of #682, not all of it: withholding the
+header protects only a client that honours it, and a truncate whose
+outcome is unknown still cannot be retried exactly-once. The optional
+key on the DDL and offset routes that the issue also asks for stays
+open under #682 itself.
+
 ## Feature walkthroughs
 
 ### Commits and concurrency control

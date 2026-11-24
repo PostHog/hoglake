@@ -3985,15 +3985,30 @@ components:
       description: >
         The catalog backend did not answer. Only a catalog backend that is
         reached over the network returns these codes; the PostgreSQL
-        backend does not. Both are retryable: back off per the
-        Retry-After header and retry. `backend_unavailable`: the backend
-        did not answer, and nothing was applied that the server knows of.
-        `commit_outcome_unknown`: a commit that the backend may or may not
-        have applied. A retry with the same `idempotency_key` is
-        exactly-once. PostgreSQL admission failures may return commit_queue_timeout;
-        containment verification may return containment_unverified. Both are retryable.
-        A retry without a key can apply the commit a second
-        time, as after a lost COMMIT acknowledgement on PostgreSQL.
+        backend does not. `backend_unavailable`: the backend did not
+        answer, and nothing was applied that the server knows of;
+        retryable, back off per the Retry-After header and retry.
+        `commit_outcome_unknown`: a write that the backend may or may not
+        have applied. It carries Retry-After when a replay of the request
+        converges, which is the default: a commit with an
+        `idempotency_key` (the retry is exactly-once), an offset commit,
+        an options patch, a containment mark or clear, the upload claim
+        verbs, table-creation prepare, publish and abort, the maintenance
+        tasks, and a catalog drop (the drop that lost its answer left the
+        catalog fenced; the replay passes the same emptiness guards and
+        finishes it). It carries no Retry-After when a replay would not
+        converge: a commit WITHOUT an `idempotency_key` (a replay
+        registers the same files a second time, as after a lost COMMIT
+        acknowledgement on PostgreSQL; send a key next time) and every
+        other DDL (create a catalog; create or drop a namespace, table or
+        view; truncate; alter), whose replay applies the DDL a second time
+        (a truncate ends files committed in between, a sort-order change
+        re-applies) or is refused as already applied (409, 404, or 422
+        for an added column): read the object to learn whether it landed
+        before deciding, as after a lost COMMIT acknowledgement (a 500)
+        on PostgreSQL. PostgreSQL admission failures may return
+        commit_queue_timeout; containment verification may return
+        containment_unverified. Both are retryable.
       headers:
         Retry-After:
           description: Seconds to back off before retrying.

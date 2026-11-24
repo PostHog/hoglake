@@ -2624,6 +2624,50 @@ data class ChangesPlan(
     val deleteFiles: List<DeleteFile>,
 )
 
+/**
+ * What a blind replay of a hoglite write would do once its outcome is
+ * unknown ([HoglakeException.CommitOutcomeUnknown]), and so whether the
+ * 503 invites one with `Retry-After` (#682). Every hoglite write is one
+ * engine transaction under a fresh txid, so an API caller's retry is a
+ * NEW transaction; the server's own retry of the same txid is exactly-once
+ * and is not what this classifies. `runTx` defaults to [CONVERGES]; the
+ * write whose replay does not converge names its class at its call.
+ */
+enum class WriteReplay {
+    /**
+     * The replay reaches the same state and answers 200, so the 503
+     * carries `Retry-After`. `runTx`'s default, so every write not named
+     * below: a commit under its idempotency_key (the receipt is
+     * replayed), an offset commit (an equal re-commit is a no-op), an
+     * options patch, a containment mark or clear, an upload claim (keyed
+     * by its upload id), renewal or abandonment, a table creation's
+     * prepare, publish or abort (keyed by its operation id), the
+     * maintenance writes (server README, "Backends"), and one DDL: a
+     * catalog drop, whose fence transaction opts out of the fence, so a
+     * replay passes the same emptiness guards, sets `dropping = 1` again
+     * and goes on to the idempotent release and delete.
+     */
+    CONVERGES,
+
+    /**
+     * A commit without an idempotency_key: duplicate paths are legal, so
+     * a replay registers the same files a second time and answers 200.
+     * No `Retry-After`; the detail says to read the table and to send a
+     * key next time.
+     */
+    KEYLESS_COMMIT,
+
+    /**
+     * A DDL other than a catalog drop: the replay applies a second time
+     * (a truncate ends the files committed in between; a sort-order
+     * change re-applies) or is refused as already applied (a create
+     * answers 409, a namespace, table or view drop 404, an add-column 422
+     * "already exists"), which reads as the DDL's own failure. No
+     * `Retry-After`; the detail says to read the object before deciding.
+     */
+    DDL,
+}
+
 /** Service-level failures the API layer maps to status codes. */
 sealed class HoglakeException(message: String) : RuntimeException(message) {
     /** The selected backend does not implement this operation. */
@@ -2930,32 +2974,61 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     open class BackendUnavailable(detail: String) : HoglakeException(detail)
 
     /**
-     * A commit the backend may or may not have applied -> HTTP 503
-     * `commit_outcome_unknown` with `Retry-After`. Raised by the hoglite
-     * backend when a transaction's attempts ended after at least one that
-     * may have applied (the engine's 504 `outcome_unknown`: applied, then
-     * the owner failed before durability was confirmed; a transport
-     * failure after the request was sent) and no later answer settled it.
+     * A write the backend may or may not have applied -> HTTP 503
+     * `commit_outcome_unknown`, with `Retry-After` only when [replaySafe].
+     * Raised by the hoglite backend when a transaction's attempts ended
+     * after at least one that may have applied (the engine's 504
+     * `outcome_unknown`: applied, then the owner failed before durability
+     * was confirmed; a transport failure after the request was sent) and
+     * no later answer settled it.
      *
-     * It IS a [BackendUnavailable] (retryable, never a refusal: the commit
-     * may have landed, so nothing may treat it as final), with its own
-     * code so a writer can tell "the database did not answer" from "your
-     * commit may be durable". Inside the server, a retry of the SAME
-     * backend transaction ([txid]) is exactly-once. The txid is
-     * server-generated, so the message tells an API caller only what it
-     * can do: a retry with the same idempotency_key is exactly-once, and
-     * one without a key is at-least-once, the same as a lost COMMIT
-     * acknowledgement on Postgres. [txid] stays in the message for
-     * operators.
+     * It IS a [BackendUnavailable] (never a refusal: the write may have
+     * landed, so nothing may treat it as final), with its own code so a
+     * writer can tell "the database did not answer" from "your write may
+     * be durable". Inside the server, a retry of the SAME backend
+     * transaction ([txid]) is exactly-once. The txid is server-generated,
+     * so the message tells an API caller only what it can do. [txid]
+     * stays in the message for operators.
+     *
+     * [replay] says what a blind replay of the REQUEST does, and so
+     * whether the 503 may invite one with `Retry-After` (#682): only a
+     * [WriteReplay.CONVERGES] write is [replaySafe]. The other classes
+     * carry NO Retry-After, as PostgreSQL's lost COMMIT acknowledgement
+     * (a 500) carries none, and their detail says to read before
+     * deciding. The hoglite client raises every unknown outcome as
+     * [WriteReplay.CONVERGES]; the write that knows better re-raises it
+     * through [withReplay] at its `runTx` call.
      */
     class CommitOutcomeUnknown(
         val txid: String,
-        detail: String,
+        /** What the backend answered, or did not: the message's tail. */
+        val detail: String,
+        val replay: WriteReplay = WriteReplay.CONVERGES,
     ) : BackendUnavailable(
-            "commit outcome unknown: it may or may not have been applied. A retry with the same " +
-                "idempotency_key is exactly-once; without a key, read the table before a retry " +
-                "(backend transaction '$txid'): $detail",
-        )
+            when (replay) {
+                WriteReplay.CONVERGES ->
+                    "write outcome unknown: it may or may not have been applied. A retry converges: a commit " +
+                        "replays its receipt under the same idempotency_key, and any other write lands the " +
+                        "same state again (backend transaction '$txid'): $detail"
+                WriteReplay.KEYLESS_COMMIT ->
+                    "commit outcome unknown: it may or may not have been applied. Do not retry it blindly: " +
+                        "without an idempotency_key a replay registers the same files a second time. Read the " +
+                        "table to learn whether it landed, and send an idempotency_key with every commit so " +
+                        "that a retry is exactly-once (backend transaction '$txid'): $detail"
+                WriteReplay.DDL ->
+                    "operation outcome unknown: it may or may not have been applied. Do not retry it blindly: " +
+                        "a replay would apply it a second time or be refused as already applied. Read the " +
+                        "catalog, namespace, table or view to learn whether it landed " +
+                        "(backend transaction '$txid'): $detail"
+            },
+        ) {
+        /** Whether the 503 carries `Retry-After`: a blind replay of the request converges. */
+        val replaySafe: Boolean get() = replay == WriteReplay.CONVERGES
+
+        /** The same unknown outcome with the write's own replay class; this one, the client's report, as cause. */
+        fun withReplay(replay: WriteReplay): CommitOutcomeUnknown =
+            CommitOutcomeUnknown(txid, detail, replay).apply { initCause(this@CommitOutcomeUnknown) }
+    }
 
     /**
      * A commit to a table with the object-prefix layout registered a file

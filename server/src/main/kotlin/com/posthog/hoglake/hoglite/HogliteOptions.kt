@@ -92,6 +92,9 @@ internal class HogliteOptions(
                             "SELECT snapshot_retention_seconds, consumer_floor, earliest_snapshot_id " +
                                 "FROM meta WHERE id = 1",
                         )
+                    // Replay-safe (runTx's default): the patch sets values, and
+                    // the attribution guard passes against a retention it
+                    // already lowered.
                     val row =
                         store.runTx(catalog, HogliteCatalogStore.freshTxid("options-patch"), null, tx)[readback]
                             .firstRow()!!

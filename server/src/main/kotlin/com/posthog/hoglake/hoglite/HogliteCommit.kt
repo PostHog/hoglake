@@ -26,6 +26,7 @@ import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
@@ -1161,9 +1162,14 @@ internal object HogliteCommit {
         // Only a new materialization mints an identity. Exact transport retries
         // reuse this txid, fingerprint, statement layout, arguments and timestamps.
         val txid = "ch:$catalog:${UUID.randomUUID()}"
+        // An API caller's retry is a new transaction: under the same
+        // idempotency_key it replays the receipt, so an unknown outcome
+        // invites it; without a key it registers the files again (duplicate
+        // paths are legal), so the 503 carries no Retry-After (#682).
+        val replay = if (request.idempotencyKey == null) WriteReplay.KEYLESS_COMMIT else WriteReplay.CONVERGES
         val results =
             try {
-                store.runTx(catalog, txid, fingerprint, tx)
+                store.runTx(catalog, txid, fingerprint, tx, replay = replay)
             } catch (e: HoglakeException.CommitConflict) {
                 if (e !== RECEIPT_CHANGED) throw e
                 val key = checkNotNull(request.idempotencyKey)
@@ -1187,7 +1193,9 @@ internal object HogliteCommit {
                 if (endedCountAt.isEmpty()) null else endedCountAt.sumOf { results[it].firstRow()!![0].asLong() }
             return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong(), endedFiles = ended)
         } catch (e: Exception) {
-            throw HoglakeException.CommitOutcomeUnknown(txid, "invalid commit readback: ${e.message}")
+            // The transaction answered, so it applied; what a retry does is
+            // the same question as above.
+            throw HoglakeException.CommitOutcomeUnknown(txid, "invalid commit readback: ${e.message}", replay)
         }
     }
 

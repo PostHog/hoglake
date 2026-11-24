@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.model.boundReencodeFor
@@ -283,9 +284,29 @@ internal class HogliteAlters(
                     }
 
                     val readback = tx.add(HogliteSql.READBACK_DDL)
+                    // STAYS EXACT, like the Postgres path (#232): table_totals is
+                    // exact at head in-tx (commit, compaction, truncate and create
+                    // keep it), and an alter changes no file counts, so the row is
+                    // the totals at the snapshot this receipt answers for, in O(1)
+                    // under the write lock. Read IN the transaction, as
+                    // AlterService does: a read after the commit could fail
+                    // although the alter applied, and invite its replay (#682).
+                    val totals =
+                        tx.add(
+                            "SELECT COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), " +
+                                "COALESCE(tt.file_size_bytes,0) FROM tables t " +
+                                "LEFT JOIN table_totals tt ON tt.table_id = t.id WHERE t.id = ?",
+                            t.tableId,
+                        )
                     val results =
                         try {
-                            store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
+                            store.runTx(
+                                catalog,
+                                HogliteCatalogStore.freshTxid("alter"),
+                                null,
+                                tx,
+                                replay = WriteReplay.DDL,
+                            )
                         } catch (e: HoglakeException.CommitConflict) {
                             if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_FILE_SET_CHANGED) throw e
                             if (attempt == 1 || (e === ALTER_SCHEMA_CHANGED && readSnapshot != null)) {
@@ -298,23 +319,9 @@ internal class HogliteAlters(
                             // the next application plan gets a fresh tx/state/allocators.
                             continue
                         }
-                    // Decoding and postcommit reads are deliberately OUTSIDE the catch.
+                    // Decoding is deliberately OUTSIDE the catch.
                     val snapshotId = results[readback].firstRow()!![0].asLong()
-
-                    // STAYS EXACT, like the Postgres path (#232): the snapshot this
-                    // receipt answers for was allocated in this transaction, so no
-                    // sampler could have seen it; an alter is rare DDL beside which
-                    // one aggregate is noise.
-                    val agg =
-                        store.queryCatalog(
-                            catalog,
-                            "SELECT COALESCE(SUM(record_count),0), COUNT(*), COALESCE(SUM(file_size_bytes),0) " +
-                                "FROM files WHERE table_id = ? AND begin_snapshot <= ? " +
-                                "AND (end_snapshot IS NULL OR end_snapshot > ?)",
-                            t.tableId,
-                            snapshotId,
-                            snapshotId,
-                        ).firstRow()!!
+                    val agg = results[totals].firstRow()!!
                     return@catalogOperation TableInfo(
                         tableId = t.tableId,
                         tableUuid = t.tableUuid,

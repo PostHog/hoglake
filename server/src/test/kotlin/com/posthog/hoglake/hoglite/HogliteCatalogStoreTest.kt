@@ -285,7 +285,13 @@ class HogliteCatalogStoreTest {
                 }
             }
         }
-        return 200 to mapOf("results" to statements.map { result() })
+        // A create reads its meta row back in the transaction (#682).
+        val results =
+            statements.map {
+                val sql = it["sql"].asText()
+                if (sql == store.metaSql && t.name != null) result(metaRow(t)) else result()
+            }
+        return 200 to mapOf("results" to results)
     }
 
     private fun seed(
@@ -315,7 +321,9 @@ class HogliteCatalogStoreTest {
         assertThat(requests[2]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
         // The enforcement probe is statement 1, still before any DDL.
         assertThat(txStatements.single()[1]).isEqualTo(HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL)
-        // The read-back of the new catalog reuses the operation's binding.
+        // The new catalog is read back in the transaction, not after it (#682).
+        assertThat(txStatements.single().last()).isEqualTo(store.metaSql)
+        assertThat(requests).hasSize(3)
         assertThat(resolved.get()).isEqualTo(1)
     }
 

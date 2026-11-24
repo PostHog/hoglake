@@ -3,6 +3,7 @@ package com.posthog.hoglake.hoglite
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.ViewInfo
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ViewBackend
@@ -88,7 +89,14 @@ internal class HogliteViews(
                         "SELECT (SELECT next_snapshot - 1 FROM meta WHERE id = 1), " +
                             "(SELECT next_view_id - 1 FROM meta WHERE id = 1)",
                     )
-                val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("view-create"), null, tx)
+                val results =
+                    store.runTx(
+                        catalog,
+                        HogliteCatalogStore.freshTxid("view-create"),
+                        null,
+                        tx,
+                        replay = WriteReplay.DDL,
+                    )
                 val viewId = results[readback].firstRow()!![1].asLong()
                 return@catalogOperation ViewInfo(
                     viewId = viewId,
@@ -171,7 +179,14 @@ internal class HogliteViews(
                     view.viewId,
                 ) { HoglakeException.NotFound("view '$namespace.$name' in catalog '$catalog'") }
                 val readback = tx.add(HogliteSql.READBACK_DDL)
-                val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("view-drop"), null, tx)
+                val results =
+                    store.runTx(
+                        catalog,
+                        HogliteCatalogStore.freshTxid("view-drop"),
+                        null,
+                        tx,
+                        replay = WriteReplay.DDL,
+                    )
                 val row = results[readback].firstRow()!!
                 return@catalogOperation CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
             }
