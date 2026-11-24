@@ -2,14 +2,16 @@ package com.posthog.hoglake.store
 
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.NamespaceDto
+import com.posthog.hoglake.api.ScanFileDto
+import com.posthog.hoglake.api.TableDto
 import com.posthog.hoglake.auth.AuthPolicy
 import com.posthog.hoglake.auth.Caller
-import com.posthog.hoglake.auth.Jwt
-import com.posthog.hoglake.auth.JwtViolation
+import com.posthog.hoglake.auth.ReadSessionProfile
+import com.posthog.hoglake.auth.ReadSessionTarget
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.Scope
-import com.posthog.hoglake.auth.SessionProfile
 import com.posthog.hoglake.auth.StoreGrant
+import com.posthog.hoglake.auth.VerifiedBackendAuthority
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.refuseIgnoredRouting
 import com.posthog.hoglake.auth.remoteSchemasAmong
@@ -29,6 +31,7 @@ import com.posthog.hoglake.hoglite.HogliteCompactionCursors
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
+import com.posthog.hoglake.hoglite.ScopedReadOutcome
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.AlterBackend
@@ -77,51 +80,136 @@ class CatalogStoreSelector(
 
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
 
-    /** Select only the operator's exact tuple, without resolving a legacy store. */
-    internal fun scopedNamespaceBinding(
+    /** Return true when dedicated read sessions are enabled and the route targets an eligible local resource. */
+    internal fun allowsReadSessionRoute(
         catalog: String,
         namespace: String,
-    ): ScopedNamespaceBinding? =
-        cfg?.scopedNamespaceBinding?.takeIf { it.catalog == catalog && it.namespace == namespace }
+        table: String? = null,
+    ): Boolean {
+        val currentCfg = cfg ?: return false
+        if (currentCfg.readSession == null) return false
+        if (MountNames.isReserved(catalog) || currentCfg.reservedNamespaces.isReserved(namespace)) return false
+        return ReadSessionProfile.isCanonicalRoute(catalog, namespace, table)
+    }
+
+    /** Return true when the request holds a verified read session for a non-reserved local table route. */
+    internal fun isReadSessionTableRoute(
+        call: ApplicationCall,
+        catalog: String,
+        namespace: String,
+        table: String,
+    ): Boolean =
+        call.verifiedBackendAuthority?.isReadSession == true && allowsReadSessionRoute(catalog, namespace, table)
+
+    private fun resolveReadSessionRouting(
+        call: ApplicationCall,
+        catalog: String,
+        resource: String,
+    ): Triple<Caller, Routing, VerifiedBackendAuthority> {
+        val currentCfg = cfg ?: throw HoglakeException.NotFound(resource)
+        if (currentCfg.readSession == null) throw HoglakeException.NotFound(resource)
+        val caller = call.hoglakeAuth.callerOrNull
+        val routing = caller?.routing
+        if (caller?.kind != Caller.Kind.SCOPED || caller.routingIgnored ||
+            routing == null || routing.backend != BackendKind.HOGLITE ||
+            routing.catalog != catalog || routing.tenant == null ||
+            currentCfg.backendKinds[routing.backendId] != BackendKind.HOGLITE ||
+            caller.catalogScopes.keys != setOf(catalog) ||
+            !caller.catalogClaimAllows(catalog, Scope.READ)
+        ) {
+            throw HoglakeException.NotFound(resource)
+        }
+        val authority = call.verifiedBackendAuthority ?: throw HoglakeException.NotFound(resource)
+        if (!authority.isReadSession || authority.storageGrants == null || authority.token.length > 64 * 1024) {
+            throw HoglakeException.NotFound(resource)
+        }
+        return Triple(caller, routing, authority)
+    }
+
+    /** Terminal typed table read. No outcome selects another store or credential. */
+    internal fun readScopedTable(
+        call: ApplicationCall,
+        target: ReadSessionTarget,
+    ): TableDto {
+        val table = target.table ?: throw HoglakeException.NotFound("table")
+        if (!allowsReadSessionRoute(target.catalog, target.namespace, table)) {
+            throw HoglakeException.NotFound("table")
+        }
+        val (caller, routing, authority) = resolveReadSessionRouting(call, target.catalog, "table")
+        val tenant = checkNotNull(routing.tenant)
+        val outcome =
+            client(routing.backendId).forRequest(authority.token)
+                .readScopedTable(tenant, target.catalog, target.namespace, table)
+        return when (outcome) {
+            ScopedReadOutcome.NotFound -> throw HoglakeException.NotFound("table")
+            ScopedReadOutcome.Forbidden -> throw HoglakeException.Forbidden("access denied")
+            is ScopedReadOutcome.Found -> {
+                val result = outcome.value
+                val fields = checkNotNull(cfg).authPredicateFields.split(',').map { it.trim() }.toSet()
+                val mark = result.containment
+                if (mark.org != null || mark.field !in fields || mark.value <= 0) {
+                    throw HoglakeException.BackendUnavailable("hoglite scoped table read unavailable")
+                }
+                if (!caller.mayUseContained(target.catalog, mark.field, mark.value, null, Scope.READ)) {
+                    throw HoglakeException.NotFound("table")
+                }
+                result.table
+            }
+        }
+    }
+
+    /** Terminal typed scan read. Every returned file path must stay inside the verified primary-catalog grant. */
+    internal fun readScopedScan(
+        call: ApplicationCall,
+        target: ReadSessionTarget,
+        snapshot: Long,
+        tableUuid: UUID,
+    ): List<ScanFileDto> {
+        val table = target.table ?: throw HoglakeException.NotFound("table")
+        if (!allowsReadSessionRoute(target.catalog, target.namespace, table)) {
+            throw HoglakeException.NotFound("table")
+        }
+        val (_, routing, authority) = resolveReadSessionRouting(call, target.catalog, "table")
+        val tenant = checkNotNull(routing.tenant)
+        val grants = checkNotNull(authority.storageGrants)
+        val outcome =
+            client(routing.backendId).forRequest(authority.token)
+                .readScopedScan(tenant, target.catalog, target.namespace, table, snapshot, tableUuid)
+        return when (outcome) {
+            ScopedReadOutcome.NotFound -> throw HoglakeException.NotFound("table")
+            ScopedReadOutcome.Forbidden -> throw HoglakeException.Forbidden("access denied")
+            is ScopedReadOutcome.Found -> {
+                val files = outcome.value
+                for (file in files) {
+                    if (!grants.allowsPrimaryCatalogObject(target.catalog, file.dataFile.path)) {
+                        throw HoglakeException.Forbidden("access denied")
+                    }
+                    val dv = file.deleteFile
+                    if (dv != null && !grants.allowsPrimaryCatalogObject(target.catalog, dv.path)) {
+                        throw HoglakeException.Forbidden("access denied")
+                    }
+                }
+                files
+            }
+        }
+    }
 
     /** Terminal typed read. No outcome can select another store or credential. */
     internal fun readScopedNamespace(
         call: ApplicationCall,
-        binding: ScopedNamespaceBinding,
+        target: ReadSessionTarget,
     ): NamespaceDto? {
-        val caller = call.hoglakeAuth.callerOrNull
-        val expected = Routing(binding.catalog, BackendKind.HOGLITE, binding.backendId, binding.tenant)
-        if (binding != cfg?.scopedNamespaceBinding || caller?.kind != Caller.Kind.SCOPED || caller.routingIgnored ||
-            caller.routing != expected || caller.catalogScopes.keys != setOf(binding.catalog) ||
-            !caller.catalogClaimAllows(binding.catalog, Scope.READ)
-        ) {
+        if (!allowsReadSessionRoute(target.catalog, target.namespace)) {
             throw HoglakeException.NotFound("namespace")
         }
-        val authority = call.verifiedBackendAuthority ?: throw HoglakeException.NotFound("namespace")
-        val token = authority.token
-        if (token.length > 64 * 1024) throw HoglakeException.NotFound("namespace")
-        if (authority.readSessionBinding != null) {
-            if (authority.readSessionBinding !== binding) {
-                throw HoglakeException.NotFound("namespace")
-            }
-        } else {
-            // The ordinary namespace read does not forward embedded credentials.
-            val claims =
-                try {
-                    Jwt.parse(token).claims
-                } catch (_: JwtViolation) {
-                    throw HoglakeException.NotFound("namespace")
-                }
-            if (SessionProfile.carried(claims) || claims.has("storage")) {
-                throw HoglakeException.NotFound("namespace")
-            }
-        }
+        val (_, routing, authority) = resolveReadSessionRouting(call, target.catalog, "namespace")
+        val tenant = checkNotNull(routing.tenant)
         val result =
-            client(binding.backendId).forRequest(token)
-                .readScopedNamespace(binding.tenant, binding.catalog, binding.namespace) ?: return null
+            client(routing.backendId).forRequest(authority.token)
+                .readScopedNamespace(tenant, target.catalog, target.namespace) ?: return null
         val held = result.containment
         val fields = checkNotNull(cfg).authPredicateFields.split(',').map { it.trim() }.toSet()
-        if (result.name != binding.namespace || result.namespaceId?.let { it > 0 } != true ||
+        if (result.name != target.namespace || result.namespaceId?.let { it > 0 } != true ||
             result.remote != null || held == null || held.org != null || held.field !in fields || held.value <= 0
         ) {
             throw HoglakeException.BackendUnavailable("scoped namespace unavailable")
@@ -177,6 +265,9 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding {
+        if (call.verifiedBackendAuthority?.isReadSession == true) {
+            return readSessionRemoteSchema(call, catalog)
+        }
         call.attributes.getOrNull(boundCatalog)?.let { (name, handed) -> if (name == catalog) return handed.binding }
         // Before any binding: a name resolves only when the caller's token allows it.
         call.requireCatalogEntitlement(catalog)
@@ -267,8 +358,34 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.RemoteSchema? {
+        if (call.verifiedBackendAuthority?.isReadSession == true) {
+            return readSessionRemoteSchema(call, catalog)
+        }
         call.requireCatalogEntitlement(catalog)
         return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
+    }
+
+    /**
+     * The only binding a dedicated read session gets from this selector: the
+     * remote schema its request path names (docs/auth.md, "Read sessions on a
+     * remote schema"). Never a local store, a served namespace or a mount, and
+     * nothing is cached for the call. The catalog check comes first and
+     * answers for the catalog; every later failure is a missing namespace.
+     * The session's verified Hoglite placement proves this server holds the
+     * catalog, so no store is read, and the caller rule of §6.5c is the one
+     * [pathSchema] applies to every caller.
+     */
+    private fun readSessionRemoteSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.RemoteSchema {
+        call.requireCatalogEntitlement(catalog)
+        if (cfg?.readSessionRelayEnabled != true) throw HoglakeException.NotFound("namespace")
+        val (schema, namespace) = namedSchema(call, catalog) ?: throw HoglakeException.NotFound("namespace")
+        resolveReadSessionRouting(call, catalog, "namespace")
+        val name = schema.match.schemaFor(namespace)
+        call.requireRemoteSchemaEntitlement(catalog, name, namespace, schema.remoteNameFor(name), schema.name)
+        return CatalogBinding.RemoteSchema(catalog, name, schema.host, schema.name)
     }
 
     /** The configured remote schema the path's `{namespace}` is, or is a case variant of; the namespace as named. */
@@ -318,6 +435,10 @@ class CatalogStoreSelector(
 
     /** Whether this server configures any remote schema. */
     val hasRemoteSchemas: Boolean get() = mountHosts.remoteSchemas().isNotEmpty()
+
+    /** Whether a dedicated read session's request for [namespace] is one this server relays: off unless configured. */
+    fun relaysReadSession(namespace: String): Boolean =
+        cfg?.readSessionRelayEnabled == true && isRemoteSchema(namespace)
 
     /** Whether [namespace] is a configured remote schema's name or a case variant: never a local namespace here. */
     fun isRemoteSchema(namespace: String): Boolean = mountHosts.remoteSchemas().any { it.match.covers(namespace) }

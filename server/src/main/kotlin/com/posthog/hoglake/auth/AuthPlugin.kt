@@ -5,7 +5,7 @@ import com.posthog.hoglake.api.errorBody
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
-import com.posthog.hoglake.store.ScopedNamespaceBinding
+import com.posthog.hoglake.store.MountNames
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
@@ -185,7 +185,7 @@ class AuthService(
 }
 
 private val AuthStateKey = AttributeKey<AuthState>("HoglakeAuthState")
-private val ReadSessionBindingKey = AttributeKey<ScopedNamespaceBinding>("HoglakeReadSessionBinding")
+private val ReadSessionConfigKey = AttributeKey<ReadSessionConfig>("HoglakeReadSessionConfig")
 
 /**
  * What the auth plugin concluded about this request.
@@ -241,8 +241,11 @@ val ApplicationCall.hoglakeAuth: AuthState
 /** Only the auth plugin constructs this request-local, redacted credential holder. */
 class VerifiedBackendAuthority internal constructor(
     internal val token: String,
-    internal val readSessionBinding: ScopedNamespaceBinding? = null,
+    internal val storageGrants: ReadSessionStorageGrants? = null,
 ) {
+    internal val isReadSession: Boolean
+        get() = storageGrants != null
+
     override fun toString(): String = "VerifiedBackendAuthority(redacted)"
 }
 
@@ -250,7 +253,7 @@ internal val ApplicationCall.verifiedBackendAuthority: VerifiedBackendAuthority?
     get() = (hoglakeAuth as? AuthState.Authenticated)?.backendAuthority
 
 internal val ApplicationCall.verifiedBackendToken: String?
-    get() = verifiedBackendAuthority?.takeIf { it.readSessionBinding == null }?.token
+    get() = verifiedBackendAuthority?.takeIf { !it.isReadSession }?.token
 
 /**
  * The audit `actor` for a request, or a refusal.
@@ -336,6 +339,13 @@ val HoglakeAuth =
                 call.application.attributes.getOrNull(AuthServiceKey)
                     ?: throw IllegalStateException("HoglakeAuth installed without an AuthService: this is a wiring bug")
 
+            val configured = call.application.attributes.getOrNull(ReadSessionConfigKey)
+            // Before the mode check: a local-only path never reaches a handler without the read-session verifier.
+            if (ReadSessionProfile.isLocalOnlyPath(call.request.path())) {
+                selectLocalOnly(call, service, configured)
+                return@onCall
+            }
+
             if (!service.mode.resolvesCallers) return@onCall
 
             val method = call.request.httpMethod
@@ -343,27 +353,33 @@ val HoglakeAuth =
             val match = AuthPolicy.match(method, path)
             // Kept for the store's check (StoreEntitlement.kt), which asks for what this route demands.
             match?.let { call.attributes.put(RouteMatchKey, it) }
-            val readBinding =
-                call.application.attributes.getOrNull(ReadSessionBindingKey)?.takeIf {
-                    it.matches(method, match)
+            val readConfig =
+                configured?.takeIf {
+                    ReadSessionProfile.isEligibleRoute(method, match, it.reservedNamespaces) ||
+                        ReadSessionProfile.isRelayRoute(method, match, it.relays)
                 }
-            val readProfile = readBinding?.readSession
+            val rawToken = bearerToken(call)
+            val useReadSession =
+                readConfig != null && rawToken != null && ReadSessionProfile.hasDedicatedAudience(rawToken)
             val token =
-                bearerToken(call)?.takeIf {
-                    readProfile == null || call.request.headers.getAll(HttpHeaders.Authorization)?.size == 1
+                rawToken?.takeIf {
+                    !useReadSession || call.request.headers.getAll(HttpHeaders.Authorization)?.size == 1
                 }
 
             var caller: Caller? = null
+            var storageGrants: ReadSessionStorageGrants? = null
             var failure: HoglakeException? = null
 
             if (token != null) {
                 try {
-                    caller =
-                        if (readProfile == null) {
-                            service.verifier!!.verify(token)
-                        } else {
-                            service.verifier!!.verifyReadSession(token, readProfile)
-                        }
+                    if (!useReadSession) {
+                        caller = service.verifier!!.verify(token)
+                    } else {
+                        val (verifiedCaller, grants) =
+                            service.verifier!!.verifyReadSessionWithGrants(token, readConfig.profile)
+                        caller = verifiedCaller
+                        storageGrants = grants
+                    }
                 } catch (v: JwtViolation) {
                     // Detail to the log, reason to the client; see JwtViolation.
                     AuthLog.debug(v) { "token refused for ${call.request.path()}" }
@@ -384,7 +400,10 @@ val HoglakeAuth =
             call.attributes.put(
                 AuthStateKey,
                 caller?.let {
-                    AuthState.Authenticated(it, token?.let { jwt -> VerifiedBackendAuthority(jwt, readBinding) })
+                    AuthState.Authenticated(
+                        it,
+                        token?.let { jwt -> VerifiedBackendAuthority(jwt, storageGrants) },
+                    )
                 } ?: AuthState.Anonymous,
             )
 
@@ -395,7 +414,7 @@ val HoglakeAuth =
             // liveness probe behind a session cookie or an expired console token
             // fetching /v1/info must not start 401-ing.
             val decision = AuthPolicy.authorize(caller, match)
-            if (readProfile != null &&
+            if (useReadSession &&
                 (decision is AuthDecision.Allow || decision is AuthDecision.ByBody)
             ) {
                 val refusal = HoglakeException.NotFound("namespace")
@@ -465,6 +484,137 @@ val HoglakeAuth =
             call.attributes.put(RefusalCountedKey, Unit)
         }
     }
+
+/**
+ * Proof that the auth plugin selected this local-only request for [target]
+ * with the read-session verifier. Only [selectLocalOnly] constructs it. A
+ * local-only route serves nothing without it.
+ */
+internal class LocalOnlySelection private constructor(
+    val target: ReadSessionTarget,
+    val decision: AuthDecision.ByNamespace,
+) {
+    internal companion object {
+        fun of(
+            target: ReadSessionTarget,
+            decision: AuthDecision.ByNamespace,
+        ) = LocalOnlySelection(target, decision)
+    }
+}
+
+private val LocalOnlySelectionKey = AttributeKey<LocalOnlySelection>("HoglakeLocalOnlySelection")
+
+/** The plugin's selection of this local-only request, or null when it selected none. */
+internal val ApplicationCall.localOnlySelection: LocalOnlySelection?
+    get() = attributes.getOrNull(LocalOnlySelectionKey)
+
+/**
+ * Decide a request on a local-only path ([ReadSessionProfile.LOCAL_ONLY_PREFIX]).
+ * It either answers the request or records a [LocalOnlySelection] for the
+ * route. Every listener without a read-session profile answers 501, in every
+ * auth mode. A path that is not one of the three read routes answers 422, and
+ * another method answers 405. These answers do not carry the marker. Every
+ * later answer carries [ReadSessionProfile.LOCAL_ONLY_MARKER]. A token
+ * failure stays a 401. A verified session that names a reserved mount, an
+ * operator-reserved namespace, or an unentitled catalog gets ordinary absence.
+ */
+private suspend fun selectLocalOnly(
+    call: ApplicationCall,
+    service: AuthService,
+    configured: ReadSessionConfig?,
+) {
+    val profile = configured?.profile
+    val verifier = service.verifier
+    if (profile == null || !service.mode.resolvesCallers || verifier == null) {
+        call.respondRefusal(HoglakeException.NotSupported("local-only reads are not configured on this listener"))
+        return
+    }
+    // The ordinary pattern, for the policy match only. The route still matches the raw path.
+    val match =
+        ReadSessionProfile.canonicalLocalOnlyPath(call.request.path())
+            ?.let { AuthPolicy.match(HttpMethod.Get, it) }
+            ?.takeIf { it.pattern in ReadSessionProfile.LOCAL_ONLY_PATTERNS }
+    if (match == null) {
+        call.respondRefusal(HoglakeException.Validation("invalid local-only request"))
+        return
+    }
+    if (call.request.httpMethod != HttpMethod.Get) {
+        call.response.header(HttpHeaders.Allow, HttpMethod.Get.value)
+        call.respond(
+            HttpStatusCode.MethodNotAllowed,
+            ApiErrorDto(
+                error = "method_not_allowed",
+                detail = "${call.request.httpMethod.value} is not served on this path",
+            ),
+        )
+        return
+    }
+    call.response.headers.append(
+        ReadSessionProfile.LOCAL_ONLY_MARKER,
+        ReadSessionProfile.LOCAL_ONLY_MARKER_VALUE,
+    )
+    call.attributes.put(RouteMatchKey, match)
+
+    val token = bearerToken(call)?.takeIf { call.request.headers.getAll(HttpHeaders.Authorization)?.size == 1 }
+    var caller: Caller? = null
+    var grants: ReadSessionStorageGrants? = null
+    var failure: HoglakeException? = null
+    if (token != null) {
+        try {
+            val (verifiedCaller, verifiedGrants) = verifier.verifyReadSessionWithGrants(token, profile)
+            caller = verifiedCaller
+            grants = verifiedGrants
+        } catch (v: JwtViolation) {
+            AuthLog.debug(v) { "token refused for ${call.request.path()}" }
+            failure = HoglakeException.Unauthenticated(v.reason, "token refused")
+        }
+    }
+    if (caller == null || token == null) {
+        call.attributes.put(AuthStateKey, AuthState.Anonymous)
+        val refusal =
+            if (failure != null) {
+                failure
+            } else {
+                HoglakeException.Unauthenticated(JwtViolation.NO_TOKEN, "a bearer token is required")
+            }
+        countRefusal(service, service.clientClass(call), null, match, refusal, enforced = true)
+        call.respondRefusal(refusal)
+        return
+    }
+    call.attributes.put(
+        AuthStateKey,
+        AuthState.Authenticated(caller, VerifiedBackendAuthority(token, grants)),
+    )
+    val catalog = match.catalog
+    val namespace = match.namespace
+    val table = if (match.pattern == ReadSessionProfile.NAMESPACE_PATTERN) null else match.table
+    val target =
+        if (catalog != null && namespace != null &&
+            (match.pattern == ReadSessionProfile.NAMESPACE_PATTERN || table != null) &&
+            !MountNames.isReserved(catalog) &&
+            !configured.reservedNamespaces.isReserved(namespace) &&
+            ReadSessionProfile.isCanonicalRoute(catalog, namespace, table)
+        ) {
+            ReadSessionTarget(catalog, namespace, table)
+        } else {
+            null
+        }
+    val decision = AuthPolicy.authorize(caller, match)
+    if (target == null || decision !is AuthDecision.ByNamespace) {
+        // A verified session gets ordinary absence for a reserved or unentitled name.
+        val refusal =
+            if (target == null) {
+                HoglakeException.NotFound("namespace")
+            } else {
+                val denied = failureFor(decision, match)
+                if (denied != null) denied else HoglakeException.NotFound("namespace")
+            }
+        countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
+        call.respondRefusal(refusal)
+        return
+    }
+    call.attributes.put(LocalOnlySelectionKey, LocalOnlySelection.of(target, decision))
+}
 
 internal suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
     val (status, body) = errorBody(failure)
@@ -669,13 +819,13 @@ fun Application.installAuth(service: AuthService) = installAuth(service, null)
 
 internal fun Application.installAuth(
     service: AuthService,
-    namespaceBinding: ScopedNamespaceBinding?,
+    readSessionConfig: ReadSessionConfig?,
 ) {
-    if (namespaceBinding?.readSession != null) {
+    if (readSessionConfig != null) {
         require(service.mode == AuthMode.ENFORCE && !service.tenantOnly) {
-            "read_session requires the enforcing API listener"
+            "read session requires the enforcing API listener"
         }
-        attributes.put(ReadSessionBindingKey, namespaceBinding)
+        attributes.put(ReadSessionConfigKey, readSessionConfig)
     }
     attributes.put(AuthServiceKey, service)
     install(HoglakeAuth)
