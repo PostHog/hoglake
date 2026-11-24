@@ -110,7 +110,7 @@ changefeed and maintenance calls.
 
 ## Backends: PostgreSQL and Hoglite
 
-One server, one REST contract, two catalog stores behind it. A request's catalog decides which one serves it; clients never see the difference.
+One server, one REST contract, two catalog stores behind it. A request's catalog decides which one serves it; clients never see the difference, except for Hoglite's limits in the table below.
 
 | | PostgreSQL | Hoglite |
 |---|---|---|
@@ -120,6 +120,7 @@ One server, one REST contract, two catalog stores behind it. A request's catalog
 | Concurrency | Per-catalog advisory lock; many writers across catalogs | One writer per tenant, serialized by hoglite; no joins across tenants |
 | Integrity | Foreign keys with `ON DELETE CASCADE`, deferred namespace edges, CHECK-constrained vocabularies (`server/schema.sql`) | The same constraints, declared per tenant (`hoglite/HogliteSchema.kt`, whose KDoc has the mapping) and enforced by hoglite's `PRAGMA foreign_keys`, which the catalog bootstrap checks |
 | Maintenance | Background loops: compaction, expiry, cleanup, hydration, retirement | No background loops yet. Expiry, cleanup, compaction and the rehydrate requeue run on demand through `POST /v1/catalogs/{catalog}/maintenance/*`; retirement only through the backend seam |
+| Transaction size | No cap | Any hoglite transaction (a commit, creation publish or alter, or a batched read) over 64 MiB (hoglited's `/tx` body cap) is refused with 422 `validation` before anything is sent, never split. A width-changing promote sends about 75–85 bytes per widened file bound (more with long file ids), so one alter tops out around 800,000–850,000 of them |
 | Placement | The default backend (`HOGLAKE_DEFAULT_BACKEND=postgres`) | Named in `HOGLAKE_BACKENDS_FILE`. Never the default: a request reaches it only through the verified `rtg` claim in its token (backend and tenant) |
 
 **What Hoglite is for.** PostgreSQL's design pays off when one catalog is big. It does not shrink to many tiny ones: a catalog per customer on a shared Postgres turns the metadata database into the multi-tenant bottleneck. Hoglite gives each low-volume catalog its own small database that opens on demand, recovers on another replica after a failure, and holds no open slot while idle (its state stays in S3). The REST contract, the commit protocol, row lineage, deletion vectors and time travel are the same on both; `HogliteCatalogStore` re-expresses the PostgreSQL store's statements against hoglite's one-round-trip transactions, and the hoglite conformance classes run the shared suite against a real `hoglited`.

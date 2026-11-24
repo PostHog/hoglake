@@ -17,6 +17,7 @@ import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.PatchField
+import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.wireObjectMapper
 import com.sun.net.httpserver.HttpServer
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
@@ -1575,12 +1576,11 @@ class HogliteExtendedGuardRaceIntegrationTest {
         }
     }
 
-    @Test
-    fun `alter stats conflict never consumes a schema retry`() {
+    /** A table `t` with one INT column `id` and one file whose stats are [stats]; returns the catalog. */
+    private fun statsTable(stats: List<ColumnStats>): String {
         val c = freshCatalog()
         store.createNamespace(c, "ns")
         store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.INT)))
-        val bound = com.posthog.hoglake.stats.IcebergSingleValue.encode(ColType.INT, 7)
         store.commit(
             c,
             CommitRequest(
@@ -1589,29 +1589,34 @@ class HogliteExtendedGuardRaceIntegrationTest {
                         TableAppend(
                             "ns",
                             "t",
-                            listOf(
-                                FileRegistration(
-                                    "s3://hoglake-it/$c/data/stats.parquet",
-                                    10,
-                                    100,
-                                    50,
-                                    listOf(ColumnStats(1, 10, 0, null, null, bound, bound)),
-                                ),
-                            ),
+                            listOf(FileRegistration("s3://hoglake-it/$c/data/stats.parquet", 10, 100, 50, stats)),
                         ),
                     ),
             ),
         )
+        return c
+    }
+
+    /** An alter hook that replaces every file's `stats_json` with [stats] before the alter's tx. */
+    private fun statsChange(
+        c: String,
+        stats: List<ColumnStats>,
+    ) = Hook(::isAlterTx, before = {
+        store.catalogOperation(c) {
+            val tx = HogliteTx()
+            tx.add("UPDATE files SET stats_json = ?", store.json.writeValueAsString(stats))
+            store.runTx(c, HogliteCatalogStore.freshTxid("stats"), null, tx)
+        }
+    })
+
+    @Test
+    fun `alter stats conflict never consumes a schema retry`() {
+        val bound = IcebergSingleValue.encode(ColType.INT, 7)
+        val c = statsTable(listOf(ColumnStats(1, 10, 0, null, null, bound, bound)))
         val before = head(c)
-        val changed = listOf(ColumnStats(1, 10, 1, null, null, bound, bound))
-        val hook =
-            Hook(::isAlterTx, before = {
-                store.catalogOperation(c) {
-                    val tx = HogliteTx()
-                    tx.add("UPDATE files SET stats_json = ?", store.json.writeValueAsString(changed))
-                    store.runTx(c, HogliteCatalogStore.freshTxid("stats"), null, tx)
-                }
-            })
+        // A changed bound of the promoted column: the widened patch's guard on the old one fails.
+        val changed = listOf(ColumnStats(1, 10, 0, null, null, IcebergSingleValue.encode(ColType.INT, 6), bound))
+        val hook = statsChange(c, changed)
         hooks += hook
         val start = seen.size
         assertThatThrownBy {
@@ -1624,6 +1629,26 @@ class HogliteExtendedGuardRaceIntegrationTest {
         assertThat(store.getTable(c, "ns", "t").columns.single().def.type).isEqualTo(ColType.INT)
         assertThat(q(c, "SELECT stats_json FROM files").firstRow()!![0].asString())
             .isEqualTo(store.json.writeValueAsString(changed))
+    }
+
+    @Test
+    fun `a concurrent stats change outside the bounds survives the promote`() {
+        val bound = IcebergSingleValue.encode(ColType.INT, 7)
+        val c = statsTable(listOf(ColumnStats(1, 10, 0, null, null, bound, bound)))
+        val before = head(c)
+        // Same bounds, another null count: the promote patches only the
+        // bounds, so the concurrent write is not lost and is no conflict.
+        val hook = statsChange(c, listOf(ColumnStats(1, 10, 1, null, null, bound, bound)))
+        hooks += hook
+        val start = seen.size
+        val result = pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.PromoteColumn("id", ColType.LONG)))
+        assertThat(hook.remaining).isZero()
+        assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(1)
+        assertThat(result.readSnapshotId).isEqualTo(before + 1)
+        assertThat(result.columns.single().def.type).isEqualTo(ColType.LONG)
+        val widened = IcebergSingleValue.encode(ColType.LONG, 7L)
+        assertThat(q(c, "SELECT stats_json FROM files").firstRow()!![0].asString())
+            .isEqualTo(store.json.writeValueAsString(listOf(ColumnStats(1, 10, 1, null, null, widened, widened))))
     }
 
     @Test

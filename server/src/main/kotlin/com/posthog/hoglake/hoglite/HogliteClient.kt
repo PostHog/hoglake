@@ -282,7 +282,9 @@ class HogliteClient(
      *
      * Throws [HogliteGuardFailure] / [HogliteRejected] for deterministic
      * refusals and [HoglakeException.BackendUnavailable] when the retry
-     * budget is exhausted or the pool's breaker is open.
+     * budget is exhausted or the pool's breaker is open. A body over
+     * [MAX_TX_BODY_BYTES] is never sent: it throws
+     * [HoglakeException.Validation].
      */
     fun tx(
         tenant: String,
@@ -302,6 +304,7 @@ class HogliteClient(
                     put("statements", materialized)
                 },
             )
+        checkTxBodySize(body)
         return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
             when {
                 status == 200 ->
@@ -377,7 +380,8 @@ class HogliteClient(
      *
      * The txid is a fresh `read:` id (the endpoint requires one; the
      * engine records nothing for a read-only transaction) and stays fixed
-     * across the call's retries.
+     * across the call's retries. A body over [MAX_TX_BODY_BYTES] is never
+     * sent, as for [tx].
      */
     fun readTx(
         tenant: String,
@@ -400,6 +404,7 @@ class HogliteClient(
                     put("statements", statements.map { it.toWire() })
                 },
             )
+        checkTxBodySize(body)
         return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, readTimeoutMs) { status, bytes ->
             when {
                 status == 200 ->
@@ -411,6 +416,19 @@ class HogliteClient(
                 status == 422 && errorCode(bytes) == CODE_REFUSED -> throw HogliteRejected(409, String(bytes))
                 else -> throw HogliteRejected(status, String(bytes))
             }
+        }
+    }
+
+    /**
+     * hoglited refuses a `/tx` body over [MAX_TX_BODY_BYTES] only after
+     * reading that much of it. Never sent, it is a deterministic
+     * [HoglakeException.Validation], not an outcome to retry (#684).
+     */
+    private fun checkTxBodySize(body: ByteArray) {
+        if (body.size > MAX_TX_BODY_BYTES) {
+            throw HoglakeException.Validation(
+                "the hoglite transaction is ${body.size} bytes, over hoglited's $MAX_TX_BODY_BYTES-byte /tx limit",
+            )
         }
     }
 
@@ -1048,6 +1066,9 @@ class HogliteClient(
 
         /** The engine's bound on one `/v1/query-batch` request. */
         const val MAX_BATCH_READS = 1000
+
+        /** hoglited's bound on one `/tx` request body (`handleTx`'s MaxBytesReader). */
+        const val MAX_TX_BODY_BYTES = 64 shl 20
 
         /** How long an engine that lacks `/v1/query-batch` is believed before it is asked again. */
         const val BATCH_UNSUPPORTED_RECHECK_MS = 60_000L

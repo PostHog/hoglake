@@ -22,6 +22,7 @@ import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.TableMetadata
 import com.posthog.hoglake.service.VariantShredding
 import com.posthog.hoglake.stats.IcebergSingleValue
+import java.util.Base64
 import java.util.UUID
 
 // Only runTx may return these exact rollback markers; never classify prose/status as them.
@@ -271,16 +272,8 @@ internal class HogliteAlters(
                     // its fence and replans once rather than landing stale.
                     tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
                     for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
-                    // One guarded write per file, after every promotion has patched the shared plan.
-                    for ((fileId, rewrite) in state.statsRewrites) {
-                        if (!rewrite.touched) continue
-                        tx.affectOne(
-                            "UPDATE files SET stats_json = ? WHERE id = ? AND stats_json = ?",
-                            store.json.writeValueAsString(rewrite.stats),
-                            fileId,
-                            rewrite.originalJson,
-                        ) { HoglakeException.CommitConflict("file stats changed under the alter") }
-                    }
+                    // After every promotion has patched the shared plan.
+                    patchWidenedBounds(tx, state)
 
                     val readback = tx.add(HogliteSql.READBACK_DDL)
                     val results =
@@ -382,7 +375,13 @@ internal class HogliteAlters(
         val statsRewrites: MutableMap<Long, StatsRewrite> = linkedMapOf(),
     )
 
-    private class StatsRewrite(val originalJson: String, var stats: List<ColumnStats>, var touched: Boolean = false)
+    /** [stats] starts as [original]; a widened entry is a copy, every other entry the same instance. */
+    private class StatsRewrite(
+        val originalJson: String,
+        val original: List<ColumnStats>,
+        var stats: List<ColumnStats> = original,
+        var touched: Boolean = false,
+    )
 
     private class Located(
         val column: Column,
@@ -652,9 +651,10 @@ internal class HogliteAlters(
      * (AlterService.reencodeStatsOnPromote): stored bounds for the
      * column were written in the OLD type's 4-byte encoding; readers
      * decode bounds under the LIVE type. The stored stats are the file
-     * row's JSON column-stats list, so the re-encode is read-patch-write
-     * per file, guarded on the old content. All promotions share one plan and
-     * one rewrite per file; an allocator fence detects files added after the read.
+     * row's JSON column-stats list, so the re-encode reads every file's
+     * list and [patchWidenedBounds] writes back only the changed bounds,
+     * guarded on their old values. All promotions share one plan; an
+     * allocator fence detects files added after the read.
      */
     private fun reencodeStatsOnPromote(
         catalog: String,
@@ -746,6 +746,65 @@ internal class HogliteAlters(
                         }
                     }
                 }
+        }
+    }
+
+    /**
+     * Write the widened bounds as patches to the stored stats, not as
+     * whole `stats_json` rewrites: hoglited caps a `/tx` body at 64 MiB,
+     * and a rewrite sent each touched file's stats twice, as the value and
+     * as its guard, so a wide table's promote could never fit (#684). Like
+     * PostgreSQL's UPDATE of the bound columns, only the bounds change.
+     *
+     * A patch is `[file id, entry index, field id, old lower, new lower,
+     * old upper, new upper]`, the bounds as stored (base64) text. A
+     * statement takes up to [BOUND_PATCHES_PER_STATEMENT] of them as one
+     * JSON argument and must update one row per patch: a file whose entry
+     * moved, or whose bound changed, since the read rolls the alter back.
+     * A concurrent change to the entry's other stats (null count, sizes)
+     * is kept, not a conflict: the widened bound depends only on the old
+     * one, which the guard pins.
+     * UPDATE ... FROM applies one source row per target row, so a file's
+     * second widened entry goes in a later round.
+     *
+     * Every patch still goes in the alter's one transaction, at about 75
+     * bytes each on the wire, so an alter tops out around 800k-850k widened
+     * bounds (files times promoted columns): past that the tx body is over
+     * the cap and [HogliteClient.tx] refuses it with Validation on every
+     * attempt. Spreading the patches across transactions under the
+     * allocator fence is not done; the read holds every file's stats in
+     * heap, which bounds the same catalogs.
+     */
+    private fun patchWidenedBounds(
+        tx: HogliteTx,
+        state: TableState,
+    ) {
+        val rounds = mutableListOf<MutableList<List<Any?>>>()
+        for ((fileId, rewrite) in state.statsRewrites) {
+            if (!rewrite.touched) continue
+            val stored = store.json.readTree(rewrite.originalJson)
+            var round = 0
+            rewrite.stats.forEachIndexed { i, stat ->
+                if (stat === rewrite.original[i]) return@forEachIndexed
+                if (rounds.size == round) rounds += mutableListOf<List<Any?>>()
+                rounds[round++] +=
+                    listOf(
+                        fileId,
+                        i,
+                        stat.fieldId,
+                        stored.path(i).path("lowerBound").textValue(),
+                        stat.lowerBound?.let(BASE64::encodeToString),
+                        stored.path(i).path("upperBound").textValue(),
+                        stat.upperBound?.let(BASE64::encodeToString),
+                    )
+            }
+        }
+        for (patches in rounds.flatMap { it.chunked(BOUND_PATCHES_PER_STATEMENT) }) {
+            tx.affectExactly(
+                patches.size.toLong(),
+                PATCH_BOUNDS_SQL,
+                store.json.writeValueAsString(patches),
+            ) { HoglakeException.CommitConflict("file stats changed under the alter") }
         }
     }
 
@@ -1210,6 +1269,24 @@ internal class HogliteAlters(
         }
 
     private companion object {
+        /** Jackson's encoding of a ByteArray, which is how `stats_json` stores a bound. */
+        val BASE64: Base64.Encoder = Base64.getEncoder()
+
+        /** Bounds patches per statement: a few hundred KB of argument, well under hoglited's caps. */
+        const val BOUND_PATCHES_PER_STATEMENT = 5000
+
+        /** [patchWidenedBounds]'s statement; `?` is the JSON array of patches. */
+        const val PATCH_BOUNDS_SQL =
+            "UPDATE files SET stats_json = json_set(stats_json, p.at || '.lowerBound', p.new_lower, " +
+                "p.at || '.upperBound', p.new_upper) " +
+                "FROM (SELECT json_extract(value, '$[0]') AS id, '$[' || json_extract(value, '$[1]') || ']' AS at, " +
+                "json_extract(value, '$[2]') AS field_id, json_extract(value, '$[3]') AS old_lower, " +
+                "json_extract(value, '$[4]') AS new_lower, json_extract(value, '$[5]') AS old_upper, " +
+                "json_extract(value, '$[6]') AS new_upper FROM json_each(?)) AS p " +
+                "WHERE files.id = p.id AND json_extract(stats_json, p.at || '.fieldId') = p.field_id " +
+                "AND json_extract(stats_json, p.at || '.lowerBound') IS p.old_lower " +
+                "AND json_extract(stats_json, p.at || '.upperBound') IS p.old_upper"
+
         /** setObjectPrefixField's emptiness probe: live data files plus live deletion vectors. */
         const val TABLE_LIVE_OBJECTS_SQL =
             "SELECT (SELECT COUNT(*) FROM files WHERE table_id = ? AND end_snapshot IS NULL) + " +

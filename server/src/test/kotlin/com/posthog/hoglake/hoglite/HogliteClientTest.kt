@@ -160,6 +160,21 @@ class HogliteClientTest {
     }
 
     @Test
+    fun `a tx or readTx body over the engine cap is refused before it is sent`() {
+        val (server, calls) = serve(Step(200, "{\"results\":[{\"cols\":[],\"rows\":[],\"affected\":1}]}"))
+        val c = client("http://127.0.0.1:${server.address.port}")
+        val over = listOf(HogliteStatement("SELECT ?", listOf("x".repeat(HogliteClient.MAX_TX_BODY_BYTES))))
+        assertThatThrownBy { c.tx("t", "tx-big", null, over) }
+            .isExactlyInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("over hoglited's 67108864-byte /tx limit")
+        assertThatThrownBy { c.readTx("t", over) }
+            .isExactlyInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("over hoglited's 67108864-byte /tx limit")
+        assertThat(calls.get()).isZero()
+        assertThat(sleeps).isEmpty()
+    }
+
+    @Test
     fun `malformed successful write arrays are unknown with the original txid`() {
         for (body in listOf(
             "{}", "{\"results\":null}", "{\"results\":[]}", "not-json",

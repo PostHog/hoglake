@@ -1,0 +1,5 @@
+---
+hoglake: patch (Server)
+---
+
+Hoglite: a width-changing promote (int to long, float to double) writes only the widened bounds of each file's stats, not the whole `stats_json` twice per file, so its transaction fits hoglited's 64 MiB `/tx` body cap on tables whose stats used to exceed it on every attempt. Only a concurrent change to a widened bound now fails the promote with 409 `file stats changed under the alter`; a concurrent change to the rest of a file's stats (null count, sizes) is kept. A Hoglite transaction body over 64 MiB is now refused with 422 `validation` before any of it is sent; hoglited refused it only after reading 64 MiB. PostgreSQL has no such cap; a Hoglite commit, creation publish or alter that large is still refused, not split. A promote's patches still share one transaction at about 75–85 bytes per widened file bound, so one alter tops out around 800,000–850,000 of them (files times promoted columns). (#684)

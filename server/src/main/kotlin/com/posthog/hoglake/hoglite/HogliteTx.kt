@@ -59,6 +59,14 @@ class HogliteTx {
         failure: () -> HoglakeException,
     ): Int = guarded(HogliteStatement(sql, args.toList(), expectAffected = 1), failure)
 
+    /** The write must affect exactly [expected] rows, else [failure]. For set-based updates that must all land. */
+    fun affectExactly(
+        expected: Long,
+        sql: String,
+        vararg args: Any?,
+        failure: () -> HoglakeException,
+    ): Int = guarded(HogliteStatement(sql, args.toList(), expectAffected = expected), failure)
+
     /** The query's scalar must equal [expected], else [failure]. For counter/head guards. */
     fun expectScalar(
         expected: Long,
