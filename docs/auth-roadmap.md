@@ -133,6 +133,12 @@ mounts — so this list keeps only what hoglake owns and what has no other home.
       The Client side (the server that holds the catalog) is built,
       [auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client);
       the Host side is not
+- [ ] **hoglake** Dedicated read sessions on a remote schema: the relay on
+      the Client, and the read verifier beside served namespaces on the Host.
+      The contract is PROPOSED in
+      [auth.md](auth.md#read-sessions-on-a-remote-schema), with the caller
+      rule pinned by the `relay` vectors. The Client side is built; the
+      Host side is not
 - [ ] **hogtower** Signing-key rotation (`rotate-key`)
 - [ ] **charts** `HOGLAKE_STORAGE_PROVIDER=broker` and its settings on
       PostHog's hoglake deployments — hogtower side live in dev
