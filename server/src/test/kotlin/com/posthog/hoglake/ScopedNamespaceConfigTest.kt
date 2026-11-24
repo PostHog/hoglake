@@ -82,7 +82,7 @@ class ScopedNamespaceConfigTest {
     }
 
     @Test
-    fun `mount hosts coexist with read sessions while served namespaces stay blocked`() {
+    fun `mount hosts coexist with read sessions`() {
         val cfg = config()
         for (match in listOf(
             """{"type":"namespace","name":"elsewhere"}""",
@@ -95,11 +95,49 @@ class ScopedNamespaceConfigTest {
             assertThat(combined.readSession).isNotNull()
             assertThat(combined.mountHosts).hasSize(1)
         }
+    }
+
+    @Test
+    fun `a server that serves namespaces enables read sessions without a hoglite backend`() {
         val served =
-            """{"families":[{"family":"team","source_catalog":"imports","predicate_field":"team_id"}]}"""
+            file(
+                "served.json",
+                """{"families":[{"family":"team","source_catalog":"imports","predicate_field":"team_id"}]}""",
+            )
+        // Beside a hoglite backend, and without any backend at all.
+        assertThat(config().copy(servedNamespacesFile = served, authSessionProfile = "on").readSession).isNotNull()
+        val host =
+            Config(
+                readSessionProfile = "example.aws-session",
+                readSessionRemoteTargets = "remote:events,remote:imports",
+                servedNamespacesFile = served,
+                authSessionProfile = "on",
+                authMode = "enforce",
+                authJwksFile = "mounted-public-jwks.json",
+                authPredicateFields = "team_id",
+            )
+        assertThat(host.readSession).isNotNull()
+        assertThat(host.backendKinds).isEmpty()
+        // A Host may keep a warning API listener when it has the public listener, which always enforces.
+        assertThat(host.copy(authMode = "warn", publicPort = 8443).readSession).isNotNull()
+        assertThatThrownBy { host.copy(authMode = "warn") }.hasMessageContaining("HOGLAKE_PUBLIC_PORT")
         assertThatThrownBy {
-            cfg.copy(servedNamespacesFile = file("served.json", served), authSessionProfile = "on")
-        }.hasMessageContaining("cannot coexist")
+            config().copy(
+                authMode = "warn",
+                publicPort = 8443,
+                servedNamespacesFile = served,
+                authSessionProfile = "on",
+            )
+        }.hasMessageContaining("HOGLAKE_PUBLIC_PORT")
+        assertThatThrownBy {
+            Config(
+                readSessionProfile = "example.aws-session",
+                readSessionRemoteTargets = "remote:events,remote:imports",
+                authMode = "enforce",
+                authJwksFile = "mounted-public-jwks.json",
+                authPredicateFields = "team_id",
+            )
+        }.hasMessageContaining("requires a configured hoglite backend or served namespaces")
     }
 
     @Test

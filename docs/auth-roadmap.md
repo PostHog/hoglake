@@ -137,8 +137,8 @@ mounts — so this list keeps only what hoglake owns and what has no other home.
       the Client, and the read verifier beside served namespaces on the Host.
       The contract is PROPOSED in
       [auth.md](auth.md#read-sessions-on-a-remote-schema), with the caller
-      rule pinned by the `relay` vectors. The Client side is built; the
-      Host side is not
+      rule pinned by the `relay` vectors. The Client side and the Host side are
+      built; a reader's own path check is not
 - [ ] **hogtower** Signing-key rotation (`rotate-key`)
 - [ ] **charts** `HOGLAKE_STORAGE_PROVIDER=broker` and its settings on
       PostHog's hoglake deployments — hogtower side live in dev

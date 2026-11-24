@@ -555,6 +555,11 @@ paths:
         `at_timestamp` are resolved on the serving host, against the
         catalogs that hold its tables, never this catalog: list a remote
         schema at head or with `at_timestamp`.
+
+
+        A dedicated read session (docs/auth.md, "Read sessions on a
+        remote schema") gets `TableSummaryIdentity` items: no counts and
+        no sizes. Every other caller gets `TableSummary` items.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -567,7 +572,10 @@ paths:
             application/json:
               schema:
                 type: array
-                items: { $ref: "#/components/schemas/TableSummary" }
+                items:
+                  oneOf:
+                    - { $ref: "#/components/schemas/TableSummary" }
+                    - { $ref: "#/components/schemas/TableSummaryIdentity" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
@@ -4473,6 +4481,18 @@ components:
           minItems: 1
           items: { $ref: "#/components/schemas/ColumnDef" }
 
+    TableSummaryIdentity:
+      type: object
+      description: >
+        A table list item for a dedicated read session: the identity
+        fields of TableSummary and none of its counts or sizes.
+      required: [name, table_uuid]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+        comment: { type: string }
+        earliest_snapshot_id: { type: integer, format: int64 }
     TableSummary:
       type: object
       required: [name, table_uuid, record_count, file_count, file_size_bytes,
