@@ -420,9 +420,10 @@ class JwtVerifier(
             if (jws.algorithm != "ES256") {
                 throw JwtViolation(JwtViolation.UNSUPPORTED_ALG, "invalid read session algorithm")
             }
-            // A miss asks for a rate-limited re-read of the mounted file and refuses
-            // this request, as the ordinary verifier does: a rotation must not wait
-            // for a token of another profile to miss first.
+            // A miss asks for a rate-limited re-read of the mounted file, so a rotation
+            // does not wait for a token of another profile to miss first. Unlike the
+            // ordinary verifier, there is no second lookup: the request that missed is
+            // refused even if the re-read has already finished.
             val key =
                 jws.keyId?.let { keyId ->
                     keys.byKeyId(keyId) ?: run {
