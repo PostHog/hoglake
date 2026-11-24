@@ -96,6 +96,23 @@ public:
 	void Commit(ClientContext &context);
 	void Rollback();
 
+	//! Default for hoglake_commit_deadline_ms: the wall time one commit's
+	//! retry loop may take across every attempt and backoff. Without it
+	//! retried read timeouts (hoglake_commit_timeout_ms each) could hold
+	//! COMMIT for max_retries × timeout, ~22 min at the defaults, against
+	//! a hung server.
+	static constexpr idx_t DEFAULT_COMMIT_DEADLINE_MS = 300000;
+	//! Ceiling on hoglake_commit_deadline_ms: half the server's floor on
+	//! HOGLAKE_RECEIPT_RETENTION_SECONDS (one hour, Config's
+	//! MIN_RECEIPT_RETENTION_SECONDS). A retry under the key replays the
+	//! receipt only while the receipt exists; one sent after cleanup
+	//! purged it publishes the same files again and reports success.
+	static constexpr idx_t MAX_COMMIT_DEADLINE_MS = 1800000;
+	//! Least wait an attempt must have to start: above the server's default
+	//! commit-lock wait (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, 30 s), so its clean
+	//! 503 commit_queue_timeout is heard rather than timed out.
+	static constexpr idx_t MIN_COMMIT_ATTEMPT_MS = 35000;
+
 	// -- catalog entry cache ----------------------------------------------
 	//! A name the listing does not hold is asked of the server once per
 	//! transaction (`probe`), and the answer says whether it is remote.

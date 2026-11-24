@@ -44,7 +44,7 @@ dev = [
     "pyyaml>=6.0",
     # A floor: the version is the root uv.lock's, shared with the sibling
     # trees; see pyhoglake's note on why not `==`.
-    "ruff>=0.16.10",
+    "ruff>=0.17.5",
     # Pinned for the same reason: mutant generation changes between
     # releases. Scoped to the pure core (keyspace, planner); run on
     # changes to those files (docs/kafka-ingestion-plan.md, Phase 1).
