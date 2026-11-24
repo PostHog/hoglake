@@ -118,12 +118,24 @@ internal class HogliteViews(
     ): List<ViewInfo> =
         store.catalogOperation(catalog) {
             val ns = store.liveNamespace(catalog, namespace)
-            return store.queryCatalog(
-                catalog,
-                "SELECT id, view_uuid, name, dialect, sql_text FROM views " +
-                    "WHERE namespace_id = ? AND dropped_snapshot IS NULL ORDER BY name",
-                ns.namespaceId,
-            ).rows.map { row ->
+            // Keyset pages under hoglited's row and byte caps (#686), on
+            // the name, which views_live keeps unique among live views:
+            // each page seeks views_live, never scans every view. The
+            // listing reads the live views, not a snapshot, so a view
+            // created or dropped between two pages shows in the pages
+            // read after it.
+            return store.keysetPages(null, VIEW_PAGE_SIZE) { last ->
+                store.queryCatalog(
+                    catalog,
+                    "SELECT id, view_uuid, name, dialect, sql_text FROM views INDEXED BY views_live " +
+                        "WHERE namespace = ? AND namespace_id = ? AND dropped_snapshot IS NULL" +
+                        (if (last == null) "" else " AND name > ?") +
+                        " ORDER BY name LIMIT $VIEW_PAGE_SIZE",
+                    namespace,
+                    ns.namespaceId,
+                    *(last?.let { arrayOf(it[2]) } ?: emptyArray()),
+                ).rows
+            }.map { row ->
                 ViewInfo(
                     viewId = row[0].asLong(),
                     viewUuid = UUID.fromString(row[1].asString()),
@@ -199,4 +211,13 @@ internal class HogliteViews(
                 sql = row[3].asString(),
             )
         }
+
+    internal companion object {
+        /**
+         * Views per page of [list]. A view's SQL has no length limit of
+         * its own, so a page is small: the 64 MiB cap holds while a
+         * page's SQL averages under 640 KiB a view.
+         */
+        const val VIEW_PAGE_SIZE = 100
+    }
 }

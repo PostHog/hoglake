@@ -12,10 +12,12 @@ import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.assertj.core.api.Assertions.entry
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertTimeoutPreemptively
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
+import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -77,8 +79,11 @@ class HogliteCatalogStoreTest {
     /** When set, the /query probe is refused with this (status, body) instead of answered. */
     private var probeRefusal: Pair<Int, Map<String, Any?>>? = null
 
-    /** The storage-usage read's row: file bytes, DV bytes, undrained removals. */
+    /** The storage-usage reads' answer: file bytes, DV bytes, undrained removals, in one range. */
     private var usage: List<Long> = listOf(0, 0, 0)
+
+    /** The keys (table id, begin snapshot, id) the file range-end lookups return, in order; the last repeats. */
+    private val rangeEnds = ArrayDeque<List<Long>>()
 
     /** The SQL of every statement of every write /tx, in order. */
     private val txStatements = CopyOnWriteArrayList<List<String>>()
@@ -178,11 +183,22 @@ class HogliteCatalogStoreTest {
         when {
             sql == HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL -> result(listOf(foreignKeys))
             sql.startsWith("SELECT name, data_path,") -> if (t.name == null) result() else result(metaRow(t))
-            sql == HogliteCatalogStore.STORAGE_USAGE_SQL -> result(usage)
+            sql == HogliteCatalogStore.STORAGE_USAGE_SQL -> result(listOf(usage[2]))
+            // One range: a file and a DV, fewer than a range of either.
+            sql == HogliteCatalogStore.STORAGE_RANGE_SQL -> result(listOf(1, usage[0], 1, 1, usage[1], 1))
+            sql.contains("INDEXED BY files_table") ->
+                result(if (rangeEnds.size > 1) rangeEnds.removeFirst() else rangeEnds.first())
             sql.startsWith("SELECT id, name, contained_field, contained_value FROM namespaces WHERE name = ?") ->
                 t.live(args!![0].asText())?.let { result(nsRow(it)) } ?: result()
-            sql.startsWith("SELECT id, name, contained_field, contained_value FROM namespaces WHERE dropped") ->
+            // The listing's one page of live namespaces at head 0 (fewer
+            // than a page), and none dropped after head 0.
+            sql.startsWith(
+                "SELECT id, name, contained_field, contained_value FROM namespaces INDEXED BY namespaces_live",
+            ) ->
                 result(*t.namespaces.filter { !it.dropped }.sortedBy { it.name }.map { nsRow(it) }.toTypedArray())
+            sql.startsWith(
+                "SELECT id, name, contained_field, contained_value FROM namespaces WHERE dropped_snapshot > ?",
+            ) -> result()
             sql.startsWith("SELECT contained_field, contained_value FROM namespaces WHERE name = ?") ->
                 t.live(args!![0].asText())?.let { result(listOf(it.field, it.value)) } ?: result()
             sql.startsWith("SELECT contained_field, contained_value FROM namespaces WHERE id = ?") ->
@@ -414,9 +430,8 @@ class HogliteCatalogStoreTest {
         assertThat(footprint.trackedBytes).isEqualTo(120)
         assertThat(footprint.pendingDeleteFiles).isEqualTo(3)
         // StorageUsageRepo's contract: ended rows still occupy storage.
-        assertThat(HogliteCatalogStore.STORAGE_USAGE_SQL)
-            .doesNotContain("end_snapshot")
-            .contains("FROM removals WHERE drained_at IS NULL")
+        assertThat(HogliteCatalogStore.STORAGE_RANGE_SQL).doesNotContain("end_snapshot")
+        assertThat(HogliteCatalogStore.STORAGE_USAGE_SQL).contains("FROM removals WHERE drained_at IS NULL")
     }
 
     @Test
@@ -425,6 +440,29 @@ class HogliteCatalogStoreTest {
         usage = listOf(Long.MAX_VALUE, 1, 0)
 
         assertThat(catchThrowable { store.storageUsage("wh") }).isInstanceOf(ArithmeticException::class.java)
+    }
+
+    @Test
+    fun `a file range end that does not pass the range start fails the read`() {
+        seed("t-wh-1", "wh")
+        rangeEnds.addAll(listOf(listOf(1, 5, 10), listOf(1, 4, 20)))
+        val ranges = AtomicInteger()
+
+        // Without the guard the walk reads the same range forever.
+        val thrown =
+            catchThrowable {
+                assertTimeoutPreemptively(Duration.ofSeconds(10)) {
+                    store.catalogOperation("wh") {
+                        store.fileRanges("wh", listOf(1L), 5, 10) { ranges.incrementAndGet() }
+                    }
+                }
+            }
+
+        assertThat(thrown)
+            .isInstanceOf(IllegalStateException::class.java)
+            .hasMessageContaining("FileKey(tableId=1, begin=4, id=20)")
+            .hasMessageContaining("FileKey(tableId=1, begin=5, id=10)")
+        assertThat(ranges.get()).isEqualTo(1)
     }
 
     @Test
