@@ -90,6 +90,79 @@ class ReadSessionProfileTest {
     }
 
     @Test
+    fun `a rotated key is read from the mounted file after the miss, not on the miss`() {
+        val jwks = directory.resolve("rotating-jwks.json")
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(pair, TestTokens.KID)}]}""")
+        val queued = mutableListOf<() -> Unit>()
+        val keys =
+            JwksSigningKeys(
+                fetch = { Files.readAllBytes(jwks) },
+                describe = "rotation-test",
+                mountedFile = true,
+                runAsync = { queued += it },
+            )
+        keys.refresh()
+        val v =
+            JwtVerifier(
+                TestTokens.ISSUER,
+                TestTokens.AUDIENCE,
+                keys,
+                predicateFields = setOf("team_id"),
+                backends = mapOf(backend to BackendKind.HOGLITE),
+            ) { 2_000_000_001L }
+        val rotated = TestTokens.keyPair()
+        val header = """{"alg":"ES256","kid":"test-key-2","typ":"JWT"}"""
+        val claims = String(java.util.Base64.getUrlDecoder().decode(token().split('.')[1]))
+        val next = TestTokens.mint(rotated, claims, header)
+
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(rotated, "test-key-2")}]}""")
+        assertThatThrownBy { v.verifyReadSession(next, profile) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.UNKNOWN_KEY)
+        assertThat(queued).hasSize(1)
+        queued.single().invoke()
+
+        assertThat(v.verifyReadSession(next, profile).subject).isEqualTo("example.alice")
+        // The removed key is gone with the same re-read.
+        assertThatThrownBy { v.verifyReadSession(token(), profile) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.UNKNOWN_KEY)
+    }
+
+    @Test
+    fun `the request that misses is refused even when the re-read finishes first`() {
+        val jwks = directory.resolve("inline-jwks.json")
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(pair, TestTokens.KID)}]}""")
+        val keys =
+            JwksSigningKeys(
+                fetch = { Files.readAllBytes(jwks) },
+                describe = "inline-rotation-test",
+                mountedFile = true,
+                runAsync = { it() },
+            )
+        keys.refresh()
+        val v =
+            JwtVerifier(
+                TestTokens.ISSUER,
+                TestTokens.AUDIENCE,
+                keys,
+                predicateFields = setOf("team_id"),
+                backends = mapOf(backend to BackendKind.HOGLITE),
+            ) { 2_000_000_001L }
+        val rotated = TestTokens.keyPair()
+        val claims = String(java.util.Base64.getUrlDecoder().decode(token().split('.')[1]))
+        val next = TestTokens.mint(rotated, claims, """{"alg":"ES256","kid":"test-key-2","typ":"JWT"}""")
+
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(rotated, "test-key-2")}]}""")
+        assertThatThrownBy { v.verifyReadSession(next, profile) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.UNKNOWN_KEY)
+        // The re-read ran inside that call, so the key was already there.
+        assertThat(keys.byKeyId("test-key-2")).isNotNull()
+        assertThat(v.verifyReadSession(next, profile).subject).isEqualTo("example.alice")
+    }
+
+    @Test
     fun `legacy and dedicated audiences cannot be mixed`() {
         val legacy = verifier(experimental = true)
         val mixed = token { (it["aud"] as ArrayNode).add(TestTokens.AUDIENCE) }
@@ -126,6 +199,7 @@ class ReadSessionProfileTest {
                 { (it["grants"][1] as ObjectNode).put("object_key", "root/2c/t/fixture_2/manifest") },
                 { (it["grants"][1] as ObjectNode).put("prefix", "root/2c/t/fixture_3/") },
                 { (it["grants"][2] as ObjectNode).put("prefix", "events/*/") },
+                { (it["grants"][2] as ObjectNode).put("prefix", "events/part(1)/") },
                 { (it["grants"][2] as ObjectNode).putArray("actions").add("s3:PutObject") },
                 { (it["grants"][3] as ObjectNode).put("catalog", "other") },
                 { (it["grants"] as ArrayNode).remove(3) },
@@ -137,6 +211,61 @@ class ReadSessionProfileTest {
                     assertThat(it.reason).isEqualTo(JwtViolation.MALFORMED)
                     assertThat(it.message).isEqualTo("read session refused")
                 }
+        }
+    }
+
+    @Test
+    fun `prefix storage grants accept valid S3 object names and reject traversal or control characters`() {
+        val jwt =
+            token { claims ->
+                val grant = claims["grants"][0] as ObjectNode
+                grant.remove("object_key")
+                grant.put("prefix", "tables/team_id=42/")
+            }
+        val (_, grants) = verifier().verifyReadSessionWithGrants(jwt, profile)
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/part(1).parquet",
+            ),
+        ).isTrue()
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/nested/part(1)+v2.parquet",
+            ),
+        ).isTrue()
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/part\uD83D\uDE00.parquet",
+            ),
+        ).isTrue()
+        assertThat(
+            grants.allowsPrimaryCatalogObject(
+                "example-catalog",
+                "s3://example-customer/tables/team_id=42/" + "a".repeat(1024 - "tables/team_id=42/".length),
+            ),
+        ).isTrue()
+        for (rejected in listOf(
+            "s3://example-customer/tables/team_id=42/../team_id=43/part(1).parquet",
+            "s3://example-customer/tables/team_id=42/./part(1).parquet",
+            "s3://example-customer/tables/team_id=42//part(1).parquet",
+            "s3://example-customer/tables/team_id=42/part\u0000.parquet",
+            "s3://example-customer/tables/team_id=42/part\n.parquet",
+            "s3://example-customer/tables/team_id=42/part\uD800.parquet",
+            "s3://example-customer/tables/team_id=42/part\uD800",
+            "s3://example-customer/tables/team_id=42/part\uDC00.parquet",
+            "s3://example-customer/tables/team_id=42/part\uDC00\uD800.parquet",
+            "s3://example-customer/tables/team_id=42/",
+            "s3://example-customer/tables/team_id=42/" + "a".repeat(1025 - "tables/team_id=42/".length),
+            "s3://example-customer/tables/team_id=42/" + "é".repeat(512),
+            "s3://example-customer/tables/team_id=43/part(1).parquet",
+            "s3://other-bucket/tables/team_id=42/part(1).parquet",
+        )) {
+            assertThat(grants.allowsPrimaryCatalogObject("example-catalog", rejected))
+                .describedAs(rejected)
+                .isFalse()
         }
     }
 }

@@ -92,9 +92,25 @@ class AuthPolicyTest {
         // vacuous pass would be worse than a failure.
         assertThat(published).hasSizeGreaterThan(60)
 
+        // The local-only routes have no policy entry. The plugin decides them before the policy table
+        // (AuthPlugin.kt, selectLocalOnly), with the dedicated read verifier only.
+        val (localOnly, ordinary) = published.partition { (_, path) -> ReadSessionProfile.isLocalOnlyPath(path) }
         val missing =
-            published.filter { (method, path) -> AuthPolicy.match(HttpMethod.parse(method.uppercase()), path) == null }
+            ordinary.filter { (method, path) -> AuthPolicy.match(HttpMethod.parse(method.uppercase()), path) == null }
         assertThat(missing).describedAs("routes published in the OpenAPI spec with no AuthPolicy entry").isEmpty()
+
+        // Each local-only route is a GET whose canonical path is exactly one of the three ordinary read patterns.
+        val canonical =
+            localOnly.map { (method, path) ->
+                val target = ReadSessionProfile.canonicalLocalOnlyPath(path)
+                Triple(method.lowercase(), target, target?.let { AuthPolicy.match(HttpMethod.Get, it)?.pattern })
+            }
+        assertThat(canonical.map { it.first }).describedAs("local-only methods").containsOnly("get")
+        assertThat(canonical.filter { it.second == null || it.second != it.third })
+            .describedAs("local-only routes whose canonical path is not an exact policy pattern")
+            .isEmpty()
+        assertThat(canonical.map { it.third }.toSet())
+            .isEqualTo(ReadSessionProfile.LOCAL_ONLY_PATTERNS)
     }
 
     @Test
