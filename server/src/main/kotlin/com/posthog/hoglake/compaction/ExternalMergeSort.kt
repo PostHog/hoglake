@@ -330,13 +330,25 @@ internal object ExternalMergeSort {
         leaves: Int,
         spill: SortSpill,
     ): Long =
-        SortMemory.runBytes(
-            SortMemory.add(
-                spill.spillBlockBytes.toLong(),
-                SortMemory.multiply(leaves.toLong(), SPILL_READER_BYTES_PER_LEAF),
+        spillEstimateWithHeadroom(
+            SortMemory.runBytes(
+                SortMemory.add(
+                    spill.spillBlockBytes.toLong(),
+                    SortMemory.multiply(leaves.toLong(), SPILL_READER_BYTES_PER_LEAF),
+                ),
+                estimatedHeadBytes(leaves),
             ),
-            estimatedHeadBytes(leaves),
         )
+
+    // Two percent, rounded up: covers the observed calibration variation without
+    // pretending to bound arbitrary pages or dictionaries. Runtime profiles still
+    // replace this estimate. Avoid multiplying before dividing near Long.MAX_VALUE.
+    internal fun spillEstimateWithHeadroom(bytes: Long): Long =
+        if (bytes < 0) {
+            Long.MAX_VALUE
+        } else {
+            SortMemory.add(bytes, bytes / 50 + if (bytes % 50 == 0L) 0 else 1)
+        }
 
     private fun estimatedHeadBytes(leaves: Int): Long =
         SortMemory.multiply(CompactionConfig.SORTED_HEAP_BYTES_PER_NODE, SortMemory.add(leaves.toLong(), 1))

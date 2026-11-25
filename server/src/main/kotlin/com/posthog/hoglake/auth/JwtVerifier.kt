@@ -393,12 +393,22 @@ class JwtVerifier(
 
     /**
      * Verify the dedicated read profile without the legacy profile parser.
-     * This method uses mounted keys. It never refreshes keys.
+     * This method uses mounted keys. A key id it has not seen asks for a
+     * re-read of the mounted file and is refused.
      */
     internal fun verifyReadSession(
         token: String,
         profile: ReadSessionProfile,
-    ): Caller =
+    ): Caller = verifyReadSessionWithGrants(token, profile).first
+
+    /**
+     * Verify the dedicated read profile and return its caller and storage grants.
+     * This method uses mounted keys and does not retain AWS credentials.
+     */
+    internal fun verifyReadSessionWithGrants(
+        token: String,
+        profile: ReadSessionProfile,
+    ): Pair<Caller, ReadSessionStorageGrants> =
         try {
             if (keys !is JwksSigningKeys || !keys.mountedFile) {
                 throw JwtViolation(JwtViolation.PROFILE_NOT_ENABLED, "read sessions require mounted keys")
@@ -410,25 +420,35 @@ class JwtVerifier(
             if (jws.algorithm != "ES256") {
                 throw JwtViolation(JwtViolation.UNSUPPORTED_ALG, "invalid read session algorithm")
             }
+            // A miss asks for a rate-limited re-read of the mounted file, so a rotation
+            // does not wait for a token of another profile to miss first. Unlike the
+            // ordinary verifier, there is no second lookup: the request that missed is
+            // refused even if the re-read has already finished.
             val key =
-                jws.keyId?.let(keys::byKeyId)
-                    ?: throw JwtViolation(JwtViolation.UNKNOWN_KEY, "invalid read session key")
+                jws.keyId?.let { keyId ->
+                    keys.byKeyId(keyId) ?: run {
+                        keys.refreshInBackground()
+                        null
+                    }
+                } ?: throw JwtViolation(JwtViolation.UNKNOWN_KEY, "invalid read session key")
             Jwt.verifySignature(jws, key)
             val claims = jws.claims
             if (Jwt.text(claims, "iss") != issuer) {
                 throw JwtViolation(JwtViolation.WRONG_ISSUER, "invalid read session issuer")
             }
-            profile.validate(claims, clock(), skewSeconds)
+            val grants = profile.validate(claims, clock(), skewSeconds)
             val route = routing(claims)
-            scopedCaller(
-                claims,
-                Jwt.text(claims, "sub"),
-                Jwt.text(claims, "jti"),
-                Jwt.textOrNull(claims, "cli"),
-                route,
-                route == null,
-                SessionProfile.Grant(emptySet(), setOf("team")),
-            )
+            val caller =
+                scopedCaller(
+                    claims,
+                    Jwt.text(claims, "sub"),
+                    Jwt.text(claims, "jti"),
+                    Jwt.textOrNull(claims, "cli"),
+                    route,
+                    route == null,
+                    SessionProfile.Grant(emptySet(), setOf("team")),
+                )
+            caller to grants
         } catch (failure: JwtViolation) {
             throw JwtViolation(failure.reason, "read session refused")
         }

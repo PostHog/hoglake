@@ -108,26 +108,37 @@ This is the single most important existing building block:
   the tenant is made; the list is the configured PostgreSQL backend's, the
   default one or the lazily opened one of `HOGLAKE_DEFAULT_BACKEND=none` with
   `HOGLAKE_POSTGRES_BACKEND_ID`, which the create opens when no request has;
-  an open that fails is the create's 503 `backend_unavailable`, not an
-  unchecked create. The reverse is NOT checked: a PostgreSQL create is
+  an open that fails, or a read that loses PostgreSQL after it opened, is the
+  create's 503 `backend_unavailable`, not an unchecked create. The check is
+  a read before the tenant PUT, not serialized against a concurrent
+  PostgreSQL create, so two such creates can race onto overlapping
+  prefixes. The reverse is NOT checked: a PostgreSQL create is
   compared with PostgreSQL catalogs only, because hoglake keeps no list of
   Hoglite tenants and hoglite offers nothing that enumerates them, so a
   PostgreSQL catalog created on a Hoglite catalog's prefix (the #666 scenario
-  with the roles swapped) is refused by nothing on the server. Disjointness
-  between Hoglite catalogs on one backend lands with #668, when
+  with the roles swapped) is refused by nothing on the server; it is tracked in #741,
+  which #668 does not close, since a PostgreSQL create never
+  consults hoglite. Disjointness between Hoglite catalogs on one backend,
+  #666's other open direction, lands with #668, when
   `HogliteCatalogStore.createCatalog` sends the `data_path` on
   `PUT /v1/tenants/{tenant}` and hoglite checks it against the other tenants'
   manifests; today the PUT carries no body and a 409/422 reads as "tenant
   exists". Until then, and for a PostgreSQL create against Hoglite catalogs,
-  for another server's PostgreSQL catalogs, and across Hoglite backends,
-  disjointness is the operator's responsibility.
+  for concurrent creates, for another server's PostgreSQL catalogs, and
+  across Hoglite backends, disjointness is the operator's responsibility.
 - `validateDataPath` bounds length (512), refuses whitespace/control chars and
   dot segments, and requires an `s3://` URI.
 
-So *"a catalog cannot write outside its own prefix, and prefixes are disjoint"*
-is already a repository invariant. What is missing is that **`data_path` itself
-is caller-supplied**, so the invariant is only as strong as the honesty of the
-caller who creates the catalog.
+So *"a catalog cannot write outside its own prefix"* is already a repository
+invariant, and *"prefixes are disjoint"* is one among one server's PostgreSQL
+catalogs, as far as `createCatalog`'s in-transaction check serializes
+concurrent creates, and for a Hoglite create against them. It is not
+enforced for a PostgreSQL create against Hoglite catalogs, between Hoglite
+catalogs, between a Hoglite create and a concurrent PostgreSQL create, or
+across servers and Hoglite backends; there the operator keeps prefixes
+disjoint. What is missing is that **`data_path` itself is caller-supplied**,
+so the invariant is only as strong as the honesty of the caller who creates
+the catalog.
 
 ### 1.4 Every S3 driver on the server uses one global credential
 
@@ -1104,6 +1115,9 @@ serve from a source catalog (§6.5d, the imports) and, when configured, the
 published stream tables beside them. The Host verifies the relayed token
 itself, so it must accept the session profile too. Nothing turns this on in
 any deployment.
+A Client with `HOGLAKE_READ_SESSION_RELAY=on` also relays a dedicated read session,
+by the same caller rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
@@ -1326,6 +1340,10 @@ relayed requests (§6.5c). The path's catalog is the customer's own, which this
 server does not hold; the data is a namespace of a source catalog in this
 server's PostgreSQL, such as the imports. One pattern covers every team, so no
 per-team entry is needed.
+
+A Host with the read session profile also admits a dedicated read session on
+the four relayed `GET` routes, by the same rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id"}]}

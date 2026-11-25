@@ -60,6 +60,8 @@ data class RouteMatch(
     val namespace: String? = null,
     /** The rule's method (HEAD matches as GET). Null only in hand-built matches. */
     val method: HttpMethod? = null,
+    /** The `{table}` segment's value, when the route has one; see [catalog]. */
+    val table: String? = null,
 )
 
 /**
@@ -351,6 +353,7 @@ object AuthPolicy {
             if (pattern.size != actual.size) continue
             var catalog: String? = null
             var namespace: String? = null
+            var table: String? = null
             var ok = true
             for (i in pattern.indices) {
                 when (val seg = pattern[i]) {
@@ -363,10 +366,11 @@ object AuthPolicy {
                         when (seg.name) {
                             "catalog" -> catalog = actual[i]
                             "namespace" -> namespace = actual[i]
+                            "table" -> table = actual[i]
                         }
                 }
             }
-            if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern, namespace, entry.method)
+            if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern, namespace, entry.method, table)
         }
         return null
     }

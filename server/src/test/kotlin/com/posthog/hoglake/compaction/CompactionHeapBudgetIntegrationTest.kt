@@ -701,7 +701,9 @@ class CompactionHeapBudgetIntegrationTest {
         // 16 MiB floor: none is checked, and the 150,000 rows are three
         // spilled runs, not fifty one-file runs.
         val dir = spillDir()
-        val chunk = 70_000L
+        // Three padded spill estimates exceed the former 70k-row budget.
+        // 74k leaves room for admission while still producing three runs.
+        val chunk = 74_000L
         val cfg =
             smallFileConfig().copy(
                 targetBytes = 256L * 1024 * 1024,
@@ -711,6 +713,12 @@ class CompactionHeapBudgetIntegrationTest {
                 sortedHeapBytes = heapBytesFor(chunk),
             )
         assertThat(cfg.verifyMinBytes).isEqualTo(CompactionConfig.DEFAULT_VERIFY_MIN_BYTES)
+        val spill = cfg.sortSpill(fixtureLiveColumns)
+        assertThat(ExternalMergeSort.spillRuns(150_000, spill)).isEqualTo(3)
+        val leaves = ParquetRewriter.outputLeafCount(fixtureLiveColumns)
+        val perRun = ExternalMergeSort.predictedSpilledRunBytes(leaves, spill)
+        assertThat(3 * perRun).isLessThanOrEqualTo(spill.mergeBudgetBytes)
+        assertThat(3 * perRun).isGreaterThan(heapBytesFor(70_000))
         val svc = CompactionService(db.jdbi, store, cfg)
         val files = 50
         val cat = realSortedTableOf("tiny", presorted(files, 3_000))
@@ -719,7 +727,7 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
         assertThat(result.filesUnchecked).isEqualTo(files.toLong())
         assertThat(result.filesVerified + result.filesUnsorted).isZero()
-        assertThat(result.runsSpilled).describedAs("150k rows at 70k a chunk").isEqualTo(3)
+        assertThat(result.runsSpilled).describedAs("150k rows at 74k a chunk").isEqualTo(3)
         assertThat(result.spillBytes).isPositive()
         assertThat(readIds(livePaths(cat).single())).hasSize(files * 3_000).isSorted()
         val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))

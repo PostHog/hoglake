@@ -9,6 +9,7 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
+import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -450,6 +451,180 @@ class HogliteScopedNamespaceClientTest {
             second.get(3, TimeUnit.SECONDS)
             assertThat(observed).containsExactlyInAnyOrder("Bearer $TOKEN", "Bearer $OTHER_TOKEN")
         }
+    }
+
+    @Test
+    fun `table read enforces 256 KiB cap exact error codes and nested columns`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+        val nested =
+            """
+            {
+              "namespace_id": 17,
+              "namespace": "reports",
+              "containment": {"field": "team_id", "value": 42},
+              "table_id": 101,
+              "table_uuid": "$tableUuid",
+              "name": "metrics",
+              "read_snapshot_id": 5,
+              "columns": [
+                {
+                  "field_id": 1,
+                  "ordinal": 0,
+                  "name": "payload",
+                  "type": "struct",
+                  "nullable": true,
+                  "children": [
+                    {"field_id": 2, "ordinal": 0, "name": "k", "type": "string", "nullable": false}
+                  ]
+                }
+              ]
+            }
+            """.trimIndent()
+        val atCap = nested.padEnd(256 * 1024, ' ').toByteArray()
+        val overCap = nested.padEnd(256 * 1024 + 1, ' ').toByteArray()
+        val responses =
+            listOf(
+                200 to atCap,
+                200 to overCap,
+                404 to """{"code":"not_found"}""".toByteArray(),
+                403 to """{"code":"forbidden"}""".toByteArray(),
+                403 to """{"code":"other"}""".toByteArray(),
+            )
+        val index = AtomicInteger()
+        val server =
+            serve {
+                val (code, payload) = responses[index.getAndIncrement()]
+                reply(it, payload, code)
+            }
+        HogliteClient(url(server)).use { base ->
+            val client = base.forRequest(TOKEN)
+            val found = client.readScopedTable("tenant_1", "lake", "reports", "metrics")
+            assertThat(found).isInstanceOf(ScopedReadOutcome.Found::class.java)
+            val table = (found as ScopedReadOutcome.Found).value.table
+            assertThat(table.columns.single().children?.single()?.name).isEqualTo("k")
+            assertThat(table.remote).isFalse()
+
+            assertThatThrownBy { client.readScopedTable("tenant_1", "lake", "reports", "metrics") }
+                .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessage("hoglite scoped table read unavailable")
+                .hasNoCause()
+            assertThat(client.readScopedTable("tenant_1", "lake", "reports", "metrics"))
+                .isEqualTo(ScopedReadOutcome.NotFound)
+            assertThat(client.readScopedTable("tenant_1", "lake", "reports", "metrics"))
+                .isEqualTo(ScopedReadOutcome.Forbidden)
+            assertThatThrownBy { client.readScopedTable("tenant_1", "lake", "reports", "metrics") }
+                .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        }
+    }
+
+    @Test
+    fun `scan read enforces 1 MiB cap exact query and file count limit`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+        val empty =
+            """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,"files":[]}"""
+        val atCap = empty.padEnd(1024 * 1024, ' ').toByteArray()
+        val overCap = empty.padEnd(1024 * 1024 + 1, ' ').toByteArray()
+        val oneFile =
+            """{"data_file":{"data_file_id":1,"path":"s3://b/k","file_format":"parquet","record_count":1,""" +
+                """"file_size_bytes":10,"row_id_start":0,"stats_state":"none","begin_snapshot":1,""" +
+                """"explicit_row_ids":false}}"""
+        val tooManyFiles =
+            (
+                """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,""" +
+                    """"files":[${List(1001) { oneFile }.joinToString(",")}]}"""
+            ).toByteArray()
+        val badDvDataFileId =
+            (
+                """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,""" +
+                    """"files":[{"data_file":{"data_file_id":1,"path":"s3://b/k","file_format":"parquet",""" +
+                    """"record_count":1,"file_size_bytes":10,"row_id_start":0,"stats_state":"none",""" +
+                    """"begin_snapshot":1,"explicit_row_ids":false},"delete_file":{"delete_file_id":2,""" +
+                    """"data_file_id":99,"path":"s3://b/d","delete_count":1,"file_size_bytes":10,""" +
+                    """"begin_snapshot":1}}]}"""
+            ).toByteArray()
+        val responses =
+            listOf(
+                200 to atCap,
+                200 to overCap,
+                200 to tooManyFiles,
+                200 to badDvDataFileId,
+                404 to """{"code":"not_found"}""".toByteArray(),
+                403 to """{"code":"forbidden"}""".toByteArray(),
+            )
+        val index = AtomicInteger()
+        val server =
+            serve {
+                assertThat(it.requestURI.rawQuery).isEqualTo("snapshot=5&table_uuid=$tableUuid")
+                val (code, payload) = responses[index.getAndIncrement()]
+                reply(it, payload, code)
+            }
+        HogliteClient(url(server)).use { base ->
+            val client = base.forRequest(TOKEN)
+            val found = client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid)
+            assertThat(found).isEqualTo(ScopedReadOutcome.Found(emptyList<Any>()))
+
+            repeat(3) {
+                assertThatThrownBy {
+                    client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid)
+                }.isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                    .hasMessage("hoglite scoped scan read unavailable")
+                    .hasNoCause()
+            }
+            assertThat(client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid))
+                .isEqualTo(ScopedReadOutcome.NotFound)
+            assertThat(client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid))
+                .isEqualTo(ScopedReadOutcome.Forbidden)
+            assertThatThrownBy {
+                client.readScopedScan("tenant_1", "lake", "reports", "metrics", -1L, tableUuid)
+            }.isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        }
+        assertThat(index.get()).isEqualTo(responses.size)
+    }
+
+    @Test
+    fun `scan read preserves explicit_row_ids for compacted files and rejects missing or invalid flags`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+
+        fun payload(explicitField: String): ByteArray =
+            (
+                """{"namespace_id":17,"namespace":"reports","table_uuid":"$tableUuid","read_snapshot_id":5,""" +
+                    """"files":[{"data_file":{"data_file_id":1,"path":"s3://b/compacted.parquet",""" +
+                    """"file_format":"parquet","record_count":10,"file_size_bytes":1024,"row_id_start":100,""" +
+                    """"stats_state":"none","begin_snapshot":4$explicitField}}]}"""
+            ).toByteArray()
+
+        val responses =
+            listOf(
+                payload(""","explicit_row_ids":true"""),
+                payload(""","explicit_row_ids":false"""),
+                payload(""),
+                payload(""","explicit_row_ids":null"""),
+                payload(""","explicit_row_ids":"true""""),
+                payload(""","explicit_row_ids":1"""),
+            )
+        val index = AtomicInteger()
+        val server = serve { reply(it, responses[index.getAndIncrement()]) }
+        HogliteClient(url(server)).use { base ->
+            val client = base.forRequest(TOKEN)
+            val compacted =
+                client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) as
+                    ScopedReadOutcome.Found
+            assertThat(compacted.value.single().dataFile.explicitRowIds).isTrue()
+
+            val positional =
+                client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) as
+                    ScopedReadOutcome.Found
+            assertThat(positional.value.single().dataFile.explicitRowIds).isFalse()
+
+            repeat(4) {
+                assertThatThrownBy {
+                    client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid)
+                }.isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                    .hasMessage("hoglite scoped scan read unavailable")
+                    .hasNoCause()
+            }
+        }
+        assertThat(index.get()).isEqualTo(responses.size)
     }
 
     @Test

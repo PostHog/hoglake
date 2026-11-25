@@ -30,6 +30,7 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
+import org.jdbi.v3.core.Jdbi
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.lang.reflect.Proxy
@@ -37,6 +38,9 @@ import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
+import java.sql.Connection
+import java.sql.SQLException
+import java.sql.SQLTransientConnectionException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -46,8 +50,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * refusal is PostgreSQL's 422, and it lands before the engine sees a
  * request. The list is the configured PostgreSQL backend's, default or
  * lazily opened; a server with no PostgreSQL backend has none to check,
- * and one whose lazy open fails answers that failure rather than create
- * unchecked.
+ * and one whose lazy open fails, or whose PostgreSQL stops answering after
+ * it opened, answers the retryable 503 rather than create unchecked.
  */
 class CatalogCreateBackendOverlapTest {
     @TempDir
@@ -133,6 +137,70 @@ class CatalogCreateBackendOverlapTest {
             assertThat(opens.get()).describedAs("the create opened the backend").isOne()
             assertThat(engineCalls.get()).describedAs("no tenant PUT for an unchecked create").isZero()
         }
+    }
+
+    @Test
+    fun `a PostgreSQL backend lost after it opened fails the create closed and retryable`() {
+        // The pool is open (PostgresRuntime.get returned a Jdbi); PostgreSQL then
+        // stops answering. The real read path: PostgresCatalogStore ->
+        // CatalogService.listCatalogs -> Jdbi, over connections that fail as
+        // Hikari (no connection from the pool) and PgJDBC (a connection that
+        // dies under the statement) do.
+        val poolTimeout = SQLTransientConnectionException("HikariPool-1 - Connection is not available")
+        val dropped = SQLException("An I/O error occurred while sending to the backend.", "08006")
+        val shutdown = SQLException("terminating connection due to administrator command", "57P01")
+        val lost =
+            listOf(
+                "pool timeout" to failingStore(open = poolTimeout),
+                "dropped connection" to failingStore(statement = dropped),
+                "server shutdown" to failingStore(statement = shutdown),
+            )
+        for ((what, store) in lost) {
+            withServer("postgres", postgres = { store }) { engineCalls, create ->
+                val response = create("s3://bucket/anything")
+                assertThat(response.status).describedAs(what).isEqualTo(HttpStatusCode.ServiceUnavailable)
+                assertThat(response.bodyAsText()).describedAs(what).contains("backend_unavailable")
+                assertThat(response.headers[HttpHeaders.RetryAfter]).describedAs(what).isNotNull()
+                assertThat(engineCalls.get()).describedAs("$what: no tenant PUT for an unchecked create").isZero()
+            }
+        }
+        // A statement PostgreSQL refuses is not an outage: the catch-all 500, and still no tenant.
+        val refused = failingStore(statement = SQLException("relation \"hog_catalog\" does not exist", "42P01"))
+        withServer("postgres", postgres = { refused }) { engineCalls, create ->
+            val response = create("s3://bucket/anything")
+            assertThat(response.status).isEqualTo(HttpStatusCode.InternalServerError)
+            assertThat(engineCalls.get()).describedAs("no tenant PUT for an unchecked create").isZero()
+        }
+    }
+
+    /**
+     * A PostgreSQL store over a Jdbi whose connection source throws [open],
+     * or whose connections open and then throw [statement] from every
+     * statement they are asked to prepare.
+     */
+    private fun failingStore(
+        open: SQLException? = null,
+        statement: SQLException? = null,
+    ): CatalogStore {
+        val connection =
+            Proxy.newProxyInstance(
+                Connection::class.java.classLoader,
+                arrayOf(Connection::class.java),
+            ) { _, method, _ ->
+                when (method.name) {
+                    "prepareStatement", "createStatement", "prepareCall" -> throw checkNotNull(statement)
+                    "getAutoCommit", "isValid" -> true
+                    "isClosed", "isReadOnly" -> false
+                    "getTransactionIsolation" -> Connection.TRANSACTION_READ_COMMITTED
+                    else -> null
+                }
+            } as Connection
+        val jdbi = Jdbi.create { open?.let { throw it } ?: connection }
+        return PostgresCatalogStore(
+            { CatalogService(jdbi) },
+            { error("no commit after a failed read") },
+            { error("no scan after a failed read") },
+        )
     }
 
     @Test
