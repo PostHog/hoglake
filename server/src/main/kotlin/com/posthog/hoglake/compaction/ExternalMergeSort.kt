@@ -643,9 +643,10 @@ internal object ExternalMergeSort {
 
     /**
      * A local spill file whose every byte passes through [meter]. Its
-     * stream needs no cleanup of ours: when the meter's refusal unwinds
-     * the writer, [ParquetRewriter.writingTo] aborts it, and
-     * [OutputWriter.abort] closes the stream it created.
+     * stream needs no cleanup of ours: a refusal while writing or while
+     * closing (the last row group) unwinds to [ParquetRewriter.writingTo],
+     * which aborts the writer, and [OutputWriter.abort] closes the stream
+     * it created.
      */
     private class MeteredSpillFile(
         private val path: Path,
