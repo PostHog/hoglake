@@ -18,10 +18,11 @@ import java.time.Instant
  * Read one tenant's maintenance ledger and indexed live backlogs.
  * No registry, fleet sampler, or PostgreSQL service participates.
  * Older schemas report unknown backlogs when the required indexes are absent.
+ * Hoglite has no hydrator loop (#675): the hydrator, like reindex, reports no interval and a null
+ * loop, so a caller reads it as manual only (rehydrate's sweep).
  */
 internal class HogliteMaintenanceStatus(
     private val store: HogliteCatalogStore,
-    private val hydratorIntervalMs: Long,
     private val expiryIntervalMs: Long,
     private val cleanupIntervalMs: Long,
     private val compactionIntervalMs: Long,
@@ -39,7 +40,7 @@ internal class HogliteMaintenanceStatus(
             val tasks = MaintenanceTask.entries.filter { it != MaintenanceTask.VERIFY }
             val loops =
                 tasks.filter {
-                    it.hasLoop && it != MaintenanceTask.REINDEX && "maintenance_runs_loop" in indexes
+                    it.hasLoop && it !in LOOPLESS && "maintenance_runs_loop" in indexes
                 }
             val statements = mutableListOf(HogliteStatement(store.metaSql))
             if ("files_live_stats" in indexes) {
@@ -84,8 +85,12 @@ internal class HogliteMaintenanceStatus(
             }
             // Every value uses the same read snapshot and the same tenant binding.
             val results = store.readCatalog(catalog, statements).iterator()
-            val meta = store.metaRow(results.next().firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
-            if (meta.name != catalog) throw HoglakeException.NotFound("catalog '$catalog'")
+            // metaRow refuses a tenant whose meta names another catalog.
+            val meta =
+                store.metaRow(
+                    catalog,
+                    results.next().firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"),
+                )
             val hydration = if ("files_live_stats" in indexes) results.next().firstRow() else null
             val removals = if ("removals_queued_at" in indexes) results.next().firstRow() else null
             val small = if ("files_live_size" in indexes) results.next().firstRow()?.get(0).asLongOrNull() else null
@@ -137,7 +142,7 @@ internal class HogliteMaintenanceStatus(
                                     MaintenanceTask.VERIFY -> error("removed task")
                                 },
                             loop =
-                                if (task == MaintenanceTask.REINDEX) {
+                                if (task in LOOPLESS) {
                                     null
                                 } else {
                                     observe(
@@ -179,21 +184,18 @@ internal class HogliteMaintenanceStatus(
                         HogliteStatement("$RUN_SELECT$where ORDER BY id DESC LIMIT ?", args),
                     ),
                 )
-            val meta = results[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'")
-            if (meta[0].asString() != catalog) throw HoglakeException.NotFound("catalog '$catalog'")
+            store.metaRow(catalog, results[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
             page(results[1].rows.map { toRun(catalog, it) }, cap)
         }
     }
 
     private fun loopIntervalOf(task: MaintenanceTask): Long? =
         when (task) {
-            MaintenanceTask.HYDRATOR -> hydratorIntervalMs
             MaintenanceTask.EXPIRY -> expiryIntervalMs
             MaintenanceTask.CLEANUP -> cleanupIntervalMs
             MaintenanceTask.COMPACTION -> compactionIntervalMs
             MaintenanceTask.RETIREMENT -> retirementIntervalMs
-            // Reindex is PostgreSQL-only. No interval applies to Hoglite.
-            MaintenanceTask.REINDEX -> null
+            // Reindex is PostgreSQL-only, and the hydrator has no Hoglite loop.
             else -> null
         }
 
@@ -252,6 +254,9 @@ internal class HogliteMaintenanceStatus(
 
     companion object {
         private const val MAX_LIMIT = 500
+
+        /** Tasks no Hoglite loop runs: reindex is PostgreSQL-only, and hydration runs inside rehydrate. */
+        private val LOOPLESS = setOf(MaintenanceTask.REINDEX, MaintenanceTask.HYDRATOR)
 
         /** Stop reporting the cadence after three missed intervals. */
         private const val STALE_GAP_MULTIPLE = 3L

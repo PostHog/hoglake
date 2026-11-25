@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.ConsumerTableOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileStats
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionValues
@@ -44,7 +45,11 @@ internal class BoundCatalogStore(
         message: String?,
     ): CatalogInfo {
         grant.closed(name)
-        return inner.createCatalog(name, dataPath, author, message)
+        return try {
+            inner.createCatalog(name, dataPath, author, message)
+        } catch (e: HoglakeException.Validation) {
+            throw grant.createRefusal(e)
+        }
     }
 
     /** Open to a scoped caller: it is what its catalog listing shows, and where an upload claim's check reads. */

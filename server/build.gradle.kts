@@ -25,10 +25,10 @@ val jdbiVersion = "3.55.0"
 // the transactional lock through the typed configuration extension. See
 // the comment there — losing that setting HANGS every migration rather
 // than failing it.
-val flywayVersion = "13.12.1"
+val flywayVersion = "13.12.2"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.57.12"
+val awsSdkVersion = "2.59.1"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -90,7 +90,7 @@ dependencies {
     // writer both live on it. hadoop-client-api is the shaded,
     // dependency-free jar; the wider Hadoop dependency tree must not leak
     // into the codebase.
-    implementation("org.apache.parquet:parquet-hadoop:1.18.1")
+    implementation("org.apache.parquet:parquet-hadoop:1.18.2")
     implementation("org.apache.hadoop:hadoop-client-api:3.5.0")
     runtimeOnly("org.apache.hadoop:hadoop-client-runtime:3.5.0")
 
@@ -103,7 +103,7 @@ dependencies {
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.6")
-    implementation("io.github.oshai:kotlin-logging-jvm:8.0.6")
+    implementation("io.github.oshai:kotlin-logging-jvm:8.0.7")
     implementation("net.logstash.logback:logstash-logback-encoder:8.1")
     implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")
     implementation("io.micrometer:micrometer-registry-prometheus:1.17.2")
@@ -120,7 +120,7 @@ dependencies {
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
     testImplementation("org.awaitility:awaitility:4.3.0")
-    testImplementation("io.kotest:kotest-property:6.2.6")
+    testImplementation("io.kotest:kotest-property:6.2.7")
 
     // Coverage-guided fuzzing (docs/fuzzing.md layer 4): jazzer-junit @FuzzTest
     // targets in src/test/kotlin/com/posthog/hoglake/fuzz. Inside the normal
@@ -249,6 +249,12 @@ tasks.test {
     // NPE otherwise arrives with no stack and no message, which makes a
     // failure report useless and any frame-based assertion unreliable.
     jvmArgs("-XX:+EnableDynamicAgentLoading", "-XX:-OmitStackTraceInFastThrow")
+    // One worker JVM runs the whole suite, and jazzer-junit's agent
+    // scans the entire test classpath with ClassGraph when a @FuzzTest
+    // class initializes. On Gradle's default worker heap that scan, late
+    // in a full run, ran the JVM out of memory and killed the executor
+    // partway through (#738). 3g completes the full suite with headroom.
+    maxHeapSize = "3g"
     testLogging {
         events("failed", "skipped")
         showStackTraces = true

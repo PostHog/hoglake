@@ -341,7 +341,9 @@ fall back to a whole-object read **capped** at
 file fails structurally with a fix-then-rehydrate message instead of
 becoming an OOM vector), and the sweep claims its batch
 `FOR UPDATE SKIP LOCKED`, so concurrent replicas hydrate disjoint sets
-instead of amplifying S3 GETs against the same head.
+instead of amplifying S3 GETs against the same head. The Hoglite
+rehydrate sweep (below) also holds its reads to the registration, which
+there the tenant writes; this hydrator does not.
 
 The footer read doubles as the **field-id audit**: any leaf without a
 `PARQUET:field_id` flags the row (`hog_data_file.missing_field_ids`,
@@ -1873,10 +1875,12 @@ trusted-row maxima before allocating larger heads. Spill profiles and
 measured row maxima replace their metadata estimates.
 
 The spill estimate includes packed scratch for the producer's 20,000-row
-pages and fixed column/page objects. An eleven-leaf run now estimates
-19,216,564 bytes. Four runs reserve 76,866,256 bytes, compared with
-76,385,594 observed bytes. This remains an estimate, not a universal
-page-count or dictionary bound.
+pages and fixed column/page objects, plus 2% rounded-up headroom for
+observed calibration variation. An eleven-leaf run estimates 19,600,896
+bytes; four runs reserve 78,403,584 bytes. Previous measurements include
+76,385,594 bytes and, on macOS ARM64, 76,945,723 bytes. This remains an
+estimate, not a universal page-count or dictionary bound; actual profiles
+still govern the merge.
 
 Owned converters release completed nested groups.
 They transfer root ownership when records return.
@@ -2075,7 +2079,7 @@ chunks, retained heap at a full GC):
 | 8,000,000 | 160 | 147 MB | 82 MB | 1,206 MB |
 
 The chunk phase is FLAT in group size. The merge held ~6.6 MB per
-spilled run (above the writer) against the current ~18.3 MiB estimate.
+spilled run (above the writer) against the current ~18.7 MiB estimate.
 The output writer also stays flat.
 It buffers one output row group until close.
 The historical buffered cost is about 140 MiB for a 128 MiB target.
@@ -2662,9 +2666,40 @@ The catalog reports on itself instead of waiting for ops SQL:
   hydrator's structural failures (above): flips `failed` → `pending`,
   catalog-wide or scoped to one namespace+table.
   Hoglite uses the token's placement and excludes ended files and dropped tables.
-  The manual action changes metadata only; it does not start a hydration sweep.
   One transaction updates all matching files, subject to the engine's write limits.
-  Full hydration still needs the existing server-side `ObjectStore` path and per-run AWS identity.
+  Hoglite has no hydrator loop, so the requeue then runs one bounded hydration sweep over the
+  same scope (#675): up to 1,000 live `pending` files of live tables, started within 10 s, read
+  through the server's `ObjectStore` with the PostgreSQL hydrator's footer read, aggregate, size
+  floor and object-prefix proof. The sweep starts after the highest file id the requeue found
+  `failed` and wraps to the lowest ids, so files that fail on every call rotate through the sweep
+  and cannot hold back newer ones. Each outcome lands in its own transaction, fenced on the file
+  still live and `pending` and its table's `schema_version`, so a concurrent ALTER, drop or end
+  leaves it pending; one bad file is marked `failed` and the sweep goes on. Stats or split offsets
+  over the scan's 64 KiB per-file limit are not stored. The tenant registers and can rewrite each
+  file's sizes (#668), so unlike the PostgreSQL hydrator the sweep's reads are held to them: the
+  tail is a closed range ending at `file_size_bytes`, a `footer_size` over
+  `HOGLAKE_HOGLITE_MAX_FOOTER_BYTES` (default 64 MiB) is not usable and the file takes the
+  whole-object read under `HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES`, and that read stops one byte
+  past `file_size_bytes`, so an object longer than its registration is marked `failed` instead of
+  landing on the heap. The sweep records its own `hydrator` run,
+  with what it resolved before any failure; its failure is logged and does not fail the requeue.
+  Call it again to drain a larger backlog (`pending_files` in `GET /maintenance/status`, which
+  reports the Hoglite hydrator with no loop: manual only).
+  The tenant can rewrite both `files.path` and `meta.data_path` (#668), so the sweep reads only
+  under a prefix it cannot: `HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE` (`s3://warehouse/{catalog}`, the
+  catalog's name substituted) when set, else the catalog's own session under the `broker`
+  provider, which the broker binds to the catalog (the broker must refuse a `prefix` outside the
+  catalog's placement, docs/auth.md). A file outside it is marked `failed` without being read.
+  With the template set, a Hoglite catalog create whose `data_path` is not the template with its
+  name answers 422, so no catalog sits inside another's bound; a catalog created before the
+  template, or whose tenant rewrote `meta.data_path`, is not swept. The broker session is resolved
+  before any file is claimed, so a refusal (`prefix_outside_catalog`) fails the run once. For that
+  up-front refusal, a catalog off its placement, and `ambient` or `static` with no template, the
+  requeue runs alone: the rehydrate records a failed `hydrator` run saying why, so
+  `GET /maintenance/status`'s `last_run` shows it, and the server warns at boot when Hoglite
+  backends are configured with neither. A session that cannot be had mid-sweep is different: the
+  sweep has run, and stops with that file still `pending` and not counted as claimed; the failed
+  run records what the sweep resolved before it as a partial result.
   Hoglite retirement is available through the backend seam for trusted placement.
   It has no HTTP trigger or background driver.
   Each retirement batch queues current vector and data paths before it deletes their rows.
