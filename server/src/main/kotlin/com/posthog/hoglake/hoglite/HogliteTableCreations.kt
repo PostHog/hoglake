@@ -157,6 +157,7 @@ internal class HogliteTableCreations(
         operationId: UUID,
     ): TableCreation =
         store.catalogOperation(catalog) {
+            store.meta(catalog) // 404 first, as on the Postgres path
             store.loadCreationOrThrow(catalog, operationId, persistExpiry = false)
         }
 

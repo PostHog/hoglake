@@ -140,6 +140,7 @@ internal class HogliteCleanup(
                         purgeCommitReceipts(catalog, m.retentionSeconds)
                     } catch (e: Exception) {
                         requireOrdinaryPurgeFailure(catalog, e)
+                        if (partlyApplied(e)) throw e
                         log.warn(e) {
                             "cleanup: the commit-receipt retention purge failed for catalog '$catalog'; " +
                                 "the drain itself is unaffected and the next run retries"
@@ -148,6 +149,7 @@ internal class HogliteCleanup(
                     }
                 Metrics.commitReceiptPurgeFailures(catalog, receipts.failures)
                 val drainedFailure = purgeDrainedLedger(catalog)
+                if (partlyApplied(drainedFailure) && !partlyApplied(ledgerFailure)) throw drainedFailure!!
                 if (ledgerFailure != null && drainedFailure != null) {
                     suppressOnce(ledgerFailure, drainedFailure)
                 }
@@ -155,7 +157,7 @@ internal class HogliteCleanup(
             } catch (e: Throwable) {
                 if (ledgerFailure == null) throw e
                 // Shutdown/fatal signals escape immediately, never another phase.
-                if (e !is Exception || terminalPurgeFailure(e)) {
+                if (e !is Exception || terminalPurgeFailure(e) || (partlyApplied(e) && !partlyApplied(ledgerFailure))) {
                     suppressOnce(e, ledgerFailure)
                     throw e
                 }
@@ -499,6 +501,17 @@ internal class HogliteCleanup(
         e is InterruptedException || e is java.util.concurrent.CancellationException ||
             Thread.currentThread().isInterrupted
 
+    /**
+     * A request that partly applied: a token that lapsed at hoglite after an
+     * earlier phase committed ([HoglakeException.CommitOutcomeUnknown.tokenLapsed],
+     * #680). The receipt and drained-ledger purges never count it as a
+     * best-effort miss, which would answer 200 and hide it; it fails the run
+     * ahead of an ordinary ledger failure, also when it ended a page whose
+     * own outcome is unknown. A page's unknown outcome with no lapse stays
+     * a best-effort miss, as on PostgreSQL.
+     */
+    private fun partlyApplied(e: Throwable?): Boolean = e is HoglakeException.CommitOutcomeUnknown && e.tokenLapsed
+
     /** Ordinary failures can be isolated; shutdown and poisoned bindings cannot. */
     private fun requireOrdinaryPurgeFailure(
         catalog: String,
@@ -572,6 +585,7 @@ internal class HogliteCleanup(
                         .firstRow()!![0].asLong()
                 } catch (e: Exception) {
                     requireOrdinaryPurgeFailure(catalog, e)
+                    if (partlyApplied(e)) throw e
                     failures++
                     log.warn(e) { "cleanup: a commit-receipt purge page failed for catalog '$catalog'" }
                     break

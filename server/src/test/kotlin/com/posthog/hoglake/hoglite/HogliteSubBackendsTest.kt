@@ -51,8 +51,70 @@ class HogliteSubBackendsTest {
                         "rows" to rows,
                         "affected" to affected,
                     )
+
+                /** One read: a `/query` body, or one statement of a read transaction. */
+                fun query(q: JsonNode): Map<String, Any> {
+                    queries.add(q)
+                    val sql = q["sql"].asText()
+                    return when {
+                        sql == "SELECT ${HogliteSchema.CREATION_NOW_SQL}" ->
+                            result(listOf(listOf(julianDate(creationClock))))
+                        sql.startsWith("SELECT name, data_path,") ->
+                            result(listOf(listOf("cat", "s3://bucket/cat", 7, 0, 0, null, null, 0)))
+                        sql.startsWith("SELECT table_uuid, definition_json") ->
+                            result(
+                                listOf(
+                                    listOf(
+                                        view.toString(),
+                                        TableCreationDefinitionCodec.encode(definition),
+                                        "s3://bucket/cat/data/$view/",
+                                        "prepared",
+                                        creationExpiresAt,
+                                        null,
+                                        null,
+                                        null,
+                                        if (julianDate(Instant.parse(creationExpiresAt)) <=
+                                            q["args"][0].asDouble()
+                                        ) {
+                                            1
+                                        } else {
+                                            0
+                                        },
+                                    ),
+                                ),
+                            )
+                        sql.startsWith("SELECT upload_id, owner") ->
+                            result(
+                                listOf(
+                                    listOf(
+                                        upload,
+                                        storedOwner,
+                                        "s3://bucket/cat",
+                                        "s3://bucket/cat/f",
+                                        "data",
+                                        "active",
+                                        Instant.now().plusSeconds(3600).toString(),
+                                    ),
+                                ),
+                            )
+                        sql.startsWith(
+                            "SELECT id, name, contained_field",
+                        ) -> result(listOf(listOf(1, "ns", null, null)))
+                        sql.startsWith(
+                            "SELECT id, view_uuid, name",
+                        ) -> result(listOf(listOf(1, view, "v", "trino", "SELECT 1")))
+                        sql.startsWith(
+                            "SELECT id, view_uuid, dialect",
+                        ) -> result(listOf(listOf(1, view, "trino", "SELECT 1")))
+                        else -> result()
+                    }
+                }
+                val readTx = body.has("txid") && body["txid"].asText().startsWith(HogliteClient.READ_TXID_PREFIX)
                 val answer =
-                    if (body.has("statements")) {
+                    if (readTx) {
+                        // A read transaction (liveNamespace): each statement is a read of the same snapshot.
+                        mapOf("results" to body["statements"].map { query(it) })
+                    } else if (body.has("statements")) {
                         val results =
                             body["statements"].map { stmt ->
                                 statements.add(stmt)
@@ -64,60 +126,7 @@ class HogliteSubBackendsTest {
                             }
                         mapOf("results" to results)
                     } else {
-                        queries.add(body)
-                        val sql = body["sql"].asText()
-                        when {
-                            sql == "SELECT ${HogliteSchema.CREATION_NOW_SQL}" ->
-                                result(listOf(listOf(julianDate(creationClock))))
-                            sql.startsWith("SELECT name, data_path,") ->
-                                result(listOf(listOf("cat", "s3://bucket/cat", 7, 0, 0, null, null, 0)))
-                            sql.startsWith("SELECT table_uuid, definition_json") ->
-                                result(
-                                    listOf(
-                                        listOf(
-                                            view.toString(),
-                                            TableCreationDefinitionCodec.encode(definition),
-                                            "s3://bucket/cat/data/$view/",
-                                            "prepared",
-                                            creationExpiresAt,
-                                            null,
-                                            null,
-                                            null,
-                                            if (julianDate(Instant.parse(creationExpiresAt)) <=
-                                                body["args"][0].asDouble()
-                                            ) {
-                                                1
-                                            } else {
-                                                0
-                                            },
-                                        ),
-                                    ),
-                                )
-                            sql.startsWith("SELECT upload_id, owner") ->
-                                result(
-                                    listOf(
-                                        listOf(
-                                            upload,
-                                            storedOwner,
-                                            "s3://bucket/cat",
-                                            "s3://bucket/cat/f",
-                                            "data",
-                                            "active",
-                                            Instant.now().plusSeconds(3600).toString(),
-                                        ),
-                                    ),
-                                )
-                            sql.startsWith(
-                                "SELECT id, name, contained_field",
-                            ) -> result(listOf(listOf(1, "ns", null, null)))
-                            sql.startsWith(
-                                "SELECT id, view_uuid, name",
-                            ) -> result(listOf(listOf(1, view, "v", "trino", "SELECT 1")))
-                            sql.startsWith(
-                                "SELECT id, view_uuid, dialect",
-                            ) -> result(listOf(listOf(1, view, "trino", "SELECT 1")))
-                            else -> result()
-                        }
+                        query(body)
                     }
                 val bytes = json.writeValueAsBytes(answer)
                 ex.sendResponseHeaders(200, bytes.size.toLong())
@@ -215,13 +224,15 @@ class HogliteSubBackendsTest {
             assertThat(expired.state).isEqualTo("aborted")
             assertThat(expired.reason).isEqualTo("expired")
             assertThat(resolutions.get()).isEqualTo(2)
-            assertThat(queries).hasSize(4)
-            for (index in listOf(0, 2)) {
-                assertThat(queries[index]["sql"].asText()).isEqualTo("SELECT ${HogliteSchema.CREATION_NOW_SQL}")
-                assertThat(queries[index + 1]["sql"].asText()).startsWith("SELECT table_uuid, definition_json")
-                assertThat(queries[index + 1]["args"][1].asText()).isEqualTo(upload.toString())
+            // Per status: the catalog's meta row (the tenant holds this catalog), the clock, then the receipt.
+            assertThat(queries).hasSize(6)
+            for (index in listOf(0, 3)) {
+                assertThat(queries[index]["sql"].asText()).isEqualTo(store.metaSql)
+                assertThat(queries[index + 1]["sql"].asText()).isEqualTo("SELECT ${HogliteSchema.CREATION_NOW_SQL}")
+                assertThat(queries[index + 2]["sql"].asText()).startsWith("SELECT table_uuid, definition_json")
+                assertThat(queries[index + 2]["args"][1].asText()).isEqualTo(upload.toString())
             }
-            assertThat(queries[1]["args"][0].asDouble()).isLessThan(queries[3]["args"][0].asDouble())
+            assertThat(queries[2]["args"][0].asDouble()).isLessThan(queries[5]["args"][0].asDouble())
             assertThat(statements).isEmpty()
             assertThat(paths).allMatch { it == "/v1/t/opaque_1/query" }
         }

@@ -2952,17 +2952,28 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * a later call of the same request failed in a way that cannot mean
      * "nothing ran" (hoglite refusing a token that expired mid-request).
      * The request partly applied, so the message says to re-read state
-     * rather than that the outcome is unknown.
+     * rather than that the outcome is unknown. It promises exactly-once
+     * only to a retry with the same key on an operation that takes one: a
+     * maintenance run, catalog drop or upload sweep takes none, and a
+     * replay of one can act on state another caller changed meanwhile.
+     *
+     * [tokenLapsed] marks a 401 that ended a call after an earlier
+     * transaction of the request applied or may have. [txid] names that
+     * earlier transaction, or the failing call's own when one of its
+     * attempts was ambiguous. A best-effort maintenance step fails its run
+     * only on that: an ambiguous outcome with no lapse is a step failure
+     * like any other.
      */
     class CommitOutcomeUnknown(
         val txid: String,
         detail: String,
         val applied: Boolean = false,
+        val tokenLapsed: Boolean = false,
     ) : BackendUnavailable(
             if (applied) {
                 "request partly applied: backend transaction '$txid' applied and a later step " +
-                    "failed. A retry with the same idempotency_key is exactly-once; without a key, " +
-                    "re-read the catalog's state before a retry: $detail"
+                    "failed. Only an operation that takes an idempotency_key is exactly-once on a " +
+                    "retry with the same key; otherwise re-read the catalog's state before a retry: $detail"
             } else {
                 "commit outcome unknown: it may or may not have been applied. A retry with the same " +
                     "idempotency_key is exactly-once; without a key, read the table before a retry " +

@@ -138,12 +138,17 @@ class HogliteRejected(
  * request has applied (or may have), a later 401 cannot mean "nothing
  * ran": it surfaces as [HoglakeException.CommitOutcomeUnknown] naming
  * that `tx` (marked [HoglakeException.CommitOutcomeUnknown.applied] when
- * it answered 200), never as the refusal a caller re-mints its token and
- * replays the whole request on. Only 401: hoglite answers it for every
- * token it cannot verify, an expired one included, and 403 only for a
- * verified token whose authority never covers the call (a tenant
- * mismatch, a non-operator on an operator route), which a retry cannot
- * change, so a 403 stays a refusal. This is the fallback: a long-running
+ * it answered 200, and always
+ * [HoglakeException.CommitOutcomeUnknown.tokenLapsed]), never as the
+ * refusal a caller re-mints its token and replays the whole request on.
+ * A 401 that ends a `tx` whose own attempt was ambiguous names that `tx`
+ * instead, unless an earlier `tx` is known to have applied, which it
+ * names, with the ambiguous one in the detail; marked tokenLapsed
+ * whenever an earlier `tx` applied or may have. Only 401: hoglite
+ * answers it for every token it cannot verify, an expired one included,
+ * and 403 only for a verified token whose authority never covers the
+ * call (a tenant mismatch, a non-operator on an operator route), which a
+ * retry cannot change, so a 403 stays a refusal. This is the fallback: a long-running
  * route refuses up front a token with too little lifetime left
  * (`CatalogStoreSelector.requireTokenLifetime`), before anything is sent.
  *
@@ -660,16 +665,32 @@ class HogliteClient(
         ): T {
             // A later refusal cannot disprove an earlier ambiguous apply.
             // Only a complete successful answer can settle this exact request.
+            val earlier = appliedTx?.get()
             if (txid != null && mayHaveApplied && status != 200) {
-                throw HoglakeException.CommitOutcomeUnknown(txid, "hoglite answered $status after an ambiguous attempt")
+                // A tx known to have applied outranks this one's unknown outcome.
+                if (status == 401 && earlier?.certain == true) {
+                    throw HoglakeException.CommitOutcomeUnknown(
+                        earlier.txid,
+                        "hoglite refused the request's token (401), as it does once the token expires, " +
+                            "after an ambiguous attempt of backend transaction '$txid'",
+                        applied = true,
+                        tokenLapsed = true,
+                    )
+                }
+                throw HoglakeException.CommitOutcomeUnknown(
+                    txid,
+                    "hoglite answered $status after an ambiguous attempt",
+                    // A 401 after an earlier tx of the request still ends a request that partly ran.
+                    tokenLapsed = status == 401 && earlier != null,
+                )
             }
             // Nor can a token that lapsed mid-request disprove an earlier tx of it.
-            val earlier = appliedTx?.get()
             if (earlier != null && status == 401) {
                 throw HoglakeException.CommitOutcomeUnknown(
                     earlier.txid,
                     "hoglite refused the request's token (401), as it does once the token expires",
                     applied = earlier.certain,
+                    tokenLapsed = true,
                 )
             }
             return parse(status, bytes)

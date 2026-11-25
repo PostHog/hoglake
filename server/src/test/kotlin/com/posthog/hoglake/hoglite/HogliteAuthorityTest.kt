@@ -162,6 +162,9 @@ class HogliteAuthorityTest {
                     assertThat(unknown.applied).describedAs(name).isTrue()
                     assertThat(unknown.message).describedAs(name)
                         .contains("request partly applied", "'first'").doesNotContain("may or may not")
+                    // No promise of exactly-once to a route that takes no idempotency_key.
+                    assertThat(unknown.message).describedAs(name)
+                        .contains("Only an operation that takes an idempotency_key")
                     // Another request, with nothing applied, keeps the refusal it can re-mint for.
                     assertThat(catchThrowable { hop(shared.forRequest("synthetic-expiring")) })
                         .describedAs(name).isExactlyInstanceOf(HogliteRejected::class.java)
@@ -197,8 +200,9 @@ class HogliteAuthorityTest {
         try {
             HogliteClient("http://127.0.0.1:${server.address.port}", sleeper = {}).use { shared ->
                 val selected = shared.forRequest("synthetic-expiring")
-                assertThatThrownBy { selected.tx("one", "uncertain", null, write) }
-                    .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                val own = catchThrowable { selected.tx("one", "uncertain", null, write) }
+                assertThat(own).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                assertThat((own as HoglakeException.CommitOutcomeUnknown).tokenLapsed).isFalse()
                 // A refused tx never ran: its 401 names "uncertain", and "refused" is recorded nowhere.
                 assertThatThrownBy { selected.tx("one", "refused", null, write) }
                     .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
@@ -207,6 +211,7 @@ class HogliteAuthorityTest {
                 val unknown = failure as HoglakeException.CommitOutcomeUnknown
                 assertThat(unknown.txid).isEqualTo("uncertain")
                 assertThat(unknown.applied).isFalse()
+                assertThat(unknown.tokenLapsed).isTrue()
                 assertThat(unknown.message).contains("may or may not", "'uncertain'")
             }
         } finally {
@@ -246,14 +251,58 @@ class HogliteAuthorityTest {
                 val uncertain = catchThrowable { selected.tx("one", "second", null, write) }
                 assertThat((uncertain as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo("second")
                 assertThat(uncertain.applied).isFalse()
+                // Its own unknown outcome, and no 401 ended it: a best-effort step may count it.
+                assertThat(uncertain.tokenLapsed).isFalse()
                 val failure = catchThrowable { selected.query("one", "SELECT 1") }
                 assertThat(failure).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
                 val unknown = failure as HoglakeException.CommitOutcomeUnknown
                 assertThat(unknown.txid).isEqualTo("first")
                 assertThat(unknown.applied).isTrue()
+                assertThat(unknown.tokenLapsed).isTrue()
             }
         } finally {
             server.stop(0)
+        }
+    }
+
+    /** A 504 and then a 401 for the retry: the tx's own outcome is unknown, and the token lapsed. */
+    @Test
+    fun `a 401 ending an ambiguous tx marks the lapse only after an earlier tx of the request`() {
+        val gatewayTimeout = 504 to """{"error":"gateway timeout"}"""
+        val refused = 401 to """{"code":"refused","error":"request not authorized"}"""
+        // "first" before "second": none, one that may have applied (504, then 401), one that did.
+        for (earlier in listOf("none", "uncertain", "applied")) {
+            val txs =
+                when (earlier) {
+                    "none" -> arrayOf(gatewayTimeout)
+                    "uncertain" -> arrayOf(gatewayTimeout, refused, gatewayTimeout)
+                    else -> arrayOf(applied, gatewayTimeout)
+                }
+            val server = refusingAfterTxs(401, *txs)
+            try {
+                HogliteClient("http://127.0.0.1:${server.address.port}", sleeper = {}).use { shared ->
+                    val selected = shared.forRequest("synthetic-expiring")
+                    if (earlier != "none") runCatching { selected.tx("one", "first", null, write) }
+                    val failure = catchThrowable { selected.tx("one", "second", null, write) }
+                    assertThat(failure).describedAs(earlier)
+                        .isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                    val unknown = failure as HoglakeException.CommitOutcomeUnknown
+                    // Only a request that partly ran fails a best-effort maintenance run on it.
+                    assertThat(unknown.tokenLapsed).describedAs(earlier).isEqualTo(earlier != "none")
+                    if (earlier == "applied") {
+                        // The request certainly partly applied: never "may or may not".
+                        assertThat(unknown.txid).isEqualTo("first")
+                        assertThat(unknown.applied).isTrue()
+                        assertThat(unknown.message)
+                            .contains("request partly applied", "'first'", "'second'").doesNotContain("may or may not")
+                    } else {
+                        assertThat(unknown.txid).describedAs(earlier).isEqualTo("second")
+                        assertThat(unknown.applied).describedAs(earlier).isFalse()
+                    }
+                }
+            } finally {
+                server.stop(0)
+            }
         }
     }
 

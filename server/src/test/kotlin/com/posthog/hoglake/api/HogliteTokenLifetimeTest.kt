@@ -10,6 +10,7 @@ import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.CleanupBackend
 import com.posthog.hoglake.service.CompactionBackend
 import com.posthog.hoglake.service.ExpiryBackend
@@ -36,6 +37,8 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
+import io.micrometer.prometheusmetrics.PrometheusConfig
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
@@ -103,6 +106,7 @@ class HogliteTokenLifetimeTest {
 
     private fun app(
         minimum: Long = 300,
+        mode: AuthMode = AuthMode.ENFORCE,
         body: suspend ApplicationTestBuilder.() -> Unit,
     ) = testApplication {
         val file = dir.resolve("backends.json")
@@ -113,7 +117,7 @@ class HogliteTokenLifetimeTest {
         val cfg =
             Config(
                 backendsFile = file.toString(),
-                authMode = "enforce",
+                authMode = mode.wire,
                 hogliteMinTokenLifetimeSeconds = minimum,
             )
         // Never asked: cleanup and compaction read hoglite first.
@@ -129,7 +133,7 @@ class HogliteTokenLifetimeTest {
         application {
             installAuth(
                 AuthService(
-                    AuthMode.ENFORCE,
+                    mode,
                     JwtVerifier(
                         TestTokens.ISSUER,
                         TestTokens.AUDIENCE,
@@ -169,6 +173,8 @@ class HogliteTokenLifetimeTest {
     @Test
     fun `a long-running hoglite route refuses a token under the minimum before any backend call`() =
         app {
+            val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+            Metrics.bind(registry)
             for (route in longRunning) {
                 val response = send(route, routed(left = 299))
                 assertThat(response.status).describedAs(route.second).isEqualTo(HttpStatusCode.Unauthorized)
@@ -178,6 +184,24 @@ class HogliteTokenLifetimeTest {
                 assertThat(response.bodyAsText()).contains("\"token_expired\"").contains("nothing ran")
             }
             assertThat(engineCalls.get()).isZero()
+            // Counted as the refusal it is, though the plugin let the request through.
+            val refused = registry.find("hoglake_auth_requests_total").tag("outcome", "invalid").counter()
+            assertThat(refused?.count()).isEqualTo(longRunning.size.toDouble())
+        }
+
+    @Test
+    fun `warn counts a token under the minimum and lets it through, as it does every refusal`() =
+        app(mode = AuthMode.WARN) {
+            val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+            Metrics.bind(registry)
+            for (route in longRunning) {
+                val before = engineCalls.get()
+                val response = send(route, routed(left = 299))
+                assertThat(response.status).describedAs(route.second).isNotEqualTo(HttpStatusCode.Unauthorized)
+                assertThat(engineCalls.get()).describedAs(route.second).isGreaterThan(before)
+            }
+            val refused = registry.find("hoglake_auth_requests_total").tag("outcome", "invalid").counter()
+            assertThat(refused?.count()).isEqualTo(longRunning.size.toDouble())
         }
 
     @Test
