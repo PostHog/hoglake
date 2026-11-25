@@ -826,7 +826,7 @@ to claim.
 | `read` | catalog get, namespaces, tables, views, files, scan, changes, partitions, stats, storage-usage, snapshots, options read, consumers read |
 | `write` | commit (all three forms), uploads, table-creations, alter, truncate, drop namespace/table, options write, consumers write |
 | `maintenance` | `POST …/maintenance/{expire,compact,rehydrate,cleanup}`, publications create/delete |
-| `admin` | `DELETE /v1/catalogs/{catalog}` (tenant-scoped self-service drop; PostgreSQL only, a hoglite catalog needs an `operator` token, §6.1), client management for this tenant |
+| `admin` | `DELETE /v1/catalogs/{catalog}` (tenant-scoped self-service drop; PostgreSQL only, a hoglite catalog needs an `operator` token, see the routing amendment to §6.2; tenant-admin drop on hoglite is PostHog/hoglite#31), client management for this tenant |
 
 The scopes are ordered `read < write < maintenance < admin`, and a held scope
 satisfies every requirement at or below it (`Scope.satisfies`, by ordinal), so a
@@ -1087,6 +1087,9 @@ serve from a source catalog (§6.5d, the imports) and, when configured, the
 published stream tables beside them. The Host verifies the relayed token
 itself, so it must accept the session profile too. Nothing turns this on in
 any deployment.
+A Client with `HOGLAKE_READ_SESSION_RELAY=on` also relays a dedicated read session,
+by the same caller rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
@@ -1309,6 +1312,10 @@ relayed requests (§6.5c). The path's catalog is the customer's own, which this
 server does not hold; the data is a namespace of a source catalog in this
 server's PostgreSQL, such as the imports. One pattern covers every team, so no
 per-team entry is needed.
+
+A Host with the read session profile also admits a dedicated read session on
+the four relayed `GET` routes, by the same rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id"}]}
