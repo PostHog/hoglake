@@ -580,6 +580,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | No `rtg`, or a different catalog | PostgreSQL default, or 404 when the default is `none` |
 | Hoglite catalog listing | Only the token's routed catalog |
 | Publications or the maintenance export on hoglite | 501 `not_supported_on_backend` |
+| `DELETE /v1/catalogs/{catalog}` on hoglite | Needs an `operator` token: hoglite deletes a tenant only for an operator, so a `tenant` token with `admin` gets 403 before anything is fenced (#683) |
 | A configured served namespace named in the path, in a catalog this server does not hold (§6.5d) | Resolved before all of the above, whatever the token's `rtg`: read from its source catalog in PostgreSQL, or refused |
 | A remote schema named in the path, in a catalog this server holds (§6.5c) | Resolved next, before any store: relayed to its host, or refused |
 
@@ -825,7 +826,7 @@ to claim.
 | `read` | catalog get, namespaces, tables, views, files, scan, changes, partitions, stats, storage-usage, snapshots, options read, consumers read |
 | `write` | commit (all three forms), uploads, table-creations, alter, truncate, drop namespace/table, options write, consumers write |
 | `maintenance` | `POST …/maintenance/{expire,compact,rehydrate,cleanup}`, publications create/delete |
-| `admin` | `DELETE /v1/catalogs/{catalog}` (tenant-scoped self-service drop), client management for this tenant |
+| `admin` | `DELETE /v1/catalogs/{catalog}` (tenant-scoped self-service drop; PostgreSQL only, a hoglite catalog needs an `operator` token, see the routing amendment to §6.2; tenant-admin drop on hoglite is PostHog/hoglite#31), client management for this tenant |
 
 The scopes are ordered `read < write < maintenance < admin`, and a held scope
 satisfies every requirement at or below it (`Scope.satisfies`, by ordinal), so a

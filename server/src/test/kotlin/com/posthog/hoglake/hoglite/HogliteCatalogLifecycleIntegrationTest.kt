@@ -64,6 +64,32 @@ class HogliteCatalogLifecycleIntegrationTest {
     }
 
     /**
+     * A drop that fails after its fence leaves the catalog readable and
+     * every write refused as "being dropped". Retrying the drop resumes
+     * from the fence: it releases and deletes the tenant instead of
+     * refusing itself as "being dropped".
+     */
+    @Test
+    fun `a drop that fails after its fence is completed by a retry`() {
+        val c = HogliteConformanceEngine.uniqueName("halfdrop")
+        store.createCatalog(c, "s3://hoglake-it/$c", null, null)
+        HogliteInterposer(engine.url()).use { proxy ->
+            proxy.hook({ m, p, _ -> m == "DELETE" && p.startsWith("/v1/tenants/") }) {
+                error("tenant delete lost")
+            }
+            assertThatThrownBy { proxy.store.dropCatalog(c, null, null) }
+                .isNotInstanceOf(HoglakeException.NotFound::class.java)
+            assertThat(store.getCatalog(c).name).isEqualTo(c)
+            assertThatThrownBy { store.createNamespace(c, "late", null, null) }
+                .isInstanceOf(HoglakeException.NotFound::class.java)
+                .hasMessageContaining("being dropped")
+
+            assertThat(proxy.store.dropCatalog(c, "test", "retry").name).isEqualTo(c)
+        }
+        assertThatThrownBy { store.getCatalog(c) }.isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    /**
      * The resolver is the caller's mapping (a token's `cat` and `rtg.t`),
      * and a wrong one must not reach the catalog the tenant holds under
      * the requested name (#670): reads, writes and the drop are the

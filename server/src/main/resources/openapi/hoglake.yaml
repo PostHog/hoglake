@@ -248,6 +248,19 @@ paths:
         afterwards, and a catalog created under it starts a new snapshot
         clock at 0. No operation receipt: do not retry an unknown outcome
         blindly — a 404 on retry may mean the first attempt succeeded.
+        A Hoglite catalog drop is not one transaction: the preconditions
+        and a write fence commit together, then the tenant is released
+        and deleted. It needs an `operator` token (403 otherwise, before
+        anything is fenced). If it fails after the fence and the original
+        catalog is still fenced (still readable, writes get 404 "being
+        dropped"), retrying the DELETE completes the drop; a retry from a
+        replica whose clock is behind may answer 409 catalog_not_empty
+        (`active_compaction_claims` or `abandoned_uploads_unsettled`)
+        until its clock passes the expiry the first attempt saw. The
+        unknown-outcome warning still holds: a drop whose response was
+        lost may already have deleted the tenant, and if an empty catalog
+        was created under the same name and routing since, a retry drops
+        that catalog instead.
       parameters:
         - { $ref: "#/components/parameters/operationAuthor" }
         - { $ref: "#/components/parameters/operationMessage" }
@@ -259,6 +272,17 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DroppedCatalog" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403":
+          description: >-
+            The credential verifies and the catalog is the caller's own,
+            but it does not hold `admin`; or, on a Hoglite catalog, it is
+            not an `operator` token (a `tenant` token with `admin` is
+            refused too, because hoglite deletes a tenant only for an
+            operator). Answered before anything is fenced. Error
+            `forbidden`. A catalog the caller is NOT entitled to is 404.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >
