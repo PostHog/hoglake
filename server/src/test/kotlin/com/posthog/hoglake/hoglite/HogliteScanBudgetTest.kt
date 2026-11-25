@@ -15,6 +15,20 @@ class HogliteScanBudgetTest {
     }
 
     @Test
+    fun `growth of a counted file charges both byte ceilings without counting a file`() {
+        val budget = HogliteScanBudget()
+        budget.add(1, HogliteCatalogStore.SCAN_MAX_METADATA_BYTES - 1)
+        budget.grow(0, 1)
+        assertThatThrownBy { budget.grow(0, 1) }
+            .isInstanceOf(HoglakeException.Validation::class.java).hasMessageContaining("requested metadata")
+        val files = HogliteScanBudget()
+        repeat(HogliteCatalogStore.SCAN_MAX_FILES) { files.add(1) }
+        files.grow(HogliteCatalogStore.SCAN_MAX_BYTES - HogliteCatalogStore.SCAN_MAX_FILES, 0)
+        assertThatThrownBy { files.grow(1, 0) }
+            .isInstanceOf(HoglakeException.Validation::class.java).hasMessageContaining("536870912 bytes")
+    }
+
+    @Test
     fun `file count accepts the ceiling and refuses the next row`() {
         val budget = HogliteScanBudget()
         repeat(HogliteCatalogStore.SCAN_MAX_FILES) { budget.add(1) }

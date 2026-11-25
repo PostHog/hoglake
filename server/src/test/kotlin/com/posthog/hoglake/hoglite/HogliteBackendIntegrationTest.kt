@@ -339,6 +339,14 @@ class HogliteBackendIntegrationTest {
             padded,
             " ".repeat(280 * 1024) + "[]",
         )
+        copyFirstFile(cat, count)
+    }
+
+    /** Copies file 1 to files 2 through [count], payloads included. */
+    private fun copyFirstFile(
+        cat: String,
+        count: Int,
+    ) {
         scaleWrite(
             cat,
             """WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i + 1 FROM n WHERE i < ?)

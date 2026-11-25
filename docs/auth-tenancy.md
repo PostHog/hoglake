@@ -547,8 +547,15 @@ It needs `HOGLAKE_POSTGRES_BACKEND_ID` to identify this process's PostgreSQL bac
 Unknown fields, invalid shapes, or multiple `cat` entries return 401 `invalid_token`.
 
 Every routed token names exactly one `cat` entry, including catalog operator tokens.
-Catalog operators retain `ten: operator` and operator authority; `cat` identifies only their placement.
-Legacy tokens without `rtg` keep their previous behavior.
+A catalog operator retains `ten: operator`, and its `cat` is its binding, not only its placement:
+it is an operator on that one catalog (every scope, containment, `POST /v1/catalogs` for that name)
+and a stranger everywhere else (404 on another catalog, 403 on the fleet routes), as
+[auth.md](auth.md#scoped-tokens-exactly) describes and hoglite enforces. The `cat` entry must grant
+`admin`; a narrower word refuses the token. An operator token without `cat` or `org` stays
+fleet-wide; one with `org` but no `cat` is refused, and one carrying `scope` is refused, as hoglite
+refuses both.
+A token without `rtg` keeps its previous placement (the default backend); the binding and the `org`
+rule above apply to an operator token with or without `rtg`.
 
 `HOGLAKE_BACKENDS_FILE` points to a JSON object with a `backends` array.
 Each entry has `id`, `kind: hoglite`, and `url`.
@@ -904,8 +911,8 @@ plugin's rules again for the name the handler passes, before it resolves a
 binding or a store (`auth/StoreEntitlement.kt`):
 
 - A request with no caller gets 401.
-- A name the token does not name (`Caller.knowsCatalog`; an operator knows every
-  catalog) gets the plugin's 404.
+- A name the token does not name (`Caller.knowsCatalog`; a fleet-wide operator
+  knows every catalog, a catalog-bound one only its own) gets the plugin's 404.
 - A name the token holds without the scope the route asks for gets the plugin's
   403, so a write route is not served from a catalog held only for read.
 - The modes are the plugin's: no check under `off`; under `warn` the refusal is
@@ -1086,6 +1093,9 @@ serve from a source catalog (§6.5d, the imports) and, when configured, the
 published stream tables beside them. The Host verifies the relayed token
 itself, so it must accept the session profile too. Nothing turns this on in
 any deployment.
+A Client with `HOGLAKE_READ_SESSION_RELAY=on` also relays a dedicated read session,
+by the same caller rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
@@ -1308,6 +1318,10 @@ relayed requests (§6.5c). The path's catalog is the customer's own, which this
 server does not hold; the data is a namespace of a source catalog in this
 server's PostgreSQL, such as the imports. One pattern covers every team, so no
 per-team entry is needed.
+
+A Host with the read session profile also admits a dedicated read session on
+the four relayed `GET` routes, by the same rule:
+[auth.md](auth.md#read-sessions-on-a-remote-schema).
 
 ```json
 {"families": [{"family": "team", "source_catalog": "imports-dev", "predicate_field": "team_id"}]}

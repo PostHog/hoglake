@@ -52,7 +52,9 @@ class HogliteCreationReadCutTest {
                     } else {
                         val sql = request["sql"].asText()
                         val row =
-                            if ("FROM table_creations" !in sql) {
+                            if ("FROM meta" in sql) {
+                                listOf("cat", "s3://bucket/cat", 0, 0, 0, null, null, 0)
+                            } else if ("FROM table_creations" !in sql) {
                                 listOf(julian(clock.get()))
                             } else {
                                 val snapshotState = state.get()

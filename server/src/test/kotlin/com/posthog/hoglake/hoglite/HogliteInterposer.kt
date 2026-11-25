@@ -22,10 +22,14 @@ import java.util.concurrent.Executors
 internal class HogliteInterposer(
     private val targetUrl: String,
 ) : AutoCloseable {
-    /** Runs [before] once for the first request that [match]es (method, path, body). */
+    /**
+     * Runs [before] once for the first request that [match]es (method, path, body), then forwards it,
+     * or, with an [answer] (status, body), answers that instead without forwarding.
+     */
     class Hook(
         val match: (String, String, String) -> Boolean,
         val before: () -> Unit,
+        val answer: Pair<Int, String>? = null,
     ) {
         @Volatile var fired = false
     }
@@ -49,6 +53,13 @@ internal class HogliteInterposer(
                             }?.also { it.fired = true }
                         }
                     hook?.before?.invoke()
+                    hook?.answer?.let { (status, canned) ->
+                        val bytes = canned.toByteArray()
+                        ex.responseHeaders.add("Content-Type", "application/json")
+                        ex.sendResponseHeaders(status, bytes.size.toLong())
+                        ex.responseBody.use { it.write(bytes) }
+                        return@createContext
+                    }
                     val publisher =
                         if (body.isEmpty()) {
                             HttpRequest.BodyPublishers.noBody()
@@ -85,6 +96,13 @@ internal class HogliteInterposer(
         match: (String, String, String) -> Boolean,
         before: () -> Unit,
     ): Hook = Hook(match, before).also { hooks += it }
+
+    /** Answers the first request that [match]es with [status] and [body], an engine refusal it never saw. */
+    fun refuse(
+        match: (String, String, String) -> Boolean,
+        status: Int,
+        body: String,
+    ): Hook = Hook(match, {}, status to body).also { hooks += it }
 
     override fun close() {
         client.close()

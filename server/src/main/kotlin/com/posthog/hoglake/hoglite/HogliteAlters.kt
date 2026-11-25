@@ -28,6 +28,9 @@ import java.util.UUID
 private val ALTER_SCHEMA_CHANGED = HoglakeException.CommitConflict("table schema changed while planning alter")
 private val ALTER_FILE_SET_CHANGED = HoglakeException.CommitConflict("file set changed while planning alter")
 
+/** File-fence replans per alter, apart from the one schema-fence replan. */
+internal const val MAX_FILE_SET_REPLANS = 3
+
 /**
  * [AlterBackend] on hoglite: [com.posthog.hoglake.service.AlterService]'s
  * op semantics over the tenant's versioned rows.
@@ -66,7 +69,14 @@ internal class HogliteAlters(
             store.catalogOperation(catalog) {
                 if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
                 var original: Triple<Long, Long, UUID>? = null
-                for (attempt in 0..1) {
+                // The schema fence and the file fence replan on separate budgets,
+                // so steady appends to the promoted table never spend the schema
+                // replan: PostgreSQL serializes the alter behind its lock and
+                // refuses neither. The bound keeps continuous ingest from
+                // livelocking a promote.
+                var schemaReplans = 0
+                var fileSetReplans = 0
+                while (true) {
                     // ONE read-only transaction for the head, the namespace
                     // and the table's version row AT that head
                     // (HogliteCatalogStore.headTableRow): the identity and
@@ -268,7 +278,7 @@ internal class HogliteAlters(
                     )
                     // Publish the schema change for the commit path's per-table
                     // fence: a blind append planned against the old schema fails
-                    // its fence and replans once rather than landing stale.
+                    // its fence and replans rather than landing stale.
                     tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
                     for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
                     // One guarded write per file, after every promotion has patched the shared plan.
@@ -287,11 +297,16 @@ internal class HogliteAlters(
                         try {
                             store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
                         } catch (e: HoglakeException.CommitConflict) {
-                            if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_FILE_SET_CHANGED) throw e
-                            if (attempt == 1 || (e === ALTER_SCHEMA_CHANGED && readSnapshot != null)) {
-                                throw HoglakeException.CommitConflict(
-                                    "table $namespace.$table changed under the alter; re-read and retry",
-                                )
+                            when {
+                                e === ALTER_SCHEMA_CHANGED && readSnapshot == null && schemaReplans < 1 ->
+                                    schemaReplans++
+                                e === ALTER_FILE_SET_CHANGED && fileSetReplans < MAX_FILE_SET_REPLANS ->
+                                    fileSetReplans++
+                                e === ALTER_SCHEMA_CHANGED || e === ALTER_FILE_SET_CHANGED ->
+                                    throw HoglakeException.CommitConflict(
+                                        "table $namespace.$table changed under the alter; re-read and retry",
+                                    )
+                                else -> throw e
                             }
                             // Nothing from the rejected plan is reused. In particular
                             // transport retries of runTx above retain their own body/id;
@@ -654,7 +669,8 @@ internal class HogliteAlters(
      * decode bounds under the LIVE type. The stored stats are the file
      * row's JSON column-stats list, so the re-encode is read-patch-write
      * per file, guarded on the old content. All promotions share one plan and
-     * one rewrite per file; an allocator fence detects files added after the read.
+     * one rewrite per file; a table-scoped fence detects files added after the read,
+     * and a stat-less count fence files hydrated after it.
      */
     private fun reencodeStatsOnPromote(
         catalog: String,
@@ -679,16 +695,39 @@ internal class HogliteAlters(
                 }
             }
         if (!state.statsLoaded) {
-            // O(1) allocator fence, BEFORE the stats read, including an empty set.
-            // Every append increments it. A catalog-wide fence is conservative for
-            // unrelated tables but avoids an O(manifest) set comparison under the tx.
-            val nextFile =
-                store.queryCatalog(catalog, "SELECT next_file_id FROM meta WHERE id = 1")
-                    .firstRow()!![0].asLong()
-            tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_FILE_SET_CHANGED }
+            // The file fence, BEFORE the stats read, including an empty set. The
+            // allocator and the head come from one row: every file below the
+            // allocator began at or before that head, and every file inserted
+            // later begins after it. The guard counts only THIS table's later
+            // files (files_listing index), so appends to other tables in a busy
+            // catalog never trip it.
+            val pinned =
+                store.queryCatalog(catalog, "SELECT next_file_id, next_snapshot - 1 FROM meta WHERE id = 1")
+                    .firstRow()!!
+            val nextFile = pinned[0].asLong()
+            tx.expectZero(
+                "SELECT COUNT(*) FROM files WHERE table_id = ? AND begin_snapshot > ?",
+                tableId,
+                pinned[1].asLong(),
+            ) { ALTER_FILE_SET_CHANGED }
+            // Hydration gives an EXISTING live file its stats (#675), which the fence above
+            // cannot see. It is the only move out of this count (requeue moves failed to
+            // pending, both inside it), so a hydration between this read and the commit
+            // lowers it and forces a fresh plan that re-encodes the file; an ended file
+            // lowers it too, which only costs a replan. `+table_id` keeps the planner on
+            // files_live_stats, so the cost is the catalog's stat-less backlog, not the
+            // table's retained manifest.
+            val statless =
+                "SELECT COUNT(*) FROM files WHERE stats_state IN ('pending', 'failed') " +
+                    "AND end_snapshot IS NULL AND +table_id = ?"
+            tx.expectScalar(
+                store.queryCatalog(catalog, statless, tableId).firstRow()!![0].asLong(),
+                statless,
+                tableId,
+            ) { ALTER_FILE_SET_CHANGED }
             // Reuse files_listing's complete ordering, including ended rows. The
-            // pinned allocator ceiling excludes later appends; its tx guard will
-            // force a fresh plan if anything was appended while paging.
+            // pinned allocator ceiling excludes later appends; the fence forces
+            // a fresh plan if this table was appended to while paging.
             var cursor: Triple<Long, Long, Long>? = null
             var pageSize = 256
             while (true) {

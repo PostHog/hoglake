@@ -8,7 +8,7 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.ExpiryBackend
-import java.time.Instant
+import java.time.DateTimeException
 
 /**
  * Port [com.posthog.hoglake.service.ExpiryService]'s two-phase sweep to one tenant.
@@ -56,7 +56,19 @@ internal class HogliteExpiry(
             }
         val attempt = runCatching { advanceFloor(catalog, pre, batchSize) }
         // Drain an earlier sweep's backlog even when this floor advance failed.
-        val purge = purge(catalog, pre.earliestSnapshotId)
+        val purge =
+            try {
+                purge(catalog, pre.earliestSnapshotId)
+            } catch (e: HoglakeException.CommitOutcomeUnknown) {
+                // The lapse wins, but a failed floor advance is still counted and audited.
+                attempt.exceptionOrNull()?.let { a ->
+                    Metrics.expiryAdvanceFailures(catalog)
+                    Audit.event("expiry", catalog, null, Audit.failureOutcome(a), a.message)
+                    if (a !== e) e.addSuppressed(a)
+                }
+                Audit.event("expiry", catalog, null, Audit.failureOutcome(e), e.message)
+                throw e
+            }
         Metrics.expiryPurgeRows(catalog, purge.dataRows + purge.deleteRows)
         Metrics.expiryPurgeFailures(catalog, purge.failures)
         if (purge.truncated) Metrics.expiryPurgeTruncated(catalog)
@@ -179,15 +191,35 @@ internal class HogliteExpiry(
             pre.retentionSeconds
                 ?: return Advance(0, pre.earliestSnapshotId, null, released)
 
-        val now = Instant.now()
-        val cutoff = HogliteSchema.fmt(now.minusSeconds(retention))
-        val firstFresh =
+        // Oldest snapshot still inside the retention window, the cutoff
+        // on the ENGINE's clock: the one that stamped every ts
+        // (insertSnapshotRow), as ExpiryService's `snapshot_time >= now()
+        // - make_interval(secs => :retention)` has both sides on the
+        // database clock. A cutoff from this pod's clock expired early or
+        // late by the skew between the two (#672).
+        //
+        // The cutoff rides the same read, because SQLite answers a date
+        // its calendar cannot hold with NULL, not an error: `ts >= NULL`
+        // matches nothing, and a null floor candidate below means "every
+        // retained snapshot is stale", so a retention past the calendar
+        // would have expired the catalog up to head. PostgreSQL's
+        // make_interval raises on that retention and the sweep writes
+        // nothing; a NULL cutoff fails this one the same way (the
+        // DateTimeException Instant.minusSeconds threw for it before).
+        val (cutoff, firstFresh) =
             store.queryCatalog(
                 catalog,
-                "SELECT MIN(id) FROM snapshots WHERE id >= ? AND ts >= ?",
+                "SELECT c, (SELECT MIN(id) FROM snapshots WHERE id >= ? AND ts >= c) " +
+                    "FROM (SELECT ${HogliteSchema.NOW_MINUS_SECONDS_SQL} AS c)",
                 pre.earliestSnapshotId,
-                cutoff,
-            ).firstRow()!![0].asLongOrNull()
+                retention,
+            ).firstRow()!!.let { it[0] as? String to it[1].asLongOrNull() }
+        if (cutoff == null) {
+            throw DateTimeException(
+                "snapshot_retention_seconds=$retention puts the retention cutoff outside the engine's " +
+                    "calendar; the floor stays at ${pre.earliestSnapshotId}",
+            )
+        }
 
         val minOffset =
             if (pre.consumerFloor) {
@@ -317,6 +349,18 @@ internal class HogliteExpiry(
         val floor: Long,
     )
 
+    /**
+     * [runCatching] for phase B's best-effort steps, except that a token
+     * that lapsed after phase A committed escapes
+     * ([HoglakeException.CommitOutcomeUnknown.tokenLapsed], #680): the
+     * request partly applied, and a 200 with a purge failure count would
+     * hide that and its transaction, also when it ended a page whose own
+     * outcome is unknown. A page's unknown outcome with no lapse stays a
+     * purge failure, as on PostgreSQL.
+     */
+    private inline fun <T> recovering(block: () -> T): Result<T> =
+        runCatching(block).onFailure { if (it is HoglakeException.CommitOutcomeUnknown && it.tokenLapsed) throw it }
+
     private fun purge(
         catalog: String,
         knownFloor: Long,
@@ -325,7 +369,7 @@ internal class HogliteExpiry(
         // least phase A's. A floor of 0 skips the phase: every ended
         // row's end_snapshot >= 1, so nothing is eligible.
         val floor =
-            runCatching { store.meta(catalog).earliestSnapshotId }.getOrNull()
+            recovering { store.meta(catalog).earliestSnapshotId }.getOrNull()
                 ?: return Purge(0, 0, 0, 1, truncated = true, remaining = null, floor = knownFloor)
         if (floor <= 0) return Purge(0, 0, 0, 0, truncated = false, remaining = 0, floor = floor)
 
@@ -346,7 +390,7 @@ internal class HogliteExpiry(
                 break
             }
             val page =
-                runCatching {
+                recovering {
                     store.queryCatalog(
                         catalog,
                         "SELECT delete_file_id, path FROM dvs " +
@@ -361,7 +405,7 @@ internal class HogliteExpiry(
                 }
             if (page.isEmpty()) break
             val ids = page.map { it[0].asLong() }
-            runCatching {
+            recovering {
                 val tx = HogliteTx()
                 // Queue from transaction-local rows, not the page's stale paths.
                 tx.add(
@@ -401,7 +445,7 @@ internal class HogliteExpiry(
                 break
             }
             val page =
-                runCatching {
+                recovering {
                     store.queryCatalog(
                         catalog,
                         "SELECT id, path FROM files " +
@@ -416,7 +460,7 @@ internal class HogliteExpiry(
                 }
             if (page.isEmpty()) break
             val ids = page.map { it[0].asLong() }
-            runCatching {
+            recovering {
                 val tx = HogliteTx()
                 // The riding vectors' removals come from the same
                 // predicate INSIDE the transaction: a DV that lands
@@ -466,7 +510,7 @@ internal class HogliteExpiry(
 
         val remaining =
             if (truncated) {
-                runCatching {
+                recovering {
                     val cap = PURGE_REMAINING_CAP
                     store.queryCatalog(
                         catalog,
