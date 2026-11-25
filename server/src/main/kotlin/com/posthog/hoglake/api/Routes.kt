@@ -309,9 +309,7 @@ fun Application.installApiRoutes(
                         when (val binding = selector.resolve(call, call.catalog())) {
                             is CatalogBinding.RemoteSchema -> binding.host.schemaNamespace(call, binding)
                             is CatalogBinding.Served -> {
-                                if (call.isReadSession) {
-                                    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
-                                }
+                                if (call.isReadSession) requireReadSessionListingQuery(call)
                                 call.respond(
                                     // No id: it is a counter of the shared source catalog.
                                     NamespaceDto(
@@ -372,6 +370,7 @@ fun Application.installApiRoutes(
                             when (val binding = selector.resolve(call, call.catalog())) {
                                 is CatalogBinding.RemoteSchema -> binding.host.schemaTables(call, binding)
                                 is CatalogBinding.Served -> {
+                                    if (call.isReadSession) requireReadSessionListingQuery(call)
                                     val tables =
                                         binding.reader.tables(
                                             call.longQuery("snapshot"),
@@ -379,7 +378,6 @@ fun Application.installApiRoutes(
                                         )
                                     if (call.isReadSession) {
                                         // No totals: they are not computed from grant-checked files.
-                                        call.response.headers.append(HttpHeaders.CacheControl, "no-store")
                                         call.respond(tables.map { it.toReadSessionDto() })
                                     } else {
                                         call.respond(tables.map { it.toDto() })
@@ -1426,6 +1424,18 @@ private fun requireReadSessionTableQuery(call: ApplicationCall) {
     val queryIndex = uri.indexOf('?')
     if (queryIndex != -1 && uri.substring(queryIndex + 1) != "totals=false") {
         throw BadRequestException("invalid scoped table request")
+    }
+}
+
+/**
+ * A read session's namespace `GET` and table list take no query: a session
+ * reads the current state only, so `snapshot`, `at_timestamp` and every other
+ * parameter is refused before anything is read.
+ */
+private fun requireReadSessionListingQuery(call: ApplicationCall) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    if (call.request.uri.contains('?')) {
+        throw BadRequestException("invalid scoped namespace request")
     }
 }
 
