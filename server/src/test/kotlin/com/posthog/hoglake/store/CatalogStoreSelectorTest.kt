@@ -14,6 +14,7 @@ import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
+import com.posthog.hoglake.hoglite.HogliteHydrator
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HogliteRetirement
 import com.posthog.hoglake.model.HoglakeException
@@ -235,10 +236,10 @@ class CatalogStoreSelectorTest {
                             selector.retirement(call, "lake") { error("must not construct PostgreSQL retirement") },
                             hoglite.retirement,
                         )
-                        assertView(
-                            selector.hydratorMaintenance(call, "lake") { error("must not build PostgreSQL hydrator") },
-                            hoglite.hydratorMaintenance,
-                        )
+                        val hydrator =
+                            selector.hydratorMaintenance(call, "lake") { error("must not build PostgreSQL hydrator") }
+                        assertThat(hydrator).isNotSameAs(hydrator.plain())
+                        assertThat(hydrator.plain()).isInstanceOf(HogliteHydrator::class.java)
                         val status =
                             selector.maintenanceStatus(call, "lake") { error("must not build PostgreSQL status") }
                         assertThat(status).isNotSameAs(status.plain())

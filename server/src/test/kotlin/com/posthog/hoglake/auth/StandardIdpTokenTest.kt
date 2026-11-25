@@ -250,13 +250,17 @@ class StandardIdpTokenTest {
     }
 
     @Test
-    fun `an operator token's scope claim is ignored`() {
-        val claims =
-            TestTokens.operatorClaims().replace(
-                "\"ten\":\"operator\"",
-                "\"ten\":\"operator\",\"scope\":\"x y\"",
-            )
-        assertThat(verifier().verify(es256(claims)).kind).isEqualTo(Caller.Kind.OPERATOR)
+    fun `an operator token carrying scope is refused`() {
+        // An operator's binding is spelled `cat` alone; hoglite refuses any
+        // token carrying `scope`, and so does hoglake (JwtVerifierTest).
+        for (scope in listOf("x y", "openid hoglake:lake:admin")) {
+            val claims =
+                TestTokens.operatorClaims().replace(
+                    "\"ten\":\"operator\"",
+                    "\"ten\":\"operator\",\"scope\":\"$scope\"",
+                )
+            refusal(JwtViolation.MALFORMED) { verifier().verify(es256(claims)) }
+        }
     }
 
     // ---- scoped tokens keep their strictness through scope ------------------

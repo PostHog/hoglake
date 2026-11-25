@@ -6,6 +6,8 @@ import com.posthog.hoglake.api.ScanFileDto
 import com.posthog.hoglake.api.TableDto
 import com.posthog.hoglake.auth.AuthPolicy
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.Jwt
+import com.posthog.hoglake.auth.JwtViolation
 import com.posthog.hoglake.auth.ReadSessionProfile
 import com.posthog.hoglake.auth.ReadSessionTarget
 import com.posthog.hoglake.auth.Routing
@@ -14,6 +16,7 @@ import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.VerifiedBackendAuthority
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.refuseIgnoredRouting
+import com.posthog.hoglake.auth.refuseTokenAtStore
 import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.remoteTeamSchemas
 import com.posthog.hoglake.auth.requireCatalogEntitlement
@@ -28,6 +31,7 @@ import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HogliteCompaction
 import com.posthog.hoglake.hoglite.HogliteCompactionCursors
+import com.posthog.hoglake.hoglite.HogliteHydrator
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteRetirement
@@ -51,6 +55,7 @@ import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.TeamNamespaces
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
+import io.ktor.http.HttpMethod
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
@@ -729,7 +734,17 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
     ): HydratorMaintenanceBackend =
-        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) { it.hydratorMaintenance }
+        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) {
+            // Hoglite has no hydrator loop: the requeue then hydrates pending files (#675).
+            val config = checkNotNull(cfg)
+            HogliteHydrator(
+                it,
+                objectStore,
+                maxWholeObjectBytes = config.hydratorMaxWholeObjectBytes,
+                maxFooterBytes = config.hogliteMaxFooterBytes,
+                minFileBytes = config.hydratorMinFileBytes,
+            )
+        }
 
     fun maintenanceStatus(
         call: ApplicationCall,
@@ -746,7 +761,6 @@ class CatalogStoreSelector(
             val config = checkNotNull(cfg)
             HogliteMaintenanceStatus(
                 it,
-                config.hydratorIntervalMs,
                 config.expiryIntervalMs,
                 config.cleanupIntervalMs,
                 config.compactionIntervalMs,
@@ -865,6 +879,8 @@ class CatalogStoreSelector(
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${routing.catalog}'")
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
+                    // Before the store exists, so before any backend call.
+                    requireTokenLifetime(call, routing.catalog)
                     hogliteStore(
                         routing,
                         client(routing.backendId).forRequest(call.verifiedBackendToken),
@@ -872,6 +888,42 @@ class CatalogStoreSelector(
                     )
                 }
         }
+
+    /**
+     * Refuse a hoglite request on a long-running route ([LONG_RUNNING_ROUTES])
+     * whose token has less than [Config.hogliteMinTokenLifetimeSeconds] left
+     * by hoglite's reckoning: `exp` plus hoglite's leeway, from when it
+     * verified here. hoglite verifies the token on every call, so one that
+     * lapses midway fails the request after some of its transactions applied
+     * (#680). Nothing has been sent yet, so this is the 401 `token_expired` a
+     * client re-mints its token and retries on; a request that fails midway
+     * anyway is `commit_outcome_unknown` (HogliteClient, "Request authority").
+     * Counted and audited, and let through under `warn`, as any refusal the
+     * store decides ([refuseTokenAtStore]).
+     */
+    private fun requireTokenLifetime(
+        call: ApplicationCall,
+        catalog: String,
+    ) {
+        val minimum = cfg?.hogliteMinTokenLifetimeSeconds ?: return
+        if (minimum <= 0) return
+        val route = AuthPolicy.match(call.request.httpMethod, call.request.path()) ?: return
+        if (call.request.httpMethod to route.pattern !in LONG_RUNNING_ROUTES) return
+        val authority = call.verifiedBackendAuthority ?: return
+        val expiry = Jwt.seconds(Jwt.parse(authority.token).claims, "exp")
+        val left = expiry + HogliteClient.TOKEN_LEEWAY_SECONDS - authority.verifiedAt
+        if (left < minimum) {
+            call.refuseTokenAtStore(
+                HoglakeException.Unauthenticated(
+                    JwtViolation.EXPIRED,
+                    "the token has ${left}s left at the hoglite backend, under the ${minimum}s this operation " +
+                        "requires; nothing ran: retry with a fresh token",
+                ),
+                catalog,
+                at = "token_lifetime",
+            )
+        }
+    }
 
     /**
      * Build a store from trusted placement. This method does not discover
@@ -914,6 +966,7 @@ class CatalogStoreSelector(
             // HOGLAKE_RETIREMENT_BATCH sizes PostgreSQL batches (8,000); a Hoglite batch is one transaction.
             retirementBatch = minOf(cfg.retirementBatch, HogliteRetirement.DEFAULT_BATCH),
             retirementQueueCeiling = cfg.retirementQueueCeiling,
+            dataPathTemplate = cfg.hogliteDataPathTemplate.ifEmpty { null },
         )
 
     private fun hogliteCompactionConfig(): CompactionConfig {
@@ -957,4 +1010,29 @@ class CatalogStoreSelector(
         /** Only PostgreSQL catalogs can use the PostgreSQL sampler's name-keyed totals. */
         val usePostgresTotals: Boolean,
     )
+
+    private companion object {
+        /**
+         * The routes selected for [requireTokenLifetime], by method and
+         * AuthPolicy pattern: the ones whose hoglite request runs a number
+         * of transactions that grows with the catalog's backlog, under one
+         * token. Expiry (floor, purge pages), cleanup (claims, drains, ledger
+         * purges), compaction (claims, publishes), rehydrate (the requeue,
+         * then its run row; every maintenance run adds one), the catalog
+         * drop (fence, release, delete) and the upload sweep (a fence per
+         * claim). Other routes can run more than one (a table-creation
+         * abort runs lazy expiry around its own write, a guarded publish a
+         * reject after it), but a fixed few, on a short request; a token
+         * that lapses between them still answers `commit_outcome_unknown`.
+         */
+        val LONG_RUNNING_ROUTES =
+            setOf(
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/expire",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/cleanup",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/compact",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/rehydrate",
+                HttpMethod.Delete to "/v1/catalogs/{catalog}",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/uploads/schedule-expired",
+            )
+    }
 }

@@ -428,6 +428,28 @@ class AuthPluginTest {
         }
 
     @Test
+    fun `a catalog-bound operator is an operator on its catalog and a stranger everywhere else`() =
+        testApplication {
+            application { harness(AuthMode.ENFORCE) }
+            val claims = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1","cat":{"lake":["admin"]}}"""
+            val auth = "Bearer ${token(claims)}"
+            assertThat(client.get("/v1/catalogs/lake") { header(HttpHeaders.Authorization, auth) }.status)
+                .isEqualTo(HttpStatusCode.OK)
+            val compact =
+                client.post("/v1/catalogs/lake/maintenance/compact") { header(HttpHeaders.Authorization, auth) }
+            assertThat(compact.status).isEqualTo(HttpStatusCode.OK)
+            // Another catalog is a 404, as it is for a tenant: not a 403 that confirms it exists.
+            assertThat(client.get("/v1/catalogs/other") { header(HttpHeaders.Authorization, auth) }.status)
+                .isEqualTo(HttpStatusCode.NotFound)
+            // The fleet routes are closed to it.
+            assertThat(client.get("/v1/database/health") { header(HttpHeaders.Authorization, auth) }.status)
+                .isEqualTo(HttpStatusCode.Forbidden)
+            // Provisioning reaches the handler, which holds the body's name to the binding (StoreEntitlementRoutesTest).
+            assertThat(client.post("/v1/catalogs") { header(HttpHeaders.Authorization, auth) }.status)
+                .isEqualTo(HttpStatusCode.OK)
+        }
+
+    @Test
     fun `public routes stay public, even with a stale credential attached`() =
         testApplication {
             application { harness(AuthMode.ENFORCE) }

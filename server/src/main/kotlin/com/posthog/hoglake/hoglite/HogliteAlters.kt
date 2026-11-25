@@ -669,7 +669,8 @@ internal class HogliteAlters(
      * decode bounds under the LIVE type. The stored stats are the file
      * row's JSON column-stats list, so the re-encode is read-patch-write
      * per file, guarded on the old content. All promotions share one plan and
-     * one rewrite per file; a table-scoped fence detects files added after the read.
+     * one rewrite per file; a table-scoped fence detects files added after the read,
+     * and a stat-less count fence files hydrated after it.
      */
     private fun reencodeStatsOnPromote(
         catalog: String,
@@ -708,6 +709,21 @@ internal class HogliteAlters(
                 "SELECT COUNT(*) FROM files WHERE table_id = ? AND begin_snapshot > ?",
                 tableId,
                 pinned[1].asLong(),
+            ) { ALTER_FILE_SET_CHANGED }
+            // Hydration gives an EXISTING live file its stats (#675), which the fence above
+            // cannot see. It is the only move out of this count (requeue moves failed to
+            // pending, both inside it), so a hydration between this read and the commit
+            // lowers it and forces a fresh plan that re-encodes the file; an ended file
+            // lowers it too, which only costs a replan. `+table_id` keeps the planner on
+            // files_live_stats, so the cost is the catalog's stat-less backlog, not the
+            // table's retained manifest.
+            val statless =
+                "SELECT COUNT(*) FROM files WHERE stats_state IN ('pending', 'failed') " +
+                    "AND end_snapshot IS NULL AND +table_id = ?"
+            tx.expectScalar(
+                store.queryCatalog(catalog, statless, tableId).firstRow()!![0].asLong(),
+                statless,
+                tableId,
             ) { ALTER_FILE_SET_CHANGED }
             // Reuse files_listing's complete ordering, including ended rows. The
             // pinned allocator ceiling excludes later appends; the fence forces

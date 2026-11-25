@@ -146,6 +146,17 @@ open class ObjectStore private constructor(
         }
     }
 
+    /**
+     * Resolve this view's credentials now. The SDK resolves them only when
+     * a request is sent, so a provider that refuses the grant (a broker's
+     * `prefix_outside_catalog`) otherwise surfaces as a failed GET, which a
+     * caller cannot tell from a throttle. Under `broker` the session this
+     * vends is the one the next request signs with. A no-op on the base store.
+     */
+    fun verifyCredentials() {
+        credentials?.resolveCredentials()
+    }
+
     private val log = KotlinLogging.logger {}
 
     data class Location(val bucket: String, val key: String)
@@ -159,12 +170,37 @@ open class ObjectStore private constructor(
     }
 
     /** Ranged read of the object's tail, from byte [startInclusive] to the end. */
-    fun getTail(
+    open fun getTail(
         pathUri: String,
         startInclusive: Long,
     ): ByteArray {
         require(startInclusive >= 0) { "negative range start $startInclusive for $pathUri" }
         return getRange(pathUri, "bytes=$startInclusive-")
+    }
+
+    /**
+     * At most the first [maxBytes] bytes of the object at [pathUri]. The
+     * body is read as a stream and abandoned at [maxBytes], so an object
+     * longer than the caller expects never lands on the heap whole; a
+     * result of exactly [maxBytes] may be a prefix of it. No Range header:
+     * an empty object answers a range with 416, not with no bytes.
+     *
+     * The Hoglite sweep's whole-object read (FooterFetch, held to the
+     * registration), `open` for its fault-injection tests as [get] is for
+     * compaction's and the PostgreSQL hydrator's.
+     */
+    open fun getHead(
+        pathUri: String,
+        maxBytes: Int,
+    ): ByteArray {
+        require(maxBytes > 0) { "non-positive read limit $maxBytes for $pathUri" }
+        val loc = parse(pathUri)
+        s3.getObject(GetObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build()).use { body ->
+            val bytes = body.readNBytes(maxBytes)
+            // Closing an unfinished body drains it to reuse the connection: drop it instead.
+            if (bytes.size == maxBytes) body.abort()
+            return bytes
+        }
     }
 
     /**

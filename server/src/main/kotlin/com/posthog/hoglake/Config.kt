@@ -8,6 +8,8 @@ import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.auth.ReadSessionProfile
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.hoglite.HogliteHydrator
+import com.posthog.hoglake.hydrator.FooterFetch
 import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.TeamNamespaces
@@ -39,6 +41,7 @@ class SecretString(
 }
 
 private val servedNamespacesLog = KotlinLogging.logger {}
+private val hogliteHydrationLog = KotlinLogging.logger {}
 
 /** Process configuration, with an optional backend allowlist file. */
 data class Config(
@@ -49,6 +52,17 @@ data class Config(
      * Entries contain endpoints, never credentials. Each id must be unique and canonical.
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
+    /**
+     * The least lifetime, in seconds, a token must have left at hoglite
+     * (its `exp` plus hoglite's leeway) for a hoglite request on a
+     * long-running route: a maintenance run, a catalog drop, an upload
+     * sweep. hoglite verifies the forwarded token on every call, so one
+     * that lapses midway fails the request after some of its
+     * transactions applied (#680). Refused as 401 `token_expired` before
+     * any backend call; 0 disables the check. PostgreSQL checks the token
+     * once, when the request starts, and is unaffected.
+     */
+    val hogliteMinTokenLifetimeSeconds: Long = env("HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS", "300").toLong(),
     /**
      * Profile identifier for dedicated read-session JWT verification.
      * Empty disables dedicated read sessions.
@@ -490,6 +504,33 @@ data class Config(
      */
     val hydratorMaxWholeObjectBytes: Long =
         env("HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES", "${256L * 1024 * 1024}").toLong(),
+    /**
+     * Cap on the Hoglite rehydrate sweep's footer tail read (a
+     * registration's `footer_size`, #675): a larger `footer_size` is not
+     * usable, and the file takes the whole-object read under
+     * [hydratorMaxWholeObjectBytes]. A Hoglite tenant registers and can
+     * rewrite its own sizes (#668), and without the cap a `footer_size`
+     * near `file_size_bytes` pulls the whole object through the tail.
+     * Default 64 MiB. The PostgreSQL hydrator has no footer cap.
+     */
+    val hogliteMaxFooterBytes: Long =
+        env("HOGLAKE_HOGLITE_MAX_FOOTER_BYTES", "${HogliteHydrator.DEFAULT_MAX_FOOTER_BYTES}").toLong(),
+    /**
+     * The operator's `data_path` for every Hoglite catalog, `{catalog}`
+     * replaced by the catalog's name (`s3://warehouse/{catalog}`): the
+     * prefix a Hoglite rehydrate's footer reads are confined to (#675).
+     * A tenant can rewrite its own `meta.data_path` (#668), so that row
+     * cannot say where the server's storage identity may read. Set, it is
+     * enforced: a Hoglite catalog create with any other `data_path` is a
+     * 422, and a catalog whose `data_path` is not its placement (created
+     * before the template) is not swept. Empty,
+     * the default: under the `broker` provider the read uses the
+     * catalog's own broker session, which a rewritten `data_path` cannot
+     * widen; under `ambient` or `static` a Hoglite rehydrate requeues,
+     * reads no footers, and records a failed `hydrator` run saying why
+     * (and boot warns when Hoglite backends are configured that way).
+     */
+    val hogliteDataPathTemplate: String = env("HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE", ""),
     /**
      * statement_timeout for ONE catalog's claim inside the hydrator
      * sweep (#269). A claim is `limit` rows off one range of
@@ -1579,6 +1620,18 @@ data class Config(
         }
 
     init {
+        require(hogliteDataPathTemplate.isEmpty() || HogliteHydrator.isDataPathTemplate(hogliteDataPathTemplate)) {
+            "HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE must be an s3:// URI containing ${HogliteHydrator.CATALOG}"
+        }
+        if (hogliteBackends.isNotEmpty() && hogliteDataPathTemplate.isEmpty() &&
+            effectiveStorageProvider != StorageProviderKind.BROKER
+        ) {
+            hogliteHydrationLog.warn {
+                "Hoglite backends are configured with HOGLAKE_STORAGE_PROVIDER=${effectiveStorageProvider.wire} and " +
+                    "no HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE: a Hoglite rehydrate only requeues, and pending files " +
+                    "never get column stats (#675). Set the template to hydrate them."
+            }
+        }
         require(readSessionRelay.trim().lowercase() in setOf("on", "off")) {
             "HOGLAKE_READ_SESSION_RELAY must be on or off"
         }
@@ -1758,6 +1811,10 @@ data class Config(
                     "'${authMode.trim()}'): unset it, or set the mode"
             }
         }
+        require(hogliteMinTokenLifetimeSeconds >= 0) {
+            "HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS=$hogliteMinTokenLifetimeSeconds must not be negative " +
+                "(0 disables the check)"
+        }
         require(postgresBackendId.isEmpty() || canonicalBackendId(postgresBackendId) !in hogliteBackends) {
             "HOGLAKE_POSTGRES_BACKEND_ID duplicates a hoglite backend id"
         }
@@ -1775,6 +1832,9 @@ data class Config(
         require(compactionSpillBytes >= 1) {
             "HOGLAKE_COMPACTION_SPILL_BYTES=$compactionSpillBytes must be at least 1 (the default is " +
                 "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SPILL_BYTES})"
+        }
+        require(hogliteMaxFooterBytes in 1..FooterFetch.MAX_FOOTER_BYTES) {
+            "HOGLAKE_HOGLITE_MAX_FOOTER_BYTES=$hogliteMaxFooterBytes must be in 1..${FooterFetch.MAX_FOOTER_BYTES}"
         }
         require(hydratorMinFileBytes >= 0) {
             "HOGLAKE_HYDRATOR_MIN_FILE_BYTES=$hydratorMinFileBytes must not be negative (0 writes stats " +

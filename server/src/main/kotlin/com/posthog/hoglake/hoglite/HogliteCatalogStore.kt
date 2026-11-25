@@ -100,6 +100,11 @@ class HogliteCatalogStore(
     internal val expiryPurgeBudgetMs: Long = com.posthog.hoglake.service.ExpiryService.PURGE_BUDGET_MS,
     internal val retirementBatch: Int = HogliteRetirement.DEFAULT_BATCH,
     internal val retirementQueueCeiling: Long = HogliteRetirement.DEFAULT_QUEUE_CEILING,
+    /**
+     * HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE, or null: every catalog's `data_path`, `{catalog}` its name.
+     * [createCatalog] refuses any other, and [HogliteHydrator] reads footers only under it (#675).
+     */
+    internal val dataPathTemplate: String? = null,
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 
@@ -239,6 +244,16 @@ class HogliteCatalogStore(
         catalogOperation(name, creating = true) {
             validateCatalogName(name)
             CatalogService.validateDataPath(dataPath)
+            // The template is what bounds the hydrator's reads: a catalog placed elsewhere would have its
+            // files refused, and one placed at another catalog's template path inside that one's bound.
+            dataPathTemplate?.let { HogliteHydrator.placement(it, name) }?.let { placed ->
+                if (dataPath.trimEnd('/') != placed) {
+                    throw HoglakeException.Validation(
+                        "data_path '${Identifiers.cap(dataPath)}' is not this server's Hoglite placement for " +
+                            "catalog '$name', '$placed' (HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE)",
+                    )
+                }
+            }
             val tenantId = boundTenant(name)
             backendCall(name) { client.createTenant(tenantId) }
             probeForeignKeys(name, tenantId)
@@ -1018,6 +1033,9 @@ class HogliteCatalogStore(
             if (System.nanoTime() - deadline > 0) throw unverified(null)
             return try {
                 read()
+            } catch (e: HoglakeException.CommitOutcomeUnknown) {
+                // A request that partly applied, not a scan that ran out of time.
+                throw e
             } catch (e: HoglakeException.BackendUnavailable) {
                 throw unverified(e)
             }
@@ -3322,6 +3340,7 @@ class HogliteCatalogStore(
         val code = body?.get("code")?.asText()
         val detail = body?.get("error")?.asText() ?: r.body
         return when {
+            // Only before a tx of the request applied: the client makes a later 401 CommitOutcomeUnknown.
             r.status == 401 -> HoglakeException.Unauthenticated("invalid_token", "backend refused request authority")
             r.status == 403 -> HoglakeException.Forbidden("backend refused request authority")
             r.status == 404 -> missingCatalog(catalog)

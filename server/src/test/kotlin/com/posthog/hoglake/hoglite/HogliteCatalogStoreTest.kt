@@ -878,6 +878,22 @@ class HogliteCatalogStoreTest {
         }
     }
 
+    /** A token that lapses mid-request is not a scan that ran out of time. */
+    @Test
+    fun `a refused token during a containment scan after an applied transaction keeps the unknown outcome`() {
+        seedNamespaces()
+        val request = HogliteCatalogStore(client.forRequest("synthetic-expiring"), { "t-$it-1" })
+        request.setNamespaceContainment("wh", "team_42", team42, null)
+        val marked = writes().size
+        scanAnswer = 401 to mapOf("error" to "request not authorized", "code" to "refused")
+
+        val failure =
+            catchThrowable { request.setNamespaceContainment("wh", "other", NamespaceContainment("team_id", 43), null) }
+        assertThat(failure).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+        assertThat((failure as HoglakeException.CommitOutcomeUnknown).applied).isTrue()
+        assertThat(writes()).hasSize(marked)
+    }
+
     @Test
     fun `a write between the pre-flight and the mark is refused by the guards`() {
         val t = seedNamespaces()

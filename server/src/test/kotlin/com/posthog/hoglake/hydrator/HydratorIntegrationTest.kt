@@ -991,6 +991,38 @@ class HydratorIntegrationTest {
     }
 
     @Test
+    fun `the whole-object cap does not bound a tail read`() {
+        // The cap guards the whole-object fallback only: a file with a
+        // usable footer_size reads its tail under any cap, here one byte
+        // shorter than that tail.
+        // MUTATION: bound the tail by the cap and the file falls to the
+        // capped fallback and fails.
+        val catalogId = seedCatalogAndTable()
+        val path = "s3://$BUCKET/t1/tail-under-cap.parquet"
+        store.put(path, parquetBytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+
+        assertThat(Hydrator(jdbi, store, maxWholeObjectBytes = footerSize + 7).runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+    }
+
+    @Test
+    fun `an object longer than its registration still hydrates on PostgreSQL`() {
+        // The Hoglite sweep holds its reads to the tenant's registration
+        // (#675) and fails such a file; PostgreSQL reads as it did before,
+        // the whole object, whatever file_size_bytes says.
+        // MUTATION: give the Hydrator's FooterFetch a footer cap and the
+        // read stops one byte past the registration: the file fails.
+        val catalogId = seedCatalogAndTable()
+        val path = "s3://$BUCKET/t1/longer-than-registered.parquet"
+        store.put(path, parquetBytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size - 1L, null)
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+    }
+
+    @Test
     fun `the claim shares the batch across catalogs instead of draining the lowest id first`() {
         // #269: one catalog's backlog used to sit at the head of an
         // instance-wide queue. Two catalogs with 5 pending each and a

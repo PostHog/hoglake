@@ -43,7 +43,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.ZDpYDmaIZObgtH0NZBUrHSsue6LyWWNTP0sozMUDe_3rN3CT2xuvNqi9RjK7H8VZDF2MKAOdPt6C5IoxNjuwwg",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.fHtP5UQ0DfE3u1GnMOQ9TBhoNB85LnvtrcFytwiHTemVmKH6e6my1j2UkHSVlPHuNhQlKyj_BYmXvHnBjP9xpg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -83,7 +83,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAyIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoidHJpbm8tcG9vbCIsImRsZyI6dHJ1ZSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.Vqgbvsw0IKWF6e9ufjqlpCHspYK5T73S8dBqVRpLBfekI6kJ4dKwqXCx4Z_nRNVuv8q6ZIREX5tkPyJOq7hUHQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAyIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoidHJpbm8tcG9vbCIsImRsZyI6dHJ1ZSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.cb0Gb3zfVNbDM04brxi1xZ9uSrmSW63yZw79mPBjlyGxhk5zyqs5ILbOdnalKtIAqq3NWJsiiBJJFOV7YfzRiw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -124,7 +124,7 @@
         "verdict": "refuse",
         "reason": "invalid_audience"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6Im90aGVyLXNlcnZpY2UiLCJzdWIiOiJobGNfZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoiZHVja2RiLWNsaWVudCIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.sIoRx7fCyHug6VMmG9X4EFoSb6QUWQPYJUb2lQIyUAohbL7UXsklhop09ZIJFmneJq2S4kJ6pjeJXOn5O1-QjQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6Im90aGVyLXNlcnZpY2UiLCJzdWIiOiJobGNfZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwiY2xpIjoiZHVja2RiLWNsaWVudCIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.BE9zomSjabBQ6C3pvnGlDKoAWs1_Yx8NpiJPF_yt8ZGTbXAMjErTcE_qsVvzcqynZdSCn5x7e3LWvYNc09Usyg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -161,7 +161,7 @@
         "verdict": "accept",
         "kind": "operator"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.EgBFp2D_2s6EM78q3bJCrI9Q6PLl3iAcnopdzdUSfg6BqBjEwDNd2A-40gi6HbjpjhHOZD3eXPfSEYpdI9OODQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.EB7eVHvoR_m2dzG7cGmw-SzXvDUEA8779c5hqnyxYMey3P9WktnHkXAfpJYuIYlkFacOeYXS6XbaSzMJ1b5ijw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -203,7 +203,7 @@
         "verdict": "accept",
         "kind": "scoped"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA1IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.D2aNn2QdgB0RS1VMUvW0x0laxT5qqIGKHSGZyCqbxAK1TGMJOuibvenUoUU_zPnyMepTBYl-K6qAsizj0nkDDA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA1IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.nRejOSu1a7G-HeqGac9Yr7mBB8J1TqwrKuH-9wWyTmwXilwlUPhAAMd7CiFJRks2m-bbBmoZbFtVKVwjFRFVjQ",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -256,7 +256,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA2IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.9leBPrwVkp4yoJnd9D3Kp6ccrhMWPQ2VbGDLd5CtTTFM3007h8fkhy_u3IDO090ExJaZ6CyoVye-sZmHN_W4wg",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA2IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.RNrkmrvAnh6j855NCRVBz-GcJCGqvSvHhNPfxpZG4SIYWu08eOhw8pnxRTh452nzbk-1rbI3NG-m2LqSFKtVEQ",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -315,7 +315,7 @@
         "verdict": "accept",
         "kind": "scoped"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA3IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.4cV5JwAlohsq5FxXo5NnvWatOs-QsanXAH5vNxjljabmYK72Y38CdBStKycPVtXpuaqPNXJezauJQsR3iSP4GA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA3IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.QHN2vYD6TKml4O7S5LrlmoEZAmBiAkqGb2AGvskQLrOqfOq9cclN3cDjh6MeHBQuH2__A2p6Kv6Ne_GCRpHHxw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -375,7 +375,7 @@
         "verdict": "accept",
         "kind": "operator"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.vhbPoWIhNQvEDsfKj7Z6KOvd5rmhooaGqxO3OJkkabgOQBL2juR2aKPUhePHQm60Pnub29PrRdJEs9oqX5aKKw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.vTocMPDrxky98_-7PxJCAPJ_KEmp27TyYtRGkuSHdkqPv0RrL7Zowqt66oacNNxlUSOjv8qTXWirBqcUGx1kFg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -424,7 +424,7 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA5Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.K8BvUQNzBwr6IODyalyLCtO8RblWjI1W9DKzKqidGIE_6MWO72xKPMKroQHVOibGZWk5z9Cnt-UXwhmfN8gEGw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA5Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.QVH1S8AER4YFJDWsDFaOwZIwvqvMZ2DSnv2BJyRDQP5e1RCcqlf3UncUVU6wNDfCJpLQoUdTDOcsbsDmYcKEog",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -469,7 +469,7 @@
         "verdict": "refuse",
         "reason": "invalid_token"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEwIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.AZEwm0RUvXhmZw6xljMj9NVLP6H4Zhg-pqtfZy9FaLFHr94p1Q_YGu__sa3XnqRRbgfrJANRUZrs1XwcX_NdOw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEwIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.QI-PFH54Rj1jq_3fF6idwa1MRmNqZSa0aSjtFsWfe9LKJK3KWij3qrrr4eKw_RbVGhMRuXEKYnqApi7tBrPYUQ",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -513,7 +513,7 @@
         "verdict": "refuse",
         "reason": "missing_claim"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.h8-G2WdsvdO_LAjiyQbd2tIfJe3CusYWcIusw0NtaNBFIuEPHltcsfTP6CMq-PN_l3XS8hwgoLz6M29XuddOwA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.Zuh09_WqONbvYZTKZmH91oi_xc_fT0gtgSAJvp745jng8FBPXKyoCQcpcANloqqAa3SJwQv9BzULRqZ0wuHpmA",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -555,7 +555,7 @@
         "verdict": "refuse",
         "reason": "invalid_token"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEyIiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDEsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.Q8W6PDfvKG3NQUGSXllr66HCguTT8xAxUUpFFjw-vX7U0ngHxsK3wDh9UtvBHngtvCbUrRQTrbFP9eJesz0xnA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEyIiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJleHAiOjE3NjcyMjY1MDEsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.EMMB0tsU092TXxRh3Wll4ME_sYhD7gbhZnTdfj26n6LtKN_GIg0j4xQyJzznvcu4_Gl36KXs7hjIQpAZLg4jlw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -603,7 +603,7 @@
         "verdict": "refuse",
         "reason": "profile_not_enabled"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicHJvZmlsZSI6InN0b3JhZ2Utc2Vzc2lvbiIsInZlcnNpb24iOjEsInB1cnBvc2UiOiJ1c2VyLXNlc3Npb24iLCJwcmltYXJ5X2NhdGFsb2ciOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiLCJyZW1vdGVfc2NoZW1hcyI6eyJzaGFyZWQiOlsicmVhZCJdLCJpbXBvcnRzIjpbInJlYWQiXX0sImF3cyI6eyJhY2Nlc3Nfa2V5X2lkIjoiRklDVElPTkFMX0FDQ0VTU19LRVlfSUQiLCJzZWNyZXRfYWNjZXNzX2tleSI6IkZJQ1RJT05BTF9TRUNSRVRfQUNDRVNTX0tFWSIsInNlc3Npb25fdG9rZW4iOiJGSUNUSU9OQUxfU0VTU0lPTl9UT0tFTiIsInJlZ2lvbiI6InVzLWVhc3QtMSIsImV4cGlyZXNfYXQiOjE3NjcyMjY4MDB9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.RjVbk0sHACXDEoKDJ_Pe_RGb41cOLcrIYnuAABDj5L7ehsd1k1V3tQ0moyhVe69KjCZHUxiklHOZmXEstMFsAg",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEzIiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicHJvZmlsZSI6InN0b3JhZ2Utc2Vzc2lvbiIsInZlcnNpb24iOjEsInB1cnBvc2UiOiJ1c2VyLXNlc3Npb24iLCJwcmltYXJ5X2NhdGFsb2ciOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiLCJyZW1vdGVfc2NoZW1hcyI6eyJzaGFyZWQiOlsicmVhZCJdLCJpbXBvcnRzIjpbInJlYWQiXX0sImF3cyI6eyJhY2Nlc3Nfa2V5X2lkIjoiRklDVElPTkFMX0FDQ0VTU19LRVlfSUQiLCJzZWNyZXRfYWNjZXNzX2tleSI6IkZJQ1RJT05BTF9TRUNSRVRfQUNDRVNTX0tFWSIsInNlc3Npb25fdG9rZW4iOiJGSUNUSU9OQUxfU0VTU0lPTl9UT0tFTiIsInJlZ2lvbiI6InVzLWVhc3QtMSIsImV4cGlyZXNfYXQiOjE3NjcyMjY4MDB9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.gmfaD86ADJupZ1HE2uwNTE3U1K1wc-Z6uM0x7jYwHZBlad5jkz7xcZ08TlPMEycZLPHhRlK3f0aqZK1pV4prHg",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
@@ -644,6 +644,169 @@
         "sub": "hlc_0123456789abcdef01234567",
         "ten": "tenant",
         "version": 1
+      }
+    },
+    {
+      "name": "operator_routed_without_admin",
+      "description": "A routed operator whose cat grants read, not admin: a bound operator holds every scope on its catalog whatever the words say, so a binding narrower than admin is refused as malformed, never read as a reader and never as an operator. hoglite refuses the same token.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000014",
+      "mutation": "cat grants read instead of admin",
+      "expect": {
+        "verdict": "refuse",
+        "reason": "invalid_token"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTQiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHJvdmlzaW9uZXIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjU5MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.Rk-qZQY8Ub8iGb6Hh-yiT_qul9vXqEVl4GtMrO4isjNi5GFKAnCxU0qjRKDQOrCGKZ-bgd2tkafw1dD8rJwe_Q",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000014",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "issuer:provisioner",
+        "ten": "operator"
+      }
+    },
+    {
+      "name": "operator_org_without_binding",
+      "description": "An operator token carrying org but no cat: refused as malformed, never read as a fleet-wide operator with its org dropped. hoglite accepts an unbound operator only when cat and org are both absent.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000015",
+      "mutation": "org is set with no cat",
+      "expect": {
+        "verdict": "refuse",
+        "reason": "invalid_token"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTUiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.DY8t2QWfFx11UR1WDiaB1WKiT62Hl-xeVaAOkJliauzs3NAMpayMfqDeibxyZZPv5u-VkoF2Wb35S88stDghWw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000015",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "sub": "issuer:provisioner",
+        "ten": "operator"
+      }
+    },
+    {
+      "name": "operator_scope",
+      "description": "An operator token whose binding is spelled in scope rather than cat: refused as malformed, never read as bound or as fleet-wide. An operator token carries no scope; hoglite refuses any token carrying one.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner"
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000016",
+      "mutation": "scope carries hoglake:<org>:admin with no cat",
+      "expect": {
+        "verdict": "refuse",
+        "reason": "invalid_token"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTYiLCJ0ZW4iOiJvcGVyYXRvciIsInNjb3BlIjoiaG9nbGFrZTowMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWI6YWRtaW4iLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.4qSMx1Omk3_5XkI8xB5WLB2U3FXvPy-CgzH_2S7Ml61ChChiucd3N5oHkoJtX6e-AVqgWCFtB10Jrlcd7jDMaA",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000016",
+        "nbf": 1767225600,
+        "scope": "hoglake:0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b:admin",
+        "sub": "issuer:provisioner",
+        "ten": "operator"
+      }
+    },
+    {
+      "name": "operator_blank_scope",
+      "description": "An operator token whose scope is empty and which carries no cat: refused as malformed, never read as a fleet-wide operator. An operator token carries no scope, whatever its value; hoglite refuses any token carrying one.",
+      "operator": {
+        "subject": "issuer:provisioner",
+        "client": "provisioner"
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000017",
+      "mutation": "scope is set to the empty string with no cat",
+      "expect": {
+        "verdict": "refuse",
+        "reason": "invalid_token"
+      },
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTciLCJ0ZW4iOiJvcGVyYXRvciIsInNjb3BlIjoiIiwiY2xpIjoicHJvdmlzaW9uZXIiLCJleHAiOjE3NjcyMjU5MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.477MLh181nMUaScDkY_OJyUylPjKaHUZUoIQ2COQQ7XiYBmtulkVlPGAp9JyFYs1eIfn1Bu_fS_Ygk36q1kmMw",
+      "header": {
+        "alg": "ES256",
+        "kid": "cc10b5ab649c34a4",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
+        "cli": "provisioner",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hoglake.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000017",
+        "nbf": 1767225600,
+        "scope": "",
+        "sub": "issuer:provisioner",
+        "ten": "operator"
       }
     }
   ]

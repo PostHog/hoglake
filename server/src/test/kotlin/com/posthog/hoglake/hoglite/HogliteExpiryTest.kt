@@ -3,8 +3,11 @@ package com.posthog.hoglake.hoglite
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.ExpiryResult
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.PartialResult
 import com.sun.net.httpserver.HttpServer
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterEach
@@ -44,10 +47,21 @@ class HogliteExpiryTest {
     /** What the cutoff read answers: the engine's cutoff (null past its calendar) and the floor candidate. */
     @Volatile private var cutoffRow: List<Any?> = listOf("2026-11-03T12:00:00.000Z", 5L)
 
+    /** Whether one ended file is eligible for the purge, and every call after its purge `tx` answers 401. */
+    @Volatile private var lapseAfterPurge = false
+
+    @Volatile private var lapsed = false
+
     private val server: HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex ->
                 val body = ex.requestBody.readBytes().takeIf { it.isNotEmpty() }?.let { json.readTree(it) }
+                if (lapsed) {
+                    val refused = """{"code":"refused","error":"request not authorized"}""".toByteArray()
+                    ex.sendResponseHeaders(401, refused.size.toLong())
+                    ex.responseBody.use { it.write(refused) }
+                    return@createContext
+                }
                 val answer: Any =
                     when {
                         body?.has("sql") == true -> {
@@ -58,6 +72,9 @@ class HogliteExpiryTest {
                         body?.has("statements") == true -> {
                             val statements = body["statements"].map { sent(it) }
                             writes += statements
+                            if (lapseAfterPurge && statements.any { it.sql.startsWith("DELETE FROM files") }) {
+                                lapsed = true
+                            }
                             mapOf(
                                 "results" to
                                     statements.map { st ->
@@ -102,11 +119,15 @@ class HogliteExpiryTest {
         affected: Long = 0,
     ) = mapOf("cols" to List(rows.firstOrNull()?.size ?: 0) { "c$it" }, "rows" to rows, "affected" to affected)
 
-    /** The tenant: head 9, floor 2, retention [retention], no consumer floor, no ended files. */
+    /** The tenant: head 9, floor 2, retention [retention], no consumer floor, ended file 7 under [lapseAfterPurge]. */
     private fun query(sent: Sent): List<List<Any?>> =
         when {
             sent.sql == store.metaSql -> listOf(listOf("wh", "s3://b/wh", 9, 1, 2, null, retention, 0))
             sent.sql.startsWith("SELECT c, (SELECT MIN(id) FROM snapshots") -> listOf(cutoffRow)
+            lapseAfterPurge && sent.sql.startsWith("SELECT id, path FROM files") ->
+                listOf(
+                    listOf(7, "s3://b/f.parquet"),
+                )
             else -> emptyList()
         }
 
@@ -177,5 +198,38 @@ class HogliteExpiryTest {
 
         assertThat(result.newEarliestSnapshotId).isEqualTo(9)
         assertThat(snapshotDelete().single().args).containsExactly(2L, 9L)
+    }
+
+    /**
+     * A floor advance that failed, then a token that lapsed after a purge
+     * page applied (#680): the lapse fails the run, and the advance's own
+     * failure is still counted, audited and carried as suppressed.
+     */
+    @Test
+    fun `a token lapse in the purge keeps a failed floor advance on the record`() {
+        retention = Long.MAX_VALUE
+        cutoffRow = listOf(null, null)
+        lapseAfterPurge = true
+        val registry = SimpleMeterRegistry()
+        Metrics.bind(registry)
+        try {
+            val bound = HogliteCatalogStore(client.forRequest("synthetic-expiring"), { "t-$it" })
+            // A full page of one, so the purge reads another page after the one that applied.
+            val selected = HogliteExpiry(bound, purgePage = 1, purgeBudgetMs = 10_000)
+
+            val failure = catchThrowable { selected.runOnce("wh", 100) }
+
+            assertThat(failure).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val unknown = failure as HoglakeException.CommitOutcomeUnknown
+            assertThat(unknown.tokenLapsed).isTrue()
+            assertThat(unknown.applied).isTrue()
+            assertThat(unknown.txid).startsWith("expiry-purge-data")
+            assertThat(unknown.suppressed).singleElement().isInstanceOf(DateTimeException::class.java)
+            assertThat(
+                registry.find("hoglake_expiry_advance_failures_total").tag("catalog", "wh").counter()?.count(),
+            ).isEqualTo(1.0)
+        } finally {
+            Metrics.clear()
+        }
     }
 }

@@ -55,6 +55,14 @@ class BackendConfigTest {
     }
 
     @Test
+    fun `the hoglite token lifetime minimum defaults to 300 seconds and refuses a negative value`() {
+        assertThat(Config().hogliteMinTokenLifetimeSeconds).isEqualTo(300)
+        assertThat(Config(hogliteMinTokenLifetimeSeconds = 0).hogliteMinTokenLifetimeSeconds).isZero()
+        assertThatThrownBy { Config(hogliteMinTokenLifetimeSeconds = -1) }
+            .hasMessageContaining("HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS=-1")
+    }
+
+    @Test
     fun `backend ids are canonical and unique`() {
         for (bad in listOf(id.uppercase(), "1-1-1-1-1", "not-a-uuid")) {
             assertThatThrownBy { config(entry.replace(id, bad)) }.isInstanceOf(IllegalArgumentException::class.java)
