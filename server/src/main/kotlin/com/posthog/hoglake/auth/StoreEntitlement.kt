@@ -46,6 +46,31 @@ internal fun ApplicationCall.requireCatalogEntitlement(catalog: String) {
 }
 
 /**
+ * Refuse [refusal], which the store decided against the token itself rather
+ * than a catalog name: CatalogStoreSelector's lifetime floor for a
+ * long-running hoglite route. Counted and audited as
+ * [requireCatalogEntitlement] does, once per request and with [at] naming
+ * where; `warn` lets it through, except for a scoped caller.
+ */
+internal fun ApplicationCall.refuseTokenAtStore(
+    refusal: HoglakeException,
+    catalog: String,
+    at: String,
+) {
+    val auth = hoglakeAuth
+    if (auth is AuthState.Off) return
+    val caller = auth.callerOrNull
+    val service = application.attributes[AuthServiceKey]
+    val enforced = service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED
+    if (!attributes.contains(RefusalCountedKey)) {
+        attributes.put(RefusalCountedKey, Unit)
+        val match = attributes.getOrNull(RouteMatchKey)
+        countRefusal(service, service.clientClass(this), caller, match, refusal, enforced, catalog = catalog, at = at)
+    }
+    if (enforced) throw refusal
+}
+
+/**
  * A caller whose `rtg` was ignored ([Caller.routingIgnored]) has no placement,
  * so every store but a served namespace is refused as a catalog its token
  * cannot see. Counted and audited as [requireCatalogEntitlement] does: once

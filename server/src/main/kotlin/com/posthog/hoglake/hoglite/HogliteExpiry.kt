@@ -56,7 +56,19 @@ internal class HogliteExpiry(
             }
         val attempt = runCatching { advanceFloor(catalog, pre, batchSize) }
         // Drain an earlier sweep's backlog even when this floor advance failed.
-        val purge = purge(catalog, pre.earliestSnapshotId)
+        val purge =
+            try {
+                purge(catalog, pre.earliestSnapshotId)
+            } catch (e: HoglakeException.CommitOutcomeUnknown) {
+                // The lapse wins, but a failed floor advance is still counted and audited.
+                attempt.exceptionOrNull()?.let { a ->
+                    Metrics.expiryAdvanceFailures(catalog)
+                    Audit.event("expiry", catalog, null, Audit.failureOutcome(a), a.message)
+                    if (a !== e) e.addSuppressed(a)
+                }
+                Audit.event("expiry", catalog, null, Audit.failureOutcome(e), e.message)
+                throw e
+            }
         Metrics.expiryPurgeRows(catalog, purge.dataRows + purge.deleteRows)
         Metrics.expiryPurgeFailures(catalog, purge.failures)
         if (purge.truncated) Metrics.expiryPurgeTruncated(catalog)
@@ -337,6 +349,18 @@ internal class HogliteExpiry(
         val floor: Long,
     )
 
+    /**
+     * [runCatching] for phase B's best-effort steps, except that a token
+     * that lapsed after phase A committed escapes
+     * ([HoglakeException.CommitOutcomeUnknown.tokenLapsed], #680): the
+     * request partly applied, and a 200 with a purge failure count would
+     * hide that and its transaction, also when it ended a page whose own
+     * outcome is unknown. A page's unknown outcome with no lapse stays a
+     * purge failure, as on PostgreSQL.
+     */
+    private inline fun <T> recovering(block: () -> T): Result<T> =
+        runCatching(block).onFailure { if (it is HoglakeException.CommitOutcomeUnknown && it.tokenLapsed) throw it }
+
     private fun purge(
         catalog: String,
         knownFloor: Long,
@@ -345,7 +369,7 @@ internal class HogliteExpiry(
         // least phase A's. A floor of 0 skips the phase: every ended
         // row's end_snapshot >= 1, so nothing is eligible.
         val floor =
-            runCatching { store.meta(catalog).earliestSnapshotId }.getOrNull()
+            recovering { store.meta(catalog).earliestSnapshotId }.getOrNull()
                 ?: return Purge(0, 0, 0, 1, truncated = true, remaining = null, floor = knownFloor)
         if (floor <= 0) return Purge(0, 0, 0, 0, truncated = false, remaining = 0, floor = floor)
 
@@ -366,7 +390,7 @@ internal class HogliteExpiry(
                 break
             }
             val page =
-                runCatching {
+                recovering {
                     store.queryCatalog(
                         catalog,
                         "SELECT delete_file_id, path FROM dvs " +
@@ -381,7 +405,7 @@ internal class HogliteExpiry(
                 }
             if (page.isEmpty()) break
             val ids = page.map { it[0].asLong() }
-            runCatching {
+            recovering {
                 val tx = HogliteTx()
                 // Queue from transaction-local rows, not the page's stale paths.
                 tx.add(
@@ -421,7 +445,7 @@ internal class HogliteExpiry(
                 break
             }
             val page =
-                runCatching {
+                recovering {
                     store.queryCatalog(
                         catalog,
                         "SELECT id, path FROM files " +
@@ -436,7 +460,7 @@ internal class HogliteExpiry(
                 }
             if (page.isEmpty()) break
             val ids = page.map { it[0].asLong() }
-            runCatching {
+            recovering {
                 val tx = HogliteTx()
                 // The riding vectors' removals come from the same
                 // predicate INSIDE the transaction: a DV that lands
@@ -486,7 +510,7 @@ internal class HogliteExpiry(
 
         val remaining =
             if (truncated) {
-                runCatching {
+                recovering {
                     val cap = PURGE_REMAINING_CAP
                     store.queryCatalog(
                         catalog,

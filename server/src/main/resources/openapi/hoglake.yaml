@@ -59,7 +59,12 @@ info:
     - **401** (`error`: `invalid_request`, `invalid_token`,
       `token_expired`, `invalid_signature`, …) with a
       `WWW-Authenticate: Bearer error="…"` challenge: no credential, or
-      one that does not verify. Renew and retry.
+      one that does not verify. Renew and retry. On a Hoglite catalog,
+      the long-running routes (maintenance expire, cleanup, compact and
+      rehydrate, the catalog drop, the upload sweep) also answer
+      `token_expired` for a token with less lifetime left than the
+      operation needs (`HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS`,
+      default 300), before anything runs.
     - **403** `forbidden`: the credential verifies and the catalog is
       the caller's own, but it is short of the scope this route needs.
     - **404** — NOT 403 — for a catalog the caller is not entitled to.
@@ -250,6 +255,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DroppedCatalog" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >
@@ -1548,8 +1554,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ExpiryResult" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/compact:
     post:
@@ -1586,8 +1594,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CompactionResult" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/rehydrate:
     post:
@@ -1625,6 +1635,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RehydrateResult" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
         "404": { $ref: "#/components/responses/NotFound" }
         "422":
           description: namespace/table supplied without the other
@@ -1664,6 +1675,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
         "404": { $ref: "#/components/responses/NotFound" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
@@ -2742,6 +2754,7 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { scheduled: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
         "422": { description: Limit outside allowed range }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
@@ -3926,6 +3939,14 @@ components:
         `not_yet_valid`, `invalid_signature`, `unknown_signing_key`,
         `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`, `unknown_backend`),
         and the same value appears in the `WWW-Authenticate` challenge.
+        Hoglite verifies the forwarded token on every backend call, so on
+        a Hoglite catalog a long-running route (maintenance expire,
+        cleanup, compact and rehydrate, the catalog drop, the upload
+        sweep) answers `token_expired`, before any backend call, for a
+        token with less than the configured minimum left
+        (`HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS`, default 300 s,
+        counting Hoglite's 60 s leeway past `exp`). Nothing ran: a fresh
+        token fixes it.
       headers:
         WWW-Authenticate:
           schema: { type: string }
@@ -4002,6 +4023,14 @@ components:
         containment verification may return containment_unverified. Both are retryable.
         A retry without a key can apply the commit a second
         time, as after a lost COMMIT acknowledgement on PostgreSQL.
+        On Hoglite, which verifies the request's token on every backend
+        call, a token that expires after one of the request's writes
+        applied answers `commit_outcome_unknown` naming that write, not
+        401 `invalid_token`: the request partly applied. A maintenance run
+        answers it too, never 200 with a failure count. Only an operation
+        that takes an `idempotency_key` is exactly-once on a retry with the
+        same key; otherwise, the maintenance runs, the catalog drop and the
+        upload sweep included, re-read the catalog's state before a retry.
       headers:
         Retry-After:
           description: Seconds to back off before retrying.
