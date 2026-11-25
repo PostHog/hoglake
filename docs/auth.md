@@ -520,7 +520,13 @@ hydrator's footer fetches), `write` (compaction: its inputs' reads plus the
 put and multipart upload of its output — and no delete, so a leaked or buggy
 compaction session cannot remove a tenant's referenced files), and `delete`
 (cleanup's drain of the removal queue, the one job that deletes). A broker
-grants `s3:DeleteObject` only for `delete`. The token request is the
+grants `s3:DeleteObject` only for `delete`. The `prefix` is a request, not
+an authority: a broker must bound the session by the catalog's placement as
+its own records hold it, and refuse a `prefix` outside it. hoglake sends the
+catalog's `data_path`, and a Hoglite tenant can rewrite its own (#668), so a
+broker that scoped its session to whatever `prefix` it was sent would give
+that tenant a read session on another catalog's objects. hogtower's broker
+refuses one with `prefix_outside_catalog`. The token request is the
 clients' client-credentials form, `grant_type=client_credentials` with
 `audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
 URLs must be `https` — the client secret and every vended key cross that
@@ -543,7 +549,11 @@ its own, and every session it uses is one the broker chose to grant and can
 audit. PostHog runs it, pointed at hogtower; anyone can implement the shape in
 front of their own STS wrapper or a secrets engine. Under `ambient` the
 server's role reaches every catalog it serves, which is the normal trade for a
-single-org install.
+single-org install. A Hoglite tenant can rewrite its own `data_path` (#668), so
+a Hoglite rehydrate reads footers only under `HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE`
+or the catalog's `broker` session, and under `ambient` or `static` with no
+template it only requeues and records a failed `hydrator` run saying why
+(server/README).
 
 Whatever the provider, it serves only the server's own work: the background
 jobs, and the same work when a caller with `maintenance` scope triggers it

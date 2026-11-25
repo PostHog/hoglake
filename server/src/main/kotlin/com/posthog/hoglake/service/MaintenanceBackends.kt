@@ -55,7 +55,7 @@ interface RetirementBackend {
     ): RetirementResult
 }
 
-/** The operator requeue operation. The hydrator sweep stays on PostgreSQL. */
+/** The operator requeue operation. On Hoglite, which has no hydrator loop, a bounded sweep follows it. */
 interface HydratorMaintenanceBackend {
     fun rehydrateFailed(
         catalog: String,
