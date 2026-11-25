@@ -43,6 +43,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Real purge SQL, foreign-key refusals and response-loss schedules on the published pinned engine. */
 @Tag("integration")
@@ -68,6 +69,8 @@ class HogliteCleanupLifecycleIntegrationTest {
         afterApply: (String) -> Unit = {},
         beforeApply: (String) -> Unit = {},
         observe: (String, SimpleMeterRegistry) -> Unit = { _, _ -> },
+        /** Bind the store to one request ([HogliteClient.forRequest]), which tracks the request's applied txs. */
+        requestBound: Boolean = false,
         body: (HogliteCatalogStore, String, String) -> Unit,
     ) {
         val running = engine
@@ -104,7 +107,11 @@ class HogliteCleanupLifecycleIntegrationTest {
         }
         relay.start()
         val client = HogliteClient("http://127.0.0.1:${relay.address.port}", sleeper = sleeper)
-        val store = HogliteCatalogStore(client, HogliteConformanceEngine.TENANTS)
+        val store =
+            HogliteCatalogStore(
+                if (requestBound) client.forRequest("synthetic-lapsing") else client,
+                HogliteConformanceEngine.TENANTS,
+            )
         val meters = SimpleMeterRegistry()
         Metrics.bind(meters)
         try {
@@ -811,6 +818,169 @@ class HogliteCleanupLifecycleIntegrationTest {
                 rows(store, cat, "SELECT path FROM removals ORDER BY path").flatten(),
             ).containsExactly("keep", "old")
         }
+
+    /**
+     * An unlabelled 422 is the page's own unknown outcome (HogliteClient's
+     * `tx`), on a request whose earlier txs applied, but no 401 ended it.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["cleanup-receipts", "cleanup-drained"])
+    fun `a purge page's own unknown outcome stays a best-effort miss`(phase: String) =
+        fixture(
+            rule = { txid -> if (txid.startsWith("$phase:")) 422 to "{\"error\":\"lost applied response\"}" else null },
+            requestBound = true,
+        ) { store, cat, _ ->
+            seed(store, cat)
+            attempts.clear()
+            val result = cleanup(store, cat)
+            // Not a token that lapsed mid-request (#680): PostgreSQL counts it too.
+            assertThat(result.receiptsPurgeFailures).isEqualTo(if (phase == "cleanup-receipts") 1 else 0)
+            assertThat(receiptFailures(cat)).isEqualTo(if (phase == "cleanup-receipts") 1.0 else 0.0)
+            assertThat(phaseNames()).containsExactly("cleanup-ledger", "cleanup-receipts", "cleanup-drained")
+            assertThat(
+                rows(store, cat, "SELECT status FROM maintenance_runs ORDER BY id DESC LIMIT 1").flatten(),
+            ).containsExactly("ok")
+        }
+
+    /**
+     * A token that lapses at hoglite after the receipt purge applied fails
+     * the drained-ledger purge with 401: the run partly applied, so it fails
+     * with that unknown outcome, never a best-effort miss, and ahead of an
+     * ordinary ledger failure (#680).
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a token that lapses before the drained-ledger purge fails the run with the applied receipt purge`(
+        failLedger: Boolean,
+    ) {
+        val lapsed = AtomicBoolean(false)
+        fixture(
+            rule = { if (lapsed.get()) 401 to "{\"code\":\"refused\",\"error\":\"request not authorized\"}" else null },
+            afterApply = { if (it.startsWith("cleanup-receipts:")) lapsed.set(true) },
+            requestBound = true,
+        ) { store, cat, _ ->
+            seed(store, cat)
+            if (failLedger) {
+                holdLedger(store, cat)
+            }
+            attempts.clear()
+            val failure = catchThrowable { cleanup(store, cat) }
+            assertThat(lapsed.get()).isTrue()
+            lapsed.set(false)
+            val receipts = attempts.single { it.txid.startsWith("cleanup-receipts:") }
+            assertThat(failure).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            failure as HoglakeException.CommitOutcomeUnknown
+            assertThat(failure.txid).isEqualTo(receipts.txid)
+            assertThat(failure.applied).isTrue()
+            assertThat(failure.tokenLapsed).isTrue()
+            if (failLedger) {
+                assertThat(failure.suppressed).hasSize(1)
+                assertThat(failure.suppressed.single()).isInstanceOf(HogliteIntegrityViolation::class.java)
+            } else {
+                assertThat(failure.suppressed).isEmpty()
+            }
+            assertThat(phaseNames()).containsExactly("cleanup-ledger", "cleanup-receipts", "cleanup-drained")
+            assertThat(receiptFailures(cat)).isZero()
+            assertThat(rows(store, cat, "SELECT idempotency_key FROM receipts").flatten()).containsExactly("keep")
+            assertThat(
+                rows(store, cat, "SELECT path FROM removals ORDER BY path").flatten(),
+            ).containsExactly("keep", "old")
+        }
+    }
+
+    /**
+     * The last drained-ledger page answers 504 and its retry 401: the page's
+     * own outcome is unknown, but the token lapsed after the receipt purge
+     * applied, so the run fails rather than answer 200 with a failure count,
+     * naming the receipt purge that certainly applied (#680).
+     */
+    @Test
+    fun `a token that lapses on an ambiguous drained-ledger page fails the run`() {
+        val lapsed = AtomicBoolean(false)
+        fixture(
+            rule = { txid ->
+                when {
+                    lapsed.get() -> 401 to "{\"code\":\"refused\",\"error\":\"request not authorized\"}"
+                    txid.startsWith("cleanup-drained:") -> {
+                        lapsed.set(true)
+                        504 to "{\"error\":\"gateway timeout\"}"
+                    }
+                    else -> null
+                }
+            },
+            requestBound = true,
+        ) { store, cat, _ ->
+            seed(store, cat)
+            attempts.clear()
+            val failure = catchThrowable { cleanup(store, cat) }
+            assertThat(lapsed.get()).isTrue()
+            lapsed.set(false)
+            val receipts = attempts.single { it.txid.startsWith("cleanup-receipts:") }
+            val drained = attempts.filter { it.txid.startsWith("cleanup-drained:") }.map { it.txid }.distinct()
+            assertThat(failure).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            failure as HoglakeException.CommitOutcomeUnknown
+            assertThat(failure.txid).isEqualTo(receipts.txid)
+            assertThat(failure.applied).isTrue()
+            assertThat(failure.tokenLapsed).isTrue()
+            assertThat(failure.message).contains("'${drained.single()}'")
+            assertThat(receiptFailures(cat)).isZero()
+            assertThat(rows(store, cat, "SELECT idempotency_key FROM receipts").flatten()).containsExactly("keep")
+            // The 504 was answered before forwarding: the drained rows are still there.
+            assertThat(
+                rows(store, cat, "SELECT path FROM removals ORDER BY path").flatten(),
+            ).containsExactly("keep", "old")
+        }
+    }
+
+    /**
+     * A token that lapses at hoglite after the maintenance-ledger purge
+     * applied fails the receipt page with 401, or its retry after a 504:
+     * the run fails with the ledger purge's outcome, never a receipt-purge
+     * failure, and the drained-ledger purge does not run (#680).
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a token that lapses on a receipt purge page fails the run with the applied ledger purge`(ambiguous: Boolean) {
+        val lapsed = AtomicBoolean(false)
+        val refused = 401 to "{\"code\":\"refused\",\"error\":\"request not authorized\"}"
+        fixture(
+            rule = { txid ->
+                when {
+                    lapsed.get() -> refused
+                    ambiguous && txid.startsWith("cleanup-receipts:") -> {
+                        lapsed.set(true)
+                        504 to "{\"error\":\"gateway timeout\"}"
+                    }
+                    else -> null
+                }
+            },
+            afterApply = { if (!ambiguous && it.startsWith("cleanup-ledger:")) lapsed.set(true) },
+            requestBound = true,
+        ) { store, cat, _ ->
+            seed(store, cat)
+            attempts.clear()
+            val failure = catchThrowable { cleanup(store, cat) }
+            assertThat(lapsed.get()).isTrue()
+            lapsed.set(false)
+            assertThat(failure).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            failure as HoglakeException.CommitOutcomeUnknown
+            assertThat(failure.txid).startsWith("cleanup-ledger:")
+            assertThat(failure.applied).isTrue()
+            assertThat(failure.tokenLapsed).isTrue()
+            if (ambiguous) {
+                val receipts = attempts.first { it.txid.startsWith("cleanup-receipts:") }
+                assertThat(failure.message).contains("'${receipts.txid}'")
+            }
+            assertThat(phaseNames().distinct()).containsExactly("cleanup-ledger", "cleanup-receipts")
+            assertThat(receiptFailures(cat)).isZero()
+            assertThat(
+                rows(store, cat, "SELECT idempotency_key FROM receipts ORDER BY idempotency_key").flatten(),
+            ).containsExactly("keep", "old")
+            assertThat(
+                rows(store, cat, "SELECT path FROM removals ORDER BY path").flatten(),
+            ).containsExactly("keep", "old")
+        }
+    }
 
     @Test
     fun `independent receipt purge retains snapshot retention floor and reports actual count`() =
