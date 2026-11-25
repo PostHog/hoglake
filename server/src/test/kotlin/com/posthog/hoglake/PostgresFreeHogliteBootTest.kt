@@ -78,6 +78,8 @@ class PostgresFreeHogliteBootTest {
                 TestTokens.operatorClaims().dropLast(1) +
                     """, "cat":{"lake":["admin"]}, "rtg":{"b":"hoglite","be":"$id","t":"opaque_1"}}"""
             val token = TestTokens.mint(pair, claims)
+            // Fleet-wide: the routed token is bound to `lake` (#667), so only this one reaches the fleet routes.
+            val fleetToken = TestTokens.mint(pair, TestTokens.operatorClaims())
             testApplication {
                 App.build(cfg).use { app ->
                     app.startBackground().use {
@@ -91,9 +93,14 @@ class PostgresFreeHogliteBootTest {
                         assertThat(listed.status).isEqualTo(HttpStatusCode.OK)
                         assertThat(forwardedAuthority.get() == "Bearer $token").isTrue()
                         assertThat(listed.bodyAsText()).contains("s3://bucket/lake")
-                        val maintenance =
+                        assertThat(
                             client.get("/v1/maintenance/status") {
                                 header(HttpHeaders.Authorization, "Bearer $token")
+                            }.status,
+                        ).isEqualTo(HttpStatusCode.Forbidden)
+                        val maintenance =
+                            client.get("/v1/maintenance/status") {
+                                header(HttpHeaders.Authorization, "Bearer $fleetToken")
                             }
                         assertThat(maintenance.status).isEqualTo(HttpStatusCode.NotImplemented)
                         assertThat(maintenance.bodyAsText()).contains("not_supported_on_backend")

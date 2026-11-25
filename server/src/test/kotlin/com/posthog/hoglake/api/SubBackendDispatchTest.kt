@@ -148,24 +148,40 @@ class SubBackendDispatchTest {
                     assertThat(response.status).describedAs(probe.path).isEqualTo(HttpStatusCode.UnprocessableEntity)
                     assertThat(response.bodyAsText()).contains("engine-dispatch-probe")
                     val before = engineCalls.get()
-                    for ((catalog, token) in listOf("other" to routedToken, "lake" to legacyToken)) {
-                        val fallback =
-                            client.request("/v1/catalogs/$catalog${probe.path}") {
-                                method = probe.method
-                                header(HttpHeaders.Authorization, "Bearer $token")
-                                probe.body?.let {
-                                    contentType(ContentType.Application.Json)
-                                    setBody(it)
-                                }
+                    // A routed operator is bound to the catalog it places (#667): another
+                    // catalog is one it does not know, whatever the default backend, and
+                    // neither the engine nor PostgreSQL is asked.
+                    val elsewhere =
+                        client.request("/v1/catalogs/other${probe.path}") {
+                            method = probe.method
+                            header(HttpHeaders.Authorization, "Bearer $routedToken")
+                            probe.body?.let {
+                                contentType(ContentType.Application.Json)
+                                setBody(it)
                             }
-                        assertThat(fallback.status).describedAs(probe.path).isEqualTo(HttpStatusCode.NotFound)
-                        if (default == "postgres") {
-                            assertThat(fallback.bodyAsText()).contains("postgres-dispatch-probe")
-                        } else {
-                            assertThat(fallback.bodyAsText()).doesNotContain("postgres-dispatch-probe")
                         }
-                        assertThat(engineCalls.get()).isEqualTo(before)
+                    assertThat(elsewhere.status).describedAs(probe.path).isEqualTo(HttpStatusCode.NotFound)
+                    assertThat(elsewhere.bodyAsText())
+                        .contains("catalog 'other' not found")
+                        .doesNotContain("postgres-dispatch-probe")
+                    assertThat(engineCalls.get()).isEqualTo(before)
+                    // A fleet-wide operator without placement retains the PostgreSQL fallback.
+                    val fallback =
+                        client.request("/v1/catalogs/lake${probe.path}") {
+                            method = probe.method
+                            header(HttpHeaders.Authorization, "Bearer $legacyToken")
+                            probe.body?.let {
+                                contentType(ContentType.Application.Json)
+                                setBody(it)
+                            }
+                        }
+                    assertThat(fallback.status).describedAs(probe.path).isEqualTo(HttpStatusCode.NotFound)
+                    if (default == "postgres") {
+                        assertThat(fallback.bodyAsText()).contains("postgres-dispatch-probe")
+                    } else {
+                        assertThat(fallback.bodyAsText()).doesNotContain("postgres-dispatch-probe")
                     }
+                    assertThat(engineCalls.get()).isEqualTo(before)
                 }
                 assertThat(engineCalls.get()).isEqualTo(probes.size)
             }
