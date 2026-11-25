@@ -143,22 +143,44 @@ class JwtVerifierTest {
         // hoglite accepts an unbound operator only when cat AND org are both
         // empty; an org with no grants is a binding the issuer forgot to finish,
         // and must not widen to the fleet with the org dropped. MUTATION: skip
-        // the check and both verify fleet-wide with orgId null.
-        for (extra in listOf(
-            // org alone
-            """"org":"org-1"""",
-            // org with a scope that carries only foreign values, which is no binding
-            """"org":"org-1","scope":"openid profile"""",
+        // the check and it verifies fleet-wide with orgId null.
+        val claims = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1"}"""
+        assertThatThrownBy { verifier().verify(mint(claims)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
+        // The same org with a binding is the bound operator it reads as.
+        val bound = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1","cat":{"lake":["admin"]}}"""
+        assertThat(verifier().verify(mint(bound)).orgId).isEqualTo("org-1")
+    }
+
+    @Test
+    fun `an operator token carrying scope is refused, whatever its value`() {
+        // An operator token carries no scope: no issuer mints one and hoglite
+        // refuses any token carrying it, whatever the value, as hoglake does.
+        // MUTATION: drop the scope check and each of these verifies with
+        // fleetWide true, and the one beside a `cat` verifies bound by it.
+        for (scope in listOf(
+            "\"\"",
+            "\" \"",
+            "\"openid profile\"",
+            "\"openid\\thoglake:lake:admin\"",
+            "\"openid,hoglake:lake:admin\"",
+            "\"hoglake:lake:admin\"",
+            "null",
+            "[\"hoglake:lake:admin\"]",
         )) {
-            val claims = TestTokens.operatorClaims().dropLast(1) + ",$extra}"
+            val claims = TestTokens.operatorClaims().dropLast(1) + ""","scope":$scope}"""
             assertThatThrownBy { verifier().verify(mint(claims)) }
-                .describedAs(extra)
+                .describedAs("scope $scope")
                 .isInstanceOf(JwtViolation::class.java)
                 .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
         }
-        // The same org with a binding is the bound operator it reads as.
-        val bound = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1","scope":"hoglake:lake:admin"}"""
-        assertThat(verifier().verify(mint(bound)).orgId).isEqualTo("org-1")
+        // Beside a `cat` that binds it, too: the binding is spelled `cat` alone.
+        val withCat =
+            TestTokens.operatorClaims().dropLast(1) + ""","cat":{"lake":["admin"]},"scope":"hoglake:lake:admin"}"""
+        assertThatThrownBy { verifier().verify(mint(withCat)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
     }
 
     @Test

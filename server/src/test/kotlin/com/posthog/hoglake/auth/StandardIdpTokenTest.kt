@@ -249,54 +249,18 @@ class StandardIdpTokenTest {
         }
     }
 
-    /** An operator claim set with [grants] spliced in verbatim, as [tenant] does. */
-    private fun operator(grants: String): String =
-        TestTokens.operatorClaims().replace(
-            "\"ten\":\"operator\"",
-            "\"ten\":\"operator\",\"org\":\"o1\",$grants",
-        )
-
     @Test
-    fun `an operator token's foreign scope values are ignored and it stays fleet-wide`() {
-        // No org: an unbound operator carrying org is refused (hoglite's binding rule).
-        val claims =
-            TestTokens.operatorClaims().replace("\"ten\":\"operator\"", "\"ten\":\"operator\",\"scope\":\"x y\"")
-        val caller = verifier().verify(es256(claims))
-        assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
-        assertThat(caller.fleetWide).isTrue()
-    }
-
-    @Test
-    fun `an operator token's hoglake scope values bind it exactly as cat does`() {
-        // The fail-open #667 closed for `cat` must not stay open under the
-        // standard spelling. MUTATION: ignore `scope` on an operator and this
-        // caller is fleet-wide with knowsCatalog true for every catalog.
-        val caller = verifier().verify(es256(operator(""""scope":"openid hoglake:lake:admin"""")))
-        assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
-        assertThat(caller.fleetWide).isFalse()
-        assertThat(caller.orgId).isEqualTo("o1")
-        assertThat(caller.catalogScopes).isEqualTo(mapOf("lake" to setOf(Scope.ADMIN)))
-        assertThat(caller.knowsCatalog("lake")).isTrue()
-        assertThat(caller.knowsCatalog("other")).isFalse()
-        assertThat(caller.visibleCatalogs()).containsExactly("lake")
-    }
-
-    @Test
-    fun `an operator token's scope binding must grant admin, like cat`() {
-        for (word in listOf("read", "write", "maintenance")) {
-            refusal(JwtViolation.MALFORMED) { verifier().verify(es256(operator(""""scope":"hoglake:lake:$word""""))) }
+    fun `an operator token carrying scope is refused`() {
+        // An operator's binding is spelled `cat` alone; hoglite refuses any
+        // token carrying `scope`, and so does hoglake (JwtVerifierTest).
+        for (scope in listOf("x y", "openid hoglake:lake:admin")) {
+            val claims =
+                TestTokens.operatorClaims().replace(
+                    "\"ten\":\"operator\"",
+                    "\"ten\":\"operator\",\"scope\":\"$scope\"",
+                )
+            refusal(JwtViolation.MALFORMED) { verifier().verify(es256(claims)) }
         }
-        // Only unknown words leave no catalog, which is an empty binding, refused as such.
-        refusal(JwtViolation.MISSING_CLAIM) { verifier().verify(es256(operator(""""scope":"hoglake:lake:quantum""""))) }
-    }
-
-    @Test
-    fun `an operator token whose cat and scope disagree is refused`() {
-        refusal(JwtViolation.MALFORMED) {
-            verifier().verify(es256(operator(""""cat":{"lake":["admin"]},"scope":"hoglake:pond:admin"""")))
-        }
-        val agreeing = operator(""""cat":{"lake":["admin"]},"scope":"hoglake:lake:admin"""")
-        assertThat(verifier().verify(es256(agreeing)).catalogScopes).isEqualTo(mapOf("lake" to setOf(Scope.ADMIN)))
     }
 
     // ---- scoped tokens keep their strictness through scope ------------------

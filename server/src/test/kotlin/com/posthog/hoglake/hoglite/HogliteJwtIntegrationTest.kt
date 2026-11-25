@@ -117,6 +117,18 @@ class HogliteJwtIntegrationTest {
                         }
                     assertThat(elsewhere.status).isEqualTo(HttpStatusCode.NotFound)
                     assertThat(elsewhere.bodyAsText()).contains("catalog 'other' not found")
+                    // A reserved name it does not hold is the same 404, not the
+                    // reserved name's 422, as on PostgreSQL
+                    // (BoundOperatorProvisioningIntegrationTest).
+                    val reserved = "01a1e5de-1ac5-0000-e53e-d2f9a77deae4-events"
+                    val reservedElsewhere =
+                        client.post("/v1/catalogs") {
+                            header(HttpHeaders.Authorization, "Bearer $operator")
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"$reserved","data_path":"s3://hoglake-it/reserved"}""")
+                        }
+                    assertThat(reservedElsewhere.status).isEqualTo(HttpStatusCode.NotFound)
+                    assertThat(reservedElsewhere.bodyAsText()).contains("catalog '$reserved' not found")
                     assertThat(
                         client.get("/v1/catalogs/other") {
                             header(HttpHeaders.Authorization, "Bearer $operator")

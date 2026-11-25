@@ -17,10 +17,10 @@ import java.util.UUID
  * rather than listing every catalog means an operator token does not go stale
  * when a catalog is created — and it is safe because an operator is a
  * different KIND, never a tenant with a big map. An operator token that
- * carries `cat` (or its standard spelling, `scope`) is BOUND to the catalogs it
- * names (docs/auth.md "bound to one catalog"; hoglite binds such a token to its
- * tenant): [catalogScopes] holds them, and the caller is an operator on those
- * catalogs only, see [fleetWide].
+ * carries `cat` is BOUND to the catalogs it names (docs/auth.md "bound to one
+ * catalog"; hoglite binds such a token to its tenant): [catalogScopes] holds
+ * them, and the caller is an operator on those catalogs only, see [fleetWide].
+ * The verifier refuses an operator token that carries `scope`.
  */
 data class Caller(
     /** `sub`: the client id (`client:…`) or service-account subject (`sa:…`). */
@@ -106,8 +106,9 @@ data class Caller(
     /**
      * An operator whose token names no catalog: it acts across the fleet, so
      * it reaches every catalog and the routes that name none (`/metrics`,
-     * `POST /v1/catalogs`, fleet status). An operator token carrying `cat` or
-     * `scope` is bound to those catalogs instead and is NOT fleet-wide:
+     * `POST /v1/catalogs`, fleet status). An operator token carrying `cat` is
+     * bound to those catalogs instead and is NOT fleet-wide (one carrying
+     * `scope` is refused by the verifier):
      * elsewhere it is a caller that does not know the catalog, exactly as a
      * tenant is. The verifier refuses an operator binding that names no
      * catalog, so an empty map here always means "no binding", never "a

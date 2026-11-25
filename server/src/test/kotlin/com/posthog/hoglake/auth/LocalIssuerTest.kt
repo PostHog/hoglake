@@ -235,6 +235,9 @@ class LocalIssuerTest {
             "tenant_session_profile_disabled",
             // An unbound operator carrying org: this issuer sets org only on a bound operator.
             "operator_org_without_binding",
+            // An operator carrying scope: this issuer never sets scope on an operator.
+            "operator_scope",
+            "operator_blank_scope",
         )
     }
 }

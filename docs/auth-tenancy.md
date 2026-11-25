@@ -550,10 +550,12 @@ Every routed token names exactly one `cat` entry, including catalog operator tok
 A catalog operator retains `ten: operator`, and its `cat` is its binding, not only its placement:
 it is an operator on that one catalog (every scope, containment, `POST /v1/catalogs` for that name)
 and a stranger everywhere else (404 on another catalog, 403 on the fleet routes), as
-[auth.md](auth.md) "Operator tokens" describes and hoglite enforces. The `cat` entry must grant
-`admin`; a narrower word refuses the token. An operator token without `cat`, `scope` or `org` stays
-fleet-wide; one with `org` but no `cat` or `scope` is refused, as hoglite refuses it.
-Legacy tokens without `rtg` keep their previous behavior.
+[auth.md](auth.md#scoped-tokens-exactly) describes and hoglite enforces. The `cat` entry must grant
+`admin`; a narrower word refuses the token. An operator token without `cat` or `org` stays
+fleet-wide; one with `org` but no `cat` is refused, and one carrying `scope` is refused, as hoglite
+refuses both.
+A token without `rtg` keeps its previous placement (the default backend); the binding and the `org`
+rule above apply to an operator token with or without `rtg`.
 
 `HOGLAKE_BACKENDS_FILE` points to a JSON object with a `backends` array.
 Each entry has `id`, `kind: hoglite`, and `url`.

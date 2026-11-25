@@ -102,6 +102,20 @@ internal class StoreGrant private constructor(
         if (other != null) refuse(unknownCatalog(other), other)
     }
 
+    /**
+     * A catalog create's refusal as this caller may read it. An overlap
+     * refusal names the other catalog and its data_path only to a caller
+     * whose token names that catalog (a fleet-wide operator names every
+     * one); a catalog-bound operator is told only that its data_path
+     * overlaps another catalog's, as a catalog outside its binding is
+     * otherwise a 404. Any other refusal passes through.
+     */
+    fun createRefusal(refusal: HoglakeException.Validation): HoglakeException.Validation {
+        val other = refusal.overlaps ?: return refusal
+        if (caller?.knowsCatalog(other) == true) return refusal
+        return HoglakeException.Validation(refusal.redacted ?: "data_path overlaps another catalog's")
+    }
+
     /** [items] of [name] as this caller may read them: a scoped caller sees its own namespaces only. */
     fun <T> readable(
         name: String,

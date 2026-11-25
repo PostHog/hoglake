@@ -522,42 +522,41 @@ class JwtVerifier(
             "operator" -> {
                 // A `cat` BINDS an operator to the catalogs it names (docs/auth.md
                 // "bound to one catalog"), as hoglite binds an `rtg` operator to
-                // its tenant; without one the operator is fleet-wide. The
-                // standard `scope` claim is the same grants in the IdP's
-                // spelling, so it binds the same way, through the one
-                // reconciliation grants() applies to every kind: reading a
-                // `scope` binding as fleet-wide would be the fail-open #667
-                // closes, with a different claim name. The words are a tenant's
-                // grammar (unknown ones dropped), and then held to one rule:
-                // every bound catalog must carry `admin`, which is what hoglite
-                // requires of an operator's cat (legacyAuthority); a bound
-                // operator holds every scope on a catalog it knows, so a
-                // narrower word would read as full authority, and is refused
-                // instead. A binding left with no catalog is refused rather than
-                // read as fleet-wide, because an empty binding and no binding
-                // must not be two spellings of the same thing
+                // its tenant; without one the operator is fleet-wide. An
+                // operator token carries no `scope`: no issuer mints one, and
+                // hoglite refuses any token carrying it (legacyAuthority), so
+                // hoglake refuses it too, whatever its value, rather than read
+                // a second spelling of the binding whose empty, blank or
+                // foreign-only forms would each be the fleet. The `cat` words
+                // are a tenant's grammar (unknown ones dropped), and then held
+                // to one rule: every bound catalog must carry `admin`, which is
+                // what hoglite requires of an operator's cat (legacyAuthority);
+                // a bound operator holds every scope on a catalog it knows, so
+                // a narrower word would read as full authority, and is refused
+                // instead. A binding left with no catalog is refused rather
+                // than read as fleet-wide, because an empty binding and no
+                // binding must not be two spellings of the same thing
                 // (Caller.fleetWide reads emptiness). An `rtg` always comes
                 // with a one-entry `cat` (routing()), so a routed operator is
                 // bound to the catalog it places.
-                val cat = claims.get("cat")?.let(::tenantCat)
-                val scope = scopeClaim(claims, strict = false)
+                if (claims.has("scope")) {
+                    throw JwtViolation(JwtViolation.MALFORMED, "an operator token must not carry 'scope'")
+                }
                 val bound =
-                    if (cat == null && scope == null) {
-                        null
-                    } else {
-                        operatorBinding(grants(cat, scope, "catalog-bound operator"))
+                    claims.get("cat")?.let { cat ->
+                        operatorBinding(grants(tenantCat(cat), null, "catalog-bound operator"))
                     }
                 // The org is the binding's: a fleet-wide operator acts for none.
-                // An operator token carrying `org` with no `cat` or `scope` is
-                // refused rather than read as fleet-wide with its org dropped:
-                // an issuer that named the tenant meant to bind the token, and
-                // leaving the grants off must not widen it to the fleet. hoglite
-                // accepts an unbound operator only when cat AND org are both
-                // empty (legacyAuthority), so the two agree.
+                // An operator token carrying `org` with no `cat` is refused
+                // rather than read as fleet-wide with its org dropped: an
+                // issuer that named the tenant meant to bind the token, and
+                // leaving the grants off must not widen it to the fleet.
+                // hoglite accepts an unbound operator only when cat AND org
+                // are both empty (legacyAuthority), so the two agree.
                 if (bound == null && claims.has("org")) {
                     throw JwtViolation(
                         JwtViolation.MALFORMED,
-                        "an operator token carrying 'org' must be bound to a catalog by 'cat' or 'scope'",
+                        "an operator token carrying 'org' must be bound to a catalog by 'cat'",
                     )
                 }
                 Caller(

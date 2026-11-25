@@ -2747,7 +2747,21 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      */
     open class CommitConflict(detail: String) : HoglakeException(detail)
 
-    class Validation(detail: String) : HoglakeException(detail)
+    /**
+     * -> 422. [overlaps] and [redacted] are set together, by a catalog
+     * create alone: its data_path overlaps the data_path of catalog
+     * [overlaps], and the detail names that catalog and its S3 prefix,
+     * which only a caller whose token names [overlaps] may read. A
+     * catalog-bound operator gets [redacted] instead
+     * (store/BoundCatalogStore.kt, #667). Fields, not a subclass, so every
+     * subtype keeps its own wire code (CommitConflictSpecParityTest).
+     * PostgreSQL only: the Hoglite store has no overlap check yet (#666).
+     */
+    class Validation(
+        detail: String,
+        val overlaps: String? = null,
+        val redacted: String? = null,
+    ) : HoglakeException(detail)
 
     /**
      * No credential, or one that does not verify -> HTTP 401 with
