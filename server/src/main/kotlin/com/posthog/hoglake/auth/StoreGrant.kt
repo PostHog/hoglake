@@ -89,16 +89,31 @@ internal class StoreGrant private constructor(
     /**
      * A listing of the catalogs in [visible], or of every catalog when it is
      * null. It names no single catalog, so the rule is the token's: every
-     * name must be one the token names, and "every catalog" is an operator's.
+     * name must be one the token names, and "every catalog" is a fleet-wide
+     * operator's.
      */
     fun catalogs(visible: Set<String>?) {
         val other =
             if (visible == null) {
-                "*".takeIf { caller?.kind?.isOperator() != true }
+                "*".takeIf { caller?.fleetWide != true }
             } else {
                 visible.firstOrNull { caller?.knowsCatalog(it) != true }
             }
         if (other != null) refuse(unknownCatalog(other), other)
+    }
+
+    /**
+     * A catalog create's refusal as this caller may read it. An overlap
+     * refusal names the other catalog and its data_path only to a caller
+     * whose token names that catalog (a fleet-wide operator names every
+     * one); a catalog-bound operator is told only that its data_path
+     * overlaps another catalog's, as a catalog outside its binding is
+     * otherwise a 404. Any other refusal passes through.
+     */
+    fun createRefusal(refusal: HoglakeException.Validation): HoglakeException.Validation {
+        val other = refusal.overlaps ?: return refusal
+        if (caller?.knowsCatalog(other) == true) return refusal
+        return HoglakeException.Validation(refusal.redacted ?: "data_path overlaps another catalog's")
     }
 
     /** [items] of [name] as this caller may read them: a scoped caller sees its own namespaces only. */

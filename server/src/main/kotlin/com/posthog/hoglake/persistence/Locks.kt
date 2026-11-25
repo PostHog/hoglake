@@ -53,6 +53,20 @@ object Locks {
     const val REINDEX_LOCK_CLASS: Int = 4740874
 
     /**
+     * Discriminator for the per-catalog PROMOTE STATS fence (#729):
+     * EXCLUSIVE for a width-changing promote's stats re-encode
+     * ([acquirePromoteStatsFence]), SHARED for the hydrator's
+     * end-of-sweep re-check of the narrow bounds it wrote
+     * ([acquirePromoteStatsFenceShared]). Transaction-scoped on both
+     * sides, so whichever runs second sees the other's commit: the
+     * promote's stats scan sees the sweep's bounds, or the sweep's
+     * re-check sees the promoted type. The sweep takes it only for the
+     * statements before its COMMIT, never across its footer reads, so a
+     * promote waits on a re-check, not on a sweep.
+     */
+    const val PROMOTE_STATS_FENCE_LOCK_CLASS: Int = 4740875
+
+    /**
      * Take the session lock inside a short transaction with a bounded wait.
      * The caller must release it on this handle after its claim transaction
      * commits or rolls back. Session-scoped so it can be taken in its own
@@ -314,6 +328,42 @@ object Locks {
     fun releaseReindexLock(handle: Handle) {
         handle.createQuery("SELECT pg_advisory_unlock($REINDEX_LOCK_CLASS::bigint << 32)")
             .mapTo(Boolean::class.javaObjectType)
+            .one()
+    }
+
+    /**
+     * The promote's side of [PROMOTE_STATS_FENCE_LOCK_CLASS], taken under
+     * the commit lock and before the stats scan; held to the end of the
+     * transaction. It waits only on a sweep's end-of-sweep re-check.
+     */
+    fun acquirePromoteStatsFence(
+        handle: Handle,
+        catalogId: Long,
+    ) {
+        handle.createQuery(
+            "SELECT pg_advisory_xact_lock(($PROMOTE_STATS_FENCE_LOCK_CLASS::bigint << 32) | " +
+                "(?::bigint & 4294967295))",
+        )
+            .bind(0, catalogId)
+            .mapToMap()
+            .one()
+    }
+
+    /**
+     * The hydrator's side of [PROMOTE_STATS_FENCE_LOCK_CLASS]: shared, so
+     * replicas' sweeps never wait on each other; held to the end of the
+     * sweep transaction. It waits only on a promote's transaction.
+     */
+    fun acquirePromoteStatsFenceShared(
+        handle: Handle,
+        catalogId: Long,
+    ) {
+        handle.createQuery(
+            "SELECT pg_advisory_xact_lock_shared(($PROMOTE_STATS_FENCE_LOCK_CLASS::bigint << 32) | " +
+                "(?::bigint & 4294967295))",
+        )
+            .bind(0, catalogId)
+            .mapToMap()
             .one()
     }
 

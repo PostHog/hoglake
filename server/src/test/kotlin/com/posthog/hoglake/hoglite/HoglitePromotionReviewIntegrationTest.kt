@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.sun.net.httpserver.HttpServer
@@ -90,6 +91,7 @@ class HoglitePromotionReviewIntegrationTest {
         cat: String,
         name: String,
         fields: List<Long>,
+        table: String = "t",
     ) {
         store.commit(
             cat,
@@ -98,7 +100,7 @@ class HoglitePromotionReviewIntegrationTest {
                     listOf(
                         TableAppend(
                             "ns",
-                            "t",
+                            table,
                             listOf(
                                 FileRegistration("s3://hoglake-it/$cat/$name", 1, 100, 20, fields.map(::stats)),
                             ),
@@ -175,6 +177,82 @@ class HoglitePromotionReviewIntegrationTest {
                 val bound = store.fileStats(cat, "ns", "t", file.dataFileId).columns.single().stats.lowerBound!!
                 assertThat(bound).hasSize(8)
                 assertThat(IcebergSingleValue.decode(ColType.LONG, bound)).isEqualTo(3L)
+            }
+        }
+    }
+
+    @Test
+    fun `appends to another table do not refuse or replan a promotion`() {
+        // #687: the fence was the catalog-wide file allocator, so every flush to
+        // any table tripped it, and two in a row answered 409.
+        val cat = catalog()
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("a", ColType.INT)))
+        store.createTable(cat, "ns", "u", listOf(ColumnDef("a", ColType.INT)))
+        append(cat, "before", listOf(1))
+        val publications = AtomicInteger()
+        val busy = AtomicInteger()
+        throughProxy({ path, body ->
+            if (path.endsWith("/tx") && "table_altered" in body) {
+                publications.incrementAndGet()
+                append(cat, "busy-${busy.incrementAndGet()}", listOf(1), table = "u")
+            }
+        }, { path, body ->
+            if (path.endsWith("/query") && "SELECT id, stats_json" in body) {
+                append(cat, "busy-${busy.incrementAndGet()}", listOf(1), table = "u")
+            }
+        }) { racing ->
+            racing.alters.alterTable(cat, "ns", "t", listOf(AlterOp.PromoteColumn("a", ColType.LONG)))
+        }
+        assertThat(publications.get()).isEqualTo(1)
+        assertThat(store.listFiles(cat, "ns", "u")).hasSize(busy.get())
+        val id = store.listFiles(cat, "ns", "t").single().dataFileId
+        val bound = store.fileStats(cat, "ns", "t", id).columns.single().stats.lowerBound!!
+        assertThat(IcebergSingleValue.decode(ColType.LONG, bound)).isEqualTo(3L)
+    }
+
+    @Test
+    fun `appends to the promoted table replan up to the file budget, then a typed 409`() {
+        // #687: the file fence shared the schema fence's single replan, so two
+        // appends to the promoted table during one promote answered 409.
+        val budget = MAX_FILE_SET_REPLANS
+        for (trips in listOf(budget, budget + 1)) {
+            val cat = catalog()
+            store.createTable(cat, "ns", "t", listOf(ColumnDef("a", ColType.INT)))
+            append(cat, "before", listOf(1))
+            val publications = AtomicInteger()
+            val statsReplies = AtomicInteger()
+            val busy = AtomicInteger()
+            val result =
+                runCatching {
+                    throughProxy({ path, body ->
+                        if (path.endsWith("/tx") && "table_altered" in body &&
+                            publications.incrementAndGet() <= trips
+                        ) {
+                            append(cat, "busy-${busy.incrementAndGet()}", listOf(1))
+                        }
+                    }, { path, body ->
+                        if (path.endsWith("/query") && "SELECT id, stats_json" in body &&
+                            statsReplies.incrementAndGet() <= trips
+                        ) {
+                            append(cat, "busy-${busy.incrementAndGet()}", listOf(1))
+                        }
+                    }) { racing ->
+                        racing.alters.alterTable(cat, "ns", "t", listOf(AlterOp.PromoteColumn("a", ColType.LONG)))
+                    }
+                }
+            assertThat(publications.get()).isEqualTo(budget + 1)
+            val files = store.listFiles(cat, "ns", "t")
+            assertThat(files).hasSize(1 + 2 * trips)
+            val widths =
+                files.map { store.fileStats(cat, "ns", "t", it.dataFileId).columns.single().stats.lowerBound!!.size }
+            if (trips == budget) {
+                assertThat(result.exceptionOrNull()).isNull()
+                assertThat(widths).containsOnly(8)
+            } else {
+                assertThat(result.exceptionOrNull())
+                    .isInstanceOf(HoglakeException.CommitConflict::class.java)
+                    .hasMessage("table ns.t changed under the alter; re-read and retry")
+                assertThat(widths).containsOnly(4)
             }
         }
     }

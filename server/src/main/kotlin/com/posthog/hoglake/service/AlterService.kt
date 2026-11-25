@@ -728,9 +728,15 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
      * guessed" contract's read-side dual).
      *
      * Bounded work: only this column's rows with 4-byte bounds, under the
-     * catalog lock — promote is rare DDL. Rows hydrated concurrently under
-     * the old type can still slip in AFTER this (hydrator race);
-     * compaction's bound-merge skips undecodable widths as the backstop.
+     * catalog lock — promote is rare DDL. A hydrator sweep that read the
+     * old type and has not committed its bounds is invisible to the scan
+     * below; the promote stats fence ([Locks.acquirePromoteStatsFence],
+     * #729) makes that sweep re-check them against the promoted type
+     * before its COMMIT (`Hydrator.rewidenAfterPromote`), and makes this
+     * scan wait out a re-check already under way. A compaction group
+     * aggregated under the old type commits under the catalog lock too,
+     * after this transaction, and widens its own bounds to the live type
+     * there (`CompactionService.widenToLiveTypes`).
      *
      * Which promotions need this falls out of the facade mapping rather
      * than a list: bounds are stored in the MAPPED Iceberg type's
@@ -754,12 +760,9 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
         from: ColType,
         to: ColType,
     ) {
-        val widen: (ByteArray) -> ByteArray =
-            when (boundReencodeFor(from, to)) {
-                BoundReencode.NONE -> return
-                BoundReencode.INT_TO_LONG -> ::widenIntToLong
-                BoundReencode.FLOAT_TO_DOUBLE -> ::widenFloatToDouble
-            }
+        val reencode = boundReencodeFor(from, to)
+        if (reencode == BoundReencode.NONE) return
+        Locks.acquirePromoteStatsFence(h, catalogId)
 
         data class Stale(val dataFileId: Long, val lower: ByteArray?, val upper: ByteArray?)
 
@@ -796,8 +799,8 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
             )
         for (row in stale) {
             batch
-                .bind("lower", row.lower?.let { if (it.size == 4) widen(it) else it })
-                .bind("upper", row.upper?.let { if (it.size == 4) widen(it) else it })
+                .bind("lower", row.lower?.let { IcebergSingleValue.widen(reencode, it) })
+                .bind("upper", row.upper?.let { IcebergSingleValue.widen(reencode, it) })
                 .bind("catalogId", catalogId)
                 .bind("dataFileId", row.dataFileId)
                 .bind("fieldId", fieldId)
@@ -805,14 +808,6 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
         }
         batch.execute()
     }
-
-    /** Lossless width promotion of one 4-byte int bound to the long encoding. */
-    private fun widenIntToLong(b: ByteArray): ByteArray =
-        IcebergSingleValue.encode(ColType.LONG, (IcebergSingleValue.decode(ColType.INT, b) as Int).toLong())
-
-    /** Lossless width promotion of one 4-byte float bound to the double encoding. */
-    private fun widenFloatToDouble(b: ByteArray): ByteArray =
-        IcebergSingleValue.encode(ColType.DOUBLE, (IcebergSingleValue.decode(ColType.FLOAT, b) as Float).toDouble())
 
     private fun rewriteMetadata(
         h: Handle,

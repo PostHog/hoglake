@@ -25,7 +25,7 @@ The issuer is a deployment choice, not a hoglake dependency:
 | deployment | issuer | storage credentials |
 | --- | --- | --- |
 | single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own key (`local`): `hoglake token keygen` once, `hoglake token mint` per client, no issuer service | each client's own AWS identity; the server's own (`ambient`) for its jobs |
-| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
+| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS; it must not put `scope` on operator tokens, which hoglake refuses | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
 | PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower: to clients alongside the token, to the server's jobs through the `broker` provider |
 
 hoglake's code carries no PostHog concepts. Catalog names, namespaces, the
@@ -82,6 +82,7 @@ under `local` and 404s otherwise.
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
 | `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
+| `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` | the least lifetime a token must have left at a hoglite backend for a long-running route there; default 300, 0 disables. See [below](#backends-that-verify-the-token-themselves) |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_SESSION_PROFILE` | `off` (default) or `on`: whether tokens carrying the [session profile](#session-profile-with-embedded-storage-credentials) are accepted. Off, such a token is refused as `profile_not_enabled`, never read as a plain metadata token |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
@@ -136,8 +137,8 @@ The core, which every issuer must emit:
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes, by decision | token id, for correlating a request with a token. Required because the access log names each request's token by it, and an audit line written while a request is handled reaches the token through its `request_id`; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
-| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
-| `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
+| `org` | tenant and scoped, today; optional on a catalog-bound operator; forbidden on an unbound one | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today on tenant and scoped tokens; making it optional is tracked. On an operator token it is the binding's: a catalog-bound operator may carry it or not, and an operator token carrying `org` with no `cat` is refused as malformed, never read as fleet-wide with its org dropped |
+| `cat`, or `scope` | tenant and scoped, one or both; `cat` alone on an operator, where it binds it | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph. On an `operator` token `cat` is the binding: the token is an operator on the catalogs it names and nothing elsewhere (below). Every bound catalog must carry `admin`, or the token is refused as malformed; a binding that names no catalog is refused. An operator token carries no `scope`; hoglake refuses one, as hoglite does |
 
 Authorization is per catalog. The scope vocabulary is ordered,
 `read < write < maintenance < admin`: `write` includes `read`, `maintenance`
@@ -153,7 +154,9 @@ do not start with `hoglake:` belong to other audiences and are ignored; a
 refuses the token. When both `cat` and `scope` are present they must describe
 the same grants after each has applied its own rules, or the token is
 refused. One limit: a routed (`rtg`) token still needs exactly one `cat`
-entry.
+entry. All of this is for tenant and scoped tokens: an `operator` token
+carrying `scope`, even one with only foreign values, is refused (see
+[Scoped tokens, exactly](#scoped-tokens-exactly)).
 
 Profile extensions, optional and generic. An issuer uses them when its
 deployment needs them; hoglake applies them without knowing what they mean:
@@ -183,6 +186,46 @@ issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
 
+hoglite verifies the token on every call, where hoglake checks it once
+when the request starts, and accepts it until 60 seconds past `exp`. A
+request that makes many calls can outlive its token there and fail
+partway, after some of its transactions applied (#680). Two rules cover
+that:
+
+- **Refused up front.** On a hoglite catalog, a long-running route
+  answers 401 `token_expired`, with `WWW-Authenticate: Bearer
+  error="token_expired"`, before any backend call, when `exp + 60 - now`
+  is under `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` (default 300; 0
+  disables it). `now` is when hoglake verified the token, on hoglake's
+  clock. The routes selected for the floor are the ones whose
+  transactions grow with the catalog's backlog: `POST
+  .../maintenance/expire`, `.../cleanup`, `.../compact` and
+  `.../rehydrate`, `DELETE /v1/catalogs/{catalog}` and `POST
+  .../uploads/schedule-expired`. Other routes can run a fixed few
+  transactions, and the next rule covers them. Nothing ran, so the 401
+  is safe to answer with a fresh token, which pyhoglake's
+  `ClientCredentials` and the DuckDB extension do on any 401. The
+  refusal is counted on `hoglake_auth_requests_total` and audited like
+  any other; under `warn` it is let through, except for a scoped caller.
+- **Failed midway anyway.** A 401 from hoglite after one of the
+  request's transactions applied, or may have, answers 503
+  `commit_outcome_unknown` naming that transaction, never 401: a client
+  must not re-mint and replay a request that partly ran. A maintenance
+  run answers it too, rather than 200 with a failure count. Only an
+  operation that takes an `idempotency_key` is exactly-once on a retry
+  with the same key; the routes above take none, so re-read the
+  catalog's state before running one again.
+
+Tune the minimum with the issuer's token lifetime. A fresh token has its
+lifetime plus 60 seconds left by this reckoning, less the time from mint
+to verify and any amount hoglake's clock runs ahead of the issuer's. A
+scheduler minting 5-minute tokens has 60 seconds of margin against the
+default 300: a hoglake clock more than that ahead of the issuer refuses
+every such call, and the re-minted retry too. Lower the minimum, or mint
+longer-lived tokens for maintenance.
+
+PostgreSQL catalogs are unaffected by both.
+
 #### Typed scoped namespace read
 
 This operation is disabled by default.
@@ -192,6 +235,7 @@ It confirms tenant isolation and support at every eligible owner.
 It requires enforced authentication with mounted public JWKS.
 It cannot coexist with served namespace configuration.
 The bound namespace cannot be a reserved or remote schema name.
+A `read_session` binding has one exception, described in "Dedicated read verification".
 
 The caller uses `GET /v1/catalogs/{catalog}/namespaces/{namespace}`.
 The request has no body or query parameters.
@@ -225,20 +269,56 @@ It requires ES256 with mounted keys.
 It requires exactly `trino-session`, `hoglake-session`, and `hoglite-session` in `aud`.
 The ordinary verifier refuses these audiences.
 
-Only an isolated Hoglite fixture can opt in to this verifier.
-Add `read_session` to the binding in `HOGLAKE_SCOPED_NAMESPACE_FILE`.
-The object contains `profile` and a `remote_targets` array of two distinct target IDs.
-Configure `team_id` as the only predicate field.
+Enable this verifier with `HOGLAKE_READ_SESSION_PROFILE` and `HOGLAKE_READ_SESSION_REMOTE_TARGETS`.
+Set `HOGLAKE_READ_SESSION_PROFILE` to the profile identifier.
+Set `HOGLAKE_READ_SESSION_REMOTE_TARGETS` to two distinct comma-separated target IDs.
+Configure `HOGLAKE_AUTH_MODE=enforce`, file JWKS, and `team_id` as the only predicate field.
+One server may keep `warn`: a Host with `HOGLAKE_PUBLIC_PORT`, no Hoglite backend and the relay `off`. Its API listener then never selects the read verifier; only its public listener does, which always enforces.
+The server also needs a Hoglite backend, or served namespaces (a Host, see "Read sessions on a remote schema").
 
-The API listener then requires a dedicated read token for the exact bound namespace GET.
-Add an optional canonical `table` name with `read_session` to opt in that table GET and pinned scan GET.
-All other requests keep the ordinary verifier.
+The API listener accepts dedicated read tokens on namespace GET, table GET, and pinned scan GET routes.
+It routes any non-reserved catalog, any non-reserved local namespace, and any table from the signed JWT.
+Reserved mounts and reserved namespaces keep the ordinary verifier on ordinary routes.
+The one exception is a remote schema's four relayed routes, described in "Read sessions on a remote schema".
+Ordinary tokens keep the ordinary verifier on all ordinary routes.
+
+#### Local-only read routes
+
+A dedicated client reads local objects through three local-only GET routes:
+
+- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}`
+- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`
+- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan`
+
+Each route takes the same query and gives the same body as the ordinary route without the prefix.
+A request on these routes always uses the dedicated read verifier.
+It reads only from the configured Hoglite owner named in the signed JWT.
+It never reaches a remote schema relay, a mount, or a legacy store.
+The server never redirects or rewrites it to an ordinary route.
+
+The routes answer as follows:
+
+- A listener without `HOGLAKE_READ_SESSION_PROFILE` answers `501`. So does the public listener, with or without the profile, and `HOGLAKE_AUTH_MODE=off`.
+- Another path under `/v1/local-only` answers `422`.
+- Another method on a valid route answers `405` with `Allow: GET`.
+- A missing or refused token answers `401`.
+- A verified session that names an unentitled catalog, a reserved mount, or a reserved namespace (including a remote schema) answers `404`. The server does not call the owner.
+- An eligible local namespace, table, or scan answers as the owner answers. An absent object is `404`.
+
+The `501`, `422`, and `405` answers do not carry a marker.
+Every other answer carries the response header `X-Hoglake-Local-Only: true`.
+A server that predates these routes treats them as unknown paths.
+It cannot match them to an ordinary route, so it cannot relay them.
+Its answer does not carry the marker.
+A client reads a `404` as absence only when the marker is present.
+It must refuse every other answer without the marker.
 
 Hoglake sends the original token to the configured Hoglite owner.
-It does not retry with another token or use legacy SQL after a refusal.
-The public listener never selects the dedicated verifier.
-PostgreSQL catalogs do not support this fixture.
-The fixture requires a Hoglite owner that accepts the dedicated profile on its typed reads.
+It does not retry with another token after a refusal.
+It does not fall back to legacy SQL after a refusal.
+The public listener never selects the dedicated verifier, except on the four routes of a served namespace ("Read sessions on a remote schema").
+PostgreSQL catalogs do not support this path.
+The Hoglite owner must accept the dedicated profile on its typed reads.
 
 Table GET allows omitted `totals` or `totals=false`, sets `Cache-Control: no-store`, and omits totals.
 Scan GET requires canonical `snapshot` and `table_uuid` query parameters.
@@ -264,6 +344,59 @@ The [signed read session vectors](../server/src/test/resources/oauth/read-sessio
 give the expected verdict for each verifier.
 Their keys and credentials are fictional.
 Run `just server contract-vectors` to regenerate the file.
+
+#### Read sessions on a remote schema
+
+**Status: the Client side and the Host side are built. The reader's check is PROPOSED.**
+A Client with `HOGLAKE_READ_SESSION_PROFILE` and `HOGLAKE_READ_SESSION_RELAY=on` relays a dedicated read session as described below.
+`HOGLAKE_READ_SESSION_RELAY` is `off` by default; `on` needs the profile and a remote schema in `HOGLAKE_MOUNT_HOSTS_FILE`, or the server does not start.
+A Host with `HOGLAKE_READ_SESSION_PROFILE` and served namespaces accepts one as described below. A Host without the profile refuses it with its ordinary verifier.
+The `relay` list in the read session vectors pins the caller rule.
+
+A read session already names the read-only `team` family in `remote_schemas` and one team in `prd`.
+This section lets it read that team schema through the relay, with the same bytes.
+It adds no claim and changes no claim.
+
+**On the Client** ([auth-tenancy.md §6.5c](auth-tenancy.md#65c-remote-schemas-on-the-client)):
+
+- The API listener selects the dedicated read verifier for a token with the dedicated audiences on the four relayed `GET` routes of a namespace that a remote schema entry covers, in a catalog this server holds. The four routes are the namespace, its table list, a table, and a scan.
+- The caller rule is the one of §6.5c, unchanged. The caller is `scoped`. Its `cat` allows `read` on the catalog in the request path, so a session for one catalog never relays a request that names another. It holds the schema through the `team` family entry and its `prd`.
+- The catalog is checked first, as on every route: a session whose `cat` does not name the catalog in the path gets that check's `404` for the catalog, and the namespace is never looked at. Every later failure is the `404` of a missing namespace. In both cases nothing is sent to the Host.
+- A verified read session resolves such a namespace to the remote schema only. It never resolves it to a local store, a served namespace, or a mount.
+- The server forwards the original `Authorization` header, as it does for every relayed request. It does not mint, exchange, or retry with another token.
+- Every other route keeps its verifier. The ordinary verifier still refuses the dedicated audiences. The local-only routes still never relay.
+- A request with more than one `Authorization` header is refused before it is verified, as on the local read routes.
+- A Client with the relay `off` is unchanged: the ordinary verifier refuses the token on these routes.
+
+**On the Host** ([auth-tenancy.md §6.5d](auth-tenancy.md#65d-served-namespaces-on-the-host)):
+
+- A server with served namespaces may enable the dedicated read verifier. This lifts the boot refusal that keeps the two apart.
+- A server that only serves namespaces enables it without a Hoglite backend. It ignores `rtg` on a served route, as it does for a `storage-session` token.
+- Both listeners of such a server select the verifier this way: the API listener and the public listener. On the public listener nothing else selects it: no local read, no relay and no local-only route.
+- A served family's names, in any letter case and with any leading zeros, are never a local read on such a server.
+- The listener that receives relayed requests selects the dedicated read verifier for a token with the dedicated audiences on the same four routes of a served namespace, and on no other route. Where that is the public listener, this is the one exception to "the public listener never selects the dedicated verifier".
+- The caller rule is the one of §6.5d, unchanged, in the same order: the catalog, the schema, the namespace's mark with the caller's `org`, then the caller's `prd`.
+- The verifier requires both configured remote targets among the grants, as it does on the Client.
+- Scan `GET` requires canonical `snapshot` and `table_uuid` query parameters for a read session, as the local scan does. The Host checks both against the table it resolves for the scan and answers `404` when either differs. A table that starts to shadow another of the same name between the table lookup and the scan is therefore refused, not read.
+- The Host checks every data file and deletion vector path of a scan answer against the grants of the two remote targets. It refuses an out-of-grant or malformed path with a redacted `403`, as the local scan does for the primary-catalog grants.
+- The scan query is exactly those two parameters. `include` and every other parameter is refused with `400`.
+- Table `GET` and the table list omit row totals for a read session, and table `GET` allows only an omitted `totals` or `totals=false`, as the local table route does. Totals are computed before any grant check, so they are not given to a caller whose files are checked.
+- A table list entry for a read session carries `name`, `table_uuid`, and `comment` and `earliest_snapshot_id` when set. It has none of the count and size fields.
+- The four answers carry `Cache-Control: no-store`. A Client sets the header again on the answer it relays to a read session.
+- The Host never uses the embedded credentials.
+
+**The reader** opens files with the embedded credentials, so it applies the same path check itself.
+It checks every data file and deletion vector of a scan against the grants of the two remote targets before a split contributes rows or counts.
+A count answered from metadata is included: the check does not wait for a file to be opened.
+The reader derives a count only from the files of a grant-checked scan, never from a table's totals.
+
+Open points, to settle in review of this section:
+
+- Whether the Host path check above is required, or whether the reader's check and the storage policy are enough. This section requires it.
+- A Host that serves published tables beside a source catalog needs one remote target for each storage root. The verifier takes exactly two targets today.
+
+The `relay` list of the [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json) gives one verified session, a requested catalog and namespace, and the answer of the caller rule: `relay` or `not_found`.
+It covers the held team, another team, another catalog with the same organization and team, non-canonical spellings, and names outside the family.
 
 #### Experimental profile
 
@@ -336,10 +469,34 @@ must emit all of the following:
 A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
 `invalid_predicate`, …).
 
-An `operator` token bypasses per-catalog checks and may create catalogs,
-manage containment, and read operator-only routes. Operator tokens
-are therefore only as safe as the keys in the JWKS: whoever can sign with them
-is an operator.
+An `operator` token without `cat` is fleet-wide: it bypasses
+per-catalog checks and may create catalogs, manage containment, and read
+operator-only routes. An `operator` token with `cat` (and so every
+routed one, since `rtg` needs exactly one `cat` entry) is **bound** to the
+catalogs it names: on them it is an operator, holding every scope, containment
+included; every other catalog answers 404 as it does for a tenant; `POST
+/v1/catalogs` creates only a catalog it names (another name is the same 404,
+checked before the name itself, so a reserved name it does not hold is a 404
+too, never the reserved name's 422), and its refusal for a `data_path` that
+overlaps another catalog's names that catalog and its `data_path` only when
+the token names that catalog too; the catalog listing shows its own; and the
+fleet routes (`/metrics`,
+`/v1/database/health`, `/v1/maintenance/status` and `/runs`, the debug
+surface) answer 403. Because a bound operator holds every scope on its
+catalog whatever the words say, the binding must grant `admin` on every
+catalog it names: `{"lake": ["read"]}` on an operator token is refused as
+`invalid_token` (malformed), never read as a reader and never as an operator.
+An operator token carries no `scope`; hoglake refuses one, as hoglite does:
+any `scope`, whatever its value (empty, foreign values only, or `hoglake:`
+grants), refuses an operator token as `invalid_token` (malformed), with or
+without `cat`. An unbound
+operator token must not carry `org` either: `org` names the tenant a binding
+acts for, so an operator token with `org` but no `cat` is refused as
+`invalid_token` rather than read as fleet-wide with its org dropped. This is
+the binding hoglite enforces (an unbound operator is one with neither `cat`
+nor `org`; a routed operator's `cat` must say `admin`), enforced in hoglake
+too. Operator tokens are therefore only as safe as the keys in
+the JWKS: whoever can sign with them is an operator.
 
 ### Errors
 
@@ -389,7 +546,13 @@ hydrator's footer fetches), `write` (compaction: its inputs' reads plus the
 put and multipart upload of its output — and no delete, so a leaked or buggy
 compaction session cannot remove a tenant's referenced files), and `delete`
 (cleanup's drain of the removal queue, the one job that deletes). A broker
-grants `s3:DeleteObject` only for `delete`. The token request is the
+grants `s3:DeleteObject` only for `delete`. The `prefix` is a request, not
+an authority: a broker must bound the session by the catalog's placement as
+its own records hold it, and refuse a `prefix` outside it. hoglake sends the
+catalog's `data_path`, and a Hoglite tenant can rewrite its own (#668), so a
+broker that scoped its session to whatever `prefix` it was sent would give
+that tenant a read session on another catalog's objects. hogtower's broker
+refuses one with `prefix_outside_catalog`. The token request is the
 clients' client-credentials form, `grant_type=client_credentials` with
 `audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
 URLs must be `https` — the client secret and every vended key cross that
@@ -412,7 +575,11 @@ its own, and every session it uses is one the broker chose to grant and can
 audit. PostHog runs it, pointed at hogtower; anyone can implement the shape in
 front of their own STS wrapper or a secrets engine. Under `ambient` the
 server's role reaches every catalog it serves, which is the normal trade for a
-single-org install.
+single-org install. A Hoglite tenant can rewrite its own `data_path` (#668), so
+a Hoglite rehydrate reads footers only under `HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE`
+or the catalog's `broker` session, and under `ambient` or `static` with no
+template it only requeues and records a failed `hydrator` run saying why
+(server/README).
 
 Whatever the provider, it serves only the server's own work: the background
 jobs, and the same work when a caller with `maintenance` scope triggers it

@@ -53,11 +53,17 @@ class CommitLockCallSitesTest {
             }.toList()
         // MUTATION: take the lock in a caller with its own
         // `SELECT pg_advisory_xact_lock(...)` and it is listed here.
-        assertThat(hits).hasSize(1)
-        assertThat(hits.single()).startsWith("com/posthog/hoglake/persistence/Locks.kt:")
+        assertThat(hits).allSatisfy { assertThat(it).startsWith("com/posthog/hoglake/persistence/Locks.kt:") }
         val locks = sources().single { it.first.endsWith("persistence/Locks.kt") }.second
-        val line = hits.single().substringAfterLast(':').toInt() - 1
-        assertThat(enclosingFunction(locks, line)).isEqualTo("lockStatement")
+        // The one other xact-scoped class, the promote stats fence (#729),
+        // has its own two takers; everything else is the commit lock's.
+        val byFunction = hits.map { enclosingFunction(locks, it.substringAfterLast(':').toInt() - 1) }
+        assertThat(byFunction.filterNot { it in PROMOTE_STATS_FENCE_TAKERS }).containsExactly("lockStatement")
+        for ((hit, fn) in hits.zip(byFunction)) {
+            if (fn in PROMOTE_STATS_FENCE_TAKERS) {
+                assertThat(locks[hit.substringAfterLast(':').toInt() - 1]).contains("PROMOTE_STATS_FENCE_LOCK_CLASS")
+            }
+        }
     }
 
     @Test
@@ -136,6 +142,9 @@ class CommitLockCallSitesTest {
     }
 
     private companion object {
+        /** [Locks]' functions taking the promote stats fence, not the commit lock. */
+        val PROMOTE_STATS_FENCE_TAKERS = setOf("acquirePromoteStatsFence", "acquirePromoteStatsFenceShared")
+
         /** `File.function` -> the path it passes. One entry per call site. */
         val EXPECTED: Map<String, String> =
             mapOf(

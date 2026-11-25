@@ -74,7 +74,113 @@ class JwtVerifierTest {
         assertThat(caller.orgId).isNull()
         assertThat(caller.visibleCatalogs()).isNull()
         assertThat(caller.knowsCatalog("any-catalog-at-all")).isTrue()
+        assertThat(caller.fleetWide).isTrue()
         assertThat(caller.actor).isEqualTo("operator:sa:bulk-loader")
+    }
+
+    @Test
+    fun `an operator token carrying cat is bound to those catalogs and is not fleet-wide`() {
+        val claims = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1","cat":{"lake":["admin"]}}"""
+        val caller = verifier().verify(mint(claims))
+        assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
+        assertThat(caller.fleetWide).isFalse()
+        assertThat(caller.orgId).isEqualTo("org-1")
+        assertThat(caller.catalogScopes).isEqualTo(mapOf("lake" to setOf(Scope.ADMIN)))
+        assertThat(caller.visibleCatalogs()).containsExactly("lake")
+        // Its own catalog: an operator there, every scope held.
+        assertThat(caller.knowsCatalog("lake")).isTrue()
+        assertThat(caller.holds("lake", Scope.ADMIN)).isTrue()
+        // Any other: a catalog it does not know, as for a tenant.
+        assertThat(caller.knowsCatalog("other")).isFalse()
+        assertThat(caller.holds("other", Scope.READ)).isFalse()
+        assertThat(caller.actor).isEqualTo("operator:sa:bulk-loader")
+    }
+
+    @Test
+    fun `a bound operator must be granted admin on every catalog it names`() {
+        // A bound operator holds every scope on its catalog whatever the words
+        // say, so a binding spelled narrower than admin is refused rather than
+        // read as full authority: hoglite refuses the same token. MUTATION:
+        // drop the admin check and `read` verifies with holds(lake, ADMIN) true.
+        for (cat in listOf(
+            """{"lake":["read"]}""",
+            """{"lake":["maintenance"]}""",
+            """{"lake":["admin"],"pond":["write"]}""",
+        )) {
+            val claims = TestTokens.operatorClaims().dropLast(1) + ""","cat":$cat}"""
+            assertThatThrownBy { verifier().verify(mint(claims)) }
+                .describedAs(cat)
+                .isInstanceOf(JwtViolation::class.java)
+                .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
+        }
+        // admin among other words is admin, as hoglite reads it.
+        val both = TestTokens.operatorClaims().dropLast(1) + ""","cat":{"lake":["read","admin"]}}"""
+        val bound = verifier().verify(mint(both))
+        assertThat(bound.fleetWide).isFalse()
+        assertThat(bound.holds("lake", Scope.ADMIN)).isTrue()
+        assertThat(bound.knowsCatalog("pond")).isFalse()
+    }
+
+    @Test
+    fun `a bound operator's cat naming no catalog is refused`() {
+        // MUTATION: read an empty binding as fleet-wide and these three verify
+        // with knowsCatalog true for every catalog.
+        for (cat in listOf("""{}""", """{"lake":[]}""", """{"lake":["bogus"]}""")) {
+            val claims = TestTokens.operatorClaims().dropLast(1) + ""","cat":$cat}"""
+            assertThatThrownBy { verifier().verify(mint(claims)) }
+                .describedAs(cat)
+                .isInstanceOf(JwtViolation::class.java)
+                .extracting("reason").isEqualTo(JwtViolation.MISSING_CLAIM)
+        }
+        val notAnObject = TestTokens.operatorClaims().dropLast(1) + ""","cat":["lake"]}"""
+        assertThatThrownBy { verifier().verify(mint(notAnObject)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
+    }
+
+    @Test
+    fun `an operator token carrying org but no binding is refused, not read as fleet-wide`() {
+        // hoglite accepts an unbound operator only when cat AND org are both
+        // empty; an org with no grants is a binding the issuer forgot to finish,
+        // and must not widen to the fleet with the org dropped. MUTATION: skip
+        // the check and it verifies fleet-wide with orgId null.
+        val claims = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1"}"""
+        assertThatThrownBy { verifier().verify(mint(claims)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
+        // The same org with a binding is the bound operator it reads as.
+        val bound = TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1","cat":{"lake":["admin"]}}"""
+        assertThat(verifier().verify(mint(bound)).orgId).isEqualTo("org-1")
+    }
+
+    @Test
+    fun `an operator token carrying scope is refused, whatever its value`() {
+        // An operator token carries no scope: no issuer mints one and hoglite
+        // refuses any token carrying it, whatever the value, as hoglake does.
+        // MUTATION: drop the scope check and each of these verifies with
+        // fleetWide true, and the one beside a `cat` verifies bound by it.
+        for (scope in listOf(
+            "\"\"",
+            "\" \"",
+            "\"openid profile\"",
+            "\"openid\\thoglake:lake:admin\"",
+            "\"openid,hoglake:lake:admin\"",
+            "\"hoglake:lake:admin\"",
+            "null",
+            "[\"hoglake:lake:admin\"]",
+        )) {
+            val claims = TestTokens.operatorClaims().dropLast(1) + ""","scope":$scope}"""
+            assertThatThrownBy { verifier().verify(mint(claims)) }
+                .describedAs("scope $scope")
+                .isInstanceOf(JwtViolation::class.java)
+                .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
+        }
+        // Beside a `cat` that binds it, too: the binding is spelled `cat` alone.
+        val withCat =
+            TestTokens.operatorClaims().dropLast(1) + ""","cat":{"lake":["admin"]},"scope":"hoglake:lake:admin"}"""
+        assertThatThrownBy { verifier().verify(mint(withCat)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
     }
 
     @Test

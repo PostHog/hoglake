@@ -1044,6 +1044,39 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a promote that commits during the rewrite leaves the output's bounds at 8 bytes`() {
+        // The promote race, compaction's side (#729): the output's stats
+        // are aggregated under the plan's INT, and the promote re-encodes
+        // only the stats rows its scan can see, which the output's are not
+        // until the group commits. The commit must widen them to the live
+        // LONG.
+        val v = Types.optional(PrimitiveTypeName.INT32).id(1).named("v")
+        val cat =
+            twoFileTable(
+                "promote-mid-rewrite",
+                listOf(ColumnDef("v", ColType.INT)),
+                Types.buildMessage().addField(v).named("t"),
+                file1 = listOf({ g: Group -> g.add("v", -3) }),
+                file2 = listOf({ g: Group -> g.add("v", 7) }),
+            )
+
+        svc.beforeRewrite = { alter.alterTable(cat, "ns", "t", listOf(AlterOp.PromoteColumn("v", ColType.LONG))) }
+        val result =
+            try {
+                svc.runOnce(cat, cfg)
+            } finally {
+                svc.beforeRewrite = {}
+            }
+
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+        assertThat(catalogs.getTable(cat, "ns", "t").columns.single().def.type).isEqualTo(ColType.LONG)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        val row = storedStats(cat, output.dataFileId).getValue(1L)
+        assertThat(row.lower).isEqualTo(IcebergSingleValue.encodeLong(-3))
+        assertThat(row.upper).isEqualTo(IcebergSingleValue.encodeLong(7))
+    }
+
+    @Test
     fun `bounds parquet refuses to write are not stored either - both doors agree`() {
         // parquet-java keeps a chunk's full min/max in the in-memory
         // ParquetMetadata but will not SERIALIZE its statistics once

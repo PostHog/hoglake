@@ -1,0 +1,5 @@
+---
+hoglake: patch (Server)
+---
+
+The Hoglite store verifies that the tenant a catalog resolves to holds that catalog (#670). Every read of the tenant's `meta` row checks `meta.name` against the requested catalog, and every mutating tenant transaction carries a name guard beside the drop fence, so a routing or issuer mapping error (a token whose `cat` names one catalog and whose `rtg.t` is another catalog's tenant) is a 404 for the requested catalog instead of serving, writing or dropping the other one. The answer never names the catalog the tenant holds; a warning on the server does. The live-namespace read behind every namespace- and table-scoped write (drop, truncate, create, views) reads the meta row in the same transaction, so a mis-mapped tenant is the catalog 404 before those writes can answer with the other catalog's identity (a 409 carrying its live table UUID or namespace id, a 403 on its containment mark). Views, table-creation status and the containment read used by auth read the meta row too.
