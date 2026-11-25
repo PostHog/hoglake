@@ -181,6 +181,8 @@ class BackendConfigTest {
                 authMode = "enforce",
                 defaultBackend = default,
                 requestThreads = threads,
+                // Silences #675's boot warning, which shares Config's logger.
+                hogliteDataPathTemplate = "s3://warehouse/{catalog}",
             )
         }
 
