@@ -301,6 +301,7 @@ implementations together.
 | [docs/auth-roadmap.md](docs/auth-roadmap.md) | The cross-repository checklist of what is left to do on auth, ticked as it lands |
 | [docs/auth-tenancy.md](docs/auth-tenancy.md) | Design history behind docs/auth.md: the threat model, per-catalog scopes, and why issuance and S3 vending live outside hoglake |
 | [docs/trino-integration.md](docs/trino-integration.md) | The native connector, and the commit shapes that keep Trino writes a translation away |
+| [docs/identifier-case.md](docs/identifier-case.md) | Proposed, not built: case-preserving, case-insensitive namespace, table, view and column names, resolved by the server |
 | [docs/operational-notes.md](docs/operational-notes.md) | What hoglake changes operationally and what it does not; sizing, and the ceilings to watch |
 | [docs/kafka-ingestion.md](docs/kafka-ingestion.md) | Kafka ingestion via staged keying: the design obligations millrace implements |
 | [docs/kafka-ingestion-plan.md](docs/kafka-ingestion-plan.md) | The test-led build sequence for the Kafka ingestion design |
