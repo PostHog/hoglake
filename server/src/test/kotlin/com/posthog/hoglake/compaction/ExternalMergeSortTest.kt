@@ -743,8 +743,31 @@ class ExternalMergeSortTest {
             .describedAs("no row group exceeds the output block")
             .isEqualTo(ExternalMergeSort.OUTPUT_BLOCK_BYTES + 3 * page + 7 + 1536)
         assertThat(ExternalMergeSort.predictedSpilledRunBytes(3, bounds))
-            .isEqualTo(10 + 3 * ExternalMergeSort.SPILL_READER_BYTES_PER_LEAF + 1536)
+            .isEqualTo(678_878L)
         assertThat(ExternalMergeSort.SPILL_READER_BYTES_PER_LEAF).isEqualTo(221_340)
+    }
+
+    @Test
+    fun `spill estimate headroom rounds up and saturates`() {
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(0)).isZero()
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(1)).isEqualTo(2)
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(50)).isEqualTo(51)
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(51)).isEqualTo(53)
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(-1)).isEqualTo(Long.MAX_VALUE)
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(Long.MAX_VALUE)).isEqualTo(Long.MAX_VALUE)
+        assertThat(ExternalMergeSort.spillEstimateWithHeadroom(Long.MAX_VALUE - 1)).isEqualTo(Long.MAX_VALUE)
+    }
+
+    @Test
+    fun `four spill admission reserves headroom at the merge threshold`() {
+        val bounds = spill(tmp, chunkRows = 508_400, block = 16 * 1024 * 1024)
+        val input = listOf(fake("events", 83_110_081, 2_000_000, trusted = false))
+        val projected = ExternalMergeSort.admit(input, bounds, 11).projectedBytes
+        assertThat(projected).isEqualTo(78_403_584L)
+        assertThat(projected).isGreaterThan(76_945_723L)
+        assertThat(SortMemory.fits(projected, 76_945_723L)).isFalse()
+        assertThat(SortMemory.fits(projected, projected - 1)).isFalse()
+        assertThat(SortMemory.fits(projected, projected)).isTrue()
     }
 
     @Test
@@ -952,10 +975,10 @@ class ExternalMergeSortTest {
         val medium = fake("medium", 1_000, 100)
         val small = fake("small", 100, 5)
         // Room for large + small + medium's one spilled run, not for medium as a run.
-        val result = admit(listOf(small, medium, large), spill(tmp, mergeBudget = 3_000 + 100 + 1 + 3 * 384))
+        val result = admit(listOf(small, medium, large), spill(tmp, mergeBudget = 3_000 + 100 + 1 + 3 * 384 + 8))
         assertThat(result.admitted).containsExactly(large, small)
         assertThat(result.demoted).containsExactly(medium)
-        assertThat(result.projectedBytes).isEqualTo(4_253)
+        assertThat(result.projectedBytes).isEqualTo(4_261)
     }
 
     @Test
@@ -991,7 +1014,7 @@ class ExternalMergeSortTest {
                 spill(tmp, chunkRows = 10, mergeBudget = 500 + 2_000, block = 1_000),
             )
         assertThat(result.admitted).isEmpty()
-        assertThat(result.projectedBytes).describedAs("4 runs including replacement heads").isEqualTo(5_536)
+        assertThat(result.projectedBytes).describedAs("4 runs including replacement heads").isEqualTo(5_648)
     }
 
     @Test
@@ -1262,6 +1285,26 @@ class ExternalMergeSortTest {
     // ---- merge budget, end to end ------------------------------------------------
 
     private fun perSpill(bounds: SortSpill) = ExternalMergeSort.predictedSpilledRunBytes(kvLeaves, bounds)
+
+    @Test
+    fun `pre-headroom spill estimate is refused before any input IO`() {
+        val a = CountingInputFile(clientKv("headroom-a", listOf(3, 2, 1)))
+        val b = CountingInputFile(clientKv("headroom-b", listOf(5, 4)))
+        val parent = spillParent()
+        val out = fresh("headroom-out.parquet")
+        val bounds = spill(parent, chunkRows = 2, block = 10)
+        // Three runs at the former unpadded 665,566 bytes each.
+        assertThatThrownBy {
+            rewrite(
+                listOf(input(a, "a", survivors = 3), input(b, "b", 10, survivors = 2)),
+                out,
+                bounds.copy(mergeBudgetBytes = 3 * 665_566L),
+            )
+        }.isInstanceOf(MergeBudgetExceededException::class.java)
+        assertThat(a.opened.get() + b.opened.get()).isZero()
+        assertThat(parent.listDirectoryEntries()).isEmpty()
+        assertThat(out.exists()).isFalse()
+    }
 
     @Test
     fun `predicted spilled runs over the merge budget refuse the group before any IO`() {

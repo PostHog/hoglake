@@ -23,8 +23,8 @@ class SortedMemoryCalibrationTest {
         assertThat(spill.chunkRows).isEqualTo(508_400L)
         assertThat(ExternalMergeSort.spillRuns(2_000_000, spill)).isEqualTo(4)
         // 16 MiB block, eleven 221,340-byte reader slots, and two 2,304-byte estimated heads.
-        // Each slot adds packed scratch and fixed objects to the data/dictionary page targets.
-        assertThat(ExternalMergeSort.predictedSpilledRunBytes(11, spill)).isEqualTo(19_216_564L)
+        // Each slot adds packed scratch and fixed objects; admission adds 2% headroom.
+        assertThat(ExternalMergeSort.predictedSpilledRunBytes(11, spill)).isEqualTo(19_600_896L)
         assertThat(ParquetRewriter.APPEND_MIN_ROW_GROUP_BYTES).isEqualTo(33_554_432L)
         assertThat(ExternalMergeSort.OUTPUT_BLOCK_BYTES).isEqualTo(134_217_728L)
     }
@@ -36,7 +36,7 @@ class SortedMemoryCalibrationTest {
         assertThat(ordinary["rowsVerified"].asLong()).isEqualTo(2_000_000)
         assertThat(ordinary["runsSpilled"].asInt()).isEqualTo(4)
         assertThat(ordinary["predictedRuns"].asLong()).isEqualTo(4)
-        assertThat(ordinary["admissionReservationBytes"].asLong()).isEqualTo(76_866_256L)
+        assertThat(ordinary["admissionReservationBytes"].asLong()).isEqualTo(78_403_584L)
         assertThat(ordinary["observedMergeBytes"].asLong())
             .isPositive()
             .isLessThanOrEqualTo(ordinary["admissionReservationBytes"].asLong())
