@@ -29,6 +29,9 @@ import java.util.UUID
 private val ALTER_SCHEMA_CHANGED = HoglakeException.CommitConflict("table schema changed while planning alter")
 private val ALTER_FILE_SET_CHANGED = HoglakeException.CommitConflict("file set changed while planning alter")
 
+/** File-fence replans per alter, apart from the one schema-fence replan. */
+internal const val MAX_FILE_SET_REPLANS = 3
+
 /**
  * [AlterBackend] on hoglite: [com.posthog.hoglake.service.AlterService]'s
  * op semantics over the tenant's versioned rows.
@@ -67,7 +70,14 @@ internal class HogliteAlters(
             store.catalogOperation(catalog) {
                 if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
                 var original: Triple<Long, Long, UUID>? = null
-                for (attempt in 0..1) {
+                // The schema fence and the file fence replan on separate budgets,
+                // so steady appends to the promoted table never spend the schema
+                // replan: PostgreSQL serializes the alter behind its lock and
+                // refuses neither. The bound keeps continuous ingest from
+                // livelocking a promote.
+                var schemaReplans = 0
+                var fileSetReplans = 0
+                while (true) {
                     // ONE read-only transaction for the head, the namespace
                     // and the table's version row AT that head
                     // (HogliteCatalogStore.headTableRow): the identity and
@@ -269,7 +279,7 @@ internal class HogliteAlters(
                     )
                     // Publish the schema change for the commit path's per-table
                     // fence: a blind append planned against the old schema fails
-                    // its fence and replans once rather than landing stale.
+                    // its fence and replans rather than landing stale.
                     tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
                     for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
                     // After every promotion has patched the shared plan.
@@ -280,11 +290,16 @@ internal class HogliteAlters(
                         try {
                             store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
                         } catch (e: HoglakeException.CommitConflict) {
-                            if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_FILE_SET_CHANGED) throw e
-                            if (attempt == 1 || (e === ALTER_SCHEMA_CHANGED && readSnapshot != null)) {
-                                throw HoglakeException.CommitConflict(
-                                    "table $namespace.$table changed under the alter; re-read and retry",
-                                )
+                            when {
+                                e === ALTER_SCHEMA_CHANGED && readSnapshot == null && schemaReplans < 1 ->
+                                    schemaReplans++
+                                e === ALTER_FILE_SET_CHANGED && fileSetReplans < MAX_FILE_SET_REPLANS ->
+                                    fileSetReplans++
+                                e === ALTER_SCHEMA_CHANGED || e === ALTER_FILE_SET_CHANGED ->
+                                    throw HoglakeException.CommitConflict(
+                                        "table $namespace.$table changed under the alter; re-read and retry",
+                                    )
+                                else -> throw e
                             }
                             // Nothing from the rejected plan is reused. In particular
                             // transport retries of runTx above retain their own body/id;
@@ -653,8 +668,8 @@ internal class HogliteAlters(
      * decode bounds under the LIVE type. The stored stats are the file
      * row's JSON column-stats list, so the re-encode reads every file's
      * list and [patchWidenedBounds] writes back only the changed bounds,
-     * guarded on their old values. All promotions share one plan; an
-     * allocator fence detects files added after the read.
+     * guarded on their old values. All promotions share one plan; a
+     * table-scoped fence detects files added after the read.
      */
     private fun reencodeStatsOnPromote(
         catalog: String,
@@ -679,16 +694,24 @@ internal class HogliteAlters(
                 }
             }
         if (!state.statsLoaded) {
-            // O(1) allocator fence, BEFORE the stats read, including an empty set.
-            // Every append increments it. A catalog-wide fence is conservative for
-            // unrelated tables but avoids an O(manifest) set comparison under the tx.
-            val nextFile =
-                store.queryCatalog(catalog, "SELECT next_file_id FROM meta WHERE id = 1")
-                    .firstRow()!![0].asLong()
-            tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_FILE_SET_CHANGED }
+            // The file fence, BEFORE the stats read, including an empty set. The
+            // allocator and the head come from one row: every file below the
+            // allocator began at or before that head, and every file inserted
+            // later begins after it. The guard counts only THIS table's later
+            // files (files_listing index), so appends to other tables in a busy
+            // catalog never trip it.
+            val pinned =
+                store.queryCatalog(catalog, "SELECT next_file_id, next_snapshot - 1 FROM meta WHERE id = 1")
+                    .firstRow()!!
+            val nextFile = pinned[0].asLong()
+            tx.expectZero(
+                "SELECT COUNT(*) FROM files WHERE table_id = ? AND begin_snapshot > ?",
+                tableId,
+                pinned[1].asLong(),
+            ) { ALTER_FILE_SET_CHANGED }
             // Reuse files_listing's complete ordering, including ended rows. The
-            // pinned allocator ceiling excludes later appends; its tx guard will
-            // force a fresh plan if anything was appended while paging.
+            // pinned allocator ceiling excludes later appends; the fence forces
+            // a fresh plan if this table was appended to while paging.
             var cursor: Triple<Long, Long, Long>? = null
             var pageSize = 256
             while (true) {
@@ -756,56 +779,97 @@ internal class HogliteAlters(
      * as its guard, so a wide table's promote could never fit (#684). Like
      * PostgreSQL's UPDATE of the bound columns, only the bounds change.
      *
-     * A patch is `[file id, entry index, field id, old lower, new lower,
-     * old upper, new upper]`, the bounds as stored (base64) text. A
-     * statement takes up to [BOUND_PATCHES_PER_STATEMENT] of them as one
-     * JSON argument and must update one row per patch: a file whose entry
-     * moved, or whose bound changed, since the read rolls the alter back.
-     * A concurrent change to the entry's other stats (null count, sizes)
-     * is kept, not a conflict: the widened bound depends only on the old
-     * one, which the guard pins.
+     * A file's patch is `[file id]` followed, per widened entry, by
+     * `[entry index, field id, old lower, new lower, old upper, new
+     * upper]`, the bounds as stored (base64) text. Every widened entry of
+     * a file goes in one `json_set`, so SQLite writes the file's stats
+     * once, not once per promoted column; past [BOUND_ENTRIES_PER_WRITE]
+     * entries the rest go in a later write of the same file. A statement
+     * takes patches with the same entry count, up to
+     * [BOUND_PATCHES_PER_STATEMENT] entries, as one JSON argument and must
+     * update one row per patch: a file whose entry moved, or whose bound
+     * changed, since the read rolls the alter back. A concurrent change to
+     * the entry's other stats (null count, sizes) is kept, not a conflict:
+     * the widened bound depends only on the old one, which the guard pins.
      * UPDATE ... FROM applies one source row per target row, so a file's
-     * second widened entry goes in a later round.
+     * later writes go in later statements.
      *
      * Every patch still goes in the alter's one transaction, at about 75
-     * bytes each on the wire, so an alter tops out around 800k-850k widened
-     * bounds (files times promoted columns): past that the tx body is over
-     * the cap and [HogliteClient.tx] refuses it with Validation on every
-     * attempt. Spreading the patches across transactions under the
-     * allocator fence is not done; the read holds every file's stats in
-     * heap, which bounds the same catalogs.
+     * bytes per widened stats entry on the wire, so an alter tops out around
+     * 800k-850k of them (files times promoted columns): past that the tx
+     * body is over the cap and [HogliteClient.tx] refuses it with
+     * Validation on every attempt. Spreading the patches across
+     * transactions under the file fence is not done; the read holds every
+     * file's stats in heap, which bounds the same catalogs.
      */
     private fun patchWidenedBounds(
         tx: HogliteTx,
         state: TableState,
     ) {
-        val rounds = mutableListOf<MutableList<List<Any?>>>()
+        // Keyed by (the file's nth write, entries per write): one SQL shape
+        // each, and no file twice in one statement.
+        val writes = linkedMapOf<Pair<Int, Int>, MutableList<List<Any?>>>()
         for ((fileId, rewrite) in state.statsRewrites) {
             if (!rewrite.touched) continue
             val stored = store.json.readTree(rewrite.originalJson)
-            var round = 0
-            rewrite.stats.forEachIndexed { i, stat ->
-                if (stat === rewrite.original[i]) return@forEachIndexed
-                if (rounds.size == round) rounds += mutableListOf<List<Any?>>()
-                rounds[round++] +=
-                    listOf(
-                        fileId,
-                        i,
-                        stat.fieldId,
-                        stored.path(i).path("lowerBound").textValue(),
-                        stat.lowerBound?.let(BASE64::encodeToString),
-                        stored.path(i).path("upperBound").textValue(),
-                        stat.upperBound?.let(BASE64::encodeToString),
-                    )
+            val widened = rewrite.stats.indices.filter { rewrite.stats[it] !== rewrite.original[it] }
+            widened.chunked(BOUND_ENTRIES_PER_WRITE).forEachIndexed { nth, entries ->
+                writes.getOrPut(nth to entries.size) { mutableListOf() }.add(
+                    buildList {
+                        add(fileId)
+                        for (i in entries) {
+                            val stat = rewrite.stats[i]
+                            add(i)
+                            add(stat.fieldId)
+                            add(stored.path(i).path("lowerBound").textValue())
+                            add(stat.lowerBound?.let(BASE64::encodeToString))
+                            add(stored.path(i).path("upperBound").textValue())
+                            add(stat.upperBound?.let(BASE64::encodeToString))
+                        }
+                    },
+                )
             }
         }
-        for (patches in rounds.flatMap { it.chunked(BOUND_PATCHES_PER_STATEMENT) }) {
-            tx.affectExactly(
-                patches.size.toLong(),
-                PATCH_BOUNDS_SQL,
-                store.json.writeValueAsString(patches),
-            ) { HoglakeException.CommitConflict("file stats changed under the alter") }
+        for ((key, patches) in writes) {
+            val entries = key.second
+            val sql = patchBoundsSql(entries)
+            for (batch in patches.chunked(maxOf(1, BOUND_PATCHES_PER_STATEMENT / entries))) {
+                tx.affectExactly(batch.size.toLong(), sql, store.json.writeValueAsString(batch)) {
+                    HoglakeException.CommitConflict("file stats changed under the alter")
+                }
+            }
         }
+    }
+
+    /**
+     * [patchWidenedBounds]'s statement for patches of [entries] widened
+     * entries each; `?` is the JSON array of patches.
+     */
+    private fun patchBoundsSql(entries: Int): String {
+        val range = 0 until entries
+        val columns =
+            range.joinToString("") { e ->
+                val at = 1 + 6 * e
+                ", '$[' || json_extract(value, '$[$at]') || ']' AS at$e" +
+                    ", json_extract(value, '$[${at + 1}]') AS field_id$e" +
+                    ", json_extract(value, '$[${at + 2}]') AS old_lower$e" +
+                    ", json_extract(value, '$[${at + 3}]') AS new_lower$e" +
+                    ", json_extract(value, '$[${at + 4}]') AS old_upper$e" +
+                    ", json_extract(value, '$[${at + 5}]') AS new_upper$e"
+            }
+        val sets =
+            range.joinToString(", ") { e ->
+                "p.at$e || '.lowerBound', p.new_lower$e, p.at$e || '.upperBound', p.new_upper$e"
+            }
+        val guards =
+            range.joinToString("") { e ->
+                " AND json_extract(stats_json, p.at$e || '.fieldId') = p.field_id$e" +
+                    " AND json_extract(stats_json, p.at$e || '.lowerBound') IS p.old_lower$e" +
+                    " AND json_extract(stats_json, p.at$e || '.upperBound') IS p.old_upper$e"
+            }
+        return "UPDATE files SET stats_json = json_set(stats_json, $sets) " +
+            "FROM (SELECT json_extract(value, '$[0]') AS id$columns FROM json_each(?)) AS p " +
+            "WHERE files.id = p.id$guards"
     }
 
     private fun rewriteMetadata(
@@ -1272,20 +1336,14 @@ internal class HogliteAlters(
         /** Jackson's encoding of a ByteArray, which is how `stats_json` stores a bound. */
         val BASE64: Base64.Encoder = Base64.getEncoder()
 
-        /** Bounds patches per statement: a few hundred KB of argument, well under hoglited's caps. */
+        /** Widened entries per statement: a few hundred KB of argument, well under hoglited's caps. */
         const val BOUND_PATCHES_PER_STATEMENT = 5000
 
-        /** [patchWidenedBounds]'s statement; `?` is the JSON array of patches. */
-        const val PATCH_BOUNDS_SQL =
-            "UPDATE files SET stats_json = json_set(stats_json, p.at || '.lowerBound', p.new_lower, " +
-                "p.at || '.upperBound', p.new_upper) " +
-                "FROM (SELECT json_extract(value, '$[0]') AS id, '$[' || json_extract(value, '$[1]') || ']' AS at, " +
-                "json_extract(value, '$[2]') AS field_id, json_extract(value, '$[3]') AS old_lower, " +
-                "json_extract(value, '$[4]') AS new_lower, json_extract(value, '$[5]') AS old_upper, " +
-                "json_extract(value, '$[6]') AS new_upper FROM json_each(?)) AS p " +
-                "WHERE files.id = p.id AND json_extract(stats_json, p.at || '.fieldId') = p.field_id " +
-                "AND json_extract(stats_json, p.at || '.lowerBound') IS p.old_lower " +
-                "AND json_extract(stats_json, p.at || '.upperBound') IS p.old_upper"
+        /**
+         * Widened entries per write of one file: `json_set` then takes 101
+         * arguments, under SQLite's default 127-argument function cap.
+         */
+        const val BOUND_ENTRIES_PER_WRITE = 25
 
         /** setObjectPrefixField's emptiness probe: live data files plus live deletion vectors. */
         const val TABLE_LIVE_OBJECTS_SQL =

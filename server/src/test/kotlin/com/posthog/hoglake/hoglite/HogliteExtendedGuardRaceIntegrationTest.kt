@@ -597,7 +597,7 @@ class HogliteExtendedGuardRaceIntegrationTest {
     }
 
     @Test
-    fun `an ALTER between plan and tx replans once, twice is a typed 409`() {
+    fun `ALTERs between plan and tx replan up to the schema budget, then a typed 409`() {
         val (c, _) = setup()
         var k = 0
 
@@ -620,13 +620,25 @@ class HogliteExtendedGuardRaceIntegrationTest {
         assertThat(once.isSuccess).isTrue()
         assertThat(onceAttempts).isEqualTo(2) // fence tripped, replanned, applied
 
+        // #687: PostgreSQL never refuses here, so a fence that moves again
+        // during the replan replans again rather than spending a shared slot.
+        val budget = HogliteCommit.MAX_SCHEMA_REPLANS
         seen.clear()
-        hooks += Hook({ m, p, b -> isTx(m, p, b) && "twice.parquet" in b }, remaining = 2, before = { alter() })
-        val twice = runCatching { pstore.commit(c, appendReq(c, "twice.parquet", key = UUID.randomUUID())) }
-        assertThat(twice.exceptionOrNull()).isInstanceOf(HoglakeException.CommitConflict::class.java)
+        hooks += Hook({ m, p, b -> isTx(m, p, b) && "busy.parquet" in b }, remaining = budget, before = { alter() })
+        val busy = runCatching { pstore.commit(c, appendReq(c, "busy.parquet", key = UUID.randomUUID())) }
+        assertThat(busy.exceptionOrNull()).isNull()
+        assertThat(seen.count { isWriteTxLine(it, "busy.parquet") }).isEqualTo(budget + 1)
+
+        seen.clear()
+        hooks +=
+            Hook({ m, p, b -> isTx(m, p, b) && "exhausted.parquet" in b }, remaining = budget + 1, before = { alter() })
+        val exhausted = runCatching { pstore.commit(c, appendReq(c, "exhausted.parquet", key = UUID.randomUUID())) }
+        assertThat(exhausted.exceptionOrNull()).isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(exhausted.exceptionOrNull()!!.message).contains("changed the schema ${budget + 1} times")
+        assertThat(seen.count { isWriteTxLine(it, "exhausted.parquet") }).isEqualTo(budget + 1)
         assertThat(
             store.listFiles(c, "ns", "t").map { it.path.substringAfterLast('/') },
-        ).containsExactly("once.parquet")
+        ).containsExactlyInAnyOrder("once.parquet", "busy.parquet")
     }
 
     @Test
@@ -798,7 +810,8 @@ class HogliteExtendedGuardRaceIntegrationTest {
             val replay = runCatching { pstore.commit(c, req) }
             assertThat(replay.exceptionOrNull()).isNull()
             assertThat(replay.getOrThrow()).isEqualTo(winner)
-            assertThat(guardIndex).isEqualTo(2)
+            // The receipt guard is the commit's first statement, after runTx's fence (1-based on the wire).
+            assertThat(guardIndex).isEqualTo(HogliteCatalogStore.FENCE_STATEMENTS + 1)
             assertThat(
                 seen.count {
                     it.contains("/query ") && "SELECT fingerprint, snapshot_id, schema_version FROM receipts" in it
@@ -845,7 +858,7 @@ class HogliteExtendedGuardRaceIntegrationTest {
     }
 
     @Test
-    fun `replay repair shares the single replan budget with schema changes and receipt cleanup`() {
+    fun `replay repair and schema changes replan on separate budgets`() {
         for (schedule in listOf("purge", "purge-purge", "schema-purge", "purge-schema", "purge-retained")) {
             val (c, _) = setup()
             val key = UUID.randomUUID()
@@ -862,6 +875,8 @@ class HogliteExtendedGuardRaceIntegrationTest {
                             schedule == "schema-purge" && attempts == 1 -> "schema"
                             schedule == "purge-schema" && attempts == 2 -> "schema"
                             schedule == "purge" && attempts == 2 -> "none"
+                            // #687: one budget no longer spends the other's.
+                            schedule in listOf("schema-purge", "purge-schema") && attempts == 3 -> "none"
                             else -> "receipt"
                         }
                     if (cause == "schema") {
@@ -880,8 +895,9 @@ class HogliteExtendedGuardRaceIntegrationTest {
                     }
                 })
             val result = runCatching { pstore.commit(c, req) }
-            assertThat(attempts).isEqualTo(2)
-            if (schedule in listOf("purge", "purge-retained")) {
+            val separate = schedule in listOf("schema-purge", "purge-schema")
+            assertThat(attempts).isEqualTo(if (separate) 3 else 2)
+            if (separate || schedule in listOf("purge", "purge-retained")) {
                 assertThat(result.exceptionOrNull()).isNull()
                 if (schedule == "purge-retained") assertThat(result.getOrThrow()).isEqualTo(winner)
                 assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(2)
@@ -1445,24 +1461,32 @@ class HogliteExtendedGuardRaceIntegrationTest {
 
     @Test
     fun `alter does not replan other guard indices or arbitrary statuses`() {
-        // Index 0 is the prepended catalog fence; 1 is table identity; 2
-        // is the only private schema guard. Allocator and unknown indices
-        // never share that marker, regardless of misleading error prose.
+        // The wire guard_index is 1-based. Statements 1..FENCE_STATEMENTS
+        // are runTx's fence (name guard, drop fence); the next is table
+        // identity; the one after is the only private schema guard. Fence,
+        // identity, allocator and unknown indices never share that marker,
+        // regardless of misleading error prose.
+        val fence = HogliteCatalogStore.FENCE_STATEMENTS
+        val identity = fence + 1
+        val planning = "table schema changed while planning alter"
+
+        fun expectFailed(
+            index: Int,
+            error: String,
+        ) = """{"code":"expect_failed","guard_index":$index,"error":"$error"}"""
+
         val answers =
             listOf(
-                409 to """{"code":"expect_failed","guard_index":-1,"error":"schema changed"}""",
-                409 to """{"code":"expect_failed","guard_index":0,"error":"schema changed"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":1,"error":"table schema changed while planning alter"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":2,"error":"table schema changed while planning alter"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":9,"error":"table schema changed while planning alter"}""",
-                409 to
-                    """{"code":"expect_failed","guard_index":999,"error":"schema changed"}""",
-                409 to """{"error":"table schema changed while planning alter"}""",
-                422 to """{"error":"table schema changed while planning alter"}""",
-                503 to """{"error":"table schema changed while planning alter"}""",
+                409 to expectFailed(-1, "schema changed"),
+                409 to expectFailed(0, "schema changed"),
+                409 to expectFailed(1, "schema changed"),
+                409 to expectFailed(fence, planning),
+                409 to expectFailed(identity, planning),
+                409 to expectFailed(9, planning),
+                409 to expectFailed(999, "schema changed"),
+                409 to """{"error":"$planning"}""",
+                422 to """{"error":"$planning"}""",
+                503 to """{"error":"$planning"}""",
             )
         for ((status, body) in answers) {
             val (c, _) = setup()
@@ -1493,13 +1517,15 @@ class HogliteExtendedGuardRaceIntegrationTest {
         val before = head(c)
         val lose = Hook(::isAlterTx, dropResponse = { true })
         // First really commits. The next transport attempt sees a schema-
-        // looking refusal; it cannot settle the earlier ambiguous apply.
+        // looking refusal (the schema guard follows the fence and table
+        // identity; 1-based); it cannot settle the earlier ambiguous apply.
+        val schemaGuard = HogliteCatalogStore.FENCE_STATEMENTS + 2
         val refusal =
             Hook(
                 ::isAlterTx,
                 remaining = Int.MAX_VALUE,
                 shortCircuit = 409,
-                shortCircuitBody = """{"code":"expect_failed","guard_index":3,"error":"schema changed"}""",
+                shortCircuitBody = """{"code":"expect_failed","guard_index":$schemaGuard,"error":"schema changed"}""",
             )
         hooks += lose
         hooks += refusal
@@ -1632,6 +1658,79 @@ class HogliteExtendedGuardRaceIntegrationTest {
     }
 
     @Test
+    fun `a stats entry moved under the promote rolls it back`() {
+        val bound = IcebergSingleValue.encode(ColType.INT, 7)
+        val c = statsTable(listOf(ColumnStats(1, 10, 0, null, null, bound, bound)))
+        val before = head(c)
+        // Another field's entry with the same bounds now sits at the patched
+        // index: only the patch's field id guard tells it apart.
+        val moved =
+            listOf(ColumnStats(2, 10, 0, null, null, bound, bound), ColumnStats(1, 10, 0, null, null, bound, bound))
+        val hook = statsChange(c, moved)
+        hooks += hook
+        assertThatThrownBy {
+            pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.PromoteColumn("id", ColType.LONG)))
+        }.isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessage("file stats changed under the alter")
+        assertThat(hook.remaining).isZero()
+        assertThat(head(c)).isEqualTo(before)
+        assertThat(store.getTable(c, "ns", "t").columns.single().def.type).isEqualTo(ColType.INT)
+        assertThat(q(c, "SELECT stats_json FROM files").firstRow()!![0].asString())
+            .isEqualTo(store.json.writeValueAsString(moved))
+    }
+
+    @Test
+    fun `a multi-column promote writes each file's stats once per 25 widened entries`() {
+        val c = freshCatalog()
+        store.createNamespace(c, "ns")
+        val columns = (1..50).map { ColumnDef("c$it", ColType.INT) }
+        val created = store.createTable(c, "ns", "t", columns)
+        val ids = created.columns.map { it.fieldId }
+        store.commit(
+            c,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            (1..3).map { file ->
+                                FileRegistration(
+                                    "s3://hoglake-it/$c/data/wide-$file.parquet",
+                                    10,
+                                    100,
+                                    50,
+                                    ids.map { id ->
+                                        val bound = IcebergSingleValue.encode(ColType.INT, (file * 100 + id).toInt())
+                                        ColumnStats(id, 10, 0, null, null, bound, bound)
+                                    },
+                                )
+                            },
+                        ),
+                    ),
+            ),
+        )
+        val start = seen.size
+        pstore.alters.alterTable(c, "ns", "t", columns.map { AlterOp.PromoteColumn(it.name, ColType.LONG) })
+        // 50 widened entries per file: two 25-entry writes, not one rewrite
+        // of the file's stats per promoted column. A file's second write
+        // has the same shape as its first but goes in a later statement:
+        // UPDATE ... FROM would apply only one of them.
+        val alter = seen.drop(start).single { "/tx " in it && "table_altered" in it }
+        assertThat(alter.windowed("json_set(stats_json".length).count { it == "json_set(stats_json" }).isEqualTo(2)
+        for (file in store.listFiles(c, "ns", "t")) {
+            val stats = store.fileStats(c, "ns", "t", file.dataFileId).columns
+            assertThat(stats).hasSize(50)
+            val n = file.path.substringAfterLast("wide-").substringBefore(".").toLong()
+            stats.forEach {
+                val expected = n * 100 + it.fieldId
+                assertThat(IcebergSingleValue.decode(ColType.LONG, it.stats.lowerBound!!)).isEqualTo(expected)
+                assertThat(IcebergSingleValue.decode(ColType.LONG, it.stats.upperBound!!)).isEqualTo(expected)
+            }
+        }
+    }
+
+    @Test
     fun `a concurrent stats change outside the bounds survives the promote`() {
         val bound = IcebergSingleValue.encode(ColType.INT, 7)
         val c = statsTable(listOf(ColumnStats(1, 10, 0, null, null, bound, bound)))
@@ -1743,8 +1842,11 @@ class HogliteExtendedGuardRaceIntegrationTest {
     fun `a view create re-asserts its namespace inside the transaction`() {
         val c = freshCatalog()
         store.createNamespace(c, "vns")
-        // The create has resolved the namespace; the namespace is dropped
-        // (no views yet, so the drop's check passes) before the insert.
+        // The create has resolved the namespace (liveNamespace: a read-only
+        // `/tx` carrying the meta row and the namespace); the namespace is
+        // dropped (no views yet, so the drop's check passes) before the
+        // insert. The write tx re-asserts the namespace with similar SQL,
+        // so the match is pinned to the read batch.
         val hook =
             Hook(
                 {
@@ -1752,7 +1854,7 @@ class HogliteExtendedGuardRaceIntegrationTest {
                         p,
                         b,
                     ->
-                    m == "POST" && p.endsWith("/query") && "FROM namespaces WHERE name = ?" in b
+                    m == "POST" && p.endsWith("/tx") && isReadBatch(b) && "FROM namespaces WHERE name = ?" in b
                 },
                 after = { store.dropNamespace(c, "vns", null, "test", "drop") },
             )
