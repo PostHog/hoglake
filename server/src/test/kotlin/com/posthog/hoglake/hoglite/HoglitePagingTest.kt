@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.persistence.FileRepo
@@ -29,13 +30,15 @@ class HoglitePagingTest {
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex ->
                 val body = json.readTree(ex.requestBody.readBytes())
-                val sql = body["sql"].asText()
-                val args = body["args"].map { json.treeToValue(it, Any::class.java) }
-                reads.add(sql to args)
-                val readPage = reads.any { it.first.contains("FROM files f WHERE f.table_id") }
-                val floor = if (expireAfterPage && readPage) 5 else 0
-                val rows: List<List<Any?>> =
-                    when {
+
+                /** The rows of one read: a `/query` body, or one statement of a read transaction. */
+                fun rows(q: JsonNode): List<List<Any?>> {
+                    val sql = q["sql"].asText()
+                    val args = q["args"].map { json.treeToValue(it, Any::class.java) }
+                    reads.add(sql to args)
+                    val readPage = reads.any { it.first.contains("FROM files f WHERE f.table_id") }
+                    val floor = if (expireAfterPage && readPage) 5 else 0
+                    return when {
                         sql.startsWith(
                             "SELECT name, data_path,",
                         ) -> listOf(listOf("cat", "s3://b", 4, 0, floor, null, null, 0))
@@ -53,17 +56,22 @@ class HoglitePagingTest {
                         sql.contains("FROM files f WHERE f.table_id") -> filePage(sql, args)
                         else -> emptyList()
                     }
-                val bytes =
-                    json.writeValueAsBytes(
-                        mapOf(
-                            "cols" to
-                                List(rows.firstOrNull()?.size ?: 0) {
-                                    "c$it"
-                                },
-                            "rows" to rows,
-                            "affected" to 0,
-                        ),
+                }
+
+                fun result(rows: List<List<Any?>>): Map<String, Any> =
+                    mapOf(
+                        "cols" to List(rows.firstOrNull()?.size ?: 0) { "c$it" },
+                        "rows" to rows,
+                        "affected" to 0,
                     )
+                // A read transaction (liveNamespace) answers each statement as the query would.
+                val answer =
+                    if (body.has("statements")) {
+                        mapOf("results" to body["statements"].map { result(rows(it)) })
+                    } else {
+                        result(rows(body))
+                    }
+                val bytes = json.writeValueAsBytes(answer)
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
             }

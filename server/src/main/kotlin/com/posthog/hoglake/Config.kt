@@ -6,7 +6,10 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
+import com.posthog.hoglake.auth.ReadSessionProfile
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.hoglite.HogliteHydrator
+import com.posthog.hoglake.hydrator.FooterFetch
 import com.posthog.hoglake.service.OperatorTeamNamespaces
 import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.TeamNamespaces
@@ -14,8 +17,6 @@ import com.posthog.hoglake.storage.BrokerUrls
 import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
-import com.posthog.hoglake.store.MountNames
-import com.posthog.hoglake.store.ScopedNamespaceBinding
 import com.posthog.hoglake.store.ServedFamily
 import com.posthog.hoglake.store.ServedStream
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -40,6 +41,7 @@ class SecretString(
 }
 
 private val servedNamespacesLog = KotlinLogging.logger {}
+private val hogliteHydrationLog = KotlinLogging.logger {}
 
 /** Process configuration, with an optional backend allowlist file. */
 data class Config(
@@ -51,10 +53,22 @@ data class Config(
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
     /**
-     * One exact local namespace binding for the typed scoped read.
-     * Empty disables it. The binding attests tenant-local isolation and owner support.
+     * Profile identifier for dedicated read-session JWT verification.
+     * Empty disables dedicated read sessions.
      */
-    val scopedNamespaceFile: String = env("HOGLAKE_SCOPED_NAMESPACE_FILE", ""),
+    val readSessionProfile: String = env("HOGLAKE_READ_SESSION_PROFILE", ""),
+    /**
+     * Two comma-separated remote storage targets for dedicated read sessions.
+     * Required when [readSessionProfile] is set.
+     */
+    val readSessionRemoteTargets: String = env("HOGLAKE_READ_SESSION_REMOTE_TARGETS", ""),
+    /**
+     * `on` lets a dedicated read session read a remote schema through the
+     * relay (docs/auth.md, "Read sessions on a remote schema"). `off`, the
+     * default, keeps such a route on the ordinary verifier. Requires
+     * [readSessionProfile] and a remote schema in the mount hosts file.
+     */
+    val readSessionRelay: String = env("HOGLAKE_READ_SESSION_RELAY", "off"),
     /** PostgreSQL is the only default backend. `none` disables fallback and opens PostgreSQL only on a routed request. */
     val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
     /** Optional allowlist id for this process's PostgreSQL backend. */
@@ -479,6 +493,33 @@ data class Config(
      */
     val hydratorMaxWholeObjectBytes: Long =
         env("HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES", "${256L * 1024 * 1024}").toLong(),
+    /**
+     * Cap on the Hoglite rehydrate sweep's footer tail read (a
+     * registration's `footer_size`, #675): a larger `footer_size` is not
+     * usable, and the file takes the whole-object read under
+     * [hydratorMaxWholeObjectBytes]. A Hoglite tenant registers and can
+     * rewrite its own sizes (#668), and without the cap a `footer_size`
+     * near `file_size_bytes` pulls the whole object through the tail.
+     * Default 64 MiB. The PostgreSQL hydrator has no footer cap.
+     */
+    val hogliteMaxFooterBytes: Long =
+        env("HOGLAKE_HOGLITE_MAX_FOOTER_BYTES", "${HogliteHydrator.DEFAULT_MAX_FOOTER_BYTES}").toLong(),
+    /**
+     * The operator's `data_path` for every Hoglite catalog, `{catalog}`
+     * replaced by the catalog's name (`s3://warehouse/{catalog}`): the
+     * prefix a Hoglite rehydrate's footer reads are confined to (#675).
+     * A tenant can rewrite its own `meta.data_path` (#668), so that row
+     * cannot say where the server's storage identity may read. Set, it is
+     * enforced: a Hoglite catalog create with any other `data_path` is a
+     * 422, and a catalog whose `data_path` is not its placement (created
+     * before the template) is not swept. Empty,
+     * the default: under the `broker` provider the read uses the
+     * catalog's own broker session, which a rewritten `data_path` cannot
+     * widen; under `ambient` or `static` a Hoglite rehydrate requeues,
+     * reads no footers, and records a failed `hydrator` run saying why
+     * (and boot warns when Hoglite backends are configured that way).
+     */
+    val hogliteDataPathTemplate: String = env("HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE", ""),
     /**
      * statement_timeout for ONE catalog's claim inside the hydrator
      * sweep (#269). A claim is `limit` rows off one range of
@@ -1526,7 +1567,11 @@ data class Config(
             teamFamily = mountHosts.any { it.match is MountMatch.NamespaceFamily },
         )
 
-    internal val scopedNamespaceBinding: ScopedNamespaceBinding? = ScopedNamespaceBinding.read(scopedNamespaceFile)
+    internal val readSession: ReadSessionProfile? =
+        ReadSessionProfile.fromEnv(readSessionProfile, readSessionRemoteTargets)
+
+    /** Whether a dedicated read session may read a remote schema through the relay. */
+    internal val readSessionRelayEnabled: Boolean = readSessionRelay.trim().lowercase() == "on"
 
     /** [operatorTeamNamespaceCatalogs], checked at boot: each must be a valid catalog name. */
     val operatorTeamNamespaces: OperatorTeamNamespaces = OperatorTeamNamespaces(operatorTeamNamespaceCatalogs)
@@ -1564,34 +1609,49 @@ data class Config(
         }
 
     init {
-        scopedNamespaceBinding?.let { binding ->
-            require(AuthMode.parse("HOGLAKE_AUTH_MODE", authMode) == AuthMode.ENFORCE) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_MODE=enforce"
+        require(hogliteDataPathTemplate.isEmpty() || HogliteHydrator.isDataPathTemplate(hogliteDataPathTemplate)) {
+            "HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE must be an s3:// URI containing ${HogliteHydrator.CATALOG}"
+        }
+        if (hogliteBackends.isNotEmpty() && hogliteDataPathTemplate.isEmpty() &&
+            effectiveStorageProvider != StorageProviderKind.BROKER
+        ) {
+            hogliteHydrationLog.warn {
+                "Hoglite backends are configured with HOGLAKE_STORAGE_PROVIDER=${effectiveStorageProvider.wire} and " +
+                    "no HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE: a Hoglite rehydrate only requeues, and pending files " +
+                    "never get column stats (#675). Set the template to hydrate them."
+            }
+        }
+        require(readSessionRelay.trim().lowercase() in setOf("on", "off")) {
+            "HOGLAKE_READ_SESSION_RELAY must be on or off"
+        }
+        if (readSessionRelayEnabled) {
+            require(readSession != null) { "HOGLAKE_READ_SESSION_RELAY requires HOGLAKE_READ_SESSION_PROFILE" }
+            require(mountHosts.any { it.match is MountMatch.RemoteSchemaMatch }) {
+                "HOGLAKE_READ_SESSION_RELAY requires a remote schema in HOGLAKE_MOUNT_HOSTS_FILE"
+            }
+        }
+        readSession?.let {
+            // The read verifier runs only on an enforcing listener. A Host whose API listener
+            // still warns has one: the public listener, which always enforces (docs/auth.md).
+            val mode = AuthMode.parse("HOGLAKE_AUTH_MODE", authMode)
+            val hostOnPublicListener =
+                mode == AuthMode.WARN && publicPort > 0 && servedFamilies.isNotEmpty() &&
+                    backendKinds.values.none { kind -> kind == BackendKind.HOGLITE } && !readSessionRelayEnabled
+            require(mode == AuthMode.ENFORCE || hostOnPublicListener) {
+                "HOGLAKE_READ_SESSION_PROFILE requires HOGLAKE_AUTH_MODE=enforce, or warn on a server that " +
+                    "only serves namespaces and has HOGLAKE_PUBLIC_PORT"
             }
             require(authJwksFile.isNotBlank() && authJwksUrl.isBlank()) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires file JWKS"
+                "HOGLAKE_READ_SESSION_PROFILE requires file JWKS"
             }
-            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS"
+            val fields = authPredicateFields.split(',').map(String::trim).filter(String::isNotEmpty).toSet()
+            require(fields == setOf("team_id")) {
+                "HOGLAKE_READ_SESSION_PROFILE requires only the team_id predicate field"
             }
-            if (binding.readSession != null) {
-                val fields = authPredicateFields.split(',').map(String::trim).filter(String::isNotEmpty).toSet()
-                require(fields == setOf("team_id")) {
-                    "read_session requires only the team_id predicate field"
-                }
-            }
-            require(backendKinds[binding.backendId] == BackendKind.HOGLITE) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE requires a configured hoglite backend"
-            }
-            require(!MountNames.isReserved(binding.catalog)) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved mount"
-            }
-            require(!reservedNamespaces.isReserved(binding.namespace)) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot bind a reserved namespace"
-            }
-            // Served namespaces require SQL to check local catalog placement.
-            require(servedFamilies.isEmpty()) {
-                "HOGLAKE_SCOPED_NAMESPACE_FILE cannot coexist with served namespaces"
+            // A local read needs a hoglite backend. A server that serves namespaces reads its
+            // own store for a read session instead (docs/auth.md, "Read sessions on a remote schema").
+            require(backendKinds.values.any { kind -> kind == BackendKind.HOGLITE } || servedFamilies.isNotEmpty()) {
+                "HOGLAKE_READ_SESSION_PROFILE requires a configured hoglite backend or served namespaces"
             }
         }
         val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
@@ -1757,6 +1817,9 @@ data class Config(
         require(compactionSpillBytes >= 1) {
             "HOGLAKE_COMPACTION_SPILL_BYTES=$compactionSpillBytes must be at least 1 (the default is " +
                 "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SPILL_BYTES})"
+        }
+        require(hogliteMaxFooterBytes in 1..FooterFetch.MAX_FOOTER_BYTES) {
+            "HOGLAKE_HOGLITE_MAX_FOOTER_BYTES=$hogliteMaxFooterBytes must be in 1..${FooterFetch.MAX_FOOTER_BYTES}"
         }
         require(hydratorMinFileBytes >= 0) {
             "HOGLAKE_HYDRATOR_MIN_FILE_BYTES=$hydratorMinFileBytes must not be negative (0 writes stats " +

@@ -19,10 +19,33 @@ internal class TransientFetchException(message: String, cause: Throwable) : Runt
  * usable `footer_size`, else the whole object up to [maxWholeObjectBytes].
  * A missing object is structural; every other fetch failure is a
  * [TransientFetchException] (see [Hydrator]'s failure taxonomy).
+ *
+ * [maxFooterBytes] picks how far the registration is trusted. Null (the
+ * PostgreSQL [Hydrator]) reads as before #675: the tail runs from
+ * `file_size_bytes - footer_size - 8` to the object's end, at any
+ * `footer_size`, and the whole-object read is the whole object. Set (the
+ * Hoglite rehydrate sweep, whose sizes a tenant registers and can rewrite,
+ * #668), every read is held to the registration: the tail is a closed
+ * range ending at `file_size_bytes`, a `footer_size` over [maxFooterBytes]
+ * is not usable (one near `file_size_bytes` would pull the whole object
+ * through the tail), and the whole-object read stops one byte past
+ * `file_size_bytes` ([ObjectStore.getHead]), so an object longer than its
+ * registration is structural instead of landing on the heap whole. An
+ * object shorter than its registration (a tail start past its end answers
+ * 416) and a `file_size_bytes` under the 8-byte footer suffix are
+ * structural too: no retry changes either, and a transient file stays
+ * pending and takes a sweep slot on every call.
  */
 internal class FooterFetch(
     private val maxWholeObjectBytes: Long,
+    private val maxFooterBytes: Long? = null,
 ) {
+    init {
+        require(maxFooterBytes == null || maxFooterBytes in 1..MAX_FOOTER_BYTES) {
+            "maxFooterBytes=$maxFooterBytes must be in 1..$MAX_FOOTER_BYTES"
+        }
+    }
+
     /** What [read] needs of one registered file. */
     data class Target(
         val path: String,
@@ -32,12 +55,31 @@ internal class FooterFetch(
 
     private val log = KotlinLogging.logger {}
 
+    /**
+     * The whole-object cap; held to the registration, also held to what one heap array can take
+     * ([ObjectStore.getHead] reads one byte past a size).
+     */
+    private val maxBufferBytes =
+        if (maxFooterBytes == null) maxWholeObjectBytes else minOf(maxWholeObjectBytes, Int.MAX_VALUE - 1L)
+
     fun read(
         file: Target,
         objects: ObjectStore,
     ): ParquetMetadata {
-        val footerSize = file.footerSize
-        if (footerSize != null && footerSize > 0 && footerSize + FOOTER_SUFFIX < file.fileSizeBytes) {
+        // Outside the fetch's classification below, which would call it transient: no read can serve it.
+        if (maxFooterBytes != null && file.fileSizeBytes < FOOTER_SUFFIX) {
+            throw IllegalStateException(
+                "cannot hydrate ${file.path}: file_size_bytes ${file.fileSizeBytes} is under the " +
+                    "$FOOTER_SUFFIX-byte parquet footer suffix; re-register it with its real size, then rehydrate",
+            )
+        }
+        // A footer_size over the footer cap is not usable: the whole-object
+        // read below, under its own cap, is the bound for such a file.
+        val footerSize =
+            file.footerSize?.takeIf {
+                it > 0 && (maxFooterBytes == null || it <= maxFooterBytes) && it + FOOTER_SUFFIX < file.fileSizeBytes
+            }
+        if (footerSize != null) {
             try {
                 val tailStart = file.fileSizeBytes - footerSize - FOOTER_SUFFIX
                 // Fetch failures are classified HERE, not swallowed into the
@@ -47,8 +89,21 @@ internal class FooterFetch(
                 // can trip the size cap and wrongly fail a good registration.
                 val tail =
                     try {
-                        objects.getTail(file.path, tailStart)
+                        if (maxFooterBytes == null) {
+                            objects.getTail(file.path, tailStart)
+                        } else {
+                            objects.getRange(file.path, tailStart, Math.toIntExact(footerSize + FOOTER_SUFFIX))
+                        }
                     } catch (e: Exception) {
+                        // Held to the registration, a start past the object's end is no throttle.
+                        if (maxFooterBytes != null && isUnsatisfiableRange(e)) {
+                            throw IllegalStateException(
+                                "cannot hydrate ${file.path}: the object is shorter than its registered " +
+                                    "file_size_bytes ${file.fileSizeBytes} (its tail at byte $tailStart is out of " +
+                                    "range); re-register it with its real size, then rehydrate",
+                                e,
+                            )
+                        }
                         throw classifyFetchFailure(e, file.path)
                     }
                 return parseFooter(
@@ -57,7 +112,7 @@ internal class FooterFetch(
             } catch (e: TransientFetchException) {
                 throw e
             } catch (e: Exception) {
-                if (isMissingObject(e)) throw e
+                if (isMissingObject(e) || isUnsatisfiableRange(e)) throw e
                 // The tail PARSED wrong (registered footer_size too small,
                 // region misses) — the whole-object fallback is for exactly
                 // this case.
@@ -68,12 +123,22 @@ internal class FooterFetch(
             }
         }
         // The whole-object fallback buffers the object on the heap; the cap
-        // is the OOM guard. Over-cap without a usable footer_size is
+        // is the OOM guard. Over-cap without a tail that parsed is
         // STRUCTURAL: retrying cannot shrink the file. file_size_bytes is
-        // the registered size — the only pre-GET signal we have.
-        if (file.fileSizeBytes > maxWholeObjectBytes) {
+        // the registered size — the only pre-GET signal we have, and,
+        // held to the registration, the read below holds the object to it.
+        if (file.fileSizeBytes > maxBufferBytes) {
+            val tail =
+                if (footerSize != null) {
+                    "its tail read at footer_size=$footerSize did not parse"
+                } else if (maxFooterBytes == null) {
+                    "no usable footer_size (footer_size=${file.footerSize})"
+                } else {
+                    "no usable footer_size (footer_size=${file.footerSize}, footer cap $maxFooterBytes bytes, " +
+                        "HOGLAKE_HOGLITE_MAX_FOOTER_BYTES)"
+                }
             throw IllegalStateException(
-                "cannot hydrate ${file.path}: no usable footer_size and file_size_bytes " +
+                "cannot hydrate ${file.path}: $tail and file_size_bytes " +
                     "${file.fileSizeBytes} exceeds the whole-object fallback cap " +
                     "$maxWholeObjectBytes bytes (HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES); " +
                     "re-register with a correct footer_size or raise the cap, then rehydrate",
@@ -81,10 +146,24 @@ internal class FooterFetch(
         }
         val bytes =
             try {
-                objects.get(file.path)
+                if (maxFooterBytes == null) {
+                    objects.get(file.path)
+                } else {
+                    objects.getHead(file.path, Math.toIntExact(file.fileSizeBytes + 1))
+                }
             } catch (e: Exception) {
                 throw classifyFetchFailure(e, file.path)
             }
+        // A tail that overlapped a shorter object's end did not parse and lands here: shorter is
+        // structural as the 416 above is.
+        if (maxFooterBytes != null && bytes.size.toLong() != file.fileSizeBytes) {
+            throw IllegalStateException(
+                "cannot hydrate ${file.path}: the object is " +
+                    (if (bytes.size > file.fileSizeBytes) "longer" else "shorter (${bytes.size} bytes)") +
+                    " than its registered file_size_bytes ${file.fileSizeBytes}; re-register it with its real " +
+                    "size, then rehydrate",
+            )
+        }
         return parseFooter(RegionInputFile(bytes.size.toLong(), 0, bytes, file.path))
     }
 
@@ -110,6 +189,10 @@ internal class FooterFetch(
         generateSequence(e) { it.cause }.any {
             it is NoSuchKeyException || (it is S3Exception && it.statusCode() == 404)
         }
+
+    /** A 416 / InvalidRange: a closed range starting at or past the object's end. */
+    private fun isUnsatisfiableRange(e: Throwable): Boolean =
+        generateSequence(e) { it.cause }.any { it is S3Exception && it.statusCode() == 416 }
 
     /**
      * [FooterParse] rather than ParquetFileReader directly: it translates
@@ -216,8 +299,11 @@ internal class FooterFetch(
         }
     }
 
-    private companion object {
+    companion object {
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
-        const val FOOTER_SUFFIX = 8L
+        private const val FOOTER_SUFFIX = 8L
+
+        /** The largest footer cap: the tail, footer length and magic included, is one heap array. */
+        const val MAX_FOOTER_BYTES: Long = Int.MAX_VALUE - FOOTER_SUFFIX
     }
 }

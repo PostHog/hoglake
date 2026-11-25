@@ -85,8 +85,12 @@ internal class HogliteMaintenanceStatus(
             }
             // Every value uses the same read snapshot and the same tenant binding.
             val results = store.readCatalog(catalog, statements).iterator()
-            val meta = store.metaRow(results.next().firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
-            if (meta.name != catalog) throw HoglakeException.NotFound("catalog '$catalog'")
+            // metaRow refuses a tenant whose meta names another catalog.
+            val meta =
+                store.metaRow(
+                    catalog,
+                    results.next().firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"),
+                )
             val hydration = if ("files_live_stats" in indexes) results.next().firstRow() else null
             val removals = if ("removals_queued_at" in indexes) results.next().firstRow() else null
             val small = if ("files_live_size" in indexes) results.next().firstRow()?.get(0).asLongOrNull() else null
@@ -180,8 +184,7 @@ internal class HogliteMaintenanceStatus(
                         HogliteStatement("$RUN_SELECT$where ORDER BY id DESC LIMIT ?", args),
                     ),
                 )
-            val meta = results[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'")
-            if (meta[0].asString() != catalog) throw HoglakeException.NotFound("catalog '$catalog'")
+            store.metaRow(catalog, results[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
             page(results[1].rows.map { toRun(catalog, it) }, cap)
         }
     }
