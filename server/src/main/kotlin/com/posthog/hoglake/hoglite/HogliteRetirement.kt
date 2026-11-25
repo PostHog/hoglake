@@ -24,30 +24,61 @@ internal class HogliteRetirement(
     override fun runOnce(
         catalog: String,
         trigger: MaintenanceTrigger,
-    ): RetirementResult =
-        store.recorded(catalog, MaintenanceTask.RETIREMENT, trigger) {
-            val tally = Tally()
-            try {
-                sweep(catalog, tally).also { audit(catalog, it, "ok") }
-            } catch (e: Throwable) {
-                if (tally.batches > 0) {
-                    // Refresh partial backlog after committed batches. A failed probe must not replace the task error.
-                    runCatching {
-                        tally.remaining = remaining(catalog, tally.floor)
-                    }.onFailure { secondary ->
-                        if (secondary !== e) e.addSuppressed(secondary)
+    ): RetirementResult = runUntil(catalog, trigger, System.nanoTime() + runBudgetMs * 1_000_000, runBudgetMs > 0)
+
+    /**
+     * One run that starts no batch after [deadline] (a `System.nanoTime()` instant), except an [owed]
+     * one, which it attempts however long its reads took and however late it started. A batch that
+     * commits no rows (a stuck or emptied table) does not pay that debt: the run tries the next table,
+     * starting none more than half of [OVERRUN_MS] past the deadline or its start, so one stuck table
+     * cannot take every run's only batch. Every backend call is bounded too: work by [OVERRUN_MS]
+     * past the deadline, then the backlog count by half of [BOOKKEEPING_MS] after that and the
+     * ledger write by the rest,
+     * so one run ends within [OVERRUN_MS] + [BOOKKEEPING_MS] of the deadline, or of its start
+     * if that is later, and a stalled count cannot cost the run its ledger row.
+     */
+    internal fun runUntil(
+        catalog: String,
+        trigger: MaintenanceTrigger,
+        deadline: Long,
+        owed: Boolean,
+    ): RetirementResult {
+        val started = System.nanoTime()
+        val late = if (deadline - started > 0) deadline else started
+        val workEnd = late + OVERRUN_MS * 1_000_000
+        val countEnd = workEnd + BOOKKEEPING_MS / 2 * 1_000_000
+        return HogliteClient.withDeadline(workEnd + BOOKKEEPING_MS * 1_000_000) {
+            store.recorded(catalog, MaintenanceTask.RETIREMENT, trigger) {
+                val tally = Tally()
+                val budget = Budget(deadline, late + OVERRUN_MS / 2 * 1_000_000, owed)
+                try {
+                    sweep(catalog, tally, budget, workEnd, countEnd).also { audit(catalog, it, "ok") }
+                } catch (e: Throwable) {
+                    // Refresh the backlog the run leaves, once it has read the floor that defines it.
+                    // A failed probe must not replace the task error.
+                    tally.floor?.let { floor ->
+                        runCatching {
+                            tally.remaining = remaining(catalog, floor, countEnd)
+                        }.onFailure { secondary ->
+                            if (secondary !== e) e.addSuppressed(secondary)
+                        }
                     }
+                    audit(catalog, tally.result(), "failure")
+                    if (tally.batches > 0) throw RetirementFailed(e, tally.result())
+                    throw e
                 }
-                audit(catalog, tally.result(), "failure")
-                if (tally.batches > 0) throw RetirementFailed(e, tally.result())
-                throw e
             }
         }
+    }
 
+    /** The backlog the run leaves, counted by [countEnd] so the ledger write keeps its own time. */
     private fun remaining(
         catalog: String,
         floor: Long,
-    ) = store.queryCatalog(catalog, REMAINING_SQL, floor).firstRow()!![0].asLong()
+        countEnd: Long,
+    ) = HogliteClient.withDeadline(countEnd) {
+        store.queryCatalog(catalog, REMAINING_SQL, floor).firstRow()!![0].asLong()
+    }
 
     private class RetirementFailed(cause: Throwable, override val partial: RetirementResult) :
         RuntimeException(cause.message, cause), PartialResult
@@ -61,7 +92,7 @@ internal class HogliteRetirement(
         var skipped = 0L
         var full = 0L
         var remaining = 0L
-        var floor = 0L
+        var floor: Long? = null
 
         fun result() =
             RetirementResult(tables.size.toLong(), rows, dvs, paths, batches, 0, skipped, full, 0, 0, remaining)
@@ -85,28 +116,49 @@ internal class HogliteRetirement(
         )
     }
 
+    /**
+     * Owed one batch until one commits rows, so neither reads that use the whole budget nor a stuck
+     * table can starve every run. Once one is attempted, the debt starts no batch after [owedUntil].
+     */
+    private class Budget(private val deadline: Long, private val owedUntil: Long, var owed: Boolean) {
+        var attempted = false
+
+        fun over() = System.nanoTime() - (if (owed) owedUntil else deadline) >= 0 && (!owed || attempted)
+    }
+
     private fun sweep(
         catalog: String,
         tally: Tally,
+        budget: Budget,
+        workEnd: Long,
+        countEnd: Long,
     ): RetirementResult {
-        val started = System.nanoTime()
+        // The exact backlog is counted after the work, not before it: on the work path it spent the budget.
+        HogliteClient.withDeadline(workEnd) { work(catalog, tally, budget) }
+        tally.remaining = remaining(catalog, tally.floor!!, countEnd)
+        return tally.result()
+    }
 
-        fun overBudget() = (System.nanoTime() - started) / 1_000_000 >= runBudgetMs
-
+    private fun work(
+        catalog: String,
+        tally: Tally,
+        budget: Budget,
+    ) {
         fun interrupted() {
             if (Thread.currentThread().isInterrupted) throw InterruptedException("retirement cancelled")
         }
         val floor = store.meta(catalog).earliestSnapshotId
         tally.floor = floor
-        tally.remaining = store.queryCatalog(catalog, REMAINING_SQL, floor).firstRow()!![0].asLong()
         var cursor = 0L
         while (true) {
             interrupted()
-            if (overBudget()) break
+            if (budget.over()) break
+            // Saturates at the ceiling: only "is there room" matters here.
             val queued =
                 store.queryCatalog(
                     catalog,
-                    "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL",
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM removals WHERE drained_at IS NULL LIMIT ?)",
+                    queueCeiling,
                 ).firstRow()!![0].asLong()
             if (queued >= queueCeiling) {
                 tally.full = 1
@@ -122,12 +174,13 @@ internal class HogliteRetirement(
             if (candidates.isEmpty()) break
             for (candidate in candidates) {
                 interrupted()
-                if (overBudget()) break
+                if (budget.over()) break
                 val tableId = candidate[0].asLong()
                 cursor = tableId
                 var after = FileCursor(-1, 0)
-                while (!overBudget()) {
+                while (!budget.over()) {
                     interrupted()
+                    budget.attempted = true
                     val outcome = retireBatch(catalog, tableId, candidate[1].asLong(), after)
                     if (outcome.stuck) {
                         tally.skipped++
@@ -139,6 +192,7 @@ internal class HogliteRetirement(
                     }
                     after = outcome.next ?: break
                     if (outcome.rows == 0L) continue
+                    budget.owed = false
                     tally.tables += tableId
                     tally.rows += outcome.rows
                     tally.dvs += outcome.dvs
@@ -149,8 +203,6 @@ internal class HogliteRetirement(
             }
             if (tally.full > 0 || candidates.size < CANDIDATE_PAGE_SIZE) break
         }
-        tally.remaining = store.queryCatalog(catalog, REMAINING_SQL, floor).firstRow()!![0].asLong()
-        return tally.result()
     }
 
     private data class FileCursor(val rowIdStart: Long, val fileId: Long)
@@ -241,6 +293,12 @@ internal class HogliteRetirement(
         const val DEFAULT_BATCH = 1_000
         const val DEFAULT_QUEUE_CEILING = 100_000L
         const val DEFAULT_RUN_BUDGET_MS = 30_000L
+
+        /** How long past its deadline a run's work calls may still answer: the batch in flight, or the owed one. */
+        const val OVERRUN_MS = 2_000L
+
+        /** What the backlog count and the ledger write get after the work, half each. */
+        const val BOOKKEEPING_MS = 1_000L
         const val CANDIDATE_PAGE_SIZE = 1_000
         private const val FOREIGN_VECTORS = "retirement found deletion vectors from another table"
         private const val QUEUE_FULL = "retirement removal queue is full"

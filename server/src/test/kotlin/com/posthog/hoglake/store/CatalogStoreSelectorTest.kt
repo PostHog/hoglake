@@ -121,22 +121,19 @@ class CatalogStoreSelectorTest {
     }
 
     @Test
-    fun `hoglite expiry hands retirement the configured ceiling and batch, under the purge budget`() {
+    fun `hoglite expiry hands retirement the configured ceiling and batch`() {
         val routing = Routing("lake", BackendKind.HOGLITE, id, "opaque_1")
 
         fun handOff(cfg: Config): HogliteRetirement {
             val store = CatalogStoreSelector(postgres, cfg).forPlacement(routing) as HogliteCatalogStore
             assertThat(store.retirement.batchSize).isEqualTo(store.retirementBatch)
             assertThat(store.retirement.queueCeiling).isEqualTo(store.retirementQueueCeiling)
-            return store.expiry.retirement as HogliteRetirement
+            assertThat(store.expiry.retirement).isSameAs(store.retirement)
+            return store.retirement
         }
-        val set =
-            handOff(
-                config("none").copy(retirementBatch = 250, retirementQueueCeiling = 777, expiryPurgeBudgetMs = 4321),
-            )
+        val set = handOff(config("none").copy(retirementBatch = 250, retirementQueueCeiling = 777))
         assertThat(set.batchSize).isEqualTo(250)
         assertThat(set.queueCeiling).isEqualTo(777)
-        assertThat(set.runBudgetMs).isEqualTo(4321)
         // The PostgreSQL default of 8,000 is past one Hoglite transaction's batch, so it is capped there.
         val defaults = handOff(config("none"))
         assertThat(defaults.batchSize).isEqualTo(HogliteRetirement.DEFAULT_BATCH)

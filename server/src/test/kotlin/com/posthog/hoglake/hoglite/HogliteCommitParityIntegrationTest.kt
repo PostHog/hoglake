@@ -28,9 +28,12 @@ import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
+import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
+import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 
 /** Shared commit assertions use PostgreSQL as the contract reference. Neither backend mocks publication. */
@@ -144,6 +147,20 @@ class HogliteCommitParityIntegrationTest {
                 }
         }
     }
+
+    /** The time the store stamped on snapshot [id], read back through the contract. */
+    private fun snapshotTime(
+        cat: String,
+        id: Long,
+    ): Instant = store.listSnapshots(cat, after = id - 1, limit = 1).first.single().snapshotTime
+
+    /**
+     * How far the store's clock may sit from this JVM's: the containers share
+     * the host kernel's clock on Linux and a VM's on macOS, and Hoglite keeps
+     * milliseconds, so the bound is a sanity check that the stamp is the
+     * current time, not a precision claim.
+     */
+    private val clockSkew: Duration = Duration.ofSeconds(30)
 
     private fun state(cat: String) =
         listOf(
@@ -972,5 +989,61 @@ class HogliteCommitParityIntegrationTest {
         }
             .isExactlyInstanceOf(HoglakeException.TableDropped::class.java)
         assertThat(state(cat)).isEqualTo(before)
+    }
+
+    /**
+     * A snapshot's time is the store's clock when the commit became visible,
+     * never one the caller or the pod bound: PostgreSQL's `clock_timestamp()`
+     * under the commit lock (SnapshotRepo.insert), Hoglite's engine clock
+     * inside the tenant transaction (insertSnapshotRow, #672). It is at or
+     * after the previous snapshot's, within the wall clock around the commit,
+     * and the time `at_timestamp` resolves that snapshot by.
+     */
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `a snapshot is stamped by the store's clock when it becomes visible`(backend: Backend) {
+        select(backend)
+        val cat = fixture()
+        val previous = snapshotTime(cat, head(cat))
+        val before = Instant.now()
+        val published = publish(cat, request(cat))
+        val after = Instant.now()
+        val stamped = snapshotTime(cat, published.snapshotId)
+        assertThat(stamped).isAfterOrEqualTo(previous)
+        assertThat(stamped).isBetween(before.minus(clockSkew), after.plus(clockSkew))
+        val resolved = store.resolveSnapshot(cat, stamped)
+        assertThat(resolved.snapshotId).isEqualTo(published.snapshotId)
+        assertThat(resolved.snapshotTime).isEqualTo(stamped)
+    }
+
+    /**
+     * Hoglite clamps the stamp to the previous snapshot's time, so ts stays
+     * monotone with id across an engine clock step and `at_timestamp=T`
+     * keeps resolving to the snapshot that was head at T. Hoglite only:
+     * PostgreSQL trusts its clock not to step (SnapshotRepo.insert's
+     * "modulo the DB clock stepping backwards").
+     */
+    @Test
+    fun `hoglite clamps a snapshot's time to the previous snapshot's across a clock step`() {
+        select(Backend.HOGLITE)
+        val cat = fixture()
+        val future = Instant.parse("2999-01-01T00:00:00.000Z")
+        live!!.store.catalogOperation(cat) {
+            live!!.store.runTx(
+                cat,
+                HogliteCatalogStore.freshTxid("fixture"),
+                null,
+                HogliteTx().apply {
+                    add("UPDATE snapshots SET ts = ? WHERE id = ${HogliteSchema.HEAD_SQL}", HogliteSchema.fmt(future))
+                },
+            )
+        }
+        // Two commits: the clamp holds for a snapshot whose predecessor was
+        // itself clamped, not only for the one right after the step.
+        val first = publish(cat, request(cat)).snapshotId
+        val second = publish(cat, request(cat, file(cat, "second"))).snapshotId
+        assertThat(snapshotTime(cat, first)).isEqualTo(future)
+        assertThat(snapshotTime(cat, second)).isEqualTo(future)
+        assertThat(store.resolveSnapshot(cat, future).snapshotId).isEqualTo(second)
     }
 }

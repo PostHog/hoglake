@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.model.ExpiryResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
@@ -8,9 +9,8 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.ExpiryBackend
-import com.posthog.hoglake.service.RetirementBackend
 import io.github.oshai.kotlinlogging.KotlinLogging
-import java.time.Instant
+import java.time.DateTimeException
 
 /**
  * Port [com.posthog.hoglake.service.ExpiryService]'s two-phase sweep to one tenant.
@@ -25,15 +25,20 @@ import java.time.Instant
  *
  * Hoglite has no retirement loop, so a successful sweep runs [retirement] after it (#674): the floor it
  * just advanced is what makes a dropped table eligible. Retirement records its own ledger run; its failure
- * is logged and does not fail the sweep, which has already committed. The store gives that retirement the
- * purge budget, so one request stays near twice it; the next expiry continues any backlog. A zero budget
- * retires nothing, as it purges nothing.
+ * is logged and does not fail the sweep, which has already committed. The response waits for it, so it
+ * starts no batch past twice the purge budget, at most [RETIREMENT_WINDOW_MAX_MS], from the request's
+ * arrival (queue wait included), except one it owes, so neither a zero budget nor a sweep that used the
+ * whole window stops it. Its backend calls and bookkeeping end within [HogliteRetirement.OVERRUN_MS] +
+ * [HogliteRetirement.BOOKKEEPING_MS] of that window, or of its own start if later. A sweep that ends too
+ * late for that to land by [RETIREMENT_END_MS] skips retirement, with a `retirement` audit event
+ * (`skipped_late`) and no ledger row, so it never pushes the response past that; the next expiry
+ * continues any backlog.
  */
 internal class HogliteExpiry(
     private val store: HogliteCatalogStore,
     private val purgePage: Int,
     private val purgeBudgetMs: Long,
-    internal val retirement: RetirementBackend? = null,
+    internal val retirement: HogliteRetirement? = null,
 ) : ExpiryBackend {
     private val log = KotlinLogging.logger {}
 
@@ -46,17 +51,40 @@ internal class HogliteExpiry(
         catalog: String,
         batchSize: Int,
         trigger: MaintenanceTrigger,
-    ): ExpiryResult =
-        store.recorded(catalog, MaintenanceTask.EXPIRY, trigger) {
+    ): ExpiryResult {
+        val arrived = RequestAdmission.current()?.enqueuedNanos ?: System.nanoTime()
+        return store.recorded(catalog, MaintenanceTask.EXPIRY, trigger) {
             runSweep(catalog, batchSize)
-        }.also { retire(catalog, trigger) }
+        }.also { retire(catalog, trigger, arrived) }
+    }
 
     private fun retire(
         catalog: String,
         trigger: MaintenanceTrigger,
+        arrived: Long,
     ) {
+        val retirement = retirement ?: return
+        val latestStart =
+            RETIREMENT_END_MS - HogliteRetirement.OVERRUN_MS - HogliteRetirement.BOOKKEEPING_MS
+        val sinceArrivalMs = (System.nanoTime() - arrived) / 1_000_000
+        if (sinceArrivalMs > latestStart) {
+            // No ledger row: it would cost the time the run lacks. The audit line is its trace.
+            log.warn {
+                "expiry for catalog '$catalog' ended over $latestStart ms after its request arrived; " +
+                    "retirement waits for the next expiry"
+            }
+            Audit.event(
+                "retirement",
+                catalog,
+                null,
+                outcome = "skipped_late",
+                detail = "since_arrival_ms=$sinceArrivalMs latest_start_ms=$latestStart",
+            )
+            return
+        }
+        val window = 2 * minOf(purgeBudgetMs, RETIREMENT_WINDOW_MAX_MS / 2)
         try {
-            retirement?.runOnce(catalog, trigger)
+            retirement.runUntil(catalog, trigger, arrived + window * 1_000_000, owed = true)
         } catch (e: Exception) {
             if (e is InterruptedException) Thread.currentThread().interrupt()
             log.error(e) {
@@ -204,15 +232,35 @@ internal class HogliteExpiry(
             pre.retentionSeconds
                 ?: return Advance(0, pre.earliestSnapshotId, null, released)
 
-        val now = Instant.now()
-        val cutoff = HogliteSchema.fmt(now.minusSeconds(retention))
-        val firstFresh =
+        // Oldest snapshot still inside the retention window, the cutoff
+        // on the ENGINE's clock: the one that stamped every ts
+        // (insertSnapshotRow), as ExpiryService's `snapshot_time >= now()
+        // - make_interval(secs => :retention)` has both sides on the
+        // database clock. A cutoff from this pod's clock expired early or
+        // late by the skew between the two (#672).
+        //
+        // The cutoff rides the same read, because SQLite answers a date
+        // its calendar cannot hold with NULL, not an error: `ts >= NULL`
+        // matches nothing, and a null floor candidate below means "every
+        // retained snapshot is stale", so a retention past the calendar
+        // would have expired the catalog up to head. PostgreSQL's
+        // make_interval raises on that retention and the sweep writes
+        // nothing; a NULL cutoff fails this one the same way (the
+        // DateTimeException Instant.minusSeconds threw for it before).
+        val (cutoff, firstFresh) =
             store.queryCatalog(
                 catalog,
-                "SELECT MIN(id) FROM snapshots WHERE id >= ? AND ts >= ?",
+                "SELECT c, (SELECT MIN(id) FROM snapshots WHERE id >= ? AND ts >= c) " +
+                    "FROM (SELECT ${HogliteSchema.NOW_MINUS_SECONDS_SQL} AS c)",
                 pre.earliestSnapshotId,
-                cutoff,
-            ).firstRow()!![0].asLongOrNull()
+                retention,
+            ).firstRow()!!.let { it[0] as? String to it[1].asLongOrNull() }
+        if (cutoff == null) {
+            throw DateTimeException(
+                "snapshot_retention_seconds=$retention puts the retention cutoff outside the engine's " +
+                    "calendar; the floor stays at ${pre.earliestSnapshotId}",
+            )
+        }
 
         val minOffset =
             if (pre.consumerFloor) {
@@ -520,5 +568,11 @@ internal class HogliteExpiry(
 
         /** ExpiryService.VERSIONED_TABLES_NEVER_CLEARED over the tenant schema; see the class KDoc. */
         val VERSIONED_TABLES_NEVER_CLEARED = listOf("partition_specs")
+
+        /** The latest, after the request arrived, that retirement's window closes, whatever the purge budget. */
+        const val RETIREMENT_WINDOW_MAX_MS = 20_000L
+
+        /** The latest, after the request arrived, that retirement ends: inside pyhoglake's 30 s read timeout. */
+        const val RETIREMENT_END_MS = 25_000L
     }
 }

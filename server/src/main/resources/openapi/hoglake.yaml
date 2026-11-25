@@ -555,6 +555,11 @@ paths:
         `at_timestamp` are resolved on the serving host, against the
         catalogs that hold its tables, never this catalog: list a remote
         schema at head or with `at_timestamp`.
+
+
+        A dedicated read session (docs/auth.md, "Read sessions on a
+        remote schema") gets `TableSummaryIdentity` items: no counts and
+        no sizes. Every other caller gets `TableSummary` items.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -567,7 +572,10 @@ paths:
             application/json:
               schema:
                 type: array
-                items: { $ref: "#/components/schemas/TableSummary" }
+                items:
+                  oneOf:
+                    - { $ref: "#/components/schemas/TableSummary" }
+                    - { $ref: "#/components/schemas/TableSummaryIdentity" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
@@ -970,6 +978,113 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}:
+    get:
+      operationId: getLocalOnlyNamespace
+      summary: Dedicated read session only. The bound local namespace, never a relay.
+      description: >
+        Served only on a listener with a `read_session` binding
+        (docs/auth.md, "Local-only read routes"). The request uses the
+        dedicated read verifier. It reads only the bound namespace from
+        the configured Hoglite owner, also when a remote schema relays the
+        same name on the ordinary route. A verified session that names
+        another namespace gets 404 without a backend call. The dedicated
+        token carries no namespace name: the operator binding is the only
+        namespace authority. Every answer except 405, 422 and 501 carries
+        `X-Hoglake-Local-Only: true`. A client reads a 404 as absence only
+        with that marker.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Namespace
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
+    get:
+      operationId: getLocalOnlyTable
+      summary: Dedicated read session only. The bound local table, never a relay.
+      description: >
+        As getLocalOnlyNamespace, for the bound table. The only accepted
+        query is none or exactly `totals=false`. The answer sets
+        `Cache-Control: no-store` and omits totals.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: totals
+          required: false
+          schema: { type: boolean, enum: [false] }
+      responses:
+        "200":
+          description: Table
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
+    get:
+      operationId: planLocalOnlyScan
+      summary: Dedicated read session only. The pinned scan of the bound local table, never a relay.
+      description: >
+        As getLocalOnlyNamespace, for the pinned scan of the bound table.
+        The query is exactly `snapshot` and `table_uuid`, each once, in
+        canonical form. Every returned data file and deletion vector path
+        must lie inside the verified storage grants, or the answer is 403.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: snapshot
+          required: true
+          schema: { type: integer, format: int64, minimum: 0 }
+        - in: query
+          name: table_uuid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Scan plan
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ScanFile" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
@@ -1422,9 +1537,16 @@ paths:
         sweeps use the same operation. Hoglite supports manual sweeps
         through token placement, without a background loop; each
         successful Hoglite sweep then runs retirement, which records its
-        own run and whose failure does not fail the sweep. Retirement
-        gets its own purge-sized budget, so a Hoglite call can take up to
-        about twice the purge budget; the next sweep continues a backlog.
+        own run and whose failure does not fail the sweep. The response
+        waits for retirement: it starts no batch later than twice the
+        purge budget after the request arrived, and never later than
+        20 s, except one batch it owes (a batch that commits no rows
+        does not pay that debt, and none starts more than 1 s past the
+        window or its own start), and its backend calls and ledger
+        write end within 3 s of that, or of its own start if the sweep
+        ran longer. A sweep that ends more than 22 s after arrival skips
+        retirement, so retirement never ends past 25 s after arrival.
+        The next sweep continues a backlog.
         Each sweep is bounded, preserves head, and respects the enabled
         consumer floor. Ended file rows enter the removal ledger;
         expiry does not delete their objects.
@@ -3744,7 +3866,70 @@ components:
         default 1 group).
       schema: { type: integer }
 
+  headers:
+    LocalOnlyMarker:
+      description: >
+        The marker of a local-only route. The server sends it on every
+        answer to a well-formed local-only GET on a listener that serves
+        these routes. A server that predates the routes never sends it,
+        so a client refuses every answer without it.
+      schema: { type: string, enum: ["true"] }
+
   responses:
+    LocalOnlyBadRequest:
+      description: A malformed path segment, query or body on a local-only route.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyUnauthenticated:
+      description: >
+        No dedicated read token, or one that the dedicated read verifier
+        refuses. Never absence.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyForbidden:
+      description: The owner refused the read, or a returned path is outside the storage grants.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyNotFound:
+      description: >
+        Ordinary absence: a name outside the binding, without a backend
+        call, or an absent bound object. Absence only with the marker.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyMethodNotAllowed:
+      description: A method other than GET on a local-only route. No marker.
+      headers:
+        Allow:
+          schema: { type: string, enum: ["GET"] }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyInvalidRoute:
+      description: A path under `/v1/local-only` that is not one of the three routes. No marker.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyNotConfigured:
+      description: >
+        The listener has no `read_session` binding. This includes the
+        public listener and auth mode `off`. No marker.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
     Unauthenticated:
       description: >
         No credential, or one that does not verify. `error` is a closed
@@ -4307,6 +4492,18 @@ components:
           minItems: 1
           items: { $ref: "#/components/schemas/ColumnDef" }
 
+    TableSummaryIdentity:
+      type: object
+      description: >
+        A table list item for a dedicated read session: the identity
+        fields of TableSummary and none of its counts or sizes.
+      required: [name, table_uuid]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+        comment: { type: string }
+        earliest_snapshot_id: { type: integer, format: int64 }
     TableSummary:
       type: object
       required: [name, table_uuid, record_count, file_count, file_size_bytes,

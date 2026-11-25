@@ -129,6 +129,13 @@ class HogliteRejected(
  * or timed-out connect; once one has, the call can only end committed or
  * unknown.
  *
+ * A caller can bound every call it makes on its thread by its own
+ * deadline as well ([withDeadline]): an attempt is capped at whichever
+ * of the retry budget and that deadline ends first. An attempt that
+ * deadline would leave under [MIN_RETRY_ATTEMPT_MS] is not sent, nor
+ * paused for, so the call ends at the deadline, not a backoff after it;
+ * a timeout it cut short does not feed the breaker.
+ *
  * ## Circuit breaking
  *
  * One breaker per POOL (standard, whale) — the pools fail
@@ -574,7 +581,11 @@ class HogliteClient(
         txid: String? = null,
         parse: (Int, ByteArray) -> T,
     ): T {
-        val deadline = System.nanoTime() + retryBudgetMs * 1_000_000
+        val budgetEnd = System.nanoTime() + retryBudgetMs * 1_000_000
+        val callerEnd = callerDeadline.get()
+        val callerBinds = callerEnd != null && callerEnd - budgetEnd < 0
+        val deadline = if (callerBinds) callerEnd!! else budgetEnd
+        val bound = if (callerBinds) "before the caller's deadline" else "within the ${retryBudgetMs}ms retry budget"
         var lastFailure: Throwable? = null
         // True once an attempt of a tx may have applied. From then on the
         // call ends committed or unknown, never "not committed".
@@ -592,7 +603,21 @@ class HogliteClient(
                 HoglakeException.BackendUnavailable(detail)
             }
 
+        // The refusal once the retry budget or the caller's deadline leaves no attempt.
+        fun exhausted(): HoglakeException.BackendUnavailable =
+            unavailable(
+                "hoglite ${routeFor(tenantRoutes[tenant]).first.name.lowercase()} pool did not answer " +
+                    "$method $path $bound ${outcomes.summary(ownerUrlPattern.isNotBlank())} " +
+                    "(last failure: ${lastFailure?.message})",
+            )
+
         fun backoff() {
+            // A caller's deadline that the pause would leave no retry for
+            // is refused now, not after the pause: else the call ends that
+            // pause past the deadline.
+            if (callerBinds && (deadline - System.nanoTime()) / 1_000_000 - RETRY_BACKOFF_MS < MIN_RETRY_ATTEMPT_MS) {
+                throw exhausted()
+            }
             try {
                 sleeper(RETRY_BACKOFF_MS)
             } catch (e: InterruptedException) {
@@ -637,14 +662,12 @@ class HogliteClient(
             // A RETRY squeezed into the budget's last few milliseconds
             // can only time out, and a tx attempt that timed out after
             // being sent is outcome-unknown: it would turn a clean "not
-            // applied" exhaustion into a spurious unknown.
+            // applied" exhaustion into a spurious unknown. A caller's
+            // deadline can leave even a first attempt only those
+            // milliseconds, so it gets the same floor.
             val remainingMs = (deadline - System.nanoTime()) / 1_000_000
-            if (remainingMs <= 0 || (lastFailure != null && remainingMs < MIN_RETRY_ATTEMPT_MS)) {
-                throw unavailable(
-                    "hoglite ${pool.name.lowercase()} pool did not answer $method $path within the " +
-                        "${retryBudgetMs}ms retry budget ${outcomes.summary(ownerUrlPattern.isNotBlank())} " +
-                        "(last failure: ${lastFailure?.message})",
-                )
+            if (remainingMs <= 0 || ((lastFailure != null || callerBinds) && remainingMs < MIN_RETRY_ATTEMPT_MS)) {
+                throw exhausted()
             }
             val resp =
                 try {
@@ -665,7 +688,8 @@ class HogliteClient(
                     // THIS outcome feeds the breaker — a 503 is per-tenant
                     // owner loss, not a pool outage.
                     if (pin is Route.Owner) tenantRoutes.remove(tenant, pin)
-                    breaker.onFailure()
+                    // A timeout the caller's deadline cut short says nothing about the pool.
+                    if (!(callerBinds && cutShort(e, remainingMs, timeoutMs))) breaker.onFailure()
                     // Only a connect that never completed proves the
                     // request was not sent; a timeout or reset after that
                     // can follow a commit.
@@ -882,6 +906,25 @@ class HogliteClient(
     private fun errorCode(bytes: ByteArray): String? =
         runCatching { json.readValue<Map<String, Any?>>(bytes)["code"] as? String }.getOrNull()
 
+    /**
+     * True when [e] is a timeout that only fired because the attempt was
+     * given [remainingMs] rather than its full [timeoutMs]: a connect
+     * timeout when that was below the connect timeout, any other timeout
+     * when it was below [timeoutMs].
+     */
+    private fun cutShort(
+        e: Throwable,
+        remainingMs: Long,
+        timeoutMs: Long,
+    ): Boolean {
+        val chain = generateSequence(e) { it.cause }.take(8).toList()
+        return when {
+            chain.any { it is HttpConnectTimeoutException } -> remainingMs < minOf(timeoutMs, connectTimeoutMs)
+            chain.any { it is java.net.http.HttpTimeoutException } -> remainingMs < timeoutMs
+            else -> false
+        }
+    }
+
     /** True when [e] proves the request never left: the connection itself failed. */
     private fun neverSent(e: Throwable): Boolean =
         generateSequence(e) { it.cause }.take(8).any {
@@ -1009,6 +1052,30 @@ class HogliteClient(
     }
 
     companion object {
+        /** The [withDeadline] in force on this thread, as a `System.nanoTime()` instant. */
+        private val callerDeadline = ThreadLocal<Long?>()
+
+        /**
+         * Bound every call [block] makes on this thread, through any
+         * client, by [deadlineNanos] (a `System.nanoTime()` instant) as
+         * well as by the retry budget. A call past the deadline is refused
+         * before it sends, like one past its budget. Nested scopes keep the
+         * earlier deadline. A thread-local, so work [block] hands to
+         * another thread is not bounded by it.
+         */
+        internal fun <T> withDeadline(
+            deadlineNanos: Long,
+            block: () -> T,
+        ): T {
+            val outer = callerDeadline.get()
+            callerDeadline.set(if (outer != null && outer - deadlineNanos < 0) outer else deadlineNanos)
+            try {
+                return block()
+            } finally {
+                if (outer == null) callerDeadline.remove() else callerDeadline.set(outer)
+            }
+        }
+
         fun fromConfig(backend: HogliteBackend): HogliteClient =
             HogliteClient(
                 standardUrl = backend.url,
@@ -1043,7 +1110,7 @@ class HogliteClient(
         /** Pause between retryable attempts, including 421 re-routing. */
         const val RETRY_BACKOFF_MS = 200L
 
-        /** The least budget a retry (not a first attempt) is started with. */
+        /** The least budget a retry, or a first attempt under a caller's deadline, is started with. */
         const val MIN_RETRY_ATTEMPT_MS = 50L
 
         /** The engine's bound on one `/v1/query-batch` request. */

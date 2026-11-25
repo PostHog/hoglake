@@ -15,6 +15,8 @@ import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
+import com.posthog.hoglake.auth.AuthMode
+import com.posthog.hoglake.auth.ReadSessionConfig
 import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.auth.installNamespaceGate
 import com.posthog.hoglake.commit.CommitService
@@ -59,6 +61,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.jackson.jackson
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationStopped
 import io.ktor.server.application.install
 import io.ktor.server.metrics.micrometer.MicrometerMetrics
 import io.ktor.server.plugins.calllogging.CallLogging
@@ -67,6 +70,7 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
+import io.micrometer.core.instrument.binder.MeterBinder
 import io.micrometer.core.instrument.config.MeterFilter
 import io.micrometer.prometheusmetrics.PrometheusConfig
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
@@ -512,7 +516,30 @@ class App private constructor(
         // resolves no callers, which is precisely today's behaviour. A mis-set
         // `enforce` (no issuer, no key source) fails here, at boot, naming the
         // variable — not with a fleet-wide 401 (see [auth]).
-        app.installAuth(auth, cfg.scopedNamespaceBinding?.takeUnless { auth.tenantOnly })
+        app.installAuth(
+            auth,
+            cfg.readSession?.let {
+                when {
+                    // A warning API listener never verifies a read session (Config allows it only on a Host).
+                    !auth.tenantOnly ->
+                        ReadSessionConfig(
+                            it,
+                            cfg.reservedNamespaces,
+                            relays = catalogSelector::relaysReadSession,
+                            serves = catalogSelector::servesReadSession,
+                        ).takeIf { auth.mode == AuthMode.ENFORCE }
+                    // The public listener receives relayed requests for a served namespace, and nothing else.
+                    cfg.servedFamilies.isNotEmpty() ->
+                        ReadSessionConfig(
+                            it,
+                            cfg.reservedNamespaces,
+                            serves = catalogSelector::servesReadSession,
+                            servedOnly = true,
+                        )
+                    else -> null
+                }
+            },
+        )
 
         // Then, and once: every handler installed below this line runs
         // its blocking database/object-store work on requestDispatcher
@@ -531,6 +558,7 @@ class App private constructor(
             // behaviour (api/WireJson.kt).
             jackson { configureHoglakeWire() }
         }
+        var binders: List<MeterBinder> = emptyList()
         app.install(MicrometerMetrics) {
             registry = meterRegistry
             // The JVM binders belong to the process, not to a listener: bound
@@ -540,6 +568,14 @@ class App private constructor(
             // Unmatched request paths must NOT each mint a `route` tag —
             // hostile path scans would otherwise grow series without bound.
             distinctNotRegisteredRoutes = false
+            binders = meterBinders
+        }
+        // The plugin never closes its binders, and JvmGcMetrics leaves a GC
+        // listener on the process's MXBeans that reaches this application
+        // through the registry: every stopped application (one per test)
+        // stayed reachable, ~250 MB of the test JVM's 512 MB by the end.
+        app.monitor.subscribe(ApplicationStopped) {
+            binders.forEach { (it as? AutoCloseable)?.close() }
         }
         app.install(StatusPages) { installErrorMapping() }
         app.routing {

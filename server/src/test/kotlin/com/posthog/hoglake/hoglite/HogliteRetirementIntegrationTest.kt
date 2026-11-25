@@ -1,5 +1,9 @@
 package com.posthog.hoglake.hoglite
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
@@ -10,6 +14,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.RetirementResult
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.PatchField
 import com.posthog.hoglake.service.RemovalStore
@@ -19,6 +24,7 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.slf4j.LoggerFactory
 import java.util.UUID
 
 /** Run retirement against the published engine and MinIO. */
@@ -410,20 +416,49 @@ class HogliteRetirementIntegrationTest {
         }
     }
 
-    /** A table dropped with a live file, below a floor that only expiry can advance. */
-    private fun droppedBehindRetention(cat: String): Long {
-        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
-        val path = "s3://hoglake-it/$cat/live.parquet"
+    /** A table dropped with live files, below a floor that only expiry can advance. */
+    private fun droppedBehindRetention(
+        cat: String,
+        vararg paths: String = arrayOf("s3://hoglake-it/$cat/live.parquet"),
+    ): Long = droppedWithFiles(cat, "t", *paths).also { behindRetention(cat) }
+
+    private fun droppedWithFiles(
+        cat: String,
+        name: String,
+        vararg paths: String,
+    ): Long {
+        val table = store.createTable(cat, "ns", name, listOf(ColumnDef("id", ColType.LONG)))
         store.commit(
             cat,
-            CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 1, 100))))),
+            CommitRequest(appends = listOf(TableAppend("ns", name, paths.map { FileRegistration(it, 1, 100) }))),
         )
-        store.dropTable(cat, "ns", "t", table.tableUuid, "test", "retire")
+        store.dropTable(cat, "ns", name, table.tableUuid, "test", "retire")
+        return table.tableId
+    }
+
+    /** Leave every snapshot but head stale, so the next expiry advances the floor past every drop. */
+    private fun behindRetention(cat: String) {
         store.dropNamespace(cat, "ns", author = "test", message = "empty it")
         store.options.patch(cat, PatchField.Set(1L), null, "test", "short retention")
         write(cat, "UPDATE snapshots SET ts = '2001-01-01T00:00:00.000Z'")
-        return table.tableId
     }
+
+    /** Run [body] as a request that arrived [agoMs] ago, as the dispatch seam would admit it. */
+    private fun <T> arrivedAgo(
+        agoMs: Long,
+        body: () -> T,
+    ): T {
+        RequestAdmission.holder.set(RequestAdmission(System.nanoTime() - agoMs * 1_000_000))
+        try {
+            return body()
+        } finally {
+            RequestAdmission.holder.remove()
+        }
+    }
+
+    private fun tasks(cat: String) =
+        query(cat, "SELECT task, run_trigger, status FROM maintenance_runs ORDER BY id")
+            .rows.map { row -> row.map { it.asString() } }
 
     private fun dropRefusal(cat: String) =
         (runCatching { store.dropCatalog(cat, "test", "drop") }.exceptionOrNull() as HoglakeException.CatalogNotEmpty)
@@ -453,11 +488,18 @@ class HogliteRetirementIntegrationTest {
     }
 
     @Test
-    fun `retirement after expiry runs under the purge budget, so a zero budget retires nothing`() {
+    fun `retirement after expiry attempts one batch even under a zero purge budget`() {
         val cat = catalog()
-        val tableId = droppedBehindRetention(cat)
-        // Retirement's own 30 s budget would retire the file; the purge budget of 0 must not.
-        val zero = HogliteCatalogStore(engine.client, HogliteConformanceEngine.TENANTS, expiryPurgeBudgetMs = 0)
+        val second = "s3://hoglake-it/$cat/second.parquet"
+        val tableId = droppedBehindRetention(cat, "s3://hoglake-it/$cat/first.parquet", second)
+        // The purge budget of 0 leaves the hand-off no window: only its owed batch, of one row, runs.
+        val zero =
+            HogliteCatalogStore(
+                engine.client,
+                HogliteConformanceEngine.TENANTS,
+                expiryPurgeBudgetMs = 0,
+                retirementBatch = 1,
+            )
         val expired = zero.expiry.runOnce(cat, 100)
         assertThat(expired.newEarliestSnapshotId).isEqualTo(store.getCatalog(cat).headSnapshotId)
         val ledger =
@@ -465,10 +507,141 @@ class HogliteRetirementIntegrationTest {
         assertThat(ledger.map { row -> row.take(3).map { it.asString() } })
             .containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "ok"))
         val retired = store.json.readTree(ledger[1][3].asString())
-        assertThat(retired["batches"].asLong()).isZero()
+        assertThat(retired["batches"].asLong()).isEqualTo(1)
         assertThat(retired["tables_remaining"].asLong()).isEqualTo(1)
-        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).hasSize(1)
+        assertThat(query(cat, "SELECT path FROM files WHERE table_id = ?", tableId).rows.map { it[0].asString() })
+            .containsExactly(second)
         assertThat(dropRefusal(cat)).isEqualTo(CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT)
+    }
+
+    @Test
+    fun `a stuck lower table does not take the owed batch from a retirable one`() {
+        val cat = catalog()
+        val stuck = droppedWithFiles(cat, "stuck", "s3://hoglake-it/$cat/stuck.parquet")
+        val tableId = droppedWithFiles(cat, "t", "s3://hoglake-it/$cat/live.parquet")
+        behindRetention(cat)
+        // The vector's table must exist (dvs.table_id REFERENCES tables); a dropped one does.
+        write(
+            cat,
+            "INSERT INTO dvs(delete_file_id, table_id, data_file_id, path, delete_count, file_size_bytes, " +
+                "begin_snapshot, epoch) SELECT 1, ?, id, ?, 1, 20, 1, 1 FROM files WHERE table_id = ?",
+            tableId,
+            "s3://hoglake-it/$cat/foreign.puffin",
+            stuck,
+        )
+        val zero = HogliteCatalogStore(engine.client, HogliteConformanceEngine.TENANTS, expiryPurgeBudgetMs = 0)
+        zero.expiry.runOnce(cat, 100)
+        val retired =
+            query(cat, "SELECT result_json FROM maintenance_runs WHERE task = 'retirement'").rows.single()
+                .let { store.json.readTree(it[0].asString()) }
+        // MUTATION: clear the debt before each batch and the stuck table spends it; nothing is retired.
+        assertThat(retired["skipped_tables"].asLong()).isEqualTo(1)
+        assertThat(retired["rows_retired"].asLong()).isEqualTo(1)
+        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).isEmpty()
+        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", stuck).rows).hasSize(1)
+    }
+
+    @Test
+    fun `the retirement window closes by its cap whatever the purge budget`() {
+        val cat = catalog()
+        val second = "s3://hoglake-it/$cat/second.parquet"
+        val tableId = droppedBehindRetention(cat, "s3://hoglake-it/$cat/first.parquet", second)
+        // Uncapped, a 30 s purge budget leaves a 60 s window open, and both one-row batches run.
+        val long =
+            HogliteCatalogStore(
+                engine.client,
+                HogliteConformanceEngine.TENANTS,
+                expiryPurgeBudgetMs = 30_000,
+                retirementBatch = 1,
+            )
+        arrivedAgo(HogliteExpiry.RETIREMENT_WINDOW_MAX_MS + 200) { long.expiry.runOnce(cat, 100) }
+        assertThat(tasks(cat)).containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "ok"))
+        // MUTATION: drop the cap and the second file is retired too.
+        assertThat(query(cat, "SELECT path FROM files WHERE table_id = ?", tableId).rows.map { it[0].asString() })
+            .containsExactly(second)
+    }
+
+    @Test
+    fun `an expiry that ends too late for retirement to land skips it`() {
+        val cat = catalog()
+        val tableId = droppedBehindRetention(cat)
+        val latestStart =
+            HogliteExpiry.RETIREMENT_END_MS - HogliteRetirement.OVERRUN_MS - HogliteRetirement.BOOKKEEPING_MS
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val audit = LoggerFactory.getLogger(Audit.LOGGER_NAME) as Logger
+        audit.addAppender(capture)
+        val expired =
+            try {
+                arrivedAgo(latestStart + 200) { store.expiry.runOnce(cat, 100) }
+            } finally {
+                audit.detachAppender(capture)
+                capture.stop()
+            }
+        assertThat(expired.newEarliestSnapshotId).isEqualTo(store.getCatalog(cat).headSnapshotId)
+        // MUTATION: drop the late-start check and retirement runs and records itself.
+        assertThat(tasks(cat)).containsExactly(listOf("expiry", "manual", "ok"))
+        assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).hasSize(1)
+        // MUTATION: skip without the audit event and nothing durable says retirement did not run.
+        assertThat(capture.list.map { it.formattedMessage }.filter { it.startsWith("retirement ") })
+            .containsExactly("retirement skipped_late")
+    }
+
+    @Test
+    fun `a run of stuck tables stops paying its debt and still records an ok run`() {
+        val cat = catalog()
+        // Each table's file carries a vector of the next table's, so every batch is refused as stuck.
+        val tables = (0 until 6).map { droppedWithFiles(cat, "stuck$it", "s3://hoglake-it/$cat/stuck$it.parquet") }
+        behindRetention(cat)
+        tables.forEachIndexed { i, table ->
+            write(
+                cat,
+                "INSERT INTO dvs(delete_file_id, table_id, data_file_id, path, delete_count, file_size_bytes, " +
+                    "begin_snapshot, epoch) SELECT ?, ?, id, ?, 1, 20, 1, 1 FROM files WHERE table_id = ?",
+                1_000 + i,
+                tables[(i + 1) % tables.size],
+                "s3://hoglake-it/$cat/foreign$i.puffin",
+                table,
+            )
+        }
+        HogliteInterposer(engine.url()).use { proxy ->
+            // Six stuck batches take 3 s, past the run's 2 s work bound; the debt may start none after 1 s.
+            val hooks =
+                tables.map {
+                    proxy.hook({ m, p, b -> HogliteInterposer.isWriteTx(m, p, b) && "retire-batch:" in b }) {
+                        Thread.sleep(500)
+                    }
+                }
+            val zero = HogliteCatalogStore(proxy.client, HogliteConformanceEngine.TENANTS, expiryPurgeBudgetMs = 0)
+            zero.expiry.runOnce(cat, 100)
+            // MUTATION: keep the debt until a batch commits rows, uncapped, and the run is cut off as failed.
+            assertThat(tasks(cat))
+                .containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "ok"))
+            val retired =
+                query(cat, "SELECT result_json FROM maintenance_runs WHERE task = 'retirement'").rows.single()
+                    .let { store.json.readTree(it[0].asString()) }
+            // More than one: the first stuck table did not end the run.
+            assertThat(retired["skipped_tables"].asLong()).isBetween(2, tables.size - 1L)
+            assertThat(hooks.count { it.fired }.toLong()).isEqualTo(retired["skipped_tables"].asLong())
+            assertThat(retired["rows_retired"].asLong()).isZero()
+            assertThat(query(cat, "SELECT id FROM files").rows).hasSize(tables.size)
+        }
+    }
+
+    @Test
+    fun `a retirement that fails before reading its floor sends no backlog count`() {
+        val cat = catalog()
+        droppedFiles(cat)
+        HogliteInterposer(engine.url()).use { proxy ->
+            val hook = proxy.hook({ _, _, b -> "FROM meta WHERE id = 1" in b }) { error("injected meta failure") }
+            val failure = runCatching { HogliteRetirement(proxy.store).runOnce(cat) }.exceptionOrNull()
+            assertThat(hook.fired).isTrue()
+            assertThat(failure).isNotNull().isNotInstanceOf(PartialResult::class.java)
+            assertThat(failure!!.suppressed).isEmpty()
+            // MUTATION: count from floor 0 when no floor was read and the probe goes out.
+            assertThat(proxy.requests.filter { HogliteRetirement.REMAINING_SQL in it }).isEmpty()
+            assertThat(tasks(cat)).containsExactly(listOf("retirement", "manual", "failed"))
+            assertThat(query(cat, "SELECT id FROM files").rows).hasSize(3)
+        }
     }
 
     @Test
@@ -486,5 +659,70 @@ class HogliteRetirementIntegrationTest {
         ).containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "failed"))
         assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).hasSize(1)
         assertThat(dropRefusal(cat)).isEqualTo(CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT)
+    }
+
+    @Test
+    fun `a positive budget that its reads use up still attempts one batch`() {
+        val cat = catalog()
+        droppedFiles(cat)
+        // The metadata, queue and candidate reads alone take longer than 1 ms on any engine.
+        val result = HogliteRetirement(store, batchSize = 1, runBudgetMs = 1).runOnce(cat)
+        assertThat(result.batches).isEqualTo(1)
+        assertThat(result.rowsRetired).isEqualTo(1)
+        assertThat(result.tablesRemaining).isEqualTo(1)
+        assertThat(query(cat, "SELECT id FROM files").rows).hasSize(2)
+    }
+
+    @Test
+    fun `a stalled batch after expiry ends by the request deadline, not the client's retry budget`() {
+        val cat = catalog()
+        val tableId = droppedBehindRetention(cat)
+        HogliteInterposer(engine.url()).use { proxy ->
+            val hook =
+                proxy.hook({ m, p, b -> HogliteInterposer.isWriteTx(m, p, b) && "retire-batch:" in b }) {
+                    Thread.sleep(15_000)
+                }
+            val budget = 200L
+            val budgeted =
+                HogliteCatalogStore(proxy.client, HogliteConformanceEngine.TENANTS, expiryPurgeBudgetMs = budget)
+            val started = System.nanoTime()
+            val expired = budgeted.expiry.runOnce(cat, 100)
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertThat(hook.fired).isTrue()
+            assertThat(expired.newEarliestSnapshotId).isEqualTo(store.getCatalog(cat).headSnapshotId)
+            // Unbounded, the stalled batch alone waits out the client's 8 s retry budget.
+            assertThat(elapsedMs)
+                .isLessThan(2 * budget + HogliteRetirement.OVERRUN_MS + HogliteRetirement.BOOKKEEPING_MS + 1_500)
+            assertThat(
+                query(cat, "SELECT task, run_trigger, status FROM maintenance_runs ORDER BY id")
+                    .rows.map { row -> row.map { it.asString() } },
+            ).containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "failed"))
+            assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).hasSize(1)
+        }
+    }
+
+    @Test
+    fun `a stalled backlog count after expiry leaves the retirement run its ledger row`() {
+        val cat = catalog()
+        val tableId = droppedBehindRetention(cat)
+        HogliteInterposer(engine.url()).use { proxy ->
+            val hook =
+                proxy.hook({ _, _, b -> HogliteRetirement.REMAINING_SQL in b }) { Thread.sleep(15_000) }
+            val budget = 200L
+            val budgeted =
+                HogliteCatalogStore(proxy.client, HogliteConformanceEngine.TENANTS, expiryPurgeBudgetMs = budget)
+            val started = System.nanoTime()
+            budgeted.expiry.runOnce(cat, 100)
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertThat(hook.fired).isTrue()
+            assertThat(elapsedMs)
+                .isLessThan(2 * budget + HogliteRetirement.OVERRUN_MS + HogliteRetirement.BOOKKEEPING_MS + 1_500)
+            // MUTATION: let the count run to the run's last deadline and the ledger INSERT is refused unsent.
+            assertThat(
+                query(cat, "SELECT task, run_trigger, status FROM maintenance_runs ORDER BY id")
+                    .rows.map { row -> row.map { it.asString() } },
+            ).containsExactly(listOf("expiry", "manual", "ok"), listOf("retirement", "manual", "failed"))
+            assertThat(query(cat, "SELECT id FROM files WHERE table_id = ?", tableId).rows).isEmpty()
+        }
     }
 }

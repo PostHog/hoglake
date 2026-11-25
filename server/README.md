@@ -2575,8 +2575,15 @@ The catalog reports on itself instead of waiting for ops SQL:
   Full hydration still needs the existing server-side `ObjectStore` path and per-run AWS identity.
   Hoglite retirement has no route or loop of its own: each successful manual expiry runs it
   (`POST /maintenance/expire`), recorded as its own `retirement` run, after the floor that sweep advanced.
-  It runs under the expiry purge budget (10 s by default), so one request holds both budgets;
-  the next expiry continues a backlog. It takes `HOGLAKE_RETIREMENT_QUEUE_CEILING` and `HOGLAKE_RETIREMENT_BATCH`,
+  The response waits for it, so it starts no batch later than twice the expiry purge budget after the request
+  arrived, capped at 20 s whatever the budget, except one batch it owes each run, even under a zero purge
+  budget. A batch that commits no rows (a stuck table) does not pay it: the run tries the next table, starting
+  none more than 1 s past the window or its own start. Its backend calls, backlog count and ledger write end
+  within 3 s of the window, or of its own start if the sweep ran longer. A sweep that ends more than 22 s after
+  arrival skips retirement (a warning and a `retirement` audit event with outcome `skipped_late`, no ledger
+  row), so retirement never ends past 25 s after arrival, inside pyhoglake's 30 s read timeout; the expiry
+  phase itself has no such bound. The next expiry continues a backlog. It takes
+  `HOGLAKE_RETIREMENT_QUEUE_CEILING` and `HOGLAKE_RETIREMENT_BATCH`,
   the batch capped at 1,000 rows (one Hoglite transaction).
   With a Hoglite backend configured, boot refuses either one below 1: no interval turns this hand-off off.
   A retirement failure is logged and recorded as a failed `retirement` run, and does not fail the expiry response.
