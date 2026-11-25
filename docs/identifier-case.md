@@ -29,10 +29,12 @@ hoglake identifiers become **case-preserving and case-insensitive**
 4. **Returned as stored.** A response carries the stored spelling,
    whatever the request spelled.
 5. **The fold is ASCII only.** It is the same function in Kotlin,
-   Python, C++, Java, PostgreSQL and SQLite, and it stays ASCII-only if
-   the identifier alphabet is ever widened.
+   Python, C++, Java, PostgreSQL and SQLite. That holds because the
+   identifier alphabet is ASCII; widening the alphabet reopens this
+   decision.
 6. **Files bind by field id**, as now. Names in a Parquet footer decide
-   nothing except in files that carry no ids.
+   nothing except in files that carry no ids, and those bind by
+   fold-equal name on the server as they already do in truffle.
 
 ## Why: every engine hoglake cares about folds case
 
@@ -80,6 +82,12 @@ not run.
   `HoglakeMetadata.tableWritePath` joins Trino's schema and table names
   into `data/<namespace>/<table>/`, while the server spells the table
   root with the stored names (`ObjectPrefix.tableRoot`).
+- **The server and truffle bind id-less files differently.** For a file
+  field without a field id, truffle falls back from the exact name to a
+  match that ignores case. The server's hydrator and compaction match
+  the exact name only (`FooterStats.bindIndex`).
+  [Ingestion and file registration](#ingestion-and-file-registration)
+  has the consequence.
 - **Four places already patched this on their own, each differently.**
 
   | Where | What it does |
@@ -196,9 +204,20 @@ nothing else. Two names are **fold-equal** when their folds are equal.
 - A general lowercase is wrong here. Kotlin's `lowercase()` maps the
   Kelvin sign `K` (U+212A) to `k`, so a request for `K` would resolve
   to table `k`. `ReservedNamespacesTest` already records this.
-- If the alphabet is ever widened, non-ASCII letters are **not** folded.
-  That is DuckDB's rule, and it is the only fold every language agrees
-  on.
+- **Widening the alphabet reopens this decision.** Trino lowercases
+  names with Unicode rules (`toLowerCase(ENGLISH)`), so under an ASCII
+  fold `É` and `é` would be two legal columns that truffle reads as
+  one. No Unicode fold is the same in every runtime below, either. The
+  rule is sound only while names are ASCII.
+- **`VariantShredding` keeps its own fold, on purpose.** It compares
+  the names of shredded fields, which are JSON keys and may hold any
+  Unicode, and it folds them as truffle's Parquet reader does, with the
+  JDK's `lowercase()`. An ASCII fold there would admit `É` and `é` as
+  two shredded fields that the reader takes for one. The two folds give
+  the same answer on every string the identifier pattern admits, so
+  identifiers have one rule. The two are not to be merged: the
+  shredding check moves to `Identifiers.fold` only if the reader stops
+  lowercasing footer names.
 
 | Where | The fold |
 |---|---|
@@ -225,13 +244,17 @@ Among live siblings, no two names are fold-equal.
 - The set visible at any snapshot was once the live set, so the
   property holds at every snapshot taken after the rule ships.
 - A dropped name can be reused in another case: drop `Events`, create
-  `events`.
+  `events`. This rests on an invariant the exact-name index already
+  needs: a drop ends the table's live version row in the transaction
+  that sets `dropped_snapshot` (`TableRepo.markDropped`, the only
+  PostgreSQL writer of that column).
 - A rename that changes only the case of the object itself is legal.
   The check excludes the object by id, not by name.
 - Pairs that exist before the rule ships are left as they are. Case-only
   pairs of one kind are the one case the resolution rule below has to
   handle. A table and a view that already share a name each stay
-  addressable through their own routes.
+  addressable through their own routes. Both kinds of pair have to be
+  gone before the last [rollout](#rollout) step.
 
 ### Resolution
 
@@ -261,7 +284,11 @@ acting on the wrong incarnation.
   object paths from the names in the response.
 - **Paths are spelled with the stored name.** `data/<namespace>/<table>/`
   and `<field>=<value>/` are compared as bytes. A client that builds
-  them from its own spelling writes to the wrong prefix.
+  them from its own spelling writes to the wrong prefix. Where the
+  prefix is enforced, on an object-prefix table or in a contained
+  namespace, the server refuses that commit: it checks paths against
+  the stored names, whatever the request spelled
+  ([The commit path](#the-commit-path)).
 - **Labels and dedupe keys use resolved ids or stored names.** Once a
   lookup resolves any spelling, a metric labelled with the requested
   name gets one series per spelling a client cares to send. The
@@ -280,6 +307,50 @@ acting on the wrong incarnation.
 - Reserved namespace names and the `team_<digits>` shape already fold
   ASCII. They move to `Identifiers.fold` and do not change behaviour.
 
+### Ingestion and file registration
+
+- **A registration carries no column names.** A `FileRegistration` is a
+  path, counts, sizes, partition values and stats keyed by `field_id`,
+  and the server never opens the file at commit. The only names in a
+  commit are its `namespace` and `table`, which resolve like any other
+  lookup.
+- **Files with field ids bind by id.** The case of a footer name
+  decides nothing, on the server, in truffle or in the DuckDB
+  extension. This covers truffle `INSERT`, pyhoglake, millrace,
+  hedgerow and compaction outputs.
+- **Files without field ids bind by fold-equal name, on every reader.**
+  truffle already binds by id, then by exact name, then ignoring case
+  (`HoglakeParquetFields.bind`). The server binds an id-less field by
+  exact name only (`FooterStats.bindIndex`, which the hydrator and
+  `ParquetRewriter` share), so the two disagree about the same file
+  today. `bindIndex` gains truffle's last step: the one id-less sibling
+  fold-equal to the column.
+- **An ambiguous fold match binds nothing.** Two id-less file siblings
+  fold-equal to one column, or two live columns fold-equal to one file
+  field, with no exact match: the hydrator records no stats for the
+  column, and compaction refuses the input. It never null-fills a
+  column it could not bind for this reason.
+- **Writers match their input to columns by exact name**, as now:
+  pyhoglake's Arrow columns (`_align_table`), millrace's payload keys
+  (`doc.get(column.name)`), hedgerow's projection. A payload key is
+  data: `UserId` sent to column `userid` is an unknown key, not a
+  match. pyhoglake's side is an [open question](#open-questions).
+
+The disagreement over id-less files is reachable today, without any of
+this design. PostHog's Trino import path
+(`hoglake_register_data_imports.py` in PostHog/posthog) creates the
+table through Trino, which lowercases its columns, and registers the
+source's files with `add_files`. A source column `UserId` becomes
+catalog column `userid` over a footer that says `UserId`. If the file
+carries no field ids, truffle reads the column, the hydrator records no
+stats for it, and compaction writes it as nulls: an unmatched top-level
+column is null-filled (`ParquetRewriter.planChildren` and its KDoc).
+This is read from the three sources and not reproduced. PostHog's REST
+import writer (`gigahog_register_data_imports.py`) keeps the source's
+spelling in the catalog, refuses a file that carries field ids and
+refuses columns that differ only by case, so its files bind exactly on
+both readers.
+
 ### Files whose footers hold case-colliding names
 
 The rule is about catalog names. A data file can still carry two
@@ -296,9 +367,10 @@ writer, or one written under a table that already held such a pair.
   fields refuses the batch. Renaming one with a suffix, or moving both
   into a VARIANT column, is a choice the writer's operator makes. The
   catalog never renames a column on a writer's behalf.
-- **truffle binds files without field ids by name**, exact first and
-  then ignoring case. With the catalog's names unique after folding,
-  that fallback names at most one catalog column per file column.
+- **Unique catalog names keep the id-less fallback unambiguous.** With
+  the catalog's names unique after folding, binding by fold-equal name
+  ([above](#ingestion-and-file-registration)) names at most one catalog
+  column per file column.
 
 ### Errors
 
@@ -367,11 +439,21 @@ CREATE INDEX hog_view_live_name_folded
   ends the live row and inserts a new one with the same name. A
   case-only rename in the service's write order (end the live row,
   insert the new one) passes a unique folded index; checked.
+- **The partial predicate is enough for a drop.** `end_snapshot IS
+  NULL` does not mention `hog_table.dropped_snapshot`, and does not
+  need to: `markDropped` ends the live version row in the same
+  transaction, and `hog_table_version_live_name`, the unique index on
+  the exact name, already has this predicate. Dropping `Events` with
+  `markDropped`'s statements and then creating `events` passes a unique
+  folded index; checked. The [audit](#appendix-audit-queries) has a
+  query for live version rows on dropped tables, which must be empty
+  before the unique build.
 - **Tables against views is a service check, permanently.** No index
   spans two tables. `createTable` and a table rename read
   `hog_view_live_name_folded`; `createView` reads
   `hog_table_version_live_name_folded`. Both already hold the commit
-  lock.
+  lock. No index will ever fail on a legacy pair of this kind, so the
+  last [rollout](#rollout) step waits for that audit to be empty too.
 - **Cost.** 4.1 MB for the 54,003 live names of the fixture, built in
   58 ms on an idle scratch database. `hog_table_version` rows are
   written by DDL, not by commits, so the commit path writes none of
@@ -406,10 +488,37 @@ statements outside the Hoglite store.
   than the object itself. For a table or a view the guard reads both
   `tables` and `views`. hoglite serializes a tenant's transactions,
   which is what the commit lock gives PostgreSQL.
-- **No tenant index in the first cut.** Tenants have no migrations
-  (`HogliteSchema` KDoc), so a new index reaches only new tenants. The
-  fold lookup reads a tenant's live names, which the design keeps small;
-  the PR measures it against hoglited's per-query limits.
+- **A `NOCASE` index for new tenants, from the start.** `NOCASE` cannot
+  use the `BINARY` live-name indexes (`tables_live`, `views_live`,
+  `namespaces_live`) for the name, so without one a lookup scans live
+  names. `HogliteSchema.DDL` gains `tables(namespace, name COLLATE
+  NOCASE)`, `views(namespace, name COLLATE NOCASE)` and
+  `namespaces(name COLLATE NOCASE)`, each `WHERE dropped_snapshot IS
+  NULL` and not unique, for the reason the PostgreSQL ones start out
+  not unique. Tenants have no migrations (`HogliteSchema` KDoc), so a
+  tenant that already exists keeps scanning until the first tenant
+  upgrade adds the index. It answers the same either way.
+- **The scan is bounded by one namespace's live tables**, as long as
+  the store resolves the namespace to its stored name first and then
+  compares `namespace` exactly. Measured on in-process SQLite 3.46.1
+  with the tenant's `tables` columns and its `tables_live` index, not
+  on hoglited:
+
+  | Live tables in the namespace | Exact, as today | `NOCASE`, no new index | `NOCASE`, with the index |
+  |---|---|---|---|
+  | 20 | 2 µs | 6 µs | 5 µs |
+  | 1,000 | 2 µs | 109 µs | 5 µs |
+  | 5,000 | 2 µs | 510 µs | 5 µs |
+  | 50,000 | 3 µs | 5,010 µs | 5 µs |
+
+  The scan reads the partial index, so dropped tables cost nothing.
+  Folding the namespace in the same predicate loses the bound: 50,000
+  live tables over 500 namespaces took 3,527 µs that way and 15 µs with
+  the namespace resolved first. One statement that probes the exact
+  name and falls back to the scan does not help: SQLite ran the scan
+  anyway, 736 µs on an exact hit among 50,000. The largest tenant's
+  live-table count is not known. The implementing PR reports it and
+  measures the lookup on hoglited against its per-query limits.
 - **About forty statements compare a name** across
   `HogliteCatalogStore`, `HogliteCommit`, `HogliteTableCreations`,
   `HogliteAlters`, `HogliteViews`, `HoglitePartitions`,
@@ -449,6 +558,20 @@ This is a change to the commit path, so its PR answers the six scale
 questions in AGENT.md and carries a plan test on a production-shaped
 fixture.
 
+**The path checks move to the stored names in the same change.** Today
+`CommitService` builds each `ResolvedAppend` from the request's
+spelling, and `checkObjectPrefix` and `checkContainment` compare the
+registered paths with prefixes built from it. Once `events` resolves to
+`Events`, that code would accept files under `data/<ns>/events/` for a
+table whose root is `data/<ns>/Events/`. Both checks, the `contained`
+map they read and the names in their refusals take the stored spelling
+from the commit read, and `HogliteCommit`'s counterparts do the same.
+A client that builds paths from its own spelling is then refused with
+the existing object-prefix or containment error, and nothing is
+registered under another prefix. A table with neither an object-prefix
+layout nor a contained namespace has no enforced prefix: its files are
+found by their registered paths, wherever under `data_path` they sit.
+
 ### Wire contract
 
 - **OpenAPI.** The name schemas keep their pattern and gain the rule:
@@ -467,13 +590,15 @@ fixture.
 
 | Consumer | Today | Change |
 |---|---|---|
-| truffle (`trino-hoglake`) | Sends Trino's lowercased names; builds write paths from them; exposes no hoglake views (`HoglakeMetadata` has no view methods) | Nothing for reads. Build write paths, and the names in commits, from the `namespace` and `name` of the table response. `checkNoCaseCollision` stays for legacy files |
-| Trino harness (`server/trino/`) | No mixed-case case | A namespace, table and column created in mixed case through the REST API, read through Trino in lowercase |
+| truffle (`trino-hoglake`) | Sends Trino's lowercased names; builds write paths from them; exposes no hoglake views (`HoglakeMetadata` has no view methods) | Nothing for reads. Build write paths, and the names in commits, from the `namespace` and `name` of the table response. This ships before the server resolves case ([Rollout](#rollout)). `checkNoCaseCollision` stays for legacy files |
+| Server: hydrator and compaction | Bind a file field without an id by exact name only (`FooterStats.bindIndex`) | Exact name, then the one fold-equal id-less sibling; an ambiguous match binds nothing ([Ingestion](#ingestion-and-file-registration)) |
+| Trino harness (`server/trino/`) | No mixed-case case | A namespace, table and column created in mixed case through the REST API, read through Trino in lowercase. A file without field ids whose column is spelled in another case, read before and after compaction |
 | pyhoglake | Exact names. `Catalog.namespace()` keeps the caller's spelling on its fallback path; table paths come from `TableInfo` | Take the namespace's name from the response. Arrow columns keep matching exactly (an [open question](#open-questions)) |
 | duckdb-client | Resolves through listings; conflict-checks DDL itself | Keeps working unchanged. With the capability it can send the typed name and drop the listing round trip |
 | hedgerow | Matches source and destination columns by exact name | None |
 | millrace | Looks configured columns up by exact name | None |
 | webui | Routes by names from listings | None required |
+| PostHog import writers (PostHog/posthog) | The REST writer keeps the source's column spelling and refuses case-only pairs; the Trino path creates lowercased columns over footers in the source's spelling | None. The Trino path's files depend on the server's fold binding |
 | Iceberg facade (not built) | | Resolve REST namespace, table and view identifiers with the same resolver; export stored names. Trino's Iceberg connector then needs no `case-insensitive-name-matching`. A view named like a table answers `AlreadyExists`, as Iceberg's own catalogs do |
 
 ## Rollout
@@ -483,29 +608,50 @@ a flag that defaults off, a counter, and a flip when the counter is
 quiet (AGENT.md, Scale doctrine).
 
 1. **Audit.** Run the [queries](#appendix-audit-queries) in each
-   environment. Three numbers matter: case-only pairs, tables and views
-   that share a name, and live names that are not already lowercase.
-   The last is what truffle cannot address today.
-2. **Resolve and count.** Ship the fold, the indexes, the resolver on
-   both backends, `ambiguous_name` and the capability. A request that
-   would create a case-only pair, or a table and a view sharing a name,
-   is still accepted, logged at WARN once per resolved parent per pod,
-   and counted in `hoglake_colliding_names_total{catalog,kind}`.
+   environment. Four numbers matter: case-only pairs, tables and views
+   that share a name, live version rows on dropped tables, and live
+   names that are not already lowercase. The last is what truffle
+   cannot address today.
+2. **Fix what is wrong today.** Two changes that need no flag and do
+   not wait for the rest:
+   - **truffle builds write paths, and the names in its commits, from
+     the table response.** While the server still matches exactly, the
+     response's names are the names truffle sent, so this changes
+     nothing yet. It has to be in every cluster that writes before the
+     next step, or the first `INSERT` into a table truffle could not
+     address before goes to `data/<ns>/events/` for a table stored as
+     `Events`.
+   - **The server binds files without field ids by fold-equal name**
+     ([Ingestion](#ingestion-and-file-registration)), which closes the
+     disagreement with truffle that exists today.
+3. **Resolve and count.** Ship the fold, the indexes, the resolver on
+   both backends, `ambiguous_name`, the capability, and the commit
+   path's checks against stored names. The last is the server's own
+   guard for the step before: a truffle that still builds paths from
+   lowercased names is refused on an object-prefix table or in a
+   contained namespace, and registers nothing under the wrong prefix.
+   A request that would create a case-only pair, or a table and a view
+   sharing a name, is still accepted, logged at WARN once per resolved
+   parent per pod, and counted in
+   `hoglake_colliding_names_total{catalog,kind}`.
    `HOGLAKE_REFUSE_COLLIDING_NAMES` defaults to `false`.
-3. **Refuse.** Set the flag per environment once the counter has stayed
+4. **Refuse.** Set the flag per environment once the counter has stayed
    at zero, then make `true` the default in a later release. From here
    the uniqueness rule holds for everything new.
-4. **Clients.** truffle builds paths from stored names before any
-   mixed-case table with an object-prefix layout or a contained
-   namespace is written through it. The DuckDB extension may drop its
-   listing round trip.
-5. **Enforce in the database.** Once the case-only audit is empty in
-   every environment and the flag is on, a later migration replaces the
-   three folded indexes with unique ones. A pair found before then is
-   renamed by its owner first. The table-against-view check stays in
-   the service.
+5. **Other clients.** pyhoglake takes the namespace's name from the
+   response. The DuckDB extension may drop its listing round trip.
+6. **Enforce in the database.** Once the flag is on and three audits
+   are empty in every environment (case-only pairs, tables and views
+   that share a name, live version rows on dropped tables), a later
+   migration replaces the three folded indexes with unique ones. A pair
+   found before then is renamed by its owner first. The table-against-view
+   check stays in the service, because no index spans two tables. It is
+   in the gate all the same: nothing else would ever make an owner
+   rename such a pair, and the first reader with one relation
+   namespace, truffle once it exposes hoglake views or the Iceberg
+   facade, could not serve it.
 
-Step 2 changes one thing a client could notice besides the count: a
+Step 3 changes one thing a client could notice besides the count: a
 request that answered 404 for `events` now finds `Events`. A client
 that creates on 404 stops creating case twins, which is the point.
 
@@ -523,6 +669,17 @@ that creates on 404 stops creating case twins, which is the point.
 - **Legacy pairs.** Seeded by SQL, since the API will refuse to make
   them: exact wins, a fold-only lookup is `ambiguous_name`, listings
   show both.
+- **Id-less binding.** A file without field ids whose column is spelled
+  in another case than the catalog's: the hydrator records its stats,
+  compaction keeps its values, and the Trino harness reads the same
+  values before and after compaction. An ambiguous fold match records
+  no stats and the rewriter refuses the input. The reader and rewriter
+  agreement fuzz target (`NestedAgreement`) gains id-less fields in
+  varied case.
+- **Paths.** On both backends, a commit that names an object-prefix
+  table, or a table in a contained namespace, in another spelling: with
+  paths under the stored spelling it is accepted, with paths under the
+  request's spelling it is refused.
 - **Authorization.** A scoped caller reaches its namespace through
   another spelling; the reused-name refusal fires on a fold-equal
   dropped namespace; ambiguity answers 404.
@@ -565,8 +722,9 @@ that creates on 404 stops creating case twins, which is the point.
 1. **What does a deployment holding a legacy pair do at the unique
    migration?** The build fails and rolls back, and the server cannot
    boot until the pair is renamed. Proposed: the release that carries
-   the migration names the audit as its prerequisite, and it does not
-   ship until PostHog's own environments are empty.
+   the migration names the three audits of the last rollout step as its
+   prerequisite, and it does not ship until PostHog's own environments
+   are empty.
 2. **`ambiguous_name` as 422 or 409?** Proposed 422: the request names
    nothing the server can act on, and retrying does not change that.
 3. **Should pyhoglake match Arrow column names by fold?** Today a
@@ -576,6 +734,12 @@ that creates on 404 stops creating case twins, which is the point.
    refusal.
 4. **A lowercase-only catalog option** for catalogs that will be
    registered in Glue. Not now.
+5. **How many live tables does the largest Hoglite tenant hold?** A
+   tenant created before the `NOCASE` index scans its namespace's live
+   names on every lookup that is not an exact probe
+   ([Hoglite](#hoglite)). Proposed: the implementing PR reports the
+   number, and a tenant upgrade that adds the index comes first if it
+   is in the tens of thousands.
 
 ## Appendix: audit queries
 
@@ -648,6 +812,18 @@ SELECT c.name AS catalog, n.name AS namespace,
   JOIN hog_catalog c ON c.catalog_id = tv.catalog_id
  WHERE tv.end_snapshot IS NULL AND t.dropped_snapshot IS NULL
    AND v.end_snapshot IS NULL AND NOT n.dropped;
+```
+
+PostgreSQL, live version rows on dropped tables. The unique folded
+index on `hog_table_version` is partial on `end_snapshot IS NULL` alone,
+so this must return nothing:
+
+```sql
+SELECT c.name AS catalog, tv.table_id, tv.name
+  FROM hog_table_version tv
+  JOIN hog_table t USING (catalog_id, table_id)
+  JOIN hog_catalog c USING (catalog_id)
+ WHERE tv.end_snapshot IS NULL AND t.dropped_snapshot IS NOT NULL;
 ```
 
 PostgreSQL, live names truffle cannot address today:
