@@ -1862,6 +1862,29 @@ class ExternalMergeSortTest {
         assertThat(openFds()).describedAs("descriptors after three refused spills").isLessThanOrEqualTo(before + 2)
     }
 
+    @Test
+    fun `a spill refused while closing its row group still closes the file`() {
+        // A spill file's only row group is written by OutputWriter.close().
+        // A budget just past the magic refuses its first page there, after
+        // which parquet's writer is aborted and will not close the stream.
+        val path = clientKv("fd-flush", (1L..40L).toList())
+        val before = openFds()
+        repeat(3) {
+            val refused =
+                catchThrowable {
+                    rewrite(
+                        listOf(input(LocalInputFile(path), "a", fileSizeBytes = 0)),
+                        fresh("fd-flush-refused.parquet"),
+                        spill(spillParent(), chunkRows = 2, spillBudget = 10, block = 1 shl 20),
+                    )
+                }
+            assertThat(refused).isInstanceOf(SpillBudgetExceededException::class.java)
+            refused as SpillBudgetExceededException
+            assertThat(refused.spillBytes).describedAs("only the magic was metered").isEqualTo(4)
+        }
+        assertThat(openFds()).describedAs("descriptors after three flush-time refusals").isLessThanOrEqualTo(before + 2)
+    }
+
     // ---- DVs on trusted runs ------------------------------------------------------
 
     @Test
