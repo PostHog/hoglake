@@ -68,8 +68,9 @@ class BackendUnavailableErrorMappingTest {
      * A replay-unsafe unknown outcome (#682): same status and code, so a
      * client that keys on the code still learns the write may be durable,
      * but NO Retry-After, because a blind replay would truncate twice, be
-     * refused as already applied, or register a keyless commit's files a
-     * second time. The DDL's detail says so instead of naming an
+     * refused as already applied, register a keyless commit's files a
+     * second time, or undo a write that landed in between. The DDL's and
+     * the unconditional set's details say so instead of naming an
      * idempotency_key the route does not take; the keyless commit's names
      * the key the caller should have sent.
      */
@@ -94,10 +95,17 @@ class BackendUnavailableErrorMappingTest {
                             WriteReplay.KEYLESS_COMMIT,
                         )
                     }
+                    get("/unconditional") {
+                        throw HoglakeException.CommitOutcomeUnknown(
+                            "options-patch:tx-4",
+                            "the owner failed",
+                            WriteReplay.UNCONDITIONAL,
+                        )
+                    }
                 }
             }
             val mapper = wireObjectMapper()
-            for (path in listOf("/ddl", "/keyless")) {
+            for (path in listOf("/ddl", "/keyless", "/unconditional")) {
                 val response = client.get(path)
                 assertThat(response.status).describedAs(path).isEqualTo(HttpStatusCode.ServiceUnavailable)
                 assertThat(response.headers[HttpHeaders.RetryAfter]).describedAs(path).isNull()
@@ -112,6 +120,9 @@ class BackendUnavailableErrorMappingTest {
                 .doesNotContain("idempotency_key")
             assertThat(mapper.readTree(client.get("/keyless").bodyAsText())["detail"].asText())
                 .contains("send an idempotency_key", "a second time", "ch:c:tx-3")
+            assertThat(mapper.readTree(client.get("/unconditional").bodyAsText())["detail"].asText())
+                .contains("undo", "a write that landed after it", "options-patch:tx-4")
+                .doesNotContain("idempotency_key")
         }
 
     /**

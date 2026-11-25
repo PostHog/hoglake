@@ -6,6 +6,7 @@ import com.posthog.hoglake.api.toDto
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
+import com.posthog.hoglake.model.WriteReplay
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -230,7 +232,8 @@ class HogliteCatalogStoreTest {
         return when {
             sql.contains("sqlite_master") && sql.contains("'meta'") -> if (t.name == null) 0 else 1
             sql == HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL -> foreignKeys
-            sql.contains("dropping = 0") -> if (t.dropping) 0 else 1
+            sql == HogliteCatalogStore.NAME_GUARD_SQL -> if (t.name == args!![0].asText()) 1 else 0
+            sql == HogliteCatalogStore.DROP_FENCE_SQL -> if (t.dropping) 0 else 1
             nonEmpty != null && sql.contains(nonEmpty!!.first) -> nonEmpty!!.second
             sql == "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL" ->
                 if (nsArg().dropped) 0 else 1
@@ -321,8 +324,16 @@ class HogliteCatalogStoreTest {
         assertThat(requests[2]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM sqlite_master")
         // The enforcement probe is statement 1, still before any DDL.
         assertThat(txStatements.single()[1]).isEqualTo(HogliteCatalogStore.FOREIGN_KEYS_PROBE_SQL)
+        // Snapshot 0 is stamped by the engine's clock in the transaction, not
+        // a time this pod bound (#672): author and message are the only
+        // parameters.
+        val boot = txStatements.single()
+        assertThat(boot[boot.size - 2]).isEqualTo(
+            "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
+                "VALUES (0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, 0)",
+        )
         // The new catalog is read back in the transaction, not after it (#682).
-        assertThat(txStatements.single().last()).isEqualTo(store.metaSql)
+        assertThat(boot.last()).isEqualTo(store.metaSql)
         assertThat(requests).hasSize(3)
         assertThat(resolved.get()).isEqualTo(1)
     }
@@ -442,6 +453,103 @@ class HogliteCatalogStoreTest {
             .hasMessageContaining("'gone'")
     }
 
+    /**
+     * The resolver is the caller's mapping, and a wrong one (a token whose
+     * `cat` is one catalog and whose `rtg.t` is another's tenant) must not
+     * serve the other catalog under the requested name (#670). The answer
+     * is the missing-catalog 404, naming only the requested catalog.
+     */
+    @Test
+    fun `get of a catalog whose tenant holds another catalog is NotFound and does not name that catalog`() {
+        seed("t-acme-1", "globex") // acme's tenant id holds globex
+
+        val failure = catchThrowable { store.getCatalog("acme") }
+
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("'acme'")
+        assertThat(failure.message).doesNotContain("globex")
+    }
+
+    @Test
+    fun `a read of a catalog whose tenant holds another catalog is NotFound`() {
+        seed("t-acme-1", "globex")
+        usage = listOf(100, 20, 3)
+
+        assertThat(catchThrowable { store.storageUsage("acme") })
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("'acme'")
+        // The containment read answers "no catalog" rather than globex's mark.
+        tenants["t-acme-1"]!!.namespaces += Ns(1, "team_42", field = "team_id", value = 42)
+        assertThat(store.liveContainment("acme", "team_42")).isNull()
+    }
+
+    /**
+     * A namespace- or table-scoped write answers from its pre-flight read
+     * before the transaction: a stale expected id is a 409, a contained
+     * namespace a 403, a stale table UUID a 409 carrying the live one.
+     * Under a mis-mapped tenant those would be the OTHER catalog's rows,
+     * so the pre-flight read (liveNamespace, with the meta row) refuses
+     * first with the plain missing-catalog 404, and nothing is sent.
+     */
+    @Test
+    fun `a write to a catalog whose tenant holds another catalog is NotFound before its pre-flight answers`() {
+        seed("t-acme-1", "globex")
+        val t = tenants["t-acme-1"]!!.apply { namespaces += Ns(1, "team_42", field = "team_id", value = 42) }
+
+        // Would be CommitConflict (identity) or Forbidden (contained) from globex's rows.
+        val drop = catchThrowable { store.dropNamespace("acme", "team_42", 99, "me", "drop", false) }
+        // Would be TableRecreated, naming globex's live table UUID.
+        val truncate = catchThrowable { store.truncateTable("acme", "team_42", "t", UUID.randomUUID(), "me", "cut") }
+
+        for (failure in listOf(drop, truncate)) {
+            assertThat(failure)
+                .isExactlyInstanceOf(HoglakeException.NotFound::class.java)
+                .hasMessageContaining("'acme'")
+            assertThat(failure.message).doesNotContain("globex", "contained", "identity", "incarnation")
+        }
+        assertThat(writes()).isEmpty()
+        assertThat(t.byId(1).dropped).isFalse()
+    }
+
+    /**
+     * A write whose pre-flight reads pass (here, the tenant is remapped
+     * between them and the transaction; the same shape as a write with
+     * no pre-flight read) reaches the engine, and the fence's name guard
+     * refuses it inside the transaction, so nothing is written to the
+     * other catalog and the answer is the plain missing-catalog 404.
+     */
+    @Test
+    fun `a write that reaches another catalog's tenant is refused by the name guard and writes nothing`() {
+        seed("t-acme-1", "acme")
+        val t = tenants["t-acme-1"]!!.apply { namespaces += Ns(1, "ns") }
+        beforeWrite = { it.name = "globex" }
+
+        val failure = catchThrowable { store.dropNamespace("acme", "ns", null, "me", "drop", true) }
+
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("'acme'")
+        assertThat(failure.message).doesNotContain("globex", "being dropped")
+        assertThat(writes().single()[0]).isEqualTo(HogliteCatalogStore.NAME_GUARD_SQL)
+        assertThat(t.byId(1).dropped).isFalse()
+    }
+
+    @Test
+    fun `drop of a catalog whose tenant holds another catalog is NotFound and deletes nothing`() {
+        seed("t-acme-1", "globex")
+
+        val failure = catchThrowable { store.dropCatalog("acme", null, null) }
+
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("'acme'")
+        assertThat(failure.message).doesNotContain("globex")
+        assertThat(tenants["t-acme-1"]!!.name).isEqualTo("globex")
+        assertThat(tenants["t-acme-1"]!!.dropping).isFalse()
+        assertThat(requests.filterNot { it.contains("/query") }).isEmpty()
+    }
+
     @Test
     fun `list reads the named catalogs in one batch and skips missing or foreign tenants`() {
         seed("t-a-1", "a")
@@ -496,7 +604,7 @@ class HogliteCatalogStoreTest {
         assertThat(tenants).isEmpty()
         val writes = requests.filterNot { it.contains("/query") }
         assertThat(writes).hasSize(3)
-        assertThat(writes[0]).startsWith("POST /v1/t/t-wh-1/tx :: SELECT COUNT(*) FROM namespaces")
+        assertThat(writes[0]).startsWith("POST /v1/t/t-wh-1/tx :: ${HogliteCatalogStore.NAME_GUARD_SQL}")
         assertThat(writes[1]).isEqualTo("POST /v1/t/t-wh-1/release")
         assertThat(writes[2]).isEqualTo("DELETE /v1/tenants/t-wh-1")
     }
@@ -525,20 +633,36 @@ class HogliteCatalogStoreTest {
 
     // ---- namespace containment -------------------------------------------
 
+    /**
+     * An authority refusal after the fence keeps its status, but its
+     * detail names the fence it leaves behind (#680: a token can expire
+     * inside the release/delete loop).
+     */
     @ParameterizedTest
     @ValueSource(ints = [401, 403])
-    fun `release authority refusal retains its definite API type`(status: Int) {
+    fun `release authority refusal retains its definite API type and names the fence`(status: Int) {
         seed("t-wh-1", "wh")
         authorityRefusal = "/v1/t/t-wh-1/release" to status
         val expected =
             if (status == 401) HoglakeException.Unauthenticated::class.java else HoglakeException.Forbidden::class.java
-        assertThat(catchThrowable { store.dropCatalog("wh", null, null) }).isInstanceOf(expected)
+        val failure = catchThrowable { store.dropCatalog("wh", null, null) }
+        assertThat(failure).isExactlyInstanceOf(expected)
+        assertThat(failure).hasMessageContaining("the catalog is fenced")
+        assertThat(failure).hasMessageContaining("sending DELETE again with valid authority finishes the drop")
+        assertThat(failure.cause).isInstanceOf(expected)
+        assertThat(tenants["t-wh-1"]!!.dropping).isTrue()
         assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
     }
 
+    /**
+     * The fence has applied by the time the release runs, so any other
+     * refusal of it (a proxy's 502 included) is the fence's unknown
+     * outcome (#682), not a raw [HogliteRejected] that answers 500. A 409
+     * is "not owned here", and the delete goes ahead.
+     */
     @ParameterizedTest
-    @ValueSource(ints = [404, 409, 413])
-    fun `release preserves existing non-authentication refusal semantics`(status: Int) {
+    @ValueSource(ints = [404, 409, 413, 502])
+    fun `a release refusal after the fence is the fence's unknown outcome`(status: Int) {
         seed("t-wh-1", "wh")
         authorityRefusal = "/v1/t/t-wh-1/release" to status
         val failure = catchThrowable { store.dropCatalog("wh", null, null) }
@@ -546,8 +670,12 @@ class HogliteCatalogStoreTest {
             assertThat(failure).isNull()
             assertThat(requests.any { it.startsWith("DELETE") }).isTrue()
         } else {
-            assertThat(failure).isExactlyInstanceOf(HogliteRejected::class.java)
-            assertThat((failure as HogliteRejected).status).isEqualTo(status)
+            assertThat(failure).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val unknown = failure as HoglakeException.CommitOutcomeUnknown
+            assertThat(unknown.txid).startsWith("drop-fence:")
+            assertThat(unknown.replay).isEqualTo(WriteReplay.DDL)
+            assertThat(unknown.cause).isNotInstanceOf(HogliteRejected::class.java)
+            assertThat(tenants["t-wh-1"]!!.dropping).isTrue()
             assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
         }
     }
@@ -622,8 +750,9 @@ class HogliteCatalogStoreTest {
         assertThat(t.byId(1).field).isEqualTo("team_id")
         assertThat(t.byId(1).value).isEqualTo(42)
         val tx = writes().single()
-        // The drop fence, then the guards in CatalogService's order, then the UPDATE.
+        // The fence (name guard, drop fence), then the guards in CatalogService's order, then the UPDATE.
         assertThat(tx.map { it.substringBefore(" WHERE") }).containsExactly(
+            "SELECT COUNT(*) FROM meta",
             "SELECT COUNT(*) FROM meta",
             "SELECT COUNT(*) FROM namespaces",
             "SELECT COUNT(*) FROM namespaces",
@@ -634,8 +763,10 @@ class HogliteCatalogStoreTest {
             "SELECT COUNT(*) FROM namespaces",
             "UPDATE namespaces SET contained_field = ?, contained_value = ?",
         )
-        assertThat(tx[2]).contains("contained_field IS NOT NULL")
-        assertThat(tx[7]).contains("contained_field = ? AND contained_value = ?")
+        assertThat(tx[0]).isEqualTo(HogliteCatalogStore.NAME_GUARD_SQL)
+        assertThat(tx[1]).isEqualTo(HogliteCatalogStore.DROP_FENCE_SQL)
+        assertThat(tx[3]).contains("contained_field IS NOT NULL")
+        assertThat(tx[8]).contains("contained_field = ? AND contained_value = ?")
     }
 
     @Test
@@ -872,5 +1003,6 @@ class HogliteCatalogStoreTest {
         val failure = catchThrowable { store.createNamespace("wh", "ns", null, null) }
 
         assertThat(failure).isInstanceOf(HoglakeException.NotFound::class.java).hasMessageContaining("being dropped")
+        assertThat(tenants["t-wh-1"]!!.namespaces).isEmpty()
     }
 }

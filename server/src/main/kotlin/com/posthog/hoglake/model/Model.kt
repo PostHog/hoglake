@@ -2630,22 +2630,25 @@ data class ChangesPlan(
  * 503 invites one with `Retry-After` (#682). Every hoglite write is one
  * engine transaction under a fresh txid, so an API caller's retry is a
  * NEW transaction; the server's own retry of the same txid is exactly-once
- * and is not what this classifies. `runTx` defaults to [CONVERGES]; the
- * write whose replay does not converge names its class at its call.
+ * and is not what this classifies. The replay runs after the original
+ * applied and after anything another writer did in between, so a write
+ * converges only when its replay is a no-op against both. `runTx`
+ * defaults to [CONVERGES]; the write whose replay does not converge
+ * names its class at its call.
  */
 enum class WriteReplay {
     /**
      * The replay reaches the same state and answers 200, so the 503
      * carries `Retry-After`. `runTx`'s default, so every write not named
      * below: a commit under its idempotency_key (the receipt is
-     * replayed), an offset commit (an equal re-commit is a no-op), an
-     * options patch, a containment mark or clear, an upload claim (keyed
-     * by its upload id), renewal or abandonment, a table creation's
-     * prepare, publish or abort (keyed by its operation id), the
-     * maintenance writes (server README, "Backends"), and one DDL: a
-     * catalog drop, whose fence transaction opts out of the fence, so a
-     * replay passes the same emptiness guards, sets `dropping = 1` again
-     * and goes on to the idempotent release and delete.
+     * replayed), an upload claim (keyed by its upload id), renewal or
+     * abandonment, a table creation's prepare, publish or abort (keyed by
+     * its operation id), and the maintenance writes (server README,
+     * "Backends"). A maintenance task's replay runs the NEXT batch (an
+     * expiry with `batch=1` plans from the floor the lost run advanced;
+     * a `schedule-expired` with `limit=1` fences the next eligible
+     * claim): work the next run would do anyway, which undoes nothing
+     * and is refused by nothing.
      */
     CONVERGES,
 
@@ -2658,12 +2661,28 @@ enum class WriteReplay {
     KEYLESS_COMMIT,
 
     /**
-     * A DDL other than a catalog drop: the replay applies a second time
-     * (a truncate ends the files committed in between; a sort-order
-     * change re-applies) or is refused as already applied (a create
-     * answers 409, a namespace, table or view drop 404, an add-column 422
-     * "already exists"), which reads as the DDL's own failure. No
-     * `Retry-After`; the detail says to read the object before deciding.
+     * A write that sets a value without a guard on the value it replaces:
+     * an options patch, a containment mark or clear, an offset commit. A
+     * replay alone converges, but one after another writer's change
+     * undoes that change (a patch that disabled `consumer_floor`
+     * disables the floor another operator re-enabled, and expiry passes
+     * active consumer offsets; a clear clears a mark set in between) or
+     * is refused by it (an offset behind one another worker committed
+     * answers 409 `offset_regression` for a write that applied). No
+     * `Retry-After`; the detail says to read the current value before
+     * deciding.
+     */
+    UNCONDITIONAL,
+
+    /**
+     * A DDL: the replay applies a second time (a truncate ends the files
+     * committed in between; a sort-order change re-applies; a catalog
+     * drop deletes a catalog another operator recreated under the name
+     * after the drop finished) or is refused as already applied (a
+     * create answers 409, a namespace, table or view drop 404, an
+     * add-column 422 "already exists"), which reads as the DDL's own
+     * failure. No `Retry-After`; the detail says to read the object
+     * before deciding.
      */
     DDL,
 }
@@ -3008,13 +3027,18 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
             when (replay) {
                 WriteReplay.CONVERGES ->
                     "write outcome unknown: it may or may not have been applied. A retry converges: a commit " +
-                        "replays its receipt under the same idempotency_key, and any other write lands the " +
-                        "same state again (backend transaction '$txid'): $detail"
+                        "replays its receipt under the same idempotency_key, a maintenance task runs its next " +
+                        "batch, and any other write lands the same state again (backend transaction " +
+                        "'$txid'): $detail"
                 WriteReplay.KEYLESS_COMMIT ->
                     "commit outcome unknown: it may or may not have been applied. Do not retry it blindly: " +
                         "without an idempotency_key a replay registers the same files a second time. Read the " +
                         "table to learn whether it landed, and send an idempotency_key with every commit so " +
                         "that a retry is exactly-once (backend transaction '$txid'): $detail"
+                WriteReplay.UNCONDITIONAL ->
+                    "write outcome unknown: it may or may not have been applied. Do not retry it blindly: " +
+                        "a replay would undo, or be refused by, a write that landed after it. Read the " +
+                        "current value to learn whether it landed (backend transaction '$txid'): $detail"
                 WriteReplay.DDL ->
                     "operation outcome unknown: it may or may not have been applied. Do not retry it blindly: " +
                         "a replay would apply it a second time or be refused as already applied. Read the " +

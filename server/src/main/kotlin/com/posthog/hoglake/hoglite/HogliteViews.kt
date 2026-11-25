@@ -115,6 +115,7 @@ internal class HogliteViews(
         name: String,
     ): ViewInfo =
         store.catalogOperation(catalog) {
+            // liveNamespace reads the meta row too: the catalog 404 first, as on the Postgres path.
             val ns = store.liveNamespace(catalog, namespace)
             return viewRow(catalog, ns.namespaceId, namespace, name)
                 ?: throw HoglakeException.NotFound("view '$namespace.$name' in catalog '$catalog'")

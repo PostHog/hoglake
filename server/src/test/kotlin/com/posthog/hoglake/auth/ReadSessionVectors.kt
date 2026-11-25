@@ -41,6 +41,45 @@ internal object ReadSessionVectors {
             """.trimIndent(),
         ) as ObjectNode
 
+    /**
+     * PROPOSED (docs/auth.md, "Read sessions on a remote schema"): what the
+     * caller rule answers for a verified read session and one requested
+     * catalog and namespace. `relay` is "relay" when the Client may forward
+     * the request and "not_found" when it answers the 404 of a missing
+     * namespace. The Host applies the same rule to the claims before it
+     * reads the namespace's mark.
+     */
+    private fun relay(root: ObjectNode) {
+        val vectors = root.putArray("relay")
+
+        fun add(
+            name: String,
+            catalog: String,
+            namespace: String,
+            relay: String,
+        ) {
+            // Every case is the same session: only the request differs.
+            val claims = claims()
+            val header = mapper.createObjectNode().put("alg", "ES256").put("kid", ContractVectors.KID).put("typ", "JWT")
+            vectors.addObject().apply {
+                put("name", name)
+                put("verify_at", VERIFY_AT)
+                set<ObjectNode>("claims", claims)
+                put("token", ContractVectors.sign(header, claims))
+                putObject("request").put("catalog", catalog).put("namespace", namespace)
+                putObject("expect").put("read", "accept").put("relay", relay)
+            }
+        }
+        add("the team the session holds", "example-catalog", "team_42", "relay")
+        add("another team", "example-catalog", "team_43", "not_found")
+        // The organization and the team are right; only the requested catalog differs.
+        add("another catalog, same organization and team", "other-catalog", "team_42", "not_found")
+        add("a leading zero", "example-catalog", "team_042", "not_found")
+        add("another letter case", "example-catalog", "TEAM_42", "not_found")
+        add("a name outside the family", "example-catalog", "reports", "not_found")
+        add("the family label itself", "example-catalog", "team", "not_found")
+    }
+
     fun document(): ObjectNode {
         val root = mapper.createObjectNode()
         root.put(
@@ -101,6 +140,7 @@ internal object ReadSessionVectors {
         }
         add("unbound catalog") { (it["grants"][3] as ObjectNode).put("catalog", "other") }
         add("write action") { (it["grants"][2] as ObjectNode).putArray("actions").add("s3:PutObject") }
+        relay(root)
         return root
     }
 }

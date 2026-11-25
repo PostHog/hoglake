@@ -499,7 +499,13 @@ paths:
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/Validation" }
         "503":
-          description: The prefix could not be verified within its time bound; nothing was marked.
+          description: >
+            `containment_unverified`: the prefix could not be verified
+            within its time bound; nothing was marked. Or a backend
+            failure (see BackendUnavailable), including
+            `commit_outcome_unknown` with no Retry-After: the mark may or
+            may not have landed, and a replay would undo a clear or mark
+            that landed after it, so read the namespace before deciding.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -555,6 +561,11 @@ paths:
         `at_timestamp` are resolved on the serving host, against the
         catalogs that hold its tables, never this catalog: list a remote
         schema at head or with `at_timestamp`.
+
+
+        A dedicated read session (docs/auth.md, "Read sessions on a
+        remote schema") gets `TableSummaryIdentity` items: no counts and
+        no sizes. Every other caller gets `TableSummary` items.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -567,7 +578,10 @@ paths:
             application/json:
               schema:
                 type: array
-                items: { $ref: "#/components/schemas/TableSummary" }
+                items:
+                  oneOf:
+                    - { $ref: "#/components/schemas/TableSummary" }
+                    - { $ref: "#/components/schemas/TableSummaryIdentity" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
@@ -970,6 +984,113 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}:
+    get:
+      operationId: getLocalOnlyNamespace
+      summary: Dedicated read session only. The bound local namespace, never a relay.
+      description: >
+        Served only on a listener with a `read_session` binding
+        (docs/auth.md, "Local-only read routes"). The request uses the
+        dedicated read verifier. It reads only the bound namespace from
+        the configured Hoglite owner, also when a remote schema relays the
+        same name on the ordinary route. A verified session that names
+        another namespace gets 404 without a backend call. The dedicated
+        token carries no namespace name: the operator binding is the only
+        namespace authority. Every answer except 405, 422 and 501 carries
+        `X-Hoglake-Local-Only: true`. A client reads a 404 as absence only
+        with that marker.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Namespace
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
+    get:
+      operationId: getLocalOnlyTable
+      summary: Dedicated read session only. The bound local table, never a relay.
+      description: >
+        As getLocalOnlyNamespace, for the bound table. The only accepted
+        query is none or exactly `totals=false`. The answer sets
+        `Cache-Control: no-store` and omits totals.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: totals
+          required: false
+          schema: { type: boolean, enum: [false] }
+      responses:
+        "200":
+          description: Table
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
+    get:
+      operationId: planLocalOnlyScan
+      summary: Dedicated read session only. The pinned scan of the bound local table, never a relay.
+      description: >
+        As getLocalOnlyNamespace, for the pinned scan of the bound table.
+        The query is exactly `snapshot` and `table_uuid`, each once, in
+        canonical form. Every returned data file and deletion vector path
+        must lie inside the verified storage grants, or the answer is 403.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: snapshot
+          required: true
+          schema: { type: integer, format: int64, minimum: 0 }
+        - in: query
+          name: table_uuid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Scan plan
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ScanFile" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
@@ -1413,6 +1534,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/expire:
     post:
@@ -1435,6 +1557,7 @@ paths:
               schema: { $ref: "#/components/schemas/ExpiryResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/compact:
     post:
@@ -1473,6 +1596,7 @@ paths:
               schema: { $ref: "#/components/schemas/CompactionResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/rehydrate:
     post:
@@ -2497,7 +2621,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Commit admission timed out; retry the identical request
+          description: >
+            Commit admission timed out; retry the identical request. Or
+            `commit_outcome_unknown`: the backend may or may not have
+            applied the commit, and the identical request (its
+            idempotency_key) replays the receipt or applies it once.
 
   /catalogs/{catalog}/uploads/{upload}:
     put:
@@ -2726,7 +2854,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Commit admission timed out; retry the identical request
+          description: >
+            Commit admission timed out; retry the identical request. Or
+            `commit_outcome_unknown`: the backend may or may not have
+            applied the commit, and the identical request (its
+            idempotency_key) replays the receipt or applies it once.
 
   /catalogs/{catalog}/commit/transaction:
     post:
@@ -2848,7 +2980,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Commit admission timed out; retry the identical request
+          description: >
+            Commit admission timed out; retry the identical request. Or
+            `commit_outcome_unknown`: the backend may or may not have
+            applied the commit, and the identical request (its
+            idempotency_key) replays the receipt or applies it once.
 
   /catalogs/{catalog}/commit/deletes/prepared:
     post:
@@ -2947,7 +3083,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Commit admission timed out; retry the identical request
+          description: >
+            Commit admission timed out; retry the identical request. Or
+            `commit_outcome_unknown`: the backend may or may not have
+            applied the commit, and the identical request (its
+            idempotency_key) replays the receipt or applies it once.
 
   /catalogs/{catalog}/commit/mutations/prepared:
     post:
@@ -3062,7 +3202,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Commit admission timed out; retry the identical request
+          description: >
+            Commit admission timed out; retry the identical request. Or
+            `commit_outcome_unknown`: the backend may or may not have
+            applied the commit, and the identical request (its
+            idempotency_key) replays the receipt or applies it once.
 
   /catalogs/{catalog}/commit/replacements/prepared:
     post:
@@ -3210,7 +3354,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Commit admission timed out; retry the identical request
+          description: >
+            Commit admission timed out; retry the identical request. Or
+            `commit_outcome_unknown`: the backend may or may not have
+            applied the commit, and the identical request (its
+            idempotency_key) replays the receipt or applies it once.
 
   /catalogs/{catalog}/commit:
     post:
@@ -3316,9 +3464,17 @@ paths:
             lock. Error code `commit_queue_timeout`. Explicit, retryable
             backpressure — never a generic 500; back off per the
             Retry-After header and retry the identical commit.
+            `commit_outcome_unknown` (a network-reached backend): the
+            commit may or may not have been applied. With an
+            `idempotency_key` it carries Retry-After and the identical
+            commit replays the receipt or applies it once; WITHOUT one it
+            carries no Retry-After, because a replay registers the same
+            files a second time: read the table before deciding.
           headers:
             Retry-After:
-              description: Seconds to back off before retrying.
+              description: >
+                Seconds to back off before retrying. Absent on a keyless
+                commit's `commit_outcome_unknown`.
               schema: { type: integer }
           content:
             application/json:
@@ -3740,7 +3896,70 @@ components:
         default 1 group).
       schema: { type: integer }
 
+  headers:
+    LocalOnlyMarker:
+      description: >
+        The marker of a local-only route. The server sends it on every
+        answer to a well-formed local-only GET on a listener that serves
+        these routes. A server that predates the routes never sends it,
+        so a client refuses every answer without it.
+      schema: { type: string, enum: ["true"] }
+
   responses:
+    LocalOnlyBadRequest:
+      description: A malformed path segment, query or body on a local-only route.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyUnauthenticated:
+      description: >
+        No dedicated read token, or one that the dedicated read verifier
+        refuses. Never absence.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyForbidden:
+      description: The owner refused the read, or a returned path is outside the storage grants.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyNotFound:
+      description: >
+        Ordinary absence: a name outside the binding, without a backend
+        call, or an absent bound object. Absence only with the marker.
+      headers:
+        X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyMethodNotAllowed:
+      description: A method other than GET on a local-only route. No marker.
+      headers:
+        Allow:
+          schema: { type: string, enum: ["GET"] }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyInvalidRoute:
+      description: A path under `/v1/local-only` that is not one of the three routes. No marker.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    LocalOnlyNotConfigured:
+      description: >
+        The listener has no `read_session` binding. This includes the
+        public listener and auth mode `off`. No marker.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
     Unauthenticated:
       description: >
         No credential, or one that does not verify. `error` is a closed
@@ -3821,22 +4040,31 @@ components:
         `commit_outcome_unknown`: a write that the backend may or may not
         have applied. It carries Retry-After when a replay of the request
         converges, which is the default: a commit with an
-        `idempotency_key` (the retry is exactly-once), an offset commit,
-        an options patch, a containment mark or clear, the upload claim
-        verbs, table-creation prepare, publish and abort, the maintenance
-        tasks, and a catalog drop (the drop that lost its answer left the
-        catalog fenced; the replay passes the same emptiness guards and
-        finishes it). It carries no Retry-After when a replay would not
-        converge: a commit WITHOUT an `idempotency_key` (a replay
-        registers the same files a second time, as after a lost COMMIT
-        acknowledgement on PostgreSQL; send a key next time) and every
-        other DDL (create a catalog; create or drop a namespace, table or
-        view; truncate; alter), whose replay applies the DDL a second time
-        (a truncate ends files committed in between, a sort-order change
-        re-applies) or is refused as already applied (409, 404, or 422
-        for an added column): read the object to learn whether it landed
-        before deciding, as after a lost COMMIT acknowledgement (a 500)
-        on PostgreSQL. PostgreSQL admission failures may return
+        `idempotency_key` (the retry is exactly-once), the upload claim
+        verbs, table-creation prepare, publish and abort, and the
+        maintenance tasks. Following it on a maintenance task runs the
+        next batch: an expiry with `batch=1` plans from the floor the
+        lost run advanced, and `uploads/schedule-expired` with `limit=1`
+        fences the next eligible claim. It carries no Retry-After when a
+        replay would not converge: a commit WITHOUT an `idempotency_key`
+        (a replay registers the same files a second time, as after a lost
+        COMMIT acknowledgement on PostgreSQL; send a key next time); an
+        options patch, a containment mark or clear, and an offset commit,
+        whose replay undoes a write that landed in between (a
+        `consumer_floor` another operator re-enabled) or is refused by it
+        (409 `offset_regression` behind an offset another worker
+        committed): read the current value before deciding; and every DDL
+        (create or drop a catalog, namespace, table or view; truncate;
+        alter), whose replay applies the DDL a second time (a truncate
+        ends files committed in between, a sort-order change re-applies,
+        a catalog drop deletes a catalog recreated under the same name)
+        or is refused as already applied (409, 404, or 422 for an added
+        column): read the object to learn whether it landed before
+        deciding, as after a lost COMMIT acknowledgement (a 500) on
+        PostgreSQL. A catalog read does not show a drop's write fence, so
+        a catalog drop's detail names what does: a fenced catalog answers
+        every write 404 (it is being dropped), and DELETE again finishes
+        that drop. PostgreSQL admission failures may return
         commit_queue_timeout; containment verification may return
         containment_unverified. Both are retryable.
       headers:
@@ -4318,6 +4546,18 @@ components:
           minItems: 1
           items: { $ref: "#/components/schemas/ColumnDef" }
 
+    TableSummaryIdentity:
+      type: object
+      description: >
+        A table list item for a dedicated read session: the identity
+        fields of TableSummary and none of its counts or sizes.
+      required: [name, table_uuid]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+        comment: { type: string }
+        earliest_snapshot_id: { type: integer, format: int64 }
     TableSummary:
       type: object
       required: [name, table_uuid, record_count, file_count, file_size_bytes,

@@ -2,6 +2,7 @@ package com.posthog.hoglake.hoglite
 
 import com.posthog.hoglake.model.CatalogOptions
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.WriteReplay
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.service.OptionsBackend
 import com.posthog.hoglake.service.PatchField
@@ -92,12 +93,18 @@ internal class HogliteOptions(
                             "SELECT snapshot_retention_seconds, consumer_floor, earliest_snapshot_id " +
                                 "FROM meta WHERE id = 1",
                         )
-                    // Replay-safe (runTx's default): the patch sets values, and
-                    // the attribution guard passes against a retention it
-                    // already lowered.
+                    // Not replay-safe (#682): the patch sets values without a
+                    // guard on the ones it replaces, so a replay after another
+                    // operator's patch undoes it (a consumer_floor re-enabled
+                    // in between is disabled again).
                     val row =
-                        store.runTx(catalog, HogliteCatalogStore.freshTxid("options-patch"), null, tx)[readback]
-                            .firstRow()!!
+                        store.runTx(
+                            catalog,
+                            HogliteCatalogStore.freshTxid("options-patch"),
+                            null,
+                            tx,
+                            replay = WriteReplay.UNCONDITIONAL,
+                        )[readback].firstRow()!!
                     CatalogOptions(row[0].asLongOrNull(), row[1].asLong() != 0L, row[2].asLong())
                 }
             }

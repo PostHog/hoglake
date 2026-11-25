@@ -164,25 +164,40 @@ server itself retries that txid exactly-once within its budget; an API
 caller's retry is a new transaction, so whether the 503 invites one with
 `Retry-After` is decided per write at its `runTx` call (`WriteReplay`,
 #682). The rule: a write is replay-safe by default, and names itself
-replay-unsafe when a blind replay would not converge. Replay-unsafe, so
-no `Retry-After` and a detail that says to read before deciding: a
-commit WITHOUT an `idempotency_key` (duplicate paths are legal, so a
-replay registers the same files a second time; the detail says to send a
-key next time), and every DDL but one, whose replay applies a second
-time (a truncate ends the files committed in between, a sort-order
-change re-applies) or is refused as already applied (a create 409, a
-drop 404, an add-column 422 "already exists"): a catalog create,
-namespace, table and view create and drop, truncate, alter. Everything
-else keeps the header: a commit under its `idempotency_key` (the receipt
-is replayed), an offset commit (an equal re-commit is a no-op), an
-options patch, a containment mark or clear, an upload claim (keyed by
+replay-unsafe when a blind replay would not converge. The replay runs
+after the original applied AND after whatever another writer did in
+between, so it converges only when it is a no-op against both.
+Replay-unsafe, so no `Retry-After` and a detail that says to read before
+deciding: a commit WITHOUT an `idempotency_key` (duplicate paths are
+legal, so a replay registers the same files a second time; the detail
+says to send a key next time); a write that sets a value without a guard
+on the one it replaces, whose replay undoes a later write or is refused
+by it: an options patch (a patch that disabled `consumer_floor`
+disables the floor another operator re-enabled in between), a
+containment mark or clear (a clear clears a mark set in between), an
+offset commit (behind an offset another worker committed in between it
+answers 409 `offset_regression` for a write that applied); and every
+DDL, whose replay applies a second time (a truncate ends the files
+committed in between, a sort-order change re-applies, a catalog drop
+deletes the catalog another operator recreated under the name after the
+drop finished: the request names the catalog, not the incarnation) or is
+refused as already applied (a create 409, a drop 404, an add-column 422
+"already exists"): a catalog create and drop, namespace, table and view
+create and drop, truncate, alter. A catalog drop's failure after its
+fence applied (the release or the tenant delete, whatever it answered
+short of an authority refusal) is the fence's unknown outcome too. An
+authority refusal there (a token that expired inside the drop, #680)
+keeps its 401 or 403, and its detail says the catalog is fenced. A
+read of the catalog does not show the fence, so every such detail names
+what does: a fenced catalog answers every write 404 "it is being
+dropped", and DELETE again finishes that drop. Everything else keeps the header: a commit under its
+`idempotency_key` (the receipt is replayed), an upload claim (keyed by
 its upload id), renewal, abandonment or sweep, a table creation's
-prepare, publish or abort (keyed by its operation id), the maintenance
-tasks, and the one DDL whose replay converges: a catalog drop, whose
-fence transaction opts out of the fence, so a replay of a drop that lost
-its answer passes the same emptiness guards (nothing can write past the
-fence), sets `dropping = 1` again, and goes on to the release and delete,
-which are idempotent. Every DDL reads its answer IN its transaction (an
+prepare, publish or abort (keyed by its operation id), and the
+maintenance tasks, whose replay runs the NEXT batch (an expiry with
+`batch=1` plans from the floor the lost run advanced; a
+`schedule-expired` with `limit=1` fences the next eligible claim): work
+the next run would do anyway. Every DDL reads its answer IN its transaction (an
 alter's totals and a catalog create's meta row included), as
 PostgreSQL's `AlterService` does: a read after the commit could spend
 its retry budget and answer `backend_unavailable` with `Retry-After` for
@@ -1818,10 +1833,12 @@ trusted-row maxima before allocating larger heads. Spill profiles and
 measured row maxima replace their metadata estimates.
 
 The spill estimate includes packed scratch for the producer's 20,000-row
-pages and fixed column/page objects. An eleven-leaf run now estimates
-19,216,564 bytes. Four runs reserve 76,866,256 bytes, compared with
-76,385,594 observed bytes. This remains an estimate, not a universal
-page-count or dictionary bound.
+pages and fixed column/page objects, plus 2% rounded-up headroom for
+observed calibration variation. An eleven-leaf run estimates 19,600,896
+bytes; four runs reserve 78,403,584 bytes. Previous measurements include
+76,385,594 bytes and, on macOS ARM64, 76,945,723 bytes. This remains an
+estimate, not a universal page-count or dictionary bound; actual profiles
+still govern the merge.
 
 Owned converters release completed nested groups.
 They transfer root ownership when records return.
@@ -2020,7 +2037,7 @@ chunks, retained heap at a full GC):
 | 8,000,000 | 160 | 147 MB | 82 MB | 1,206 MB |
 
 The chunk phase is FLAT in group size. The merge held ~6.6 MB per
-spilled run (above the writer) against the current ~18.3 MiB estimate.
+spilled run (above the writer) against the current ~18.7 MiB estimate.
 The output writer also stays flat.
 It buffers one output row group until close.
 The historical buffered cost is about 140 MiB for a 128 MiB target.

@@ -8,7 +8,6 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.http.HttpHeaders
-import io.ktor.http.HttpMethod
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
@@ -94,42 +93,44 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         isExport = { call, catalog -> selector.resolve(call, catalog) !is CatalogBinding.Local },
         refuseRemoteSchemas = selector::refuseRemoteSchemas.takeIf { selector.hasRemoteSchemas },
         scopedNamespace = { call, pending ->
-            if (call.request.httpMethod != HttpMethod.Get) {
-                null
-            } else {
-                selector.scopedNamespaceBinding(pending.catalog, pending.namespace)?.takeIf {
-                    it.matchesNamespace(call.request.httpMethod, call.attributes.getOrNull(RouteMatchKey))
-                }?.let { binding ->
-                    ScopedNamespaceRead {
-                        val expected = "/v1/catalogs/${binding.catalog}/namespaces/${binding.namespace}"
-                        val lengths = call.request.headers.getAll(HttpHeaders.ContentLength)
-                        if (call.request.uri != expected || (lengths != null && lengths != listOf("0")) ||
-                            call.request.headers.getAll(HttpHeaders.TransferEncoding) != null
-                        ) {
-                            throw BadRequestException("invalid scoped namespace request")
+            val match = call.attributes.getOrNull(RouteMatchKey)
+            if (call.verifiedBackendAuthority?.isReadSession == true &&
+                ReadSessionProfile.matchesNamespace(call.request.httpMethod, match) &&
+                selector.allowsReadSessionRoute(pending.catalog, pending.namespace)
+            ) {
+                ScopedNamespaceRead {
+                    val expected = "/v1/catalogs/${pending.catalog}/namespaces/${pending.namespace}"
+                    val lengths = call.request.headers.getAll(HttpHeaders.ContentLength)
+                    if (call.request.uri != expected || (lengths != null && lengths != listOf("0")) ||
+                        call.request.headers.getAll(HttpHeaders.TransferEncoding) != null
+                    ) {
+                        throw BadRequestException("invalid scoped namespace request")
+                    }
+                    // Bound end-of-stream detection, including HTTP/2 without a length.
+                    // Parent cancellation still propagates through withTimeoutOrNull.
+                    val empty =
+                        withTimeoutOrNull(5_000) {
+                            call.request.receiveChannel().readAvailable(ByteArray(1), 0, 1) == -1
                         }
-                        // Bound end-of-stream detection, including HTTP/2 without a length.
-                        // Parent cancellation still propagates through withTimeoutOrNull.
-                        val empty =
-                            withTimeoutOrNull(5_000) {
-                                call.request.receiveChannel().readAvailable(ByteArray(1), 0, 1) == -1
-                            }
-                        if (empty != true) throw BadRequestException("invalid scoped namespace request")
-                        runInterruptible { selector.readScopedNamespace(call, binding) }
+                    if (empty != true) throw BadRequestException("invalid scoped namespace request")
+                    runInterruptible {
+                        selector.readScopedNamespace(call, ReadSessionTarget(pending.catalog, pending.namespace))
                     }
                 }
+            } else {
+                null
             }
         },
         scopedTableRoute = { call, pending ->
             val match = call.attributes.getOrNull(RouteMatchKey)
-            val binding = selector.scopedNamespaceBinding(pending.catalog, pending.namespace)
-            binding != null &&
+            call.verifiedBackendAuthority?.isReadSession == true &&
                 (
-                    binding.matchesTable(call.request.httpMethod, match) ||
-                        binding.matchesScan(call.request.httpMethod, match)
+                    ReadSessionProfile.matchesTable(call.request.httpMethod, match) ||
+                        ReadSessionProfile.matchesScan(call.request.httpMethod, match)
                 ) &&
-                call.verifiedBackendAuthority?.readSessionBinding === binding
+                selector.allowsReadSessionRoute(pending.catalog, pending.namespace, match?.table)
         },
+        relaysReadSession = { selector.relaysReadSession(it) || selector.servesReadSession(it) },
     )
 }
 
@@ -146,6 +147,7 @@ private fun Application.installCallNamespaceGate(
     refuseRemoteSchemas: ((ApplicationCall, String, Collection<String>) -> Unit)? = null,
     scopedNamespace: (ApplicationCall, AuthDecision.ByNamespace) -> ScopedNamespaceRead? = { _, _ -> null },
     scopedTableRoute: (ApplicationCall, AuthDecision.ByNamespace) -> Boolean = { _, _ -> false },
+    relaysReadSession: (String) -> Boolean = { false },
 ) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
@@ -167,7 +169,11 @@ private fun Application.installCallNamespaceGate(
             // The table and scan routes execute terminal typed reads without legacy SQL.
             return@intercept
         }
-        if (selected == null && call.verifiedBackendAuthority?.readSessionBinding != null) {
+        // A read session on a remote schema or a served namespace goes on to
+        // isExport, which hands it that binding or the 404 of a missing namespace.
+        if (selected == null && call.verifiedBackendAuthority?.isReadSession == true &&
+            !relaysReadSession(pending.namespace)
+        ) {
             val refusal = HoglakeException.NotFound("namespace")
             countRefusal(
                 service,

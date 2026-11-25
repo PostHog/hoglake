@@ -37,12 +37,14 @@ import java.util.concurrent.atomic.AtomicReference
  * chosen write and then loses its answer, so the store sees exactly what
  * an owner that failed after durability shows it. The write that
  * converges on replay keeps `replaySafe` (and so its Retry-After); the
- * keyless commit and the DDL, whose replay would apply twice or be
- * refused, do not, and the replay itself is run here to show what the
- * invitation would have met. The catalog drop is the DDL that converges,
- * and has its own case. The relay can also let a DDL's answer through
- * and then fail every read after it, so a DDL that read its answer after
- * the commit would fail for a read that spent its retry budget.
+ * keyless commit, the unconditional set and the DDL, whose replay would
+ * apply twice, undo a write that landed in between, or be refused, do
+ * not, and the replay itself is run here to show what the invitation
+ * would have met. The catalog drop has its own cases: its hazard is a
+ * catalog recreated under the name. The relay can also let a DDL's
+ * answer through and then fail every read after it, so a DDL that read
+ * its answer after the commit would fail for a read that spent its retry
+ * budget, or answer one chosen engine request with a fixed status.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -63,7 +65,26 @@ class HogliteWriteReplayIntegrationTest {
         private val lose: AtomicReference<String?>,
         private val downAfter: AtomicReference<String?>,
         private val down: AtomicBoolean,
+        private val refuse: AtomicReference<Pair<Regex, Int>?>,
     ) {
+        /**
+         * Runs [write] with every engine request whose `METHOD path`
+         * matches [request] answered [status] by the relay, never
+         * forwarded, and returns what [write] threw.
+         */
+        fun refusing(
+            request: Regex,
+            status: Int,
+            write: () -> Unit,
+        ): Throwable? {
+            refuse.set(request to status)
+            try {
+                return catchThrowable(write)
+            } finally {
+                refuse.set(null)
+            }
+        }
+
         /**
          * Runs [write] with the answer of its first `prefix:` transaction
          * lost after the engine applied it, and returns the unknown outcome
@@ -138,6 +159,7 @@ class HogliteWriteReplayIntegrationTest {
         val lose = AtomicReference<String?>(null)
         val downAfter = AtomicReference<String?>(null)
         val down = AtomicBoolean(false)
+        val refuse = AtomicReference<Pair<Regex, Int>?>(null)
         val upstream = HttpClient.newHttpClient()
         val relay = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         relay.createContext("/") { ex ->
@@ -146,6 +168,13 @@ class HogliteWriteReplayIntegrationTest {
                 // Retried by the client as not applied until its budget is spent.
                 val bytes = "{\"code\":\"not_applied\",\"error\":\"reads down\"}".toByteArray()
                 ex.sendResponseHeaders(503, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+                return@createContext
+            }
+            val refusal = refuse.get()
+            if (refusal != null && refusal.first.matches("${ex.requestMethod} ${ex.requestURI.path}")) {
+                val bytes = "{\"error\":\"refused by the relay\"}".toByteArray()
+                ex.sendResponseHeaders(refusal.second, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
                 return@createContext
             }
@@ -184,7 +213,7 @@ class HogliteWriteReplayIntegrationTest {
         try {
             val catalog = HogliteConformanceEngine.uniqueName("replay")
             store.createCatalog(catalog, "s3://hoglake-it/$catalog")
-            body(Fixture(store, catalog, lose, downAfter, down))
+            body(Fixture(store, catalog, lose, downAfter, down, refuse))
         } finally {
             client.close()
             relay.stop(0)
@@ -196,41 +225,24 @@ class HogliteWriteReplayIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(
-        strings = [
-            "commit-keyed", "offset", "options-patch", "containment-mark", "containment-clear",
-            "upload-claim", "upload-renew", "upload-abandon",
-        ],
+        strings = ["commit-keyed", "upload-claim", "upload-renew", "upload-abandon"],
     )
     fun `a write whose replay converges keeps its retry invitation and a replay lands the same state`(write: String) =
         fixture { f ->
             val c = f.catalog
             f.store.createNamespace(c, "ns")
-            val t = f.store.createTable(c, "ns", "t", listOf(id))
-            val head = f.append("a.parquet").snapshotId
+            f.store.createTable(c, "ns", "t", listOf(id))
+            f.append("a.parquet")
             val key = UUID.randomUUID()
             val owner = UUID.randomUUID()
             val upload = UUID.randomUUID()
-            val team = NamespaceContainment("team_id", 7)
-            f.store.createNamespace(c, "team_7")
-            if (write == "containment-clear") f.store.setNamespaceContainment(c, "team_7", team, "op")
             if (write != "upload-claim") f.store.uploads.claim(c, upload, owner, "s3://hoglake-it/$c/up", "data")
             val claimed = f.rows("SELECT path FROM uploads WHERE upload_id = ?", upload.toString()).map { it[0] }
 
-            val prefix =
-                when (write) {
-                    "commit-keyed" -> "ch"
-                    "offset" -> "offset"
-                    "options-patch" -> "options-patch"
-                    "containment-mark", "containment-clear" -> "ns-containment"
-                    else -> write
-                }
+            val prefix = if (write == "commit-keyed") "ch" else write
             val action: () -> Any =
                 when (write) {
                     "commit-keyed" -> ({ f.append("b.parquet", key) })
-                    "offset" -> ({ f.store.commitOffset(c, "reader", t.tableUuid, head) })
-                    "options-patch" -> ({ f.store.options.patch(c, PatchField.Set(3600L), true, "test", "lower") })
-                    "containment-mark" -> ({ f.store.setNamespaceContainment(c, "team_7", team, "op") })
-                    "containment-clear" -> ({ f.store.setNamespaceContainment(c, "team_7", null, "op") })
                     "upload-claim" -> ({ f.store.uploads.claim(c, upload, owner, "s3://hoglake-it/$c/up", "data") })
                     "upload-renew" -> ({ f.store.uploads.renew(c, owner) })
                     else -> ({ f.store.uploads.abandon(c, owner, claimed.map { it as String }) })
@@ -241,9 +253,6 @@ class HogliteWriteReplayIntegrationTest {
                 {
                     listOf(
                         f.paths(),
-                        runCatching { f.store.getOffset(c, "reader", t.tableUuid).committedSnapshot }.getOrNull(),
-                        f.store.options.get(c),
-                        f.store.liveContainment(c, "team_7"),
                         f.rows("SELECT upload_id, owner, prefix, path, state FROM uploads ORDER BY upload_id"),
                     )
                 }
@@ -256,6 +265,72 @@ class HogliteWriteReplayIntegrationTest {
             assertThatCode { action() }.describedAs("the blind replay of '$write'").doesNotThrowAnyException()
             assertThat(state()).describedAs("the state after the replay of '$write'").isEqualTo(applied)
         }
+
+    /**
+     * A write that sets a value without a guard on the one it replaces: a
+     * replay alone would land the same state, but the replay the header
+     * invites runs after whatever another writer did in between, and
+     * undoes it or is refused by it.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["options-patch", "containment-mark", "containment-clear", "offset"])
+    fun `an unconditional set is reported without a retry invitation because its replay undoes a later write`(
+        write: String,
+    ) = fixture { f ->
+        val c = f.catalog
+        f.store.createNamespace(c, "ns")
+        val t = f.store.createTable(c, "ns", "t", listOf(id))
+        val first = f.append("a.parquet").snapshotId
+        val team = NamespaceContainment("team_id", 7)
+        f.store.createNamespace(c, "team_7")
+        if (write == "containment-clear") f.store.setNamespaceContainment(c, "team_7", team, "op")
+
+        val prefix = if (write.startsWith("containment")) "ns-containment" else write
+        val action: () -> Any =
+            when (write) {
+                "options-patch" -> ({ f.store.options.patch(c, PatchField.Absent, false, "test", "floor off") })
+                "containment-mark" -> ({ f.store.setNamespaceContainment(c, "team_7", team, "op") })
+                "containment-clear" -> ({ f.store.setNamespaceContainment(c, "team_7", null, "op") })
+                else -> ({ f.store.commitOffset(c, "reader", t.tableUuid, first) })
+            }
+        val unknown = f.losing(prefix) { action() }
+        assertThat(unknown.replay).isEqualTo(WriteReplay.UNCONDITIONAL)
+        assertThat(unknown.replaySafe).isFalse()
+        assertThat(unknown.message)
+            .contains("Do not retry it blindly", "undo", unknown.txid)
+            .doesNotContain("idempotency_key")
+        assertThat(unknown.cause).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+
+        // Another writer lands in between, and this is what the replay the
+        // header would have invited does to it.
+        when (write) {
+            "options-patch" -> {
+                assertThat(f.store.options.get(c).consumerFloor).isFalse()
+                f.store.options.patch(c, PatchField.Absent, true, "other", "floor on")
+                action()
+                assertThat(f.store.options.get(c).consumerFloor).describedAs("re-enabled in between").isFalse()
+            }
+            "containment-mark" -> {
+                assertThat(f.store.liveContainment(c, "team_7")).isEqualTo(team)
+                f.store.setNamespaceContainment(c, "team_7", null, "other")
+                action()
+                assertThat(f.store.liveContainment(c, "team_7")).describedAs("cleared in between").isEqualTo(team)
+            }
+            "containment-clear" -> {
+                assertThat(f.store.liveContainment(c, "team_7")).isNull()
+                f.store.setNamespaceContainment(c, "team_7", team, "other")
+                action()
+                assertThat(f.store.liveContainment(c, "team_7")).describedAs("re-marked in between").isNull()
+            }
+            else -> {
+                assertThat(f.store.getOffset(c, "reader", t.tableUuid).committedSnapshot).isEqualTo(first)
+                val second = f.append("b.parquet").snapshotId
+                f.store.commitOffset(c, "reader", t.tableUuid, second)
+                assertThatThrownBy { action() }.isInstanceOf(HoglakeException.OffsetRegression::class.java)
+                assertThat(f.store.getOffset(c, "reader", t.tableUuid).committedSnapshot).isEqualTo(second)
+            }
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(
@@ -366,14 +441,15 @@ class HogliteWriteReplayIntegrationTest {
         }
 
     /**
-     * The one DDL whose replay converges, so it keeps the default and its
-     * Retry-After: the drop's fence transaction opts out of the fence, so
-     * a lost answer leaves the catalog fenced but present (nothing after
-     * the fence ran), and a replay passes the same emptiness guards, sets
-     * `dropping = 1` again and finishes the release and delete.
+     * The catalog drop is a DDL like the others: the request names the
+     * catalog, not the incarnation the fence protects. A lost fence answer
+     * leaves the catalog fenced but present; another operator finishes the
+     * drop and recreates the name, and the replay the header would have
+     * invited passes the same emptiness guards against the empty
+     * replacement and deletes it.
      */
     @Test
-    fun `a catalog drop whose fence answer is lost keeps its retry invitation and a replay finishes the drop`() =
+    fun `a catalog drop whose fence answer is lost is reported without a retry invitation`() =
         fixture { f ->
             val c2 = HogliteConformanceEngine.uniqueName("replay")
             f.store.createCatalog(c2, "s3://hoglake-it/$c2", "test", "create")
@@ -387,15 +463,84 @@ class HogliteWriteReplayIntegrationTest {
             assertThat(dropping()).isEqualTo(0L)
 
             val unknown = f.losing("drop-fence") { f.store.dropCatalog(c2, "test", "drop") }
-            assertThat(unknown.replay).isEqualTo(WriteReplay.CONVERGES)
-            assertThat(unknown.replaySafe).isTrue()
-            assertThat(unknown.message).doesNotContain("Do not retry it blindly")
+            assertThat(unknown.replay).isEqualTo(WriteReplay.DDL)
+            assertThat(unknown.replaySafe).isFalse()
+            assertThat(unknown.message).contains("Do not retry it blindly", unknown.txid)
+            // The read the DDL detail advises does not show the fence; the detail names what does.
+            assertThat(unknown.message).contains("(it is being dropped), sending DELETE again finishes the drop")
+            assertThat(unknown.cause).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
             // Fenced, not dropped: the release and delete never ran.
             assertThat(f.store.getCatalog(c2).name).isEqualTo(c2)
             assertThat(dropping()).isEqualTo(1L)
 
-            val dropped = f.store.dropCatalog(c2, "test", "drop")
-            assertThat(dropped.name).isEqualTo(c2)
+            f.store.dropCatalog(c2, "other", "finish")
+            val replacement = f.store.createCatalog(c2, "s3://hoglake-it/$c2-new", "other", "recreate")
+            assertThat(replacement.dataPath).isEqualTo("s3://hoglake-it/$c2-new")
+            f.store.dropCatalog(c2, "test", "drop")
+            assertThatThrownBy { f.store.getCatalog(c2) }
+                .describedAs("the replacement")
+                .isInstanceOf(HoglakeException.NotFound::class.java)
+        }
+
+    /**
+     * A failure after the drop's fence applied (here every request after
+     * it fails, so the release spends its retry budget) is the fence's
+     * unknown outcome, not a `backend_unavailable` whose Retry-After
+     * would invite the same replay.
+     */
+    @Test
+    fun `a catalog drop that fails after its fence is the fence's unknown outcome`() =
+        fixture { f ->
+            val c2 = HogliteConformanceEngine.uniqueName("replay")
+            f.store.createCatalog(c2, "s3://hoglake-it/$c2", "test", "create")
+
+            val thrown =
+                catchThrowable { f.readsFailingAfter("drop-fence") { f.store.dropCatalog(c2, "test", "drop") } }
+            assertThat(thrown).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val unknown = thrown as HoglakeException.CommitOutcomeUnknown
+            assertThat(unknown.txid).startsWith("drop-fence:")
+            assertThat(unknown.replay).isEqualTo(WriteReplay.DDL)
+            assertThat(unknown.message).contains("the catalog is fenced", "Do not retry it blindly")
+            assertThat(unknown.cause).isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            // The catalog is still there, fenced: an operator who read it drops it again.
+            assertThat(f.store.getCatalog(c2).name).isEqualTo(c2)
+            f.store.dropCatalog(c2, "test", "drop")
+            assertThatThrownBy { f.store.getCatalog(c2) }.isInstanceOf(HoglakeException.NotFound::class.java)
+        }
+
+    /**
+     * A final engine refusal after the drop's fence applied (a proxy's
+     * 502 on the release, a 422 on the tenant delete) is the fence's
+     * unknown outcome too, not a 500 or a 422 that reads as the drop's
+     * own refusal of a catalog it left fenced.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["release-502", "delete-422"])
+    fun `a catalog drop refused after its fence is the fence's unknown outcome`(refusal: String) =
+        fixture { f ->
+            val c2 = HogliteConformanceEngine.uniqueName("replay")
+            f.store.createCatalog(c2, "s3://hoglake-it/$c2", "test", "create")
+            val release = refusal == "release-502"
+            val request = if (release) Regex("POST .*/release") else Regex("DELETE /v1/tenants/.*")
+            val cause =
+                if (release) {
+                    HoglakeException.BackendUnavailable::class.java
+                } else {
+                    HoglakeException.Validation::class.java
+                }
+
+            val thrown = f.refusing(request, if (release) 502 else 422) { f.store.dropCatalog(c2, "test", "drop") }
+            assertThat(thrown).isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val unknown = thrown as HoglakeException.CommitOutcomeUnknown
+            assertThat(unknown.txid).startsWith("drop-fence:")
+            assertThat(unknown.replay).isEqualTo(WriteReplay.DDL)
+            assertThat(unknown.message).contains("the catalog is fenced", "sending DELETE again finishes the drop")
+            assertThat(unknown.cause).isInstanceOf(cause)
+            // Fenced: a write is refused as being dropped, and DELETE again finishes the drop.
+            assertThatThrownBy { f.store.createNamespace(c2, "late") }
+                .isInstanceOf(HoglakeException.NotFound::class.java)
+                .hasMessageContaining("being dropped")
+            f.store.dropCatalog(c2, "test", "drop")
             assertThatThrownBy { f.store.getCatalog(c2) }.isInstanceOf(HoglakeException.NotFound::class.java)
         }
 }

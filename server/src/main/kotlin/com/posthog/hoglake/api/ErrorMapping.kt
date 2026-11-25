@@ -70,9 +70,11 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  *                          never a generic 500)
  * - CommitOutcomeUnknown -> 503 `commit_outcome_unknown`, + Retry-After
  *                          only when the write's blind replay converges
- *                          (`replaySafe`): a keyless commit or a DDL, whose
- *                          replay would apply twice or be refused, gets no
- *                          invitation (#682)
+ *                          (`replaySafe`): a keyless commit, an
+ *                          unconditional set (options, containment,
+ *                          offset) or a DDL, whose replay would apply
+ *                          twice, undo a later write or be refused, gets
+ *                          no invitation (#682)
  * - malformed body / unparseable query or path params -> 400. This
  *   includes the receives ktor refuses BEFORE deserialization even
  *   starts (ContentTransformationException): a body sent under a
@@ -311,9 +313,10 @@ private suspend fun ApplicationCall.respondHoglakeFailure(cause: HoglakeExceptio
         when (cause) {
             // Before its BackendUnavailable parent: an unknown outcome
             // invites a replay only when the replay converges. A keyless
-            // commit's replay registers its files twice and a DDL's applies
-            // twice (truncate) or is refused as already applied, so their
-            // 503 carries no Retry-After, as PostgreSQL's lost COMMIT
+            // commit's replay registers its files twice, an unconditional
+            // set's undoes a write that landed in between, and a DDL's
+            // applies twice (truncate) or is refused as already applied, so
+            // their 503 carries no Retry-After, as PostgreSQL's lost COMMIT
             // acknowledgement carries none (#682).
             is HoglakeException.CommitOutcomeUnknown -> cause.replaySafe
             is HoglakeException.CommitQueueTimeout,

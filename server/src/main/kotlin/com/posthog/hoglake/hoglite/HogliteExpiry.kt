@@ -8,7 +8,7 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.ExpiryBackend
-import java.time.Instant
+import java.time.DateTimeException
 
 /**
  * Port [com.posthog.hoglake.service.ExpiryService]'s two-phase sweep to one tenant.
@@ -179,15 +179,35 @@ internal class HogliteExpiry(
             pre.retentionSeconds
                 ?: return Advance(0, pre.earliestSnapshotId, null, released)
 
-        val now = Instant.now()
-        val cutoff = HogliteSchema.fmt(now.minusSeconds(retention))
-        val firstFresh =
+        // Oldest snapshot still inside the retention window, the cutoff
+        // on the ENGINE's clock: the one that stamped every ts
+        // (insertSnapshotRow), as ExpiryService's `snapshot_time >= now()
+        // - make_interval(secs => :retention)` has both sides on the
+        // database clock. A cutoff from this pod's clock expired early or
+        // late by the skew between the two (#672).
+        //
+        // The cutoff rides the same read, because SQLite answers a date
+        // its calendar cannot hold with NULL, not an error: `ts >= NULL`
+        // matches nothing, and a null floor candidate below means "every
+        // retained snapshot is stale", so a retention past the calendar
+        // would have expired the catalog up to head. PostgreSQL's
+        // make_interval raises on that retention and the sweep writes
+        // nothing; a NULL cutoff fails this one the same way (the
+        // DateTimeException Instant.minusSeconds threw for it before).
+        val (cutoff, firstFresh) =
             store.queryCatalog(
                 catalog,
-                "SELECT MIN(id) FROM snapshots WHERE id >= ? AND ts >= ?",
+                "SELECT c, (SELECT MIN(id) FROM snapshots WHERE id >= ? AND ts >= c) " +
+                    "FROM (SELECT ${HogliteSchema.NOW_MINUS_SECONDS_SQL} AS c)",
                 pre.earliestSnapshotId,
-                cutoff,
-            ).firstRow()!![0].asLongOrNull()
+                retention,
+            ).firstRow()!!.let { it[0] as? String to it[1].asLongOrNull() }
+        if (cutoff == null) {
+            throw DateTimeException(
+                "snapshot_retention_seconds=$retention puts the retention cutoff outside the engine's " +
+                    "calendar; the floor stays at ${pre.earliestSnapshotId}",
+            )
+        }
 
         val minOffset =
             if (pre.consumerFloor) {
