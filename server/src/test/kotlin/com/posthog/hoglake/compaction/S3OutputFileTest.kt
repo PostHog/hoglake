@@ -9,6 +9,7 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.PositionOutputStream
 import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
@@ -251,6 +252,75 @@ class S3OutputFileTest {
 
         assertThat(store.completed).describedAs("nothing may be published").isNull()
         assertThat(store.aborted).describedAs("the upload must be discarded").isTrue()
+    }
+
+    @Test
+    fun `a close that fails after trailer-shaped bytes discards before closing the stream`() {
+        // The trailer gate is a heuristic: a close that fails after the
+        // last row group (beforeFooter, partway through end) leaves the
+        // stream ending in arbitrary page bytes, not a missing trailer.
+        // Here they are made to read as one on purpose: the payload ends
+        // with (4, PAR1), and the next write fails. Closing the stream
+        // before the discard would complete that upload.
+        val trailer = byteArrayOf(4, 0, 0, 0) + "PAR1".toByteArray()
+        val columns = listOf(Column(1, 0, ColumnDef("payload", ColType.BINARY)))
+        val schema = ParquetRewriter.outputSchema(columns)
+        val shape = ParquetRewriter.OutputShape(columns, schema, ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW)
+        val group = SimpleGroupFactory(schema).newGroup()
+        group.add(0, Binary.fromConstantByteArray("x".repeat(64).toByteArray() + trailer))
+        group.add(1, 0L)
+        val store = FakeStore()
+        val out = FailingAfter(S3OutputFile(store, "s3://b/out.parquet"), trailer)
+
+        assertThatThrownBy {
+            ParquetRewriter.writingTo(out, schema, ParquetRewriter.OutputCodec(CompressionCodecName.UNCOMPRESSED)) {
+                // The page store buffers the row; it reaches the stream in close().
+                it.write(ParquetRewriter.Row(group, 0, plan = shape.identityPlan))
+            }
+        }.isInstanceOf(IOException::class.java)
+            .hasMessageContaining("injected")
+
+        assertThat(out.fired).describedAs("the failure came after trailer-shaped bytes").isTrue()
+        assertThat(store.completed).describedAs("nothing may be published").isNull()
+        assertThat(store.aborted).describedAs("the upload must be discarded").isTrue()
+    }
+
+    /** [target]'s stream, failing the first write after it received [after] as its last bytes. */
+    private class FailingAfter(
+        private val target: S3OutputFile,
+        private val after: ByteArray,
+    ) : DiscardableOutputFile by target {
+        var fired = false
+
+        override fun create(blockSizeHint: Long): PositionOutputStream {
+            val stream = target.create(blockSizeHint)
+            return object : PositionOutputStream() {
+                private var last = ByteArray(0)
+
+                override fun getPos(): Long = stream.pos
+
+                override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
+
+                override fun write(
+                    b: ByteArray,
+                    off: Int,
+                    len: Int,
+                ) {
+                    if (last.contentEquals(after)) {
+                        fired = true
+                        throw IOException("injected failure after trailer-shaped bytes")
+                    }
+                    stream.write(b, off, len)
+                    last = (last + b.copyOfRange(off, off + len)).takeLast(after.size).toByteArray()
+                }
+
+                override fun flush() = stream.flush()
+
+                override fun close() = stream.close()
+            }
+        }
+
+        override fun createOrOverwrite(blockSizeHint: Long): PositionOutputStream = create(blockSizeHint)
     }
 
     @Test
