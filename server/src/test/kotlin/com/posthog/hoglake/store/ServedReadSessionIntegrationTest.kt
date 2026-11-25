@@ -75,6 +75,10 @@ abstract class ServedReadSessionCases(authMode: String) {
     protected val ns = "/v1/catalogs/$cust/namespaces/team_42"
     private val importsPrefix = "$source/org_id=$orgA/team_id=42/"
     private val filePath = "s3://bucket/${importsPrefix}events/a.parquet"
+
+    // The stream half: one table shared by every team, laid out on `team_id`, published as `pageviews`.
+    private val streamSource = "stream"
+    private val streamFile = "s3://bucket/$streamSource/team_id=42/pageviews/s42.parquet"
     private val api: io.ktor.server.engine.EmbeddedServer<*, *>
     private val public: io.ktor.server.engine.EmbeddedServer<*, *>
     private val app: App
@@ -121,12 +125,72 @@ abstract class ServedReadSessionCases(authMode: String) {
                     ),
             ),
         )
+        catalogs.createCatalog(streamSource, "s3://bucket/$streamSource")
+        catalogs.createNamespace(streamSource, "ingest")
+        val pageviews =
+            catalogs.createTable(
+                streamSource,
+                "ingest",
+                "pageviews",
+                listOf(ColumnDef("team_id", ColType.LONG), ColumnDef("v", ColType.LONG)),
+            )
+        db.jdbi.useHandle<Exception> { h ->
+            val catId =
+                h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :n")
+                    .bind("n", streamSource).mapTo(Long::class.java).one()
+            val teamField = pageviews.columns.single { it.def.name == "team_id" }.fieldId
+            h.execute(
+                "INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot) VALUES (?, ?, 1, 0)",
+                catId,
+                pageviews.tableId,
+            )
+            h.execute(
+                "INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, " +
+                    "transform) VALUES (?, ?, 1, 0, ?, 'identity')",
+                catId,
+                pageviews.tableId,
+                teamField,
+            )
+            h.execute(
+                "INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id) " +
+                    "VALUES (?, ?, 1, ?)",
+                catId,
+                pageviews.tableId,
+                teamField,
+            )
+            // One file of the session's team, and one of another team in the same table.
+            for ((id, team, path) in listOf(
+                Triple(1L, "42", streamFile),
+                Triple(2L, "43", "s3://bucket/$streamSource/team_id=43/pageviews/s43.parquet"),
+            )) {
+                h.execute(
+                    "INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, " +
+                        "end_snapshot, path, record_count, file_size_bytes, row_id_start, spec_id, " +
+                        "stats_state, prefix_quarantined) VALUES (?, ?, ?, 1, NULL, ?, 10, 1000, ?, 1, " +
+                        "'provided', false)",
+                    catId,
+                    id,
+                    pageviews.tableId,
+                    path,
+                    id * 1000,
+                )
+                h.execute(
+                    "INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value) " +
+                        "VALUES (?, ?, 0, ?)",
+                    catId,
+                    id,
+                    team,
+                )
+            }
+        }
+        val stream = """"stream":{"catalog":"$streamSource","namespace":"ingest","tables":["pageviews"]}"""
         val served =
             Files.createTempFile("hoglake-served-read-ns-", ".json").also {
                 it.toFile().deleteOnExit()
                 Files.writeString(
                     it,
-                    """{"families":[{"family":"team","source_catalog":"$source","predicate_field":"team_id"}]}""",
+                    """{"families":[{"family":"team","source_catalog":"$source",""" +
+                        """"predicate_field":"team_id",$stream}]}""",
                 )
             }
         val cfg =
@@ -170,6 +234,7 @@ abstract class ServedReadSessionCases(authMode: String) {
         team: Int = 42,
         catalog: String = cust,
         imports: String = importsPrefix,
+        events: String = "$streamSource/team_id=$team/",
         audiences: String = """["trino-session","hoglake-session","hoglite-session"]""",
     ): String {
         val iat = System.currentTimeMillis() / 1000 - 5
@@ -186,7 +251,7 @@ abstract class ServedReadSessionCases(authMode: String) {
                 """"aws":{"access_key_id":"FICTIONAL_KEY","secret_access_key":"FICTIONAL_SECRET",""" +
                 """"session_token":"FICTIONAL_TOKEN","region":"us-east-1","expires_at":$exp},"grants":[""" +
                 """{"target":"remote:imports","bucket":"bucket","prefix":"$imports",$grant},""" +
-                """{"target":"remote:events","bucket":"bucket","prefix":"stream/team_id=$team/",$grant},""" +
+                """{"target":"remote:events","bucket":"bucket","prefix":"$events",$grant},""" +
                 """{"target":"$catalog","bucket":"bucket-cust","prefix":"tables/",$grant},""" +
                 """{"target":"$hogliteId","bucket":"bucket-owner",""" +
                 """"object_key":"root/2c/t/fixture_3/manifest",$grant}""" +
@@ -236,10 +301,13 @@ abstract class ServedReadSessionCases(authMode: String) {
             val tables = send(port, "$ns/tables", session())
             assertThat(tables.statusCode()).describedAs(tables.body()).isEqualTo(200)
             val listed = mapper.readTree(tables.body())
-            assertThat(listed.map { it["name"].asText() }).containsExactly("events")
-            assertThat(listed[0]["table_uuid"].asText()).isEqualTo(tableUuid())
-            assertThat(listed[0].fieldNames().asSequence().toList())
-                .doesNotContain("record_count", "file_count", "file_size_bytes", "snapshot_count")
+            assertThat(listed.map { it["name"].asText() }).containsExactlyInAnyOrder("events", "pageviews")
+            assertThat(listed.single { it["name"].asText() == "events" }["table_uuid"].asText())
+                .isEqualTo(tableUuid())
+            for (entry in listed) {
+                assertThat(entry.fieldNames().asSequence().toList())
+                    .doesNotContain("record_count", "file_count", "file_size_bytes", "snapshot_count")
+            }
             assertThat(tables.headers().firstValue("Cache-Control")).hasValue("no-store")
 
             for (query in listOf("", "?totals=false")) {
@@ -265,6 +333,58 @@ abstract class ServedReadSessionCases(authMode: String) {
             assertThat(files.map { it["data_file"]["path"].asText() }).containsExactly(filePath)
             assertThat(files[0]["delete_file"]["path"].asText()).endsWith("/dv/a.dv")
             assertThat(scan.headers().firstValue("Cache-Control")).hasValue("no-store")
+        }
+    }
+
+    @Test
+    fun `a stream table is served to the session's own team under the events grant`() {
+        for (port in ports) {
+            val table = send(port, "$ns/tables/pageviews?totals=false", session())
+            assertThat(table.statusCode()).describedAs(table.body()).isEqualTo(200)
+            val described = mapper.readTree(table.body())
+            assertThat(described["namespace"].asText()).isEqualTo("team_42")
+            assertThat(described.fieldNames().asSequence().toList())
+                .doesNotContain("record_count", "file_count", "file_size_bytes", "totals_snapshot_id", "totals_as_of")
+            // The scan as an engine sends it: the snapshot and UUID of the table answer.
+            val scan =
+                "$ns/tables/pageviews/scan?snapshot=${described["read_snapshot_id"].asLong()}" +
+                    "&table_uuid=${described["table_uuid"].asText()}"
+
+            val files = send(port, scan, session())
+            assertThat(files.statusCode()).describedAs(files.body()).isEqualTo(200)
+            // The team's file alone: the other team's file in the same table is not in the answer.
+            assertThat(mapper.readTree(files.body()).map { it["data_file"]["path"].asText() })
+                .containsExactly(streamFile)
+            assertThat(files.body()).doesNotContain("s43.parquet")
+            assertThat(files.headers().firstValue("Cache-Control")).hasValue("no-store")
+
+            // The events grant bounds it: another team's prefix, or another root.
+            for (events in listOf("$streamSource/team_id=420/", "other/team_id=42/")) {
+                val refused = send(port, scan, session(events = events))
+                assertThat(refused.statusCode()).describedAs(refused.body()).isEqualTo(403)
+                assertThat(refused.body()).doesNotContain("s42.parquet", "bucket", streamSource)
+            }
+            // The import half does not need the events grant.
+            assertThat(send(port, scanPath(), session(events = "other/team_id=42/")).statusCode()).isEqualTo(200)
+        }
+    }
+
+    @Test
+    fun `the namespace and the table list take no query`() {
+        for (port in ports) {
+            for (route in listOf(ns, "$ns/tables")) {
+                for (query in listOf(
+                    "?snapshot=${head()}",
+                    "?at_timestamp=2026-01-01T00:00:00Z",
+                    "?snapshot=1&at_timestamp=2026-01-01T00:00:00Z",
+                    "?totals=false",
+                )) {
+                    val refused = send(port, "$route$query", session())
+                    assertThat(refused.statusCode()).describedAs("$route$query").isEqualTo(400)
+                    assertThat(refused.body()).describedAs("$route$query").doesNotContain("team_42", "events")
+                    assertThat(refused.headers().firstValue("Cache-Control")).hasValue("no-store")
+                }
+            }
         }
     }
 
