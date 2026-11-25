@@ -90,6 +90,79 @@ class ReadSessionProfileTest {
     }
 
     @Test
+    fun `a rotated key is read from the mounted file after the miss, not on the miss`() {
+        val jwks = directory.resolve("rotating-jwks.json")
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(pair, TestTokens.KID)}]}""")
+        val queued = mutableListOf<() -> Unit>()
+        val keys =
+            JwksSigningKeys(
+                fetch = { Files.readAllBytes(jwks) },
+                describe = "rotation-test",
+                mountedFile = true,
+                runAsync = { queued += it },
+            )
+        keys.refresh()
+        val v =
+            JwtVerifier(
+                TestTokens.ISSUER,
+                TestTokens.AUDIENCE,
+                keys,
+                predicateFields = setOf("team_id"),
+                backends = mapOf(backend to BackendKind.HOGLITE),
+            ) { 2_000_000_001L }
+        val rotated = TestTokens.keyPair()
+        val header = """{"alg":"ES256","kid":"test-key-2","typ":"JWT"}"""
+        val claims = String(java.util.Base64.getUrlDecoder().decode(token().split('.')[1]))
+        val next = TestTokens.mint(rotated, claims, header)
+
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(rotated, "test-key-2")}]}""")
+        assertThatThrownBy { v.verifyReadSession(next, profile) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.UNKNOWN_KEY)
+        assertThat(queued).hasSize(1)
+        queued.single().invoke()
+
+        assertThat(v.verifyReadSession(next, profile).subject).isEqualTo("example.alice")
+        // The removed key is gone with the same re-read.
+        assertThatThrownBy { v.verifyReadSession(token(), profile) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.UNKNOWN_KEY)
+    }
+
+    @Test
+    fun `the request that misses is refused even when the re-read finishes first`() {
+        val jwks = directory.resolve("inline-jwks.json")
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(pair, TestTokens.KID)}]}""")
+        val keys =
+            JwksSigningKeys(
+                fetch = { Files.readAllBytes(jwks) },
+                describe = "inline-rotation-test",
+                mountedFile = true,
+                runAsync = { it() },
+            )
+        keys.refresh()
+        val v =
+            JwtVerifier(
+                TestTokens.ISSUER,
+                TestTokens.AUDIENCE,
+                keys,
+                predicateFields = setOf("team_id"),
+                backends = mapOf(backend to BackendKind.HOGLITE),
+            ) { 2_000_000_001L }
+        val rotated = TestTokens.keyPair()
+        val claims = String(java.util.Base64.getUrlDecoder().decode(token().split('.')[1]))
+        val next = TestTokens.mint(rotated, claims, """{"alg":"ES256","kid":"test-key-2","typ":"JWT"}""")
+
+        Files.writeString(jwks, """{"keys":[${TestTokens.ecJwk(rotated, "test-key-2")}]}""")
+        assertThatThrownBy { v.verifyReadSession(next, profile) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.UNKNOWN_KEY)
+        // The re-read ran inside that call, so the key was already there.
+        assertThat(keys.byKeyId("test-key-2")).isNotNull()
+        assertThat(v.verifyReadSession(next, profile).subject).isEqualTo("example.alice")
+    }
+
+    @Test
     fun `legacy and dedicated audiences cannot be mixed`() {
         val legacy = verifier(experimental = true)
         val mixed = token { (it["aud"] as ArrayNode).add(TestTokens.AUDIENCE) }

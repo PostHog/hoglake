@@ -249,6 +249,12 @@ tasks.test {
     // NPE otherwise arrives with no stack and no message, which makes a
     // failure report useless and any frame-based assertion unreliable.
     jvmArgs("-XX:+EnableDynamicAgentLoading", "-XX:-OmitStackTraceInFastThrow")
+    // One worker JVM runs the whole suite, and jazzer-junit's agent
+    // scans the entire test classpath with ClassGraph when a @FuzzTest
+    // class initializes. On Gradle's default worker heap that scan, late
+    // in a full run, ran the JVM out of memory and killed the executor
+    // partway through (#738). 3g completes the full suite with headroom.
+    maxHeapSize = "3g"
     testLogging {
         events("failed", "skipped")
         showStackTraces = true
