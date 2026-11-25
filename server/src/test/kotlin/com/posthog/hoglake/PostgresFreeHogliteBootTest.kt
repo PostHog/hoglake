@@ -21,8 +21,9 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
 import java.time.Duration
+import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class PostgresFreeHogliteBootTest {
@@ -33,12 +34,18 @@ class PostgresFreeHogliteBootTest {
     fun `hoglite routes and readiness do not open PG or start its maintenance loops`() {
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         val healthy = AtomicInteger(200)
-        val stallMs = AtomicLong()
+        // A probe that reads a latch here is held until the test opens it,
+        // and counted in `held`, so the test knows WHICH probe is in flight.
+        val hold = AtomicReference<CountDownLatch?>()
+        val held = AtomicInteger()
         val probes = AtomicInteger()
         val forwardedAuthority = AtomicReference<String?>()
         server.createContext("/v1/healthz") { exchange ->
             probes.incrementAndGet()
-            Thread.sleep(stallMs.get())
+            hold.get()?.let {
+                held.incrementAndGet()
+                it.await()
+            }
             exchange.sendResponseHeaders(healthy.get(), -1)
             exchange.close()
         }
@@ -96,11 +103,16 @@ class PostgresFreeHogliteBootTest {
 
                         fun reachable() = series("hoglake_hoglite_backend_reachable")
 
+                        fun attemptsHung() = series("hoglake_hoglite_health_probe_attempts_hung")
+
                         assertThat(client.get("/healthz").status).isEqualTo(HttpStatusCode.OK)
                         // The hoglite_health loop, not the readiness call, probes the
-                        // backend: startBackground started it without PostgreSQL.
-                        await().atMost(Duration.ofSeconds(10)).until { probes.get() >= 1 && reachable() == 1.0 }
-                        assertThat(series("hoglake_hoglite_health_probe_attempts_hung")).isEqualTo(0.0)
+                        // backend: startBackground started it without PostgreSQL. The
+                        // loop ticks at 100 ms, so a probe may be in flight at any
+                        // scrape; between two of them both series settle.
+                        await().atMost(Duration.ofSeconds(10)).until {
+                            probes.get() >= 1 && reachable() == 1.0 && attemptsHung() == 0.0
+                        }
                         val listed =
                             client.get("/v1/catalogs") {
                                 header(HttpHeaders.Authorization, "Bearer $token")
@@ -133,15 +145,27 @@ class PostgresFreeHogliteBootTest {
                         //
                         // MUTATION: have `/healthz` await `catalogSelector.hogliteReachable`
                         // and the elapsed assertion reds by the stall.
-                        stallMs.set(3_000)
-                        val sampler = app.hogliteBackendHealth
-                        await().atMost(Duration.ofSeconds(10)).until { sampler.outstandingAttempts == 1 }
-                        val started = System.nanoTime()
-                        assertThat(client.get("/healthz").status).isEqualTo(HttpStatusCode.OK)
-                        assertThat((System.nanoTime() - started) / 1_000_000).isLessThan(1_000)
-                        // Single flight: the loop ticks at 100 ms, the stalled attempt is
-                        // inside its 4 s deadline, so no tick launched a second one.
-                        assertThat(sampler.outstandingAttempts).isEqualTo(1)
+                        val latch = CountDownLatch(1)
+                        hold.set(latch)
+                        try {
+                            await().atMost(Duration.ofSeconds(10)).until { held.get() == 1 }
+                            val sampler = app.hogliteBackendHealth
+                            val backend = UUID.fromString(id)
+                            val launched = sampler.launchedProbes(backend)
+                            val started = System.nanoTime()
+                            assertThat(client.get("/healthz").status).isEqualTo(HttpStatusCode.OK)
+                            assertThat((System.nanoTime() - started) / 1_000_000).isLessThan(1_000)
+                            // The held probe is the one attempt in flight, which the
+                            // gauge shows; ticks at 100 ms find it inside its 4 s
+                            // deadline and start nothing (single flight).
+                            Thread.sleep(500)
+                            assertThat(attemptsHung()).isEqualTo(1.0)
+                            assertThat(sampler.launchedProbes(backend)).isEqualTo(launched)
+                            assertThat(held.get()).isEqualTo(1)
+                        } finally {
+                            hold.set(null)
+                            latch.countDown()
+                        }
                     }
                 }
             }

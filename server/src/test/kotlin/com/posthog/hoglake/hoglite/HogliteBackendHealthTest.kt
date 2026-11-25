@@ -1,8 +1,13 @@
 package com.posthog.hoglake.hoglite
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import org.assertj.core.api.Assertions.assertThat
 import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.Test
+import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -172,15 +177,16 @@ class HogliteBackendHealthTest {
 
     /**
      * A backend whose probes hang READS UNREACHABLE, not whatever its
-     * last completed probe said: abandoning an attempt publishes 0, and
-     * so does the cap's refusal. The series is the only hoglite health
+     * last completed probe said: an attempt past its deadline reads 0,
+     * and so does the cap's refusal. The series is the only hoglite health
      * signal (#678), so a backend that answered once and then hung must
      * not show 1 until the pod restarts, which is what `HealthProbe`'s
      * `refuse()` answering false comes to.
      *
-     * MUTATION: drop the `backend.reachable = 0.0` in the abandon branch
-     * and the first assertion reads 1.0; drop the one in the cap branch
-     * (and the abandon one) and the second does.
+     * MUTATION: drop the overdue check in `reachable` and the
+     * `backend.reachable = 0.0` in the abandon branch and the first
+     * assertion reads 1.0; drop those and the one in the cap branch and
+     * the second does.
      */
     @Test
     fun `a backend whose probes hang past their deadline reads unreachable`() {
@@ -219,7 +225,7 @@ class HogliteBackendHealthTest {
      * gives — must not overwrite the fresh attempt's true; the series
      * carries the newest attempt's result until the next tick.
      *
-     * MUTATION: drop the `backend.inFlight?.seq == seq` check and the
+     * MUTATION: drop the `backend.inFlight === attempt` check and the
      * stale false lands over the fresh true — the last assertion reads
      * 0.0.
      */
@@ -243,6 +249,150 @@ class HogliteBackendHealthTest {
             } finally {
                 gate.latch.countDown()
             }
+        }
+    }
+
+    /**
+     * The deadline holds when no tick checks it. The default sampling
+     * interval (10 s) is longer than a default deadline (4 s), so a probe
+     * that answers after its deadline but before the next tick is the
+     * ordinary late case: it is a failed probe, and publishes 0 even
+     * though it said reachable and nothing replaced it.
+     *
+     * MUTATION: publish `answer` without the `late` check and the series
+     * reads 1.0.
+     */
+    @Test
+    fun `an attempt that answers reachable past its deadline publishes unreachable`() {
+        val slow: (UUID) -> Boolean = {
+            Thread.sleep(300)
+            true
+        }
+        HogliteBackendHealth(mapOf(a to 100L), slow).use { health ->
+            health.sample()
+            await().atMost(Duration.ofSeconds(5)).until { health.outstandingAttempts == 0 }
+            assertThat(health.reachable(a)).isEqualTo(0.0)
+            assertThat(health.launchedProbes(a)).isEqualTo(1L)
+        }
+    }
+
+    /**
+     * And the series shows the expiry when the attempt crosses its
+     * deadline, not at the next tick: a backend that answered once and
+     * whose next probe hangs reads 0 with no further [sample] call.
+     *
+     * MUTATION: drop the overdue check in `reachable` and it reads the
+     * first probe's 1.0 until a tick abandons the attempt.
+     */
+    @Test
+    fun `an attempt past its deadline reads unreachable before the next tick`() {
+        val gate = Gate()
+        val calls = AtomicInteger()
+        val probe: (UUID) -> Boolean = { if (calls.incrementAndGet() == 1) true else gate.hang() }
+        HogliteBackendHealth(mapOf(a to 1_000L), probe).use { health ->
+            try {
+                health.sample()
+                await().atMost(Duration.ofSeconds(5)).until { health.reachable(a) == 1.0 }
+
+                health.sample()
+                await().atMost(Duration.ofSeconds(5)).until { gate.entered.get() == 1 }
+                assertThat(health.reachable(a)).isEqualTo(1.0)
+                Thread.sleep(1_200)
+
+                assertThat(health.reachable(a)).isEqualTo(0.0)
+                assertThat(health.launchedProbes(a)).isEqualTo(2L)
+            } finally {
+                gate.latch.countDown()
+            }
+        }
+    }
+
+    /**
+     * A stall at the cap is logged once, when the cap is reached, and the
+     * recovery once, when a parked attempt has returned and an attempt
+     * starts again: a backend hung for an hour must not log the refusal
+     * and an "abandoning ... launching" line that launches nothing on
+     * every tick of it.
+     *
+     * MUTATION: drop the `if (backend.capped) return` and the refusal is
+     * logged on each of the four capped ticks; move the abandon warning
+     * back above the cap branch and it is logged on each of them too.
+     */
+    @Test
+    fun `a stall at the cap logs the refusal and the recovery once each`() {
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val logger = LoggerFactory.getLogger(HogliteBackendHealth::class.java) as Logger
+        logger.addAppender(capture)
+        val gate = Gate()
+        val calls = AtomicInteger()
+        val probe: (UUID) -> Boolean = { if (calls.incrementAndGet() <= 2) gate.hang() else true }
+        try {
+            HogliteBackendHealth(mapOf(a to 50L), probe).use { health ->
+                try {
+                    repeat(6) {
+                        health.sample()
+                        Thread.sleep(120)
+                    }
+                    assertThat(health.launchedProbes(a)).isEqualTo(HogliteBackendHealth.MAX_CONCURRENT_PROBES.toLong())
+                    assertThat(capture.list.count { it.level == Level.ERROR }).isEqualTo(1)
+                    assertThat(capture.list.count { it.formattedMessage.startsWith("abandoning ") }).isEqualTo(1)
+
+                    gate.latch.countDown()
+                    await().atMost(Duration.ofSeconds(5)).until { health.outstandingAttempts == 0 }
+                    health.sample()
+                    await().atMost(Duration.ofSeconds(5)).until { health.reachable(a) == 1.0 }
+                    assertThat(capture.list.count { it.formattedMessage.contains("sampling resumes") }).isEqualTo(1)
+                    assertThat(capture.list.count { it.level == Level.ERROR }).isEqualTo(1)
+                } finally {
+                    gate.latch.countDown()
+                }
+            }
+        } finally {
+            logger.detachAppender(capture)
+        }
+    }
+
+    /**
+     * An attempt that answers is uncounted in the same step as its answer
+     * is taken. With one abandoned attempt parked, a tick that found the
+     * answer taken but the attempt still counted would read two
+     * outstanding, take the cap branch, overwrite the fresh 1 with 0 and
+     * log the restart ERROR for a backend that just answered. The window
+     * is microseconds wide, so ticks spin against replacements that
+     * answer at once: every launch is another chance to land in it. The
+     * deadline is long only so a replacement stalled by a GC pause or a
+     * busy CI box is not abandoned too, which would legitimately park a
+     * second attempt; the window does not depend on it.
+     *
+     * MUTATION: move `running.decrementAndGet()` out of the
+     * `synchronized(backend)` block, after it, and the ERROR is logged.
+     */
+    @Test
+    fun `a tick right after an answer does not take the cap branch while one attempt is parked`() {
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val logger = LoggerFactory.getLogger(HogliteBackendHealth::class.java) as Logger
+        logger.addAppender(capture)
+        val gate = Gate()
+        val calls = AtomicInteger()
+        val probe: (UUID) -> Boolean = { if (calls.incrementAndGet() == 1) gate.hang() else true }
+        try {
+            HogliteBackendHealth(mapOf(a to 2_000L), probe).use { health ->
+                try {
+                    health.sample()
+                    await().atMost(Duration.ofSeconds(5)).until { gate.entered.get() == 1 }
+                    Thread.sleep(2_200)
+
+                    val until = System.nanoTime() + Duration.ofMillis(500).toNanos()
+                    while (System.nanoTime() < until) health.sample()
+
+                    assertThat(health.launchedProbes(a)).isGreaterThan(100L)
+                    assertThat(capture.list.filter { it.level == Level.ERROR }).isEmpty()
+                } finally {
+                    gate.latch.countDown()
+                }
+            }
+        } finally {
+            logger.detachAppender(capture)
         }
     }
 

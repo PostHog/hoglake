@@ -2863,8 +2863,9 @@ transaction (`observability/`):
   `hoglake_hoglite_backend_reachable{backend}` is one series per
   configured hoglite backend — 1 when its standard pool answered the
   `hoglite_health` loop's last probe
-  (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`, 10 s), 0 when it did not or
-  the probe hung past its deadline, NaN before the first — and is where
+  (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`, 10 s), 0 when it did not,
+  answered past its deadline, or is still in flight past it (from that
+  moment, not the next tick), NaN before the first — and is where
   a hoglite outage is read, because it is not in `/healthz`'s status
   (#678; see Health below). Its companion
   `hoglake_hoglite_health_probe_attempts_hung{backend}` counts
@@ -2932,8 +2933,9 @@ transaction (`observability/`):
   process with a hoglite backend, PostgreSQL or not
   (`hoglite/HogliteBackendHealth.kt`: single flight per backend, an age
   bound of twice the backend's `connect_timeout_ms` past which the
-  attempt is abandoned and reads 0, a late answer from an abandoned
-  attempt dropped, two attempts parked at most) into
+  attempt reads 0 and is abandoned, a late answer reads 0 and one from
+  an abandoned attempt is dropped, two attempts parked at most, the cap
+  logged once per stall) into
   `hoglake_hoglite_backend_reachable{backend}`. A loop and not a
   `/healthz` side effect, so the series is live on a pod with no
   readiness probe. `/healthz` neither awaits nor starts a hoglite

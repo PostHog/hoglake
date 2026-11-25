@@ -1338,8 +1338,9 @@ object Metrics {
      * `hoglake_hoglite_backend_reachable{backend}` — one series per
      * configured hoglite backend: 1 when its standard pool answered the
      * last probe of the `hoglite_health` loop
-     * (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`), 0 when it did not or the
-     * probe hung past its deadline, NaN before the first answer landed
+     * (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`), 0 when it did not, answered
+     * past its deadline, or is still in flight past it, NaN before the
+     * first answer landed
      * (`HogliteBackendHealth`).
      *
      * This is where hoglite health is READ, because it is no longer in

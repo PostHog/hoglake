@@ -63,10 +63,16 @@ import java.util.concurrent.atomic.AtomicLong
  *   Past the deadline the attempt is ABANDONED and a fresh one started,
  *   for the reason `HealthProbe` gives: an attempt hung below the
  *   client's own timeouts would otherwise pin the series for the rest
- *   of the pod's life. Abandoning publishes 0 — a probe that outlasted
- *   its deadline is a failed probe, which is how `HealthProbe` reads
- *   its own — so a backend whose probes hang cannot keep showing the 1
- *   its last completed probe left.
+ *   of the pod's life.
+ * - **The deadline is enforced on the series, not only on the tick.**
+ *   A probe that outlasted its deadline is a failed probe, which is how
+ *   `HealthProbe` reads its own, so [reachable] reads 0 from the moment
+ *   the attempt in flight crosses its deadline, and that attempt
+ *   publishes 0 if it answers late. The sampling interval (10 s) is
+ *   longer than a default deadline (4 s): checked only on a tick, an
+ *   attempt answering at 6 s would publish 1, and a backend whose
+ *   probes hang would show its last completed probe's 1 until the next
+ *   tick.
  * - **Only the attempt in flight publishes.** An abandoned attempt that
  *   finishes late drops its answer, so a stale false cannot overwrite
  *   the fresh attempt's true, or the reverse: the series carries the
@@ -74,10 +80,13 @@ import java.util.concurrent.atomic.AtomicLong
  * - **A cap of [MAX_CONCURRENT_PROBES] outstanding attempts per
  *   backend.** With two already hung nothing more is started, so a
  *   permanent hang costs two parked threads per backend and never
- *   leaks more. The refusal publishes 0 too, and the parked attempts
- *   are `hoglake_hoglite_health_probe_attempts_hung{backend}`
- *   ([outstandingAttempts]): at the cap sampling resumes only when a
+ *   leaks more. The expired attempt stays the one in flight and the
+ *   series reads 0; the parked attempts are
+ *   `hoglake_hoglite_health_probe_attempts_hung{backend}`
+ *   ([outstandingAttempts]). At the cap sampling resumes only when a
  *   parked attempt returns, so a cap that persists needs a restart.
+ *   Reaching the cap and leaving it are logged once each, not on every
+ *   tick of the stall.
  * - **Never throws, never blocks the caller.** A probe that throws
  *   reads as unreachable.
  *
@@ -94,17 +103,31 @@ class HogliteBackendHealth(
 ) : AutoCloseable {
     private val log = KotlinLogging.logger {}
 
-    /** [seq] is the backend's launch count at launch, so a finished attempt can tell whether it was superseded. */
-    private class Attempt(val seq: Long, val task: Future<*>, val startedNanos: Long)
+    /** [answered] is set, under the backend's lock, when the attempt's own answer has been taken. */
+    private class Attempt(val startedNanos: Long) {
+        lateinit var task: Future<*>
+        var answered = false
+    }
 
     private class Backend(val deadlineMs: Long) {
         var inFlight: Attempt? = null
         val running = AtomicInteger()
         val launched = AtomicLong()
 
+        /** Whether the cap refused the last tick, so the refusal and the recovery are logged once each. */
+        var capped = false
+
         /** The last answer: 1.0 reachable, 0.0 not, NaN before the first answer landed. */
         @Volatile
         var reachable: Double = Double.NaN
+
+        /** The attempt in flight that has not answered yet, or null. Under the lock. */
+        fun pending(): Attempt? = inFlight?.takeIf { !it.answered && !it.task.isDone }
+
+        fun ageMs(
+            attempt: Attempt,
+            nowNanos: Long,
+        ): Long = (nowNanos - attempt.startedNanos) / 1_000_000
     }
 
     private val backends: Map<UUID, Backend> = deadlinesMs.mapValues { Backend(it.value) }
@@ -130,11 +153,19 @@ class HogliteBackendHealth(
 
     /**
      * The last answer for [id]: 1.0 when its standard pool answered the
-     * most recent completed probe, 0.0 when it did not or when the most
-     * recent attempt was abandoned past its deadline, NaN before any
-     * probe completed (or for an id that is not a configured backend).
+     * most recent completed probe inside its deadline, 0.0 when it did
+     * not, when the attempt in flight is already past its deadline, or
+     * when the most recent attempt was abandoned; NaN before any probe
+     * completed (or for an id that is not a configured backend).
      */
-    fun reachable(id: UUID): Double = backends[id]?.reachable ?: Double.NaN
+    fun reachable(id: UUID): Double {
+        val backend = backends[id] ?: return Double.NaN
+        synchronized(backend) {
+            val current = backend.pending()
+            if (current != null && backend.ageMs(current, System.nanoTime()) > backend.deadlineMs) return 0.0
+            return backend.reachable
+        }
+    }
 
     /**
      * Attempts of [id] started and not finished — hung ones included.
@@ -159,46 +190,69 @@ class HogliteBackendHealth(
         backend: Backend,
     ) {
         synchronized(backend) {
-            val current = backend.inFlight
-            if (current != null && !current.task.isDone) {
-                val ageMs = (System.nanoTime() - current.startedNanos) / 1_000_000
+            val current = backend.pending()
+            val ageMs = current?.let { backend.ageMs(it, System.nanoTime()) }
+            if (ageMs != null) {
                 if (ageMs <= backend.deadlineMs) return
-                log.warn {
-                    "abandoning a hoglite health probe attempt of backend $id ${ageMs}ms old " +
-                        "(deadline ${backend.deadlineMs}ms); reporting it unreachable and launching a fresh " +
-                        "attempt so a hung one cannot pin hoglake_hoglite_backend_reachable at its last value"
-                }
                 backend.reachable = 0.0
             }
             if (backend.running.get() >= MAX_CONCURRENT_PROBES) {
+                backend.reachable = 0.0
+                if (backend.capped) return
+                backend.capped = true
                 // ERROR, as HealthProbe's refusal is: past this point the
                 // sampler cannot recover on its own and the remedy is a
                 // restart, so the line has to be one an alert can key on.
+                // Once per stall, not per tick: the state is the gauge's.
                 log.error {
                     "$MAX_CONCURRENT_PROBES hoglite health probe attempts of backend $id are hung and cannot be " +
                         "interrupted; hoglake_hoglite_backend_reachable reads 0 until one returns, or until " +
                         "this pod restarts (see hoglake_hoglite_health_probe_attempts_hung)"
                 }
-                backend.reachable = 0.0
                 return
             }
+            if (backend.capped) {
+                backend.capped = false
+                log.warn { "a parked hoglite health probe attempt of backend $id returned; sampling resumes" }
+            }
+            if (ageMs != null) {
+                log.warn {
+                    "abandoning a hoglite health probe attempt of backend $id ${ageMs}ms old " +
+                        "(deadline ${backend.deadlineMs}ms); reporting it unreachable and launching a fresh " +
+                        "attempt so a hung one cannot pin hoglake_hoglite_backend_reachable at its last value"
+                }
+            }
             backend.running.incrementAndGet()
-            val seq = backend.launched.incrementAndGet()
-            val task =
+            backend.launched.incrementAndGet()
+            val attempt = Attempt(System.nanoTime())
+            attempt.task =
                 executor.submit {
+                    var answer = 0.0
                     try {
-                        val answer = if (probeQuietly(id)) 1.0 else 0.0
+                        answer = if (probeQuietly(id)) 1.0 else 0.0
+                    } finally {
                         // Under the lock, so it cannot interleave with a
                         // launch: an attempt the sampler has abandoned is no
                         // longer the one in flight, and its answer is stale.
+                        // One past its deadline is a failed probe, whatever
+                        // it says, even when no tick has replaced it yet.
+                        // The decrement is in the same block as the publish:
+                        // a tick between the two would find the answer taken
+                        // and the attempt still counted, and with an
+                        // abandoned attempt parked would take the cap branch,
+                        // overwrite the fresh answer with 0 and log the
+                        // restart ERROR for a backend that just answered.
                         synchronized(backend) {
-                            if (backend.inFlight?.seq == seq) backend.reachable = answer
+                            if (backend.inFlight === attempt) {
+                                val late = backend.ageMs(attempt, System.nanoTime()) > backend.deadlineMs
+                                backend.reachable = if (late) 0.0 else answer
+                                attempt.answered = true
+                            }
+                            backend.running.decrementAndGet()
                         }
-                    } finally {
-                        backend.running.decrementAndGet()
                     }
                 }
-            backend.inFlight = Attempt(seq, task, System.nanoTime())
+            backend.inFlight = attempt
         }
     }
 
