@@ -14,12 +14,16 @@ import java.net.ConnectException
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpConnectTimeoutException
+import java.net.http.HttpHeaders
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /** One statement of a hoglite transaction (`/v1/t/{tid}/tx`), or the single statement of a `/query`. */
 data class HogliteStatement(
@@ -77,6 +81,12 @@ class HogliteGuardFailure(
 class HogliteRejected(
     val status: Int,
     val body: String,
+    /**
+     * hoglite's clock when it answered, from the response's `Date`, in epoch
+     * seconds; set on a 401 only, null when the answer carried none. It is
+     * the verifier's clock unless a peer relayed the 401 (#681).
+     */
+    val backendClockSeconds: Long? = null,
 ) : RuntimeException("hoglite $status: $body")
 
 /*
@@ -130,6 +140,28 @@ class HogliteRejected(
  * not labelled `not_applied`, or a transport failure other than a refused
  * or timed-out connect; once one has, the call can only end committed or
  * unknown.
+ *
+ * ## Request authority
+ *
+ * A client bound to one request ([forRequest]) forwards the caller's
+ * token on every call, and hoglite verifies it on every call, where
+ * PostgreSQL checks it once when the request starts. Once a `tx` of the
+ * request has applied (or may have), a later 401 cannot mean "nothing
+ * ran": it surfaces as [HoglakeException.CommitOutcomeUnknown] naming
+ * that `tx` (marked [HoglakeException.CommitOutcomeUnknown.applied] when
+ * it answered 200, and always
+ * [HoglakeException.CommitOutcomeUnknown.tokenLapsed]), never as the
+ * refusal a caller re-mints its token and replays the whole request on.
+ * A 401 that ends a `tx` whose own attempt was ambiguous names that `tx`
+ * instead, unless an earlier `tx` is known to have applied, which it
+ * names, with the ambiguous one in the detail; marked tokenLapsed
+ * whenever an earlier `tx` applied or may have. Only 401: hoglite
+ * answers it for every token it cannot verify, an expired one included,
+ * and 403 only for a verified token whose authority never covers the
+ * call (a tenant mismatch, a non-operator on an operator route), which a
+ * retry cannot change, so a 403 stays a refusal. This is the fallback: a long-running
+ * route refuses up front a token with too little lifetime left
+ * (`CatalogStoreSelector.requireTokenLifetime`), before anything is sent.
  *
  * ## Circuit breaking
  *
@@ -198,6 +230,19 @@ class HogliteClient(
             Pool.WHALE to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
         )
 
+    /** A `tx` of this request that applied ([certain]) or may have applied. */
+    private class RequestTx(
+        val txid: String,
+        val certain: Boolean,
+    )
+
+    /**
+     * The last `tx` of this request that applied, else the last that may
+     * have applied, null until one has. Not tracked on the shared client, which serves
+     * every request. See "Request authority" in the class KDoc.
+     */
+    private val appliedTx: AtomicReference<RequestTx?>? = if (shared != null) AtomicReference(null) else null
+
     /** Bind immutable request authority. Share transport, routing pins, and breakers. */
     internal fun forRequest(token: String?): HogliteClient =
         HogliteClient(
@@ -207,54 +252,78 @@ class HogliteClient(
         )
 
     /**
-     * Whether the forwarded token's `exp` has passed, by this pod's clock.
-     * False with no token or no readable `exp`: hoglake verified the token
-     * it forwards, so neither is an expiry a re-mint would fix.
+     * Whether the forwarded token's `exp` has passed by this pod's clock, or
+     * by more than [HOGLITE_CLOCK_SKEW_SECONDS] on [backendClockSeconds],
+     * where hoglite's exp rule refuses it. False with no token or no
+     * readable `exp`: hoglake verified the token it forwards, so neither is
+     * an expiry a re-mint would fix.
      */
-    internal fun bearerExpired(nowSeconds: Long = System.currentTimeMillis() / 1000): Boolean {
+    internal fun bearerExpired(
+        nowSeconds: Long = System.currentTimeMillis() / 1000,
+        backendClockSeconds: Long? = null,
+    ): Boolean {
         val token = bearerToken ?: return false
         val exp = runCatching { Jwt.seconds(Jwt.parse(token).claims, "exp") }.getOrNull() ?: return false
-        return nowSeconds >= exp
+        return nowSeconds >= exp ||
+            (backendClockSeconds != null && backendClockSeconds - HOGLITE_CLOCK_SKEW_SECONDS > exp)
     }
 
     /**
      * The later of the forwarded token's integer `iat` and `nbf`, when it is
-     * more than [HOGLITE_CLOCK_SKEW_SECONDS] ahead of this pod's clock; null
+     * more than [HOGLITE_CLOCK_SKEW_SECONDS] ahead of [clockSeconds]; null
      * otherwise. hoglake admits such a token within
      * `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS`, hoglite within its fixed leeway, so
-     * only a token past that leeway is one hoglite's clock rule refuses with
-     * the clocks in sync. A token ahead by less was refused for another rule.
+     * only a token past that leeway by hoglite's clock is one its clock rule
+     * refuses. A token ahead by less was refused for another rule.
      */
-    internal fun bearerIssuedAhead(nowSeconds: Long = System.currentTimeMillis() / 1000): Long? {
+    internal fun bearerIssuedAhead(clockSeconds: Long = System.currentTimeMillis() / 1000): Long? {
         val token = bearerToken ?: return null
         val claims = runCatching { Jwt.parse(token).claims }.getOrNull() ?: return null
         return listOf("iat", "nbf")
             .mapNotNull { name -> claims.get(name)?.takeIf { it.isIntegralNumber }?.asLong() }
             .maxOrNull()
-            ?.takeIf { it - nowSeconds > HOGLITE_CLOCK_SKEW_SECONDS }
+            ?.takeIf { it - clockSeconds > HOGLITE_CLOCK_SKEW_SECONDS }
     }
 
     /**
      * What hoglite's 401 for the forwarded token means to the caller. It does
      * not say which rule failed: a token past its `exp` is renewed by a
-     * re-mint; a token issued beyond hoglite's leeway ahead of this pod's
-     * clock is retried, unchanged, once hoglite's clock admits it; any other
+     * re-mint; a token issued beyond hoglite's leeway ahead of hoglite's
+     * clock is retried, unchanged, once that clock admits it; any other
      * broke a rule hoglake does not apply, which a re-mint with the same
      * claims cannot satisfy (#681).
+     *
+     * [backendClockSeconds] is hoglite's clock from the refusal's `Date`
+     * ([backendClock]). It is the clock of the pod that answered, which is
+     * not always the one that verified: a pod that relays the owner's 401
+     * stamps its own `Date`. Each rule is judged on the clock that reads it
+     * more strictly, so that neither pod's verdict is missed. `exp` has
+     * passed on either clock; `iat` and `nbf` lead the earlier of the two,
+     * since a trailing verifier is the one that refuses an early token.
+     * Measured from this pod's clock alone, a hoglite clock trailing it by a
+     * second turned the retry into a 403 (review of #724); from the `Date`
+     * alone, so did an owner behind the pod that relayed its 401. A wait
+     * the earlier clock overstates shrinks to 0 on the retries, and the
+     * answer then falls through to 403.
      */
-    internal fun authorityRefusal(nowSeconds: Long = System.currentTimeMillis() / 1000): HoglakeException {
-        if (bearerExpired(nowSeconds)) {
+    internal fun authorityRefusal(
+        backendClockSeconds: Long? = null,
+        nowSeconds: Long = System.currentTimeMillis() / 1000,
+    ): HoglakeException {
+        if (bearerExpired(nowSeconds, backendClockSeconds)) {
             return HoglakeException.Unauthenticated(
                 JwtViolation.EXPIRED,
                 "backend refused request authority: expired",
             )
         }
-        val ahead = bearerIssuedAhead(nowSeconds)
+        val clock = minOf(backendClockSeconds ?: nowSeconds, nowSeconds)
+        val ahead = bearerIssuedAhead(clock)
         if (ahead != null) {
             // At least 1: bearerIssuedAhead answers only past hoglite's leeway.
-            val wait = (ahead - HOGLITE_CLOCK_SKEW_SECONDS - nowSeconds).coerceAtMost(MAX_NOT_YET_VALID_RETRY_SECONDS)
+            val wait = (ahead - HOGLITE_CLOCK_SKEW_SECONDS - clock).coerceAtMost(MAX_NOT_YET_VALID_RETRY_SECONDS)
+            val whose = if (clock < nowSeconds) "hoglite's" else "hoglake's"
             return HoglakeException.BackendTokenNotYetValid(
-                "hoglite refused a token issued ${ahead - nowSeconds}s ahead of hoglake's clock; " +
+                "hoglite refused a token issued ${ahead - clock}s ahead of $whose clock; " +
                     "retry the same token after ${wait}s (docs/auth.md, Backends that verify the token themselves)",
                 retryAfterSeconds = wait,
             )
@@ -287,8 +356,7 @@ class HogliteClient(
             catalog,
             namespace,
             readTimeoutMs,
-            ::authorityRefusal,
-        )
+        ) { backendClock -> authorityRefusal(backendClock) }
     }
 
     /**
@@ -312,8 +380,7 @@ class HogliteClient(
             namespace,
             table,
             readTimeoutMs,
-            ::authorityRefusal,
-        )
+        ) { backendClock -> authorityRefusal(backendClock) }
     }
 
     /**
@@ -341,8 +408,7 @@ class HogliteClient(
             snapshot,
             tableUuid,
             readTimeoutMs,
-            ::authorityRefusal,
-        )
+        ) { backendClock -> authorityRefusal(backendClock) }
     }
 
     /**
@@ -374,6 +440,26 @@ class HogliteClient(
                     put("statements", materialized)
                 },
             )
+        try {
+            return applyTx(tenant, txid, body, statementCount).also { appliedTx?.set(RequestTx(txid, certain = true)) }
+        } catch (e: HoglakeException.CommitOutcomeUnknown) {
+            // Only this tx's own unknown outcome: a 401 naming an earlier tx
+            // records nothing new. Never downgrades a tx known to have applied.
+            if (e.txid == txid && !e.applied) {
+                appliedTx?.updateAndGet { earlier ->
+                    earlier?.takeIf { it.certain } ?: RequestTx(txid, certain = false)
+                }
+            }
+            throw e
+        }
+    }
+
+    private fun applyTx(
+        tenant: String,
+        txid: String,
+        body: ByteArray,
+        statementCount: Int,
+    ): List<HogliteQueryResult> {
         return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
             when {
                 status == 200 ->
@@ -681,8 +767,33 @@ class HogliteClient(
         ): T {
             // A later refusal cannot disprove an earlier ambiguous apply.
             // Only a complete successful answer can settle this exact request.
+            val earlier = appliedTx?.get()
             if (txid != null && mayHaveApplied && status != 200) {
-                throw HoglakeException.CommitOutcomeUnknown(txid, "hoglite answered $status after an ambiguous attempt")
+                // A tx known to have applied outranks this one's unknown outcome.
+                if (status == 401 && earlier?.certain == true) {
+                    throw HoglakeException.CommitOutcomeUnknown(
+                        earlier.txid,
+                        "hoglite refused the request's token (401), as it does once the token expires, " +
+                            "after an ambiguous attempt of backend transaction '$txid'",
+                        applied = true,
+                        tokenLapsed = true,
+                    )
+                }
+                throw HoglakeException.CommitOutcomeUnknown(
+                    txid,
+                    "hoglite answered $status after an ambiguous attempt",
+                    // A 401 after an earlier tx of the request still ends a request that partly ran.
+                    tokenLapsed = status == 401 && earlier != null,
+                )
+            }
+            // Nor can a token that lapsed mid-request disprove an earlier tx of it.
+            if (earlier != null && status == 401) {
+                throw HoglakeException.CommitOutcomeUnknown(
+                    earlier.txid,
+                    "hoglite refused the request's token (401), as it does once the token expires",
+                    applied = earlier.certain,
+                    tokenLapsed = true,
+                )
             }
             return parse(status, bytes)
         }
@@ -792,7 +903,13 @@ class HogliteClient(
                     // Surface other statuses without another transport attempt.
                     // Operation-specific classification distinguishes request
                     // refusals, unknown read failures, and ambiguous writes.
-                    return finalAnswer(resp.statusCode(), resp.body())
+                    if (resp.statusCode() != 401) return finalAnswer(resp.statusCode(), resp.body())
+                    // A 401 carries hoglite's clock, which authorityRefusal reads (#681).
+                    try {
+                        return finalAnswer(401, resp.body())
+                    } catch (e: HogliteRejected) {
+                        throw if (e.status == 401) HogliteRejected(401, e.body, backendClock(resp.headers())) else e
+                    }
                 }
             }
         }
@@ -1081,6 +1198,12 @@ class HogliteClient(
     }
 
     companion object {
+        /**
+         * How long past its `exp` hoglited still accepts a token: hoglite's
+         * fixed leeway, not configurable here. See "Request authority".
+         */
+        const val TOKEN_LEEWAY_SECONDS = 60L
+
         fun fromConfig(backend: HogliteBackend): HogliteClient =
             HogliteClient(
                 standardUrl = backend.url,
@@ -1114,6 +1237,17 @@ class HogliteClient(
          * ahead of the clock. A longer wait is asked again on the retry.
          */
         const val MAX_NOT_YET_VALID_RETRY_SECONDS = 300L
+
+        /**
+         * hoglite's clock from an answer's `Date`, in epoch seconds; null when
+         * it carries none or one that does not parse. hoglited's Go server
+         * stamps every answer with it, at whole-second resolution.
+         */
+        internal fun backendClock(headers: HttpHeaders): Long? =
+            headers.firstValue("Date").orElse(null)?.let { date ->
+                runCatching { ZonedDateTime.parse(date, DateTimeFormatter.RFC_1123_DATE_TIME).toEpochSecond() }
+                    .getOrNull()
+            }
 
         /** The `client` half of hoglite's (client, txid) dedup key. */
         const val CLIENT_NAME = "hoglake"

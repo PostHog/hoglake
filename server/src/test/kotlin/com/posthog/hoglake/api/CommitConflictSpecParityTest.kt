@@ -307,6 +307,12 @@ class CommitConflictSpecParityTest {
         val ctor = type.primaryConstructor!!
         val args =
             ctor.parameters.map { parameter ->
+                fun unknownParameter(): Nothing =
+                    error(
+                        "add a placeholder for ${parameter.type} in instantiate(), and while " +
+                            "you are there decide whether ${type.simpleName} needs its own " +
+                            "wire code in errorBody",
+                    )
                 when (parameter.type.classifier) {
                     // MountHostRefused relays a host's own code: no arm of its
                     // own to fall out of, so it gets a code no arm answers.
@@ -319,12 +325,19 @@ class CommitConflictSpecParityTest {
                     // CatalogNotEmpty's reason. One wire code for every
                     // reason, by design (see the exception's KDoc).
                     CatalogNotEmptyReason::class -> CatalogNotEmptyReason.entries.first()
-                    else ->
-                        error(
-                            "add a placeholder for ${parameter.type} in instantiate(), and while " +
-                                "you are there decide whether ${type.simpleName} needs its own " +
-                                "wire code in errorBody",
-                        )
+                    // CommitOutcomeUnknown's applied: it changes the message, not the
+                    // code. Both cases are a 503 a caller must not read as "nothing ran".
+                    // Its tokenLapsed changes neither: still 503 commit_outcome_unknown.
+                    // Only those two: any other Boolean still asks for a decision.
+                    Boolean::class ->
+                        if (type == HoglakeException.CommitOutcomeUnknown::class &&
+                            parameter.name in setOf("applied", "tokenLapsed")
+                        ) {
+                            true
+                        } else {
+                            unknownParameter()
+                        }
+                    else -> unknownParameter()
                 }
             }
         return ctor.call(*args.toTypedArray()) as HoglakeException

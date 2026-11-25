@@ -2945,18 +2945,19 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     /**
      * hoglite refused, with its 401, a token hoglake verified whose `iat` or
-     * `nbf` is more than hoglite's fixed 60 s ahead of hoglake's clock ->
-     * HTTP 503 `backend_unavailable` with [retryAfterSeconds] as the
-     * `Retry-After`. hoglake admits such a token within
-     * `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS`, hoglite within its 60 s, so the
-     * same token passes once the clock catches up (#681).
+     * `nbf` is more than hoglite's fixed 60 s ahead of hoglite's clock (the
+     * refusal's `Date`) -> HTTP 503 `backend_unavailable` with
+     * [retryAfterSeconds] as the `Retry-After`. hoglake admits such a token
+     * within `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS`, hoglite within its 60 s, so
+     * the same token passes once hoglite's clock catches up (#681).
      *
      * It IS a [BackendUnavailable] on the wire: nothing was applied, and a
      * client that tells a 503 that applied nothing by its code (the DuckDB
      * extension's commit retry) retries it as one, with the same token, not
-     * a re-mint. Metrics and audit give it its own outcome: the cause is a
-     * caller's clock or hoglake's skew setting, not the database failing to
-     * answer, and an operator pages on the latter.
+     * a re-mint. Audit (and the counters that take its outcome) gives it its
+     * own outcome: the cause is a caller's clock, hoglake's skew setting or
+     * hoglite's clock, not the database failing to answer, and an operator
+     * pages on the latter.
      */
     class BackendTokenNotYetValid(
         detail: String,
@@ -2981,14 +2982,38 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * one without a key is at-least-once, the same as a lost COMMIT
      * acknowledgement on Postgres. [txid] stays in the message for
      * operators.
+     *
+     * [applied] marks the other case with this code: [txid] did apply and
+     * a later call of the same request failed in a way that cannot mean
+     * "nothing ran" (hoglite refusing a token that expired mid-request).
+     * The request partly applied, so the message says to re-read state
+     * rather than that the outcome is unknown. It promises exactly-once
+     * only to a retry with the same key on an operation that takes one: a
+     * maintenance run, catalog drop or upload sweep takes none, and a
+     * replay of one can act on state another caller changed meanwhile.
+     *
+     * [tokenLapsed] marks a 401 that ended a call after an earlier
+     * transaction of the request applied or may have. [txid] names that
+     * earlier transaction, or the failing call's own when one of its
+     * attempts was ambiguous. A best-effort maintenance step fails its run
+     * only on that: an ambiguous outcome with no lapse is a step failure
+     * like any other.
      */
     class CommitOutcomeUnknown(
         val txid: String,
         detail: String,
+        val applied: Boolean = false,
+        val tokenLapsed: Boolean = false,
     ) : BackendUnavailable(
-            "commit outcome unknown: it may or may not have been applied. A retry with the same " +
-                "idempotency_key is exactly-once; without a key, read the table before a retry " +
-                "(backend transaction '$txid'): $detail",
+            if (applied) {
+                "request partly applied: backend transaction '$txid' applied and a later step " +
+                    "failed. Only an operation that takes an idempotency_key is exactly-once on a " +
+                    "retry with the same key; otherwise re-read the catalog's state before a retry: $detail"
+            } else {
+                "commit outcome unknown: it may or may not have been applied. A retry with the same " +
+                    "idempotency_key is exactly-once; without a key, read the table before a retry " +
+                    "(backend transaction '$txid'): $detail"
+            },
         )
 
     /**

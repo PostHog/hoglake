@@ -1180,7 +1180,9 @@ object Metrics {
             is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
             // A caller's clock or hoglake's skew, not the database failing to
             // answer: its own outcome, though the wire code is backend_unavailable.
-            // Before BackendUnavailable: it is one.
+            // Before BackendUnavailable: it is one. Only Hoglite raises it, and
+            // Hoglite commits do not reach this counter yet (#677): the arm
+            // keeps the outcome apart for then.
             is HoglakeException.BackendTokenNotYetValid -> "backend_token_not_yet_valid"
             is HoglakeException.BackendUnavailable -> "backend_unavailable"
             is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"

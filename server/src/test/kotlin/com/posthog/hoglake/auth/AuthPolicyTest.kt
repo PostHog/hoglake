@@ -92,9 +92,48 @@ class AuthPolicyTest {
         // vacuous pass would be worse than a failure.
         assertThat(published).hasSizeGreaterThan(60)
 
+        // The local-only routes have no policy entry. The plugin decides them before the policy table
+        // (AuthPlugin.kt, selectLocalOnly), with the dedicated read verifier only.
+        val (localOnly, ordinary) = published.partition { (_, path) -> ReadSessionProfile.isLocalOnlyPath(path) }
         val missing =
-            published.filter { (method, path) -> AuthPolicy.match(HttpMethod.parse(method.uppercase()), path) == null }
+            ordinary.filter { (method, path) -> AuthPolicy.match(HttpMethod.parse(method.uppercase()), path) == null }
         assertThat(missing).describedAs("routes published in the OpenAPI spec with no AuthPolicy entry").isEmpty()
+
+        // Each local-only route is a GET whose canonical path is exactly one of the three ordinary read patterns.
+        val canonical =
+            localOnly.map { (method, path) ->
+                val target = ReadSessionProfile.canonicalLocalOnlyPath(path)
+                Triple(method.lowercase(), target, target?.let { AuthPolicy.match(HttpMethod.Get, it)?.pattern })
+            }
+        assertThat(canonical.map { it.first }).describedAs("local-only methods").containsOnly("get")
+        assertThat(canonical.filter { it.second == null || it.second != it.third })
+            .describedAs("local-only routes whose canonical path is not an exact policy pattern")
+            .isEmpty()
+        assertThat(canonical.map { it.third }.toSet())
+            .isEqualTo(ReadSessionProfile.LOCAL_ONLY_PATTERNS)
+    }
+
+    /**
+     * Each local-only read reaches the owner's verifier, whose 401 for a
+     * token hoglake accepted is 403 `backend_refused_authority` (#681), so
+     * each documents that 403.
+     */
+    @Test
+    fun `every local-only read documents the owner's 403`() {
+        val text =
+            checkNotNull(javaClass.getResourceAsStream("/openapi/hoglake.yaml")) {
+                "openapi/hoglake.yaml is not on the test classpath"
+            }.bufferedReader().readText()
+        val blocks =
+            Regex("""\n  (/local-only/\S*):\n""").findAll(text).map { header ->
+                val rest = text.substring(header.range.last + 1)
+                header.groupValues[1] to rest.substring(0, Regex("\n  /").find(rest)?.range?.first ?: rest.length)
+            }.toList()
+        val forbidden = "\"403\": { \$ref: \"#/components/responses/LocalOnlyForbidden\" }"
+        assertThat(blocks).hasSameSizeAs(ReadSessionProfile.LOCAL_ONLY_PATTERNS)
+        assertThat(blocks.filterNot { (_, block) -> forbidden in block })
+            .describedAs("local-only reads without the owner's 403")
+            .isEmpty()
     }
 
     @Test

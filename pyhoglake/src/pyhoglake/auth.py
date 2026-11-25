@@ -41,10 +41,11 @@ class ClientCredentials(httpx.Auth):
     """RFC 6749 client credentials, cached until shortly before expiry.
 
     A 401 from hoglake replaces the token once and retries the request.
-    That is safe for writes too: hoglake decides authentication before any
-    handler runs, so a 401 means the request did nothing, and the causes a
+    That is safe for writes too: hoglake answers 401 only before any catalog
+    work starts, so a 401 means the request did nothing, and the causes a
     fresh token fixes — revocation, a signing key the server has not loaded
-    yet, early expiry by clock skew — are the ones that produce it.
+    yet, early expiry by clock skew, too little lifetime left for a
+    long-running Hoglite route — are the ones that produce it.
     """
 
     # Refresh this far before expiry, capped at a fifth of the lifetime.

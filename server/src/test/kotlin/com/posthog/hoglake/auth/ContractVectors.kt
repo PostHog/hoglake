@@ -154,7 +154,8 @@ object ContractVectors {
     /** [document] with every token's signature segment removed: the part regeneration must reproduce. */
     fun withoutSignatures(document: JsonNode): JsonNode {
         val copy = document.deepCopy<JsonNode>()
-        (copy["vectors"] as ArrayNode).forEach { vector ->
+        // "relay" is the second signed list of the read session document.
+        listOfNotNull(copy["vectors"], copy["relay"]).flatMap { it as ArrayNode }.forEach { vector ->
             val token = vector["token"].asText()
             (vector as ObjectNode).put("token", token.substringBeforeLast('.'))
         }

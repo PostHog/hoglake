@@ -70,7 +70,7 @@ class HogliteRefusalMappingTest {
         fun refusal(claims: String) =
             HogliteClient(
                 "http://unused.invalid",
-            ).forRequest(tokenWith(claims)).authorityRefusal(now)
+            ).forRequest(tokenWith(claims)).authorityRefusal(nowSeconds = now)
 
         for ((claims, wait) in listOf(
             """{"exp":$exp,"iat":${now + 120},"nbf":${now + 120}}""" to 60L,
@@ -105,6 +105,161 @@ class HogliteRefusalMappingTest {
         val mapped = storeFor(ahead).mapRejected("cat", HogliteRejected(401, """{"code":"refused"}"""))
         assertThat(mapped).isExactlyInstanceOf(HoglakeException.BackendTokenNotYetValid::class.java)
         assertThat((mapped as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds).isPositive()
+    }
+
+    /**
+     * hoglite's clock, from its refusal's `Date`, measures a token issued
+     * ahead when it trails hoglake's (review of #724). A token 65 s ahead of
+     * hoglake's clock on a hoglite 2 s behind it waits 7 s, not 5; the retry
+     * hoglake's clock alone would have asked for, still early on hoglite, is
+     * a 503 again with the rest of the wait, never the final 403. A `Date`
+     * ahead of hoglake's clock may be a relaying pod's, not the verifier's,
+     * so hoglake's clock measures the lead then.
+     */
+    @Test
+    fun `hoglite's clock in its refusal measures the wait for a token issued ahead`() {
+        val now = 1_800_000_000L
+        val base = HogliteClient("http://unused.invalid")
+        val ahead = base.forRequest(tokenWith("""{"exp":${now + 3600},"iat":${now + 65}}"""))
+
+        fun waitAt(
+            client: HogliteClient,
+            hoglite: Long,
+            hoglake: Long,
+        ): Long? {
+            val refusal = client.authorityRefusal(hoglite, hoglake)
+            return (refusal as? HoglakeException.BackendTokenNotYetValid)?.retryAfterSeconds
+        }
+
+        assertThat(waitAt(ahead, now - 2, now)).isEqualTo(7L)
+        assertThat(waitAt(ahead, now + 3, now + 5)).isEqualTo(2L)
+        // A relayed Date 10 s ahead reads a 55 s lead; an owner on hoglake's clock saw 65 s.
+        assertThat(waitAt(ahead, now + 10, now)).isEqualTo(5L)
+        // Within hoglite's leeway on both clocks: another rule refused it.
+        val inside = base.forRequest(tokenWith("""{"exp":${now + 3600},"iat":${now + 55}}"""))
+        assertThat(inside.authorityRefusal(now + 10, now))
+            .isExactlyInstanceOf(HoglakeException.BackendRefusedAuthority::class.java)
+        // Within hoglake's 60 s but past them on a hoglite clock 3 s behind.
+        val near = base.forRequest(tokenWith("""{"exp":${now + 3600},"iat":${now + 59}}"""))
+        assertThat(waitAt(near, now - 3, now)).isEqualTo(2L)
+        // The store hands the refusal's clock on; it reads this pod's clock off the wall.
+        val wall = System.currentTimeMillis() / 1000
+        val wallAhead = base.forRequest(tokenWith("""{"exp":${wall + 3600},"iat":${wall + 65}}"""))
+        val mapped =
+            HogliteCatalogStore(wallAhead, { "opaque_1" }).mapRejected(
+                "cat",
+                HogliteRejected(401, """{"code":"refused"}""", backendClockSeconds = wall - 2),
+            )
+        assertThat((mapped as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds).isEqualTo(7L)
+    }
+
+    /**
+     * hoglite's exp rule runs on its clock: a token with 20 s left by
+     * hoglake's clock is past hoglite's 60 s on a hoglite 90 s ahead, and a
+     * re-mint fixes it, so the answer is 401 `token_expired`, not the 403
+     * that tells the client not to re-mint.
+     */
+    @Test
+    fun `a token past its exp on hoglite's clock is expired`() {
+        val now = 1_800_000_000L
+        val client = HogliteClient("http://unused.invalid").forRequest(tokenExpiring(now + 20))
+        val failure = client.authorityRefusal(now + 90, now)
+        assertThat(failure).isExactlyInstanceOf(HoglakeException.Unauthenticated::class.java)
+        assertThat((failure as HoglakeException.Unauthenticated).reason).isEqualTo(JwtViolation.EXPIRED)
+        // Within hoglite's 60 s past exp, its exp rule did not refuse it.
+        assertThat(client.authorityRefusal(now + 80, now))
+            .isExactlyInstanceOf(HoglakeException.BackendRefusedAuthority::class.java)
+    }
+
+    /** The call loop reads hoglite's clock from its 401's `Date` (review of #724). */
+    @Test
+    fun `a backend 401 carries hoglite's Date to the refusal`() {
+        val wall = System.currentTimeMillis() / 1000
+        val token = tokenWith("""{"exp":${wall + 3600},"iat":${wall + 65}}""")
+        HogliteRawAnswer(
+            401,
+            HogliteRawAnswer.httpDate(wall - 30),
+            """{"error":"request not authorized","code":"refused"}""",
+        ).use { hoglite ->
+            HogliteClient(hoglite.url).use { client ->
+                val selected = HogliteCatalogStore(client.forRequest(token), { "opaque_1" })
+                val failure =
+                    catchThrowable {
+                        selected.catalogOperation("cat") { selected.queryCatalog("cat", "SELECT 1") }
+                    }
+                assertThat(failure).isExactlyInstanceOf(HoglakeException.BackendTokenNotYetValid::class.java)
+                // 95 s ahead of hoglite's Date, so 35 s; hoglake's clock alone would say 5.
+                assertThat((failure as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds).isEqualTo(35L)
+            }
+            assertThat(hoglite.calls.get()).isEqualTo(1)
+        }
+    }
+
+    /**
+     * A `/v1/query-batch` item's 401 carries no `Date`: the first such item
+     * is re-read on its own, and its 401 brings the `Date` the refusal is
+     * judged on. That refusal fails the call, so the other refused items
+     * are not re-read one by one (#681).
+     */
+    @Test
+    fun `a batch item 401 is judged on the clock of its own re-read`() {
+        val wall = System.currentTimeMillis() / 1000
+        val token = tokenWith("""{"exp":${wall + 3600},"iat":${wall + 65}}""")
+        val item = """{"status":401,"body":{"code":"refused"}}"""
+        HogliteRawAnswer(
+            401,
+            HogliteRawAnswer.httpDate(wall - 30),
+            """{"error":"request not authorized","code":"refused"}""",
+            byPath =
+                mapOf(
+                    "/v1/query-batch" to
+                        (200 to """{"results":[$item,$item,$item]}"""),
+                ),
+        ).use { hoglite ->
+            HogliteClient(hoglite.url).use { client ->
+                val failure =
+                    catchThrowable {
+                        HogliteCatalogStore(client.forRequest(token), { "opaque_1" }).listCatalogs(setOf("a", "b", "c"))
+                    }
+                assertThat(failure).isExactlyInstanceOf(HoglakeException.BackendTokenNotYetValid::class.java)
+                // 95 s ahead of the re-read's Date, so 35 s; hoglake's clock alone would say 5.
+                assertThat((failure as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds).isEqualTo(35L)
+            }
+            assertThat(hoglite.calls.get()).isEqualTo(2)
+        }
+    }
+
+    /**
+     * When the first refused batch item's re-read succeeds, the other
+     * refused items are re-read too rather than dropped from the list
+     * (review of #724). The fake answers every tenant query with the meta
+     * row of `a`, so `b` and `c` are skipped on the name check; the call
+     * count is what shows they were re-read.
+     */
+    @Test
+    fun `batch item 401s are all re-read when the first re-read succeeds`() {
+        val wall = System.currentTimeMillis() / 1000
+        val token = tokenWith("""{"exp":${wall + 3600},"iat":${wall - 5}}""")
+        val item = """{"status":401,"body":{"code":"refused"}}"""
+        val row = """["a","s3://lake/a/",0,1,0,null,null,0]"""
+        val meta = """{"cols":["c0","c1","c2","c3","c4","c5","c6","c7"],"rows":[$row],"affected":0}"""
+        HogliteRawAnswer(
+            401,
+            HogliteRawAnswer.httpDate(wall),
+            """{"error":"request not authorized","code":"refused"}""",
+            byPath =
+                mapOf(
+                    "/v1/query-batch" to (200 to """{"results":[$item,$item,$item]}"""),
+                    "/v1/t/opaque_1/query" to (200 to meta),
+                ),
+        ).use { hoglite ->
+            HogliteClient(hoglite.url).use { client ->
+                val store = HogliteCatalogStore(client.forRequest(token), { "opaque_1" })
+                val listed = store.listCatalogs(setOf("a", "b", "c"))
+                assertThat(listed.map { it.name }).containsExactly("a")
+            }
+            assertThat(hoglite.calls.get()).isEqualTo(4)
+        }
     }
 
     @Test
@@ -283,7 +438,9 @@ class HogliteRefusalMappingTest {
                             selected.listCatalogs(setOf("cat"))
                         }
                     }.isInstanceOf(expected)
-                    assertThat(calls.get()).isEqualTo(if (mode == "batch-fallback") 2 else 1)
+                    // A batch item's 401 is re-read on its own for its Date.
+                    val retried = mode == "batch-fallback" || (mode == "batch-item" && status == 401)
+                    assertThat(calls.get()).isEqualTo(if (retried) 2 else 1)
                 }
             } finally {
                 server.stop(0)

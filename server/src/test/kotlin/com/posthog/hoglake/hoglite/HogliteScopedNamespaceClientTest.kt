@@ -218,6 +218,32 @@ class HogliteScopedNamespaceClientTest {
         assertThat(calls.get()).isEqualTo(15)
     }
 
+    /** A typed read measures a token issued ahead from hoglite's `Date`, not hoglake's clock (review of #724). */
+    @Test
+    fun `an unauthorized refusal on every typed read waits by hoglite's clock`() {
+        val tableUuid = UUID.fromString("11111111-1111-4111-8111-111111111111")
+        val wall = System.currentTimeMillis() / 1000
+        HogliteRawAnswer(401, HogliteRawAnswer.httpDate(wall - 30), """{"code":"unauthorized"}""").use { hoglite ->
+            HogliteClient(hoglite.url, retryBudgetMs = 50, sleeper = { error("unexpected retry") }).use { base ->
+                val client = base.forRequest(tokenIssuedAt(wall + 65))
+                val reads =
+                    listOf<() -> Any?>(
+                        { client.readScopedNamespace("tenant_1", "lake", "reports") },
+                        { client.readScopedTable("tenant_1", "lake", "reports", "metrics") },
+                        { client.readScopedScan("tenant_1", "lake", "reports", "metrics", 5L, tableUuid) },
+                    )
+                for (read in reads) {
+                    val failure = catchThrowable { read() }
+                    assertThat(failure).isExactlyInstanceOf(HoglakeException.BackendTokenNotYetValid::class.java)
+                    // 95 s ahead of hoglite's Date, so 35 s; hoglake's clock alone would say 5.
+                    assertThat((failure as HoglakeException.BackendTokenNotYetValid).retryAfterSeconds)
+                        .isEqualTo(35L)
+                }
+            }
+            assertThat(hoglite.calls.get()).isEqualTo(3)
+        }
+    }
+
     @Test
     fun `success requires exactly the fixed DTO fields and types`() {
         val good = validBody()

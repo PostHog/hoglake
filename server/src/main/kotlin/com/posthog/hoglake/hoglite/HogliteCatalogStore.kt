@@ -265,9 +265,12 @@ class HogliteCatalogStore(
                 name,
                 dataPath,
             )
+            // Snapshot 0's ts comes from the engine's clock, like every later
+            // snapshot's ([insertSnapshotRow]), so the clamp never starts
+            // from a pod's time.
             boot.add(
-                "INSERT INTO snapshots(id, ts, author, message, schema_version) VALUES (0, ?, ?, ?, 0)",
-                HogliteSchema.now(),
+                "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
+                    "VALUES (0, ${HogliteSchema.NOW_SQL}, ?, ?, 0)",
                 author,
                 message,
             )
@@ -333,7 +336,7 @@ class HogliteCatalogStore(
                     log.warn { "catalog '$name' resolved to a tenant whose meta names '${row[0]}'; skipping" }
                     null
                 }
-                else -> metaRow(row).toCatalogInfo()
+                else -> metaRow(name, row).toCatalogInfo()
             }
         }
     }
@@ -344,16 +347,23 @@ class HogliteCatalogStore(
     /**
      * The meta row of each (name, tenant) in [bound], in order: the row,
      * or null when that tenant does not exist (404) or has no meta row.
-     * Any other answer for an item is retried on its own through
-     * [HogliteClient.query] (which owns re-routing and the retry budget),
-     * and an item that still fails fails the call, as a single
-     * [getCatalog] would. That covers a whale-class tenant: the batch goes
-     * to the standard pool, which answers that item 421 with the class,
-     * and the retry follows the hint to the whale pool.
+     * A 403 fails the call. Any other answer for an item is retried on its
+     * own through [HogliteClient.query] (which owns re-routing and the
+     * retry budget), and an item that still fails fails the call, as a
+     * single [getCatalog] would. That covers a whale-class tenant: the
+     * batch goes to the standard pool, which answers that item 421 with the
+     * class, and the retry follows the hint to the whale pool. An item's
+     * 401 carries no `Date`, so the first such item is re-read alone, and
+     * its refusal fails the call with a `Date`. That is often a relaying
+     * pod's, not the verifier's, so [HogliteClient.authorityRefusal] judges
+     * each rule on the stricter of it and hoglake's clock. The other 401
+     * items are retried only when that re-read succeeds, so a refused token
+     * costs one read more, not one per item.
      */
     private fun readMetas(bound: List<Pair<String, String>>): List<List<Any?>?> {
         val out = arrayOfNulls<List<Any?>>(bound.size)
         val retry = mutableListOf<Int>()
+        val refused = mutableListOf<Int>()
         val sql = metaSql
         val chunks = bound.indices.chunked(listBatchSize.coerceIn(1, HogliteClient.MAX_BATCH_READS))
         // The chunks are independent requests: sent together, a list costs
@@ -374,11 +384,15 @@ class HogliteCatalogStore(
                 when {
                     a.status == 200 -> out[i] = a.result!!.firstRow()
                     a.status == 404 -> out[i] = null
-                    a.status == 401 || a.status == 403 ->
-                        throw mapRejected(bound[i].first, HogliteRejected(a.status, a.body))
+                    a.status == 403 -> throw mapRejected(bound[i].first, HogliteRejected(a.status, a.body))
+                    a.status == 401 -> refused += i
                     else -> retry += i
                 }
             }
+        }
+        refused.firstOrNull()?.let { i ->
+            out[i] = readMetaOne(bound[i].first, bound[i].second, sql)
+            retry += refused.drop(1)
         }
         if (retry.isNotEmpty()) {
             val rows = parallelReads(retry) { i -> readMetaOne(bound[i].first, bound[i].second, sql) }
@@ -459,7 +473,7 @@ class HogliteCatalogStore(
         // transaction: the guards run in the resolution ORDER the
         // Postgres side documents (CatalogNotEmptyReason's KDoc is the
         // contract), and the same tx sets meta.dropping, which every
-        // mutating tenant tx guards on (runTx statement 0) — so no
+        // mutating tenant tx guards on (runTx's DROP_FENCE_SQL) — so no
         // namespace or commit can land between these
         // checks and the tenant deletion below. The fence tx itself
         // opts out of the fence (a retried drop after a partial failure
@@ -473,6 +487,7 @@ class HogliteCatalogStore(
 
         val fenceNow = HogliteSchema.now()
         val fence = HogliteTx()
+        fence.expectOne(NAME_GUARD_SQL, catalog) { missingCatalog(catalog) }
 
         fun emptyGuard(
             sql: String,
@@ -656,7 +671,6 @@ class HogliteCatalogStore(
         namespace: String,
     ): NamespaceInfo =
         catalogOperation(catalog) {
-            meta(catalog)
             return liveNamespace(catalog, namespace)
         }
 
@@ -817,7 +831,7 @@ class HogliteCatalogStore(
                         ),
                     ),
                 )
-            val meta = metaRow(pre[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+            val meta = metaRow(catalog, pre[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
             val ns =
                 pre[1].firstRow()?.let { namespaceInfo(it) }
                     ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
@@ -947,12 +961,24 @@ class HogliteCatalogStore(
     ): NamespaceContainment? =
         try {
             catalogOperation(catalog) {
-                queryCatalog(
-                    catalog,
-                    "SELECT contained_field, contained_value FROM namespaces " +
-                        "WHERE name = ? AND dropped_snapshot IS NULL",
-                    namespace,
-                ).firstRow()?.takeIf { it[0] != null }?.let { NamespaceContainment(it[0].asString(), it[1].asLong()) }
+                // The meta row rides along in the same read so the name
+                // check costs no round trip: this is an auth read, and a
+                // mis-mapped tenant must answer "no catalog", not another
+                // catalog's containment.
+                val (metaResult, row) =
+                    readCatalog(
+                        catalog,
+                        listOf(
+                            HogliteStatement(metaSql),
+                            HogliteStatement(
+                                "SELECT contained_field, contained_value FROM namespaces " +
+                                    "WHERE name = ? AND dropped_snapshot IS NULL",
+                                listOf(namespace),
+                            ),
+                        ),
+                    )
+                metaRow(catalog, metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+                row.firstRow()?.takeIf { it[0] != null }?.let { NamespaceContainment(it[0].asString(), it[1].asLong()) }
             }
         } catch (_: HoglakeException.NotFound) {
             null
@@ -1003,6 +1029,9 @@ class HogliteCatalogStore(
                 read()
             } catch (e: HoglakeException.BackendTokenNotYetValid) {
                 // The caller's token, not the scan: keep its Retry-After.
+                throw e
+            } catch (e: HoglakeException.CommitOutcomeUnknown) {
+                // A request that partly applied, not a scan that ran out of time.
                 throw e
             } catch (e: HoglakeException.BackendUnavailable) {
                 throw unverified(e)
@@ -1283,7 +1312,7 @@ class HogliteCatalogStore(
                     ),
                 ),
             )
-        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val m = metaRow(catalog, metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
         val ns =
             nsResult.firstRow()?.let { namespaceInfo(it) }
                 ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
@@ -1334,7 +1363,7 @@ class HogliteCatalogStore(
                     ),
                 ),
             )
-        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val m = metaRow(catalog, metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
         val at = resolveRead(catalog, m, null, null)
         nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
         val row =
@@ -1509,7 +1538,7 @@ class HogliteCatalogStore(
                     ),
                 ),
             )
-        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val m = metaRow(catalog, metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
         nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
         // One transaction is one engine snapshot, so a statement head that
         // differs from the meta row is an engine defect, never a race.
@@ -2468,7 +2497,7 @@ class HogliteCatalogStore(
         val row =
             queryCatalog(catalog, metaSql).firstRow()
                 ?: throw HoglakeException.NotFound("catalog '$catalog'")
-        return metaRow(row)
+        return metaRow(catalog, row)
     }
 
     private sealed interface DropMetadata {
@@ -2489,12 +2518,32 @@ class HogliteCatalogStore(
                 if (tenantAbsent(r)) return DropMetadata.Absent
                 throw mapRejected(catalog, r)
             } ?: throw HoglakeException.BackendUnavailable("catalog '$catalog' has no metadata row")
-        return DropMetadata.Present(metaRow(row))
+        return DropMetadata.Present(metaRow(catalog, row))
     }
 
-    internal fun metaRow(row: List<Any?>): MetaRow =
-        MetaRow(
-            name = row[0].asString(),
+    /**
+     * A [metaSql] row as the meta row of [catalog]. The row's name must
+     * be [catalog]: [tenants] is the caller's mapping, and a mapping
+     * error (a token whose `cat` names one catalog and whose `rtg.t` is
+     * another catalog's tenant) must not serve, write or drop the other
+     * catalog under the requested name (#670). The mismatch is NotFound
+     * for the REQUESTED catalog, which names nothing about the tenant's
+     * actual catalog to the caller; the warning carries both for the
+     * operator. Every path that reads the meta row parses it here, and
+     * the drop fence ([runTx]) guards the same equality for every
+     * mutating transaction, so a write with no meta read is refused too.
+     */
+    internal fun metaRow(
+        catalog: String,
+        row: List<Any?>,
+    ): MetaRow {
+        val name = row[0].asString()
+        if (name != catalog) {
+            log.warn { "catalog '$catalog' resolved to a tenant whose meta names '$name'; refusing" }
+            throw missingCatalog(catalog)
+        }
+        return MetaRow(
+            name = name,
             dataPath = row[1].asString(),
             head = row[2].asLong(),
             schemaVersion = row[3].asLong(),
@@ -2503,6 +2552,7 @@ class HogliteCatalogStore(
             retentionSeconds = row[6].asLongOrNull(),
             consumerFloor = row[7].asLong() != 0L,
         )
+    }
 
     /** Resolve the read snapshot for a read path, with hoglake's guard order and typed refusals. */
     internal fun resolveRead(
@@ -2555,16 +2605,37 @@ class HogliteCatalogStore(
                     "(earliest retained snapshot is ${m.earliestSnapshotId})",
             )
 
+    /**
+     * The live namespace named [namespace], read together with the meta
+     * row. This is the pre-flight read of every namespace- and
+     * table-scoped write (dropNamespace, dropTable, truncateTable,
+     * createTable, views) and of [liveTable], and those writes answer
+     * from it before [runTx]'s name guard runs: a stale expected id or
+     * UUID is a 409 carrying the live one, a contained namespace a 403,
+     * an unknown name the namespace 404. Checking the meta row here
+     * keeps a mis-mapped tenant (#670) the catalog 404 on those answers
+     * too, at no extra round trip, in hoglake's check order (the catalog
+     * before the namespace).
+     */
     internal fun liveNamespace(
         catalog: String,
         namespace: String,
-    ): NamespaceInfo =
-        queryCatalog(
-            catalog,
-            "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL",
-            namespace,
-        ).firstRow()?.let { namespaceInfo(it) }
+    ): NamespaceInfo {
+        val (metaResult, nsResult) =
+            readCatalog(
+                catalog,
+                listOf(
+                    HogliteStatement(metaSql),
+                    HogliteStatement(
+                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL",
+                        listOf(namespace),
+                    ),
+                ),
+            )
+        metaRow(catalog, metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        return nsResult.firstRow()?.let { namespaceInfo(it) }
             ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+    }
 
     /** The namespace incarnation alive at [at]: created at or before it, not dropped by it. */
     private fun namespaceAt(
@@ -3101,12 +3172,16 @@ class HogliteCatalogStore(
     /**
      * Run [tx] against [catalog]'s tenant.
      *
-     * Every mutating tenant transaction carries the DROP FENCE as
-     * statement 0: dropCatalog's fencing phase sets `meta.dropping`
-     * under the same guard set that proves the catalog empty, and this
-     * statement is what stops any later write (namespace create, commit)
-     * from landing between those checks and the tenant's
-     * deletion. Bootstrap opts out (it is what CREATES the meta row).
+     * Every mutating tenant transaction carries the FENCE as its first
+     * [FENCE_STATEMENTS] statements. Statement 0 is the NAME GUARD: the
+     * tenant's meta names [catalog], so a tenant [tenants] mapped to the
+     * wrong name is never written (the [metaRow] check for writes whose
+     * pre-flight reads skip the meta row; #670). Statement 1 is the DROP
+     * FENCE: dropCatalog's fencing phase sets `meta.dropping` under the
+     * same guard set that proves the catalog empty, and this statement
+     * is what stops any later write (namespace create, commit) from
+     * landing between those checks and the tenant's deletion. Bootstrap
+     * opts out (it is what CREATES the meta row).
      */
     internal fun runTx(
         catalog: String,
@@ -3119,11 +3194,8 @@ class HogliteCatalogStore(
             val statements =
                 if (fenced) {
                     listOf(
-                        HogliteStatement(
-                            "SELECT COUNT(*) FROM meta WHERE id = 1 AND dropping = 0",
-                            emptyList(),
-                            expectScalarInt = 1,
-                        ),
+                        HogliteStatement(NAME_GUARD_SQL, listOf(catalog), expectScalarInt = 1),
+                        HogliteStatement(DROP_FENCE_SQL, emptyList(), expectScalarInt = 1),
                     ) + tx.statements()
                 } else {
                     tx.statements()
@@ -3132,13 +3204,17 @@ class HogliteCatalogStore(
                 withBoundTenant(catalog) { tenant ->
                     client.tx(tenant, txid, fp, statements)
                 }
-            if (fenced) results.subList(1, results.size) else results
+            if (fenced) results.subList(FENCE_STATEMENTS, results.size) else results
         } catch (g: HogliteGuardFailure) {
             if (fenced) {
-                if (g.statementIndex == 0) {
-                    throw missingCatalog(catalog, "catalog '$catalog' (it is being dropped)")
+                when (g.statementIndex) {
+                    0 -> {
+                        log.warn { "catalog '$catalog' resolved to a tenant holding another catalog; refused" }
+                        throw missingCatalog(catalog)
+                    }
+                    1 -> throw missingCatalog(catalog, "catalog '$catalog' (it is being dropped)")
                 }
-                throw tx.classify(HogliteGuardFailure(g.statementIndex - 1, g.message ?: "guard failed"))
+                throw tx.classify(HogliteGuardFailure(g.statementIndex - FENCE_STATEMENTS, g.message ?: "guard failed"))
             }
             throw tx.classify(g)
         } catch (r: HogliteRejected) {
@@ -3256,7 +3332,8 @@ class HogliteCatalogStore(
         val code = body?.get("code")?.asText()
         val detail = body?.get("error")?.asText() ?: r.body
         return when {
-            r.status == 401 -> client.authorityRefusal()
+            // Only before a tx of the request applied: the client makes a later 401 CommitOutcomeUnknown.
+            r.status == 401 -> client.authorityRefusal(r.backendClockSeconds)
             r.status == 403 -> HoglakeException.Forbidden("backend refused request authority")
             r.status == 404 -> missingCatalog(catalog)
             code == "result_too_large" ->
@@ -3387,6 +3464,15 @@ class HogliteCatalogStore(
 
         /** SQLite's message for a refused FOREIGN KEY, immediate or at commit (deferred). */
         internal const val FOREIGN_KEY_REFUSAL = "FOREIGN KEY constraint failed"
+
+        /** [runTx]'s fence, statement 0: the tenant's meta names the catalog being written (one `?`, the name). */
+        internal const val NAME_GUARD_SQL = "SELECT COUNT(*) FROM meta WHERE id = 1 AND name = ?"
+
+        /** [runTx]'s fence, statement 1: no drop has fenced the catalog. */
+        internal const val DROP_FENCE_SQL = "SELECT COUNT(*) FROM meta WHERE id = 1 AND dropping = 0"
+
+        /** The statements [runTx] prepends to a fenced transaction; its results are stripped from the answer. */
+        internal const val FENCE_STATEMENTS = 2
 
         internal fun freshTxid(prefix: String): String = "$prefix:${UUID.randomUUID()}"
     }
