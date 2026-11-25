@@ -82,6 +82,7 @@ under `local` and 404s otherwise.
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
 | `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
+| `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` | the least lifetime a token must have left at a hoglite backend for a long-running route there; default 300, 0 disables. See [below](#backends-that-verify-the-token-themselves) |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_SESSION_PROFILE` | `off` (default) or `on`: whether tokens carrying the [session profile](#session-profile-with-embedded-storage-credentials) are accepted. Off, such a token is refused as `profile_not_enabled`, never read as a plain metadata token |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
@@ -184,6 +185,46 @@ there; only a catalog-bound `operator` request provisions or deletes. An
 issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
+
+hoglite verifies the token on every call, where hoglake checks it once
+when the request starts, and accepts it until 60 seconds past `exp`. A
+request that makes many calls can outlive its token there and fail
+partway, after some of its transactions applied (#680). Two rules cover
+that:
+
+- **Refused up front.** On a hoglite catalog, a long-running route
+  answers 401 `token_expired`, with `WWW-Authenticate: Bearer
+  error="token_expired"`, before any backend call, when `exp + 60 - now`
+  is under `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` (default 300; 0
+  disables it). `now` is when hoglake verified the token, on hoglake's
+  clock. The routes selected for the floor are the ones whose
+  transactions grow with the catalog's backlog: `POST
+  .../maintenance/expire`, `.../cleanup`, `.../compact` and
+  `.../rehydrate`, `DELETE /v1/catalogs/{catalog}` and `POST
+  .../uploads/schedule-expired`. Other routes can run a fixed few
+  transactions, and the next rule covers them. Nothing ran, so the 401
+  is safe to answer with a fresh token, which pyhoglake's
+  `ClientCredentials` and the DuckDB extension do on any 401. The
+  refusal is counted on `hoglake_auth_requests_total` and audited like
+  any other; under `warn` it is let through, except for a scoped caller.
+- **Failed midway anyway.** A 401 from hoglite after one of the
+  request's transactions applied, or may have, answers 503
+  `commit_outcome_unknown` naming that transaction, never 401: a client
+  must not re-mint and replay a request that partly ran. A maintenance
+  run answers it too, rather than 200 with a failure count. Only an
+  operation that takes an `idempotency_key` is exactly-once on a retry
+  with the same key; the routes above take none, so re-read the
+  catalog's state before running one again.
+
+Tune the minimum with the issuer's token lifetime. A fresh token has its
+lifetime plus 60 seconds left by this reckoning, less the time from mint
+to verify and any amount hoglake's clock runs ahead of the issuer's. A
+scheduler minting 5-minute tokens has 60 seconds of margin against the
+default 300: a hoglake clock more than that ahead of the issuer refuses
+every such call, and the re-minted retry too. Lower the minimum, or mint
+longer-lived tokens for maintenance.
+
+PostgreSQL catalogs are unaffected by both.
 
 #### Typed scoped namespace read
 
@@ -505,7 +546,13 @@ hydrator's footer fetches), `write` (compaction: its inputs' reads plus the
 put and multipart upload of its output — and no delete, so a leaked or buggy
 compaction session cannot remove a tenant's referenced files), and `delete`
 (cleanup's drain of the removal queue, the one job that deletes). A broker
-grants `s3:DeleteObject` only for `delete`. The token request is the
+grants `s3:DeleteObject` only for `delete`. The `prefix` is a request, not
+an authority: a broker must bound the session by the catalog's placement as
+its own records hold it, and refuse a `prefix` outside it. hoglake sends the
+catalog's `data_path`, and a Hoglite tenant can rewrite its own (#668), so a
+broker that scoped its session to whatever `prefix` it was sent would give
+that tenant a read session on another catalog's objects. hogtower's broker
+refuses one with `prefix_outside_catalog`. The token request is the
 clients' client-credentials form, `grant_type=client_credentials` with
 `audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
 URLs must be `https` — the client secret and every vended key cross that
@@ -528,7 +575,11 @@ its own, and every session it uses is one the broker chose to grant and can
 audit. PostHog runs it, pointed at hogtower; anyone can implement the shape in
 front of their own STS wrapper or a secrets engine. Under `ambient` the
 server's role reaches every catalog it serves, which is the normal trade for a
-single-org install.
+single-org install. A Hoglite tenant can rewrite its own `data_path` (#668), so
+a Hoglite rehydrate reads footers only under `HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE`
+or the catalog's `broker` session, and under `ambient` or `static` with no
+template it only requeues and records a failed `hydrator` run saying why
+(server/README).
 
 Whatever the provider, it serves only the server's own work: the background
 jobs, and the same work when a caller with `maintenance` scope triggers it

@@ -25,7 +25,7 @@ class HogliteMaintenanceStatusIntegrationTest {
     private val store get() = engine.store
 
     private fun backend(source: HogliteCatalogStore = store) =
-        HogliteMaintenanceStatus(source, 101, 102, 103, 104, 105, 1000)
+        HogliteMaintenanceStatus(source, 102, 103, 104, 105, 1000)
 
     @BeforeAll
     fun start() {
@@ -91,11 +91,12 @@ class HogliteMaintenanceStatusIntegrationTest {
             MaintenanceTask.RETIREMENT,
             MaintenanceTask.REINDEX,
         )
-        assertThat(status.tasks.map { it.loopIntervalMs }).containsExactly(101L, 102L, 103L, 104L, 105L, null)
+        assertThat(status.tasks.map { it.loopIntervalMs }).containsExactly(null, 102L, 103L, 104L, 105L, null)
         assertThat(status.tasks.map { it.lastRun }).containsOnlyNulls()
         assertThat(status.tasks[0].backlog).isEqualTo(MaintenanceBacklog.HydratorBacklog(0, 0))
         assertThat(status.tasks[2].backlog).isEqualTo(MaintenanceBacklog.CleanupBacklog(0, null))
         assertThat(status.tasks[3].backlog).isEqualTo(MaintenanceBacklog.CompactionBacklog(0, 1000))
+        assertThat(status.tasks.first().loop).isNull()
         assertThat(status.tasks.last().loop).isNull()
         assertThat(backend().runs(cat, null, null, 50).runs).isEmpty()
     }
@@ -213,8 +214,8 @@ class HogliteMaintenanceStatusIntegrationTest {
         assertThat(cleanup.lastRun!!.trigger).isEqualTo(MaintenanceTrigger.MANUAL)
         assertThat(cleanup.loop!!.intervalMs).isEqualTo(60_000)
         assertThat(cleanup.loop!!.lastRunAt).isEqualTo(HogliteSchema.parse(HogliteSchema.fmt(now.minusSeconds(60))))
-        assertThat(tasks.getValue(MaintenanceTask.HYDRATOR).loop!!.intervalMs).isNull()
-        assertThat(tasks.getValue(MaintenanceTask.HYDRATOR).loop!!.recordsEverySweep).isFalse()
+        // Hoglite has no hydrator loop (#675): even loop-triggered rows report none.
+        assertThat(tasks.getValue(MaintenanceTask.HYDRATOR).loop).isNull()
         assertThat(tasks.getValue(MaintenanceTask.EXPIRY).loop!!.intervalMs).isNull()
         assertThat(tasks.getValue(MaintenanceTask.EXPIRY).loop!!.lastRunAt).isNotNull()
     }

@@ -242,6 +242,8 @@ val ApplicationCall.hoglakeAuth: AuthState
 class VerifiedBackendAuthority internal constructor(
     internal val token: String,
     internal val storageGrants: ReadSessionStorageGrants? = null,
+    /** When the token verified, in epoch seconds on the verifier's clock ([JwtVerifier.now]). */
+    internal val verifiedAt: Long,
 ) {
     internal val isReadSession: Boolean
         get() = storageGrants != null
@@ -408,7 +410,9 @@ val HoglakeAuth =
                 caller?.let {
                     AuthState.Authenticated(
                         it,
-                        token?.let { jwt -> VerifiedBackendAuthority(jwt, storageGrants) },
+                        token?.let { jwt ->
+                            VerifiedBackendAuthority(jwt, storageGrants, service.verifier!!.now())
+                        },
                     )
                 } ?: AuthState.Anonymous,
             )
@@ -589,7 +593,7 @@ private suspend fun selectLocalOnly(
     }
     call.attributes.put(
         AuthStateKey,
-        AuthState.Authenticated(caller, VerifiedBackendAuthority(token, grants)),
+        AuthState.Authenticated(caller, VerifiedBackendAuthority(token, grants, verifier.now())),
     )
     val catalog = match.catalog
     val namespace = match.namespace

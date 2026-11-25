@@ -308,11 +308,13 @@ object ParquetRewriter {
             }
         // NOT inside the try: close() is what completes the upload, so a
         // failure here means the object never landed whole, and it must
-        // discard for the same reason a write failure does.
+        // discard for the same reason a write failure does. A failed close
+        // leaves the stream open; abort() closes it, after the discard.
         try {
             writer.close()
         } catch (e: Throwable) {
             (output as? DiscardableOutputFile)?.discard()
+            runCatching { writer.abort() }
             throw e
         }
         // The written footer, for the output's row-group offsets. Asked

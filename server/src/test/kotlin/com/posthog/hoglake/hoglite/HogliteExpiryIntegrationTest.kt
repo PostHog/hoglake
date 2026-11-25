@@ -343,8 +343,10 @@ class HogliteExpiryIntegrationTest {
         assertThat(n(c, "SELECT COUNT(*) FROM removals")).isEqualTo(1)
     }
 
-    @Test
-    fun `a failed purge page rolls back its queue and the next sweep drains it with retention disabled`() {
+    /** 422 unlabelled: the page's own unknown outcome, still a purge failure and not a token lapse (#680). */
+    @ParameterizedTest
+    @ValueSource(ints = [400, 422])
+    fun `a failed purge page rolls back its queue and the next sweep drains it with retention disabled`(status: Int) {
         val (c, t) = setup()
         val appended = store.commit(c, appendReq(c, "ended.parquet")).snapshotId
         val file = store.listFiles(c, "ns", "t").single()
@@ -357,7 +359,7 @@ class HogliteExpiryIntegrationTest {
         val hook =
             Hook(
                 { m, p, b -> isTx(m, p, b) && "expiry-purge-data" in b },
-                shortCircuit = 400,
+                shortCircuit = status,
             )
         hooks += hook
         val failed = HogliteExpiry(pstore, 1, 10_000).runOnce(c, 100)

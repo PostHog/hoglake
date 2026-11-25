@@ -53,10 +53,14 @@ import java.nio.ByteBuffer
  * the spill block tests (`fat rows do not overshoot the spill block`) pin
  * its behaviour.
  *
- * Failure: any throw from [write] or [appendRowGroups] marks the writer
- * aborted, and [abort] (which [ParquetRewriter.writingTo] calls on every
- * failure path, after discarding the destination) closes the stream
- * without writing a footer.
+ * Failure: any throw from [write], [appendRowGroups] or [close] marks the
+ * writer aborted, and [abort] (which [ParquetRewriter.writingTo] calls on
+ * every failure path, after discarding the destination) closes the stream
+ * without writing a footer. A failed [close] releases everything but the
+ * stream: parquet's writer leaves it open once aborted, and closing it
+ * before the discard could complete an S3 upload whose last eight bytes
+ * happen to read as a trailer (the close can fail after the last row
+ * group is written, in `beforeFooter` or partway through `end`).
  */
 internal class OutputWriter(
     output: OutputFile,
@@ -410,10 +414,14 @@ internal class OutputWriter(
     /**
      * Give up: no footer, buffers released, the stream closed. The caller
      * has already discarded the destination, so closing it cannot
-     * complete it.
+     * complete it. After a failed [close] only the stream is left: an
+     * aborted `ParquetFileWriter.close()` skips it.
      */
     fun abort() {
-        if (closed) return
+        if (closed) {
+            if (aborted) runCatching { stream?.close() }
+            return
+        }
         closed = true
         aborted = true
         file.abort()
