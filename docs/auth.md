@@ -380,6 +380,7 @@ It adds no claim and changes no claim.
 - Scan `GET` requires canonical `snapshot` and `table_uuid` query parameters for a read session, as the local scan does. The Host checks both against the table it resolves for the scan and answers `404` when either differs. A table that starts to shadow another of the same name between the table lookup and the scan is therefore refused, not read.
 - The Host checks every data file and deletion vector path of a scan answer against the grants of the two remote targets. It refuses an out-of-grant or malformed path with a redacted `403`, as the local scan does for the primary-catalog grants.
 - The scan query is exactly those two parameters. `include` and every other parameter is refused with `400`.
+- Namespace `GET` and the table list take no query for a read session. `snapshot`, `at_timestamp` and every other parameter is refused with `400`, before anything is read: a read session lists the current state only.
 - Table `GET` and the table list omit row totals for a read session, and table `GET` allows only an omitted `totals` or `totals=false`, as the local table route does. Totals are computed before any grant check, so they are not given to a caller whose files are checked.
 - A table list entry for a read session carries `name`, `table_uuid`, and `comment` and `earliest_snapshot_id` when set. It has none of the count and size fields.
 - The four answers carry `Cache-Control: no-store`. A Client sets the header again on the answer it relays to a read session.
