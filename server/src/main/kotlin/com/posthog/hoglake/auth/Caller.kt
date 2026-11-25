@@ -12,11 +12,15 @@ import java.util.UUID
  * rule live in one place: if a route handler wanted to make a second
  * authorization decision, it would have to justify it against this type.
  *
- * [catalogScopes] is empty for an operator, whose authority is not enumerated;
- * [kind] is what distinguishes them. Keeping [catalogScopes] empty rather than
- * listing every catalog means an operator token does not go stale when a
- * catalog is created — and it is safe because an operator is a different KIND,
- * never a tenant with a big map.
+ * [catalogScopes] is empty for a fleet-wide operator, whose authority is not
+ * enumerated; [kind] is what distinguishes them. Keeping [catalogScopes] empty
+ * rather than listing every catalog means an operator token does not go stale
+ * when a catalog is created — and it is safe because an operator is a
+ * different KIND, never a tenant with a big map. An operator token that
+ * carries `cat` is BOUND to the catalogs it names (docs/auth.md "bound to one
+ * catalog"; hoglite binds such a token to its tenant): [catalogScopes] holds
+ * them, and the caller is an operator on those catalogs only, see [fleetWide].
+ * The verifier refuses an operator token that carries `scope`.
  */
 data class Caller(
     /** `sub`: the client id (`client:…`) or service-account subject (`sa:…`). */
@@ -24,7 +28,13 @@ data class Caller(
     /** The org this caller acts for. Legacy operator tokens have none. */
     val orgId: String?,
     val kind: Kind,
-    /** Catalog name -> the scopes held on it. Empty for [Kind.OPERATOR]. */
+    /**
+     * Catalog name -> the scopes held on it. Empty for a fleet-wide
+     * [Kind.OPERATOR]; the bound catalogs of a catalog-bound one, each
+     * granting [Scope.ADMIN] because the verifier refuses any other binding
+     * (as hoglite does). The words are not consulted here: an operator holds
+     * every scope on a catalog it knows.
+     */
     val catalogScopes: Map<String, Set<Scope>>,
     /** `jti`, for correlating an audit line with a token and an STS session. */
     val tokenId: String,
@@ -94,21 +104,38 @@ data class Caller(
         get() = if (kind.isOperator()) "operator:$subject" else subject
 
     /**
+     * An operator whose token names no catalog: it acts across the fleet, so
+     * it reaches every catalog and the routes that name none (`/metrics`,
+     * `POST /v1/catalogs`, fleet status). An operator token carrying `cat` is
+     * bound to those catalogs instead and is NOT fleet-wide (one carrying
+     * `scope` is refused by the verifier):
+     * elsewhere it is a caller that does not know the catalog, exactly as a
+     * tenant is. The verifier refuses an operator binding that names no
+     * catalog, so an empty map here always means "no binding", never "a
+     * binding with nothing in it".
+     */
+    val fleetWide: Boolean
+        get() = kind.isOperator() && catalogScopes.isEmpty()
+
+    /**
      * Is this caller entitled to see [catalog] at all?
      *
      * Every request that names a catalog asks this first, and a `false` is
      * reported as **404, not 403** — see [AuthDecision]. A 403 would confirm the
      * catalog exists, which turns an org UUID the caller was never given into an
-     * enumeration oracle.
+     * enumeration oracle. A catalog-bound operator is held to its catalogs
+     * here, like a tenant; only a [fleetWide] one knows every catalog.
      */
-    fun knowsCatalog(catalog: String): Boolean = kind.isOperator() || catalogScopes.containsKey(catalog)
+    fun knowsCatalog(catalog: String): Boolean = fleetWide || catalogScopes.containsKey(catalog)
 
     /** Holder of [scope] on [catalog], by [Scope.satisfies]. */
     fun holds(
         catalog: String,
         scope: Scope,
     ): Boolean {
-        if (kind.isOperator()) return true
+        // An operator holds every scope on a catalog it knows: all of them for
+        // a fleet-wide one, its bound catalogs' for a catalog-bound one.
+        if (kind.isOperator()) return knowsCatalog(catalog)
         // Fail closed: a scoped caller's authority is per object, never per
         // catalog. A route that asked this would otherwise hand it the catalog.
         if (kind == Kind.SCOPED) return false
@@ -171,8 +198,12 @@ data class Caller(
         scope: Scope,
     ): Boolean = catalogScopes[catalog]?.any { it.satisfies(scope) } == true
 
-    /** Every catalog name this caller may read — the filter for fleet-wide listings. */
-    fun visibleCatalogs(): Set<String>? = if (kind.isOperator()) null else catalogScopes.keys
+    /**
+     * Every catalog name this caller may read — the filter for fleet-wide
+     * listings. Null, "every catalog", only for a [fleetWide] operator; a
+     * catalog-bound one lists its bound catalogs, as a tenant does.
+     */
+    fun visibleCatalogs(): Set<String>? = if (fleetWide) null else catalogScopes.keys
 }
 
 /**

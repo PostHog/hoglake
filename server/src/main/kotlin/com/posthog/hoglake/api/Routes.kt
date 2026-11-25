@@ -13,6 +13,7 @@ import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.countRefusal
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.localOnlySelection
+import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.auth.resolveActor
 import com.posthog.hoglake.auth.verifiedBackendAuthority
@@ -184,6 +185,11 @@ fun Application.installApiRoutes(
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
+                // The token first: a catalog-bound operator gets the 404 of a
+                // catalog it does not name for every other name, a reserved
+                // one included, never the reserved name's 422 (docs/auth.md
+                // "Scoped tokens, exactly"). The selector asks again, counting once.
+                call.requireCatalogEntitlement(req.name)
                 // Before placement picks a backend, so no backend can create
                 // a catalog that shares a name with a mount.
                 if (MountNames.isReserved(req.name)) {

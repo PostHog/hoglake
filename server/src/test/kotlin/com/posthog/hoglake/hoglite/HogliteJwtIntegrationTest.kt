@@ -113,6 +113,47 @@ class HogliteJwtIntegrationTest {
                             setBody("""{"name":"lake","data_path":"s3://hoglake-it/lake"}""")
                         }
                     assertThat(created.status).isEqualTo(HttpStatusCode.Created)
+                    // The provisioning operator is bound to the catalog its rtg places
+                    // (#667), as hoglite binds it to the tenant: another catalog is one
+                    // it does not know, on the provisioning route (the body's name) and
+                    // on a catalog route alike, and the fleet routes are closed to it.
+                    val elsewhere =
+                        client.post("/v1/catalogs") {
+                            header(HttpHeaders.Authorization, "Bearer $operator")
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"other","data_path":"s3://hoglake-it/other"}""")
+                        }
+                    assertThat(elsewhere.status).isEqualTo(HttpStatusCode.NotFound)
+                    assertThat(elsewhere.bodyAsText()).contains("catalog 'other' not found")
+                    // A reserved name it does not hold is the same 404, not the
+                    // reserved name's 422, as on PostgreSQL
+                    // (BoundOperatorProvisioningIntegrationTest).
+                    val reserved = "01a1e5de-1ac5-0000-e53e-d2f9a77deae4-events"
+                    val reservedElsewhere =
+                        client.post("/v1/catalogs") {
+                            header(HttpHeaders.Authorization, "Bearer $operator")
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"$reserved","data_path":"s3://hoglake-it/reserved"}""")
+                        }
+                    assertThat(reservedElsewhere.status).isEqualTo(HttpStatusCode.NotFound)
+                    assertThat(reservedElsewhere.bodyAsText()).contains("catalog '$reserved' not found")
+                    assertThat(
+                        client.get("/v1/catalogs/other") {
+                            header(HttpHeaders.Authorization, "Bearer $operator")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.NotFound)
+                    for (fleet in listOf("/metrics", "/v1/maintenance/status", "/v1/database/health")) {
+                        assertThat(client.get(fleet) { header(HttpHeaders.Authorization, "Bearer $operator") }.status)
+                            .describedAs(fleet)
+                            .isEqualTo(HttpStatusCode.Forbidden)
+                    }
+                    // The listing shows it its own catalog and nothing else.
+                    val listed =
+                        client.get("/v1/catalogs") {
+                            header(HttpHeaders.Authorization, "Bearer $operator")
+                        }
+                    assertThat(listed.status).isEqualTo(HttpStatusCode.OK)
+                    assertThat(listed.bodyAsText()).contains("\"lake\"").doesNotContain("\"other\"")
                     // ADMIN satisfies generic policy, but cannot release this backend's tenant.
                     assertThat(
                         client.delete("/v1/catalogs/lake?message=drop") {

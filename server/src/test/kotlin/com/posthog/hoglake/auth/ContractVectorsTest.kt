@@ -211,8 +211,10 @@ class ContractVectorsTest {
                     )
                     assertThat(caller.orgId).isEqualTo(claims["org"].asText())
                     if (vector["expect"]["kind"].asText() == "operator") {
+                        // A routed operator is bound to the catalog it places, not fleet-wide.
                         assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
-                        assertThat(caller.catalogScopes).isEmpty()
+                        assertThat(caller.fleetWide).isFalse()
+                        assertThat(caller.catalogScopes.keys).containsExactly(claims["cat"].fieldNames().next())
                     }
                 }
             }

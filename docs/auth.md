@@ -25,7 +25,7 @@ The issuer is a deployment choice, not a hoglake dependency:
 | deployment | issuer | storage credentials |
 | --- | --- | --- |
 | single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own key (`local`): `hoglake token keygen` once, `hoglake token mint` per client, no issuer service | each client's own AWS identity; the server's own (`ambient`) for its jobs |
-| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
+| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS; it must not put `scope` on operator tokens, which hoglake refuses | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
 | PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower: to clients alongside the token, to the server's jobs through the `broker` provider |
 
 hoglake's code carries no PostHog concepts. Catalog names, namespaces, the
@@ -137,8 +137,8 @@ The core, which every issuer must emit:
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes, by decision | token id, for correlating a request with a token. Required because the access log names each request's token by it, and an audit line written while a request is handled reaches the token through its `request_id`; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
-| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
-| `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
+| `org` | tenant and scoped, today; optional on a catalog-bound operator; forbidden on an unbound one | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today on tenant and scoped tokens; making it optional is tracked. On an operator token it is the binding's: a catalog-bound operator may carry it or not, and an operator token carrying `org` with no `cat` is refused as malformed, never read as fleet-wide with its org dropped |
+| `cat`, or `scope` | tenant and scoped, one or both; `cat` alone on an operator, where it binds it | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph. On an `operator` token `cat` is the binding: the token is an operator on the catalogs it names and nothing elsewhere (below). Every bound catalog must carry `admin`, or the token is refused as malformed; a binding that names no catalog is refused. An operator token carries no `scope`; hoglake refuses one, as hoglite does |
 
 Authorization is per catalog. The scope vocabulary is ordered,
 `read < write < maintenance < admin`: `write` includes `read`, `maintenance`
@@ -154,7 +154,9 @@ do not start with `hoglake:` belong to other audiences and are ignored; a
 refuses the token. When both `cat` and `scope` are present they must describe
 the same grants after each has applied its own rules, or the token is
 refused. One limit: a routed (`rtg`) token still needs exactly one `cat`
-entry.
+entry. All of this is for tenant and scoped tokens: an `operator` token
+carrying `scope`, even one with only foreign values, is refused (see
+[Scoped tokens, exactly](#scoped-tokens-exactly)).
 
 Profile extensions, optional and generic. An issuer uses them when its
 deployment needs them; hoglake applies them without knowing what they mean:
@@ -467,10 +469,34 @@ must emit all of the following:
 A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
 `invalid_predicate`, …).
 
-An `operator` token bypasses per-catalog checks and may create catalogs,
-manage containment, and read operator-only routes. Operator tokens
-are therefore only as safe as the keys in the JWKS: whoever can sign with them
-is an operator.
+An `operator` token without `cat` is fleet-wide: it bypasses
+per-catalog checks and may create catalogs, manage containment, and read
+operator-only routes. An `operator` token with `cat` (and so every
+routed one, since `rtg` needs exactly one `cat` entry) is **bound** to the
+catalogs it names: on them it is an operator, holding every scope, containment
+included; every other catalog answers 404 as it does for a tenant; `POST
+/v1/catalogs` creates only a catalog it names (another name is the same 404,
+checked before the name itself, so a reserved name it does not hold is a 404
+too, never the reserved name's 422), and its refusal for a `data_path` that
+overlaps another catalog's names that catalog and its `data_path` only when
+the token names that catalog too; the catalog listing shows its own; and the
+fleet routes (`/metrics`,
+`/v1/database/health`, `/v1/maintenance/status` and `/runs`, the debug
+surface) answer 403. Because a bound operator holds every scope on its
+catalog whatever the words say, the binding must grant `admin` on every
+catalog it names: `{"lake": ["read"]}` on an operator token is refused as
+`invalid_token` (malformed), never read as a reader and never as an operator.
+An operator token carries no `scope`; hoglake refuses one, as hoglite does:
+any `scope`, whatever its value (empty, foreign values only, or `hoglake:`
+grants), refuses an operator token as `invalid_token` (malformed), with or
+without `cat`. An unbound
+operator token must not carry `org` either: `org` names the tenant a binding
+acts for, so an operator token with `org` but no `cat` is refused as
+`invalid_token` rather than read as fleet-wide with its org dropped. This is
+the binding hoglite enforces (an unbound operator is one with neither `cat`
+nor `org`; a routed operator's `cat` must say `admin`), enforced in hoglake
+too. Operator tokens are therefore only as safe as the keys in
+the JWKS: whoever can sign with them is an operator.
 
 ### Errors
 
