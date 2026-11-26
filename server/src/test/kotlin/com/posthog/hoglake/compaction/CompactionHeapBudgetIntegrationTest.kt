@@ -19,12 +19,15 @@ import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
+import io.micrometer.prometheusmetrics.PrometheusConfig
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -267,23 +270,35 @@ class CompactionHeapBudgetIntegrationTest {
             )
         observedStore.use {
             val service = CompactionService(db.jdbi, it, cfg)
-            val first = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-            assertThat(first.groupsCompacted).isZero()
-            assertThat(first.mergeBudgetExceeded).isEqualTo(1)
-            assertThat(first.oversizedRowGroups).isEqualTo(1)
-            assertThat(first.failedGroups).isZero()
-            val firstReads = reads.get()
-            assertThat(firstReads).isPositive()
-            val second = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-            assertThat(second.mergeBudgetExceeded).isEqualTo(1)
-            assertThat(second.oversizedRowGroups).isEqualTo(1)
-            assertThat(second.failedGroups).isZero()
-            assertThat(reads.get()).isEqualTo(firstReads)
-            val raised = cfg.copy(sortedHeapBytes = 64L shl 20)
-            val retry = service.runOnce(cat, raised, MaintenanceTrigger.LOOP)
-            assertThat(retry.groupsCompacted).isEqualTo(1)
-            assertThat(retry.mergeBudgetExceeded).isZero()
-            assertThat(reads.get()).isGreaterThan(firstReads)
+            val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+            Metrics.bind(registry)
+            try {
+                val first = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+                assertThat(first.groupsCompacted).isZero()
+                assertThat(first.mergeBudgetExceeded).isEqualTo(1)
+                assertThat(first.oversizedRowGroups).isEqualTo(1)
+                assertThat(first.failedGroups).isZero()
+                val firstReads = reads.get()
+                assertThat(firstReads).isPositive()
+                assertThat(registry.find("hoglake_compaction_memory_refusal_cache_hits_total").counter()).isNull()
+                val second = service.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+                assertThat(second.mergeBudgetExceeded).isEqualTo(1)
+                assertThat(second.oversizedRowGroups).isEqualTo(1)
+                assertThat(second.failedGroups).isZero()
+                assertThat(reads.get()).isEqualTo(firstReads)
+                val hits = registry.get("hoglake_compaction_memory_refusal_cache_hits_total").counter()
+                val hitsAfterRetry = hits.count()
+                assertThat(hitsAfterRetry).isPositive()
+                val raised = cfg.copy(sortedHeapBytes = 64L shl 20)
+                val retry = service.runOnce(cat, raised, MaintenanceTrigger.LOOP)
+                assertThat(retry.groupsCompacted).isEqualTo(1)
+                assertThat(retry.mergeBudgetExceeded).isZero()
+                assertThat(reads.get()).isGreaterThan(firstReads)
+                assertThat(hits.count()).isEqualTo(hitsAfterRetry)
+            } finally {
+                Metrics.clear()
+                registry.close()
+            }
         }
     }
 

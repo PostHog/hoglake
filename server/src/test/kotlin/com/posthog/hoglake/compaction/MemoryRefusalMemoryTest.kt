@@ -7,6 +7,9 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.observability.Metrics
+import io.micrometer.prometheusmetrics.PrometheusConfig
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.nio.file.Path
@@ -32,6 +35,71 @@ class MemoryRefusalMemoryTest {
         bounds: SortSpill = spill,
         appendFloor: Long = 32L * 1024 * 1024,
     ) = MemoryRefusalMemory.key(ctx, inputs, bounds, layouts, appendFloor)
+
+    @Test
+    fun `metrics count hits not insertions or misses and gauge tracks bounded live caches`() {
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        try {
+            val first = MemoryRefusalMemory(2)
+            val second = MemoryRefusalMemory(1)
+            val tracker = MemoryRefusalCacheTracker()
+            tracker.track(first)
+            tracker.track(first)
+            tracker.track(second)
+            val gauge = registry.get("hoglake_compaction_memory_refusal_cache_entries").gauge()
+            assertThat(tracker.entryCount()).isZero()
+            val a = MemoryRefusalMemory.Identity(1, 0, 0, 0)
+            val b = MemoryRefusalMemory.Identity(2, 0, 0, 0)
+            val c = MemoryRefusalMemory.Identity(3, 0, 0, 0)
+            assertThat(first.recall(a)).isNull()
+            first.remember(a, MemoryRefusalMemory.Reason.SPILL)
+            first.remember(a, MemoryRefusalMemory.Reason.MERGE)
+            first.remember(b, MemoryRefusalMemory.Reason.OVERSIZED_ROW)
+            second.remember(a, MemoryRefusalMemory.Reason.SPILL)
+            assertThat(tracker.entryCount()).isEqualTo(3)
+            assertThat(gauge.value()).isGreaterThanOrEqualTo(3.0)
+            assertThat(registry.find("hoglake_compaction_memory_refusal_cache_hits_total").counter()).isNull()
+            assertThat(first.recall(a)).isEqualTo(MemoryRefusalMemory.Reason.MERGE)
+            first.remember(c, MemoryRefusalMemory.Reason.SPILL)
+            assertThat(first.recall(b)).isNull()
+            assertThat(second.recall(a)).isEqualTo(MemoryRefusalMemory.Reason.SPILL)
+            assertThat(tracker.entryCount()).isEqualTo(3)
+            assertThat(gauge.value()).isGreaterThanOrEqualTo(3.0)
+            val hits = registry.get("hoglake_compaction_memory_refusal_cache_hits_total").counter()
+            assertThat(hits.count()).isEqualTo(2.0)
+            assertThat(hits.id.tags).isEmpty()
+            assertThat(gauge.id.tags).isEmpty()
+        } finally {
+            Metrics.clear()
+            registry.close()
+        }
+    }
+
+    @Test
+    fun `rebinding moves hits to the new registry and preserves the live sampler`() {
+        val first = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        val second = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        val cache = MemoryRefusalMemory(1)
+        val key = MemoryRefusalMemory.Identity(1, 0, 0, 0)
+        cache.remember(key, MemoryRefusalMemory.Reason.MERGE)
+        try {
+            Metrics.bind(first)
+            cache.recall(key)
+            val oldHits = first.get("hoglake_compaction_memory_refusal_cache_hits_total").counter()
+            Metrics.bind(second)
+            cache.recall(key)
+            assertThat(oldHits.count()).isEqualTo(1.0)
+            assertThat(second.get("hoglake_compaction_memory_refusal_cache_hits_total").counter().count())
+                .isEqualTo(1.0)
+            assertThat(second.get("hoglake_compaction_memory_refusal_cache_entries").gauge().value())
+                .isGreaterThanOrEqualTo(1.0)
+        } finally {
+            Metrics.clear()
+            first.close()
+            second.close()
+        }
+    }
 
     @Test
     fun `cache bounds entries and evicts the least recently recalled identity`() {

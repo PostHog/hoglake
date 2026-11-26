@@ -1,6 +1,7 @@
 package com.posthog.hoglake.observability
 
 import com.posthog.hoglake.api.RequestDispatcher
+import com.posthog.hoglake.compaction.MemoryRefusalMemory
 import com.posthog.hoglake.model.HoglakeException
 import com.zaxxer.hikari.HikariDataSource
 import io.micrometer.core.instrument.Gauge
@@ -54,6 +55,10 @@ object Metrics {
                 .description("Wait for a blocking-dispatcher thread, before the handler started")
                 .publishPercentileHistogram()
                 .register(registry)
+        }
+
+        val compactionMemoryRefusalCacheHits by lazy {
+            registry.counter("hoglake_compaction_memory_refusal_cache_hits_total")
         }
 
         // The commit-lock families are per catalog (and the hold per path),
@@ -148,6 +153,11 @@ object Metrics {
     @Volatile
     private var timers: BoundTimers? = null
 
+    // The gauge retains this singleton, never the weakly tracked cache owners.
+    private object RefusalCacheEntriesSampler {
+        fun sample(): Double = MemoryRefusalMemory.liveEntryCount().toDouble()
+    }
+
     /**
      * The bound registry, for the observability surfaces in this
      * package that are GAUGES rather than counters and are therefore
@@ -162,6 +172,10 @@ object Metrics {
     fun bind(r: MeterRegistry) {
         registry = r
         timers = BoundTimers(r)
+        Gauge.builder("hoglake_compaction_memory_refusal_cache_entries", RefusalCacheEntriesSampler) { it.sample() }
+            .description("Entries in live process-local compaction memory refusal caches")
+            .strongReference(true)
+            .register(r)
     }
 
     /** Unbind (tests). */
@@ -642,6 +656,11 @@ object Metrics {
                 reason,
             )
         }
+    }
+
+    /** Successful lookups, including speculative planning lookups; never a new refusal. */
+    internal fun compactionMemoryRefusalCacheHit() {
+        timers?.compactionMemoryRefusalCacheHits?.increment()
     }
 
     /**
