@@ -164,7 +164,12 @@ internal object ReadSessionVectors {
             (it["grants"][0]["actions"] as ArrayNode).add("s3:DeleteObject")
         }
         add("writable manifest grant", base = ::writableClaims) {
-            (it["grants"][1] as ObjectNode).putArray("actions").add("s3:GetObject").add("s3:PutObject")
+            val actions = (it["grants"][1] as ObjectNode).putArray("actions")
+            ReadSessionProfile.WRITE_ACTIONS.forEach { action -> actions.add(action) }
+        }
+        add("writable remote grant", base = ::writableClaims) {
+            val actions = (it["grants"][2] as ObjectNode).putArray("actions")
+            ReadSessionProfile.WRITE_ACTIONS.forEach { action -> actions.add(action) }
         }
         add("writable remote_schemas", base = ::writableClaims) {
             (it["remote_schemas"] as ObjectNode).putArray("team").add("write")

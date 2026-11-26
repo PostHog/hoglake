@@ -351,7 +351,8 @@ The verifier enforces strict coupling across `cat`, `prd`, and primary-catalog s
 
 Both read-only and writable sessions are admitted on the local-only read routes and on the four relayed or served remote `GET` routes.
 On a remote `GET` route, a writable session's `prd.team_id.<team_id>: "write"` satisfies read-only authority for `team_<team_id>` and grants no write permission.
-Local-only write routes require a writable session and refuse a read-only session.
+Note: because the relay forwards the caller's original `Authorization` header unchanged, the Host must be in the same trust boundary as the Client for the session's embedded credentials.
+Planned local-only write routes will require a writable session and refuse a read-only session; only the three local-only `GET` routes are implemented today.
 
 The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
 give the expected verdict for each verifier.
