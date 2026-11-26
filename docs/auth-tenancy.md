@@ -817,9 +817,9 @@ to claim.
 - **Callers.** A non-operator gets 403 `forbidden`: a tenant, and a scoped
   token, which cannot create namespaces at all. Operators are unaffected, and
   so is auth `off`, which has no callers to tell apart.
-- **Auth modes.** Under `warn`, a request with no valid token is treated as
-  the operator, as everywhere else, so this rule is enforced only in `enforce`
-  mode or on the public listener.
+- **Auth modes.** In `warn` mode, a request needs a verified operator token to
+  create a matching namespace. A request without one gets 403. Other namespace
+  creates keep their existing behavior.
 - **Boot.** Each entry must match the catalog-name pattern, else the server
   does not start.
 - **Existing namespaces are left alone.** One created before its catalog was

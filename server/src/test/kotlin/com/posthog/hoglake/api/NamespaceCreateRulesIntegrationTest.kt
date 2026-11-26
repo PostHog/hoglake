@@ -187,6 +187,20 @@ class NamespaceCreateRulesIntegrationTest {
     }
 
     @Test
+    fun `warn mode requires a verified operator for team names in listed catalogs`() {
+        withServer(AuthMode.WARN) { port ->
+            val before = footprint(listed)
+            assertRefused(create(port, null, listed, "team_41"), 403, "forbidden", "missing token")
+            assertRefused(create(port, "invalid-token", listed, "team_41"), 403, "forbidden", "invalid token")
+            assertRefused(create(port, tenant(listed), listed, "team_41"), 403, "forbidden", "tenant token")
+            assertThat(footprint(listed)).isEqualTo(before)
+            assertThat(create(port, operator(), listed, "team_41", mark(41)).statusCode()).isEqualTo(201)
+            assertThat(create(port, null, unlisted, "team_42").statusCode()).isEqualTo(201)
+            assertThat(create(port, null, listed, "analytics").statusCode()).isEqualTo(201)
+        }
+    }
+
+    @Test
     fun `an operator creates and marks a namespace in one call, and the read shows the mark`() {
         withServer { port ->
             val made = create(port, operator(), listed, "team_31", mark(31))

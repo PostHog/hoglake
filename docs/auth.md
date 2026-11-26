@@ -40,7 +40,7 @@ one issuer among possible issuers.
 | mode | behaviour | when |
 | --- | --- | --- |
 | `off` (default) | no verification; every request is accepted and the caller-supplied `author` is trusted | local development, CI, a single-tenant install on a trusted network |
-| `warn` | tokens are verified and decisions are computed and counted, but nothing is refused, except a verified scoped token, which is filtered as in `enforce` | measuring before a cutover: watch `hoglake_auth_requests_total{outcome="missing"}` reach zero per client class |
+| `warn` | verifies tokens and counts decisions. Enforces restrictions on verified scoped tokens. Requires a verified operator token for [protected team namespace creation](auth-tenancy.md#62d-operator-only-team-namespaces). | measuring before a cutover: watch `hoglake_auth_requests_total{outcome="missing"}` reach zero per client class |
 | `enforce` | deny by default; a route without a verified, sufficient token gets 401 or 403 | production |
 | `local` | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer) | a standalone install that wants real authentication and no extra service |
 
