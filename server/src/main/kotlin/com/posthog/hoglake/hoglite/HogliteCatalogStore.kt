@@ -1740,11 +1740,30 @@ class HogliteCatalogStore(
                         " AND EXISTS (SELECT 1 FROM json_each(f.partition_values_json) pv " +
                             "WHERE pv.key = $keyIndex AND pv.value = ?)"
                     }
+                // Ordering bounds read one stats entry, the sort order's leading
+                // field, and nothing reads split offsets: narrowing in the engine
+                // keeps a page of wide files inside its response cap (#685). The
+                // keyset subquery picks the page first, so the narrowing walks
+                // only the page's stats_json.
+                val sortSpec = sortSpecAt(catalog, t.tableId, at)
+                val leadingFieldId = sortSpec?.fields?.firstOrNull()?.sourceFieldId
+                val stats =
+                    if (leadingFieldId == null) {
+                        "NULL"
+                    } else {
+                        "(SELECT json_group_array(json(s.value)) FROM json_each(f.stats_json) s " +
+                            "WHERE json_extract(s.value, '\$.fieldId') = ?)"
+                    }
+                val projection =
+                    HogliteSql.FILE_COLUMNS
+                        .replace("f.stats_json", stats)
+                        .replace("f.split_offsets_json", "NULL")
                 val prefix =
-                    "SELECT ${HogliteSql.FILE_COLUMNS} FROM files f WHERE f.table_id = ? " +
+                    "SELECT $projection FROM (SELECT f.id AS fid FROM files f WHERE f.table_id = ? " +
                         "AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)" + partitionWhere
                 val baseArgs =
                     buildList<Any?> {
+                        if (leadingFieldId != null) add(leadingFieldId)
                         add(t.tableId)
                         add(at)
                         add(at)
@@ -1753,6 +1772,7 @@ class HogliteCatalogStore(
                 val page = mutableListOf<FileRow>()
                 var last: List<Any?>? = null
                 var remaining = limit ?: Int.MAX_VALUE
+                var pageSize = SCAN_PAGE_SIZE
                 while (remaining > 0) {
                     val cursor = last
                     val cursorArgs = mutableListOf<Any?>()
@@ -1778,20 +1798,30 @@ class HogliteCatalogStore(
                             val comparison = if (desc) "<" else ">"
                             " AND (${sortColumnSql(sort)} $comparison ? OR (${sortColumnSql(sort)} = ? AND f.id > ?))"
                         }
-                    val count = minOf(remaining, SCAN_PAGE_SIZE)
+                    val count = minOf(remaining, pageSize)
                     val initialOffset = if (last == null && limit != null) offset else 0
                     val rows =
-                        queryCatalog(
-                            catalog,
-                            prefix + after + " ORDER BY $orderBy LIMIT ? OFFSET ?",
-                            *(baseArgs + cursorArgs + listOf(count, initialOffset)).toTypedArray(),
-                        ).rows
+                        try {
+                            queryCatalog(
+                                catalog,
+                                prefix + after + " ORDER BY $orderBy LIMIT ? OFFSET ?) k " +
+                                    "JOIN files f ON f.id = k.fid ORDER BY $orderBy",
+                                *(baseArgs + cursorArgs + listOf(count, initialOffset)).toTypedArray(),
+                            ).rows
+                        } catch (tooLarge: HoglakeException.BackendResultTooLarge) {
+                            // One stats entry per file can still exceed the cap: wide
+                            // string bounds on the leading sort field. Narrow the next
+                            // statement from the same cursor, never retry the refused one.
+                            if (count == 1) throw tooLarge
+                            pageSize = maxOf(1, count / 2)
+                            continue
+                        }
                     page.addAll(rows.map { toFileRow(it) })
                     remaining -= rows.size
                     if (rows.size < count) break
                     last = rows.last()
                 }
-                return withOrderingBounds(catalog, t.tableId, at, page)
+                return withOrderingBounds(catalog, t.tableId, at, sortSpec, page)
             }
         }
 
@@ -2126,7 +2156,38 @@ class HogliteCatalogStore(
                 // that was live then.
                 // Only requested payload travels over the wire. Keyset pages share
                 // one logical snapshot AND the operation's immutable tenant binding.
-                val statsBytes = if (columnStats != null) "length(CAST(f.stats_json AS BLOB))" else "0"
+                // `stats_fields` narrows the stored stats IN the engine, so a
+                // one-field request over a wide table costs one entry per file,
+                // not the whole stats_json, against every budget below (#685).
+                val fieldIds = columnStats?.fieldIds
+                val wantedCte = if (fieldIds != null) "WITH wanted(id) AS (SELECT value FROM json_each(?)) " else ""
+                val wantedArgs: Array<Any?> = fieldIds?.let { arrayOf(json.writeValueAsString(it)) } ?: emptyArray()
+                val narrowFrom =
+                    "FROM json_each(f.stats_json) s " +
+                        "WHERE json_extract(s.value, '\$.fieldId') IN (SELECT id FROM wanted)"
+                val narrowedAgg = "json_group_array(json(s.value))"
+                val narrowed = if (fieldIds == null) "f.stats_json" else "(SELECT $narrowedAgg $narrowFrom)"
+                // Narrowing walks the file's whole stats_json, so it runs ONCE
+                // per row: the MATERIALIZED page keeps SQLite from copying it
+                // into the length check, the CASE and the length column, and
+                // its LIMITed keyset subquery from running it on rows past the
+                // page. A page of 256 files of a 1,000-column table still costs
+                // about 0.1 s of hoglited time, 10,000 columns about 1 s.
+                // The page holds a narrowed payload only up to the per-row
+                // share, and the length of a larger one in its place: never
+                // 256 full payloads the CASE below then drops (128 of 2 MiB
+                // took ~380 MiB of SQLite heap or temp files). SQLite computes
+                // the three identical aggregate calls once.
+                val pageNarrowed =
+                    "(SELECT CASE WHEN length(CAST($narrowedAgg AS BLOB)) <= $SCAN_MAX_ROW_JSON_BYTES " +
+                        "THEN $narrowedAgg ELSE length(CAST($narrowedAgg AS BLOB)) END $narrowFrom)"
+                val statsColumn = if (fieldIds == null) "f.stats_json" else "p.ns"
+                val statsBytes =
+                    when {
+                        columnStats == null -> "0"
+                        fieldIds == null -> "length(CAST(f.stats_json AS BLOB))"
+                        else -> "CASE WHEN typeof(p.ns) = 'integer' THEN p.ns ELSE length(CAST(p.ns AS BLOB)) END"
+                    }
                 val offsetBytes = if (splitOffsets) "length(CAST(f.split_offsets_json AS BLOB))" else "0"
 
                 fun boundedJson(
@@ -2138,9 +2199,51 @@ class HogliteCatalogStore(
                     } else {
                         "CASE WHEN $bytes <= $SCAN_MAX_ROW_JSON_BYTES THEN $column ELSE NULL END"
                     }
+
+                // A payload over the page's per-row share is not refused: it is
+                // read outside the page, so a page stays inside the engine's
+                // response cap and a file PostgreSQL serves (100k split offsets,
+                // stats of a wide table) is served here too (#685). The page's
+                // oversized payloads of one column share a query while their
+                // summed length stays under SCAN_ALONE_BATCH_BYTES: one round
+                // trip per batch, not per file.
+                fun oversized(
+                    column: String,
+                    lengths: Map<Long, Long>,
+                ): Map<Long, Any?> {
+                    val payloads = HashMap<Long, Any?>()
+                    val batch = mutableListOf<Long>()
+                    var batchBytes = 0L
+
+                    fun read() {
+                        if (batch.isEmpty()) return
+                        queryCatalog(
+                            catalog,
+                            "${wantedCte}SELECT f.id, $column FROM files f " +
+                                "WHERE f.id IN (SELECT value FROM json_each(?))",
+                            *wantedArgs,
+                            json.writeValueAsString(batch),
+                        ).rows.forEach { payloads[it[0].asLong()] = it[1] }
+                        // A page's file is never missing here unless expiry purged
+                        // it, which retainedRead reports as Expired; never read
+                        // a missing payload as null.
+                        check(payloads.keys.containsAll(batch)) {
+                            "scan plan read-alone payloads missing for files ${batch - payloads.keys}"
+                        }
+                        batch.clear()
+                        batchBytes = 0L
+                    }
+                    for ((fileId, length) in lengths) {
+                        if (batchBytes + length > SCAN_ALONE_BATCH_BYTES) read()
+                        batch += fileId
+                        batchBytes += length
+                    }
+                    read()
+                    return payloads
+                }
                 val projection =
                     HogliteSql.FILE_COLUMNS
-                        .replace("f.stats_json", boundedJson("f.stats_json", statsBytes))
+                        .replace("f.stats_json", boundedJson(statsColumn, statsBytes))
                         .replace("f.split_offsets_json", boundedJson("f.split_offsets_json", offsetBytes))
                 var afterRow = -1L
                 var afterId = -1L
@@ -2151,47 +2254,78 @@ class HogliteCatalogStore(
                     val rows =
                         queryCatalog(
                             catalog,
-                            """SELECT $projection,
+                            """${if (fieldIds != null) "$wantedCte," else "WITH"} page AS MATERIALIZED (
+                               SELECT f.id AS id, ${if (fieldIds != null) pageNarrowed else "NULL"} AS ns
+                                 FROM (SELECT f.id FROM files f
+                                        WHERE f.table_id = ? AND f.begin_snapshot <= ?
+                                          AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)
+                                          AND (f.row_id_start, f.id) > (?, ?)
+                                        ORDER BY f.row_id_start, f.id LIMIT ?) k
+                                 JOIN files f ON f.id = k.id)
+                       SELECT $projection,
                               d.delete_file_id, d.path, d.delete_count, d.file_size_bytes, d.begin_snapshot,
                               $statsBytes, $offsetBytes
-                         FROM files f
+                         FROM page p
+                         JOIN files f ON f.id = p.id
                          LEFT JOIN dvs d ON d.data_file_id = f.id
                            AND d.begin_snapshot <= ? AND (d.end_snapshot IS NULL OR d.end_snapshot > ?)
                            AND d.epoch = (SELECT MAX(d2.epoch) FROM dvs d2
                                            WHERE d2.data_file_id = f.id AND d2.begin_snapshot <= ?
                                              AND (d2.end_snapshot IS NULL OR d2.end_snapshot > ?))
-                        WHERE f.table_id = ? AND f.begin_snapshot <= ?
-                          AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)
-                          AND (f.row_id_start, f.id) > (?, ?)
-                        ORDER BY f.row_id_start, f.id LIMIT ?""",
-                            at,
-                            at,
-                            at,
-                            at,
+                        ORDER BY f.row_id_start, f.id""",
+                            *wantedArgs,
                             t.tableId,
                             at,
                             at,
                             afterRow,
                             afterId,
                             SCAN_PAGE_SIZE,
+                            at,
+                            at,
+                            at,
+                            at,
                         )
-                    for (r in rows.rows) {
-                        if ((r[20].asLongOrNull() ?: 0L) > SCAN_MAX_ROW_JSON_BYTES ||
-                            (r[21].asLongOrNull() ?: 0L) > SCAN_MAX_ROW_JSON_BYTES
-                        ) {
-                            throw HoglakeException.Validation(
-                                "scan plan file metadata exceeds maximum $SCAN_MAX_ROW_JSON_BYTES bytes",
-                            )
-                        }
+                    val statsAlone = LinkedHashMap<Long, Long>()
+                    val offsetsAlone = LinkedHashMap<Long, Long>()
+                    for (row in rows.rows) {
+                        val statsLength = row[20].asLongOrNull() ?: 0L
+                        val offsetsLength = row[21].asLongOrNull() ?: 0L
+                        if (statsLength > SCAN_MAX_ROW_JSON_BYTES) statsAlone[row[0].asLong()] = statsLength
+                        if (offsetsLength > SCAN_MAX_ROW_JSON_BYTES) offsetsAlone[row[0].asLong()] = offsetsLength
                         // Conservative UTF-8 + JSON envelope budget, independent of
-                        // HTTP timeouts. Refuse, never return a truncated scan.
+                        // HTTP timeouts. Refuse, never return a truncated scan. It
+                        // runs before a payload is read alone, so an unaffordable
+                        // one is never fetched.
                         budget.add(
-                            512L + json.writeValueAsBytes(r).size,
-                            (r[20].asLongOrNull() ?: 0L) + (r[21].asLongOrNull() ?: 0L),
+                            512L + json.writeValueAsBytes(row).size +
+                                (statsAlone[row[0].asLong()] ?: 0L) + (offsetsAlone[row[0].asLong()] ?: 0L),
+                            statsLength + offsetsLength,
                         )
                     }
+                    val stats = oversized(narrowed, statsAlone)
+                    val offsets = oversized("f.split_offsets_json", offsetsAlone)
+                    // The budget charged the lengths the page measured. A payload
+                    // rewritten in place since (a concurrent INT -> LONG promotion
+                    // widens stats_json) comes back longer: charge the difference
+                    // before the page is accepted, or the caps stop being caps.
+                    for ((charged, fetched) in listOf(statsAlone to stats, offsetsAlone to offsets)) {
+                        for ((fileId, length) in charged) {
+                            val payload = fetched[fileId] as? String ?: continue
+                            val grown = payload.toByteArray(Charsets.UTF_8).size - length
+                            if (grown > 0) budget.grow(grown, grown)
+                        }
+                    }
+                    val page =
+                        rows.rows.map { row ->
+                            val fileId = row[0].asLong()
+                            if (fileId !in statsAlone && fileId !in offsetsAlone) return@map row
+                            row.toMutableList().apply {
+                                if (fileId in statsAlone) this[12] = stats[fileId]
+                                if (fileId in offsetsAlone) this[13] = offsets[fileId]
+                            }
+                        }
                     collected.addAll(
-                        rows.rows.map { r ->
+                        page.map { r ->
                             val fr = toFileRow(r)
                             val dv =
                                 if (r[15] == null) {
@@ -2961,10 +3095,10 @@ class HogliteCatalogStore(
         catalog: String,
         tableId: Long,
         at: Long,
+        sort: SortSpec?,
         page: List<FileRow>,
     ): List<DataFile> {
         if (page.isEmpty()) return emptyList()
-        val sort = sortSpecAt(catalog, tableId, at)
         if (sort == null || sort.fields.isEmpty()) {
             return page.map { fr ->
                 val f = fr.file
@@ -3415,7 +3549,16 @@ class HogliteCatalogStore(
         internal const val SCAN_PAGE_SIZE = 256
         internal const val SCAN_MAX_FILES = 1_000_000
         internal const val SCAN_MAX_BYTES = 512L * 1024 * 1024
+
+        /** Largest payload a scan page carries inline; a larger one is read alone, never refused. */
         internal const val SCAN_MAX_ROW_JSON_BYTES = 64 * 1024
+
+        /**
+         * Summed stored length of the payloads one read-alone query carries:
+         * a quarter of hoglited's 64 MiB response cap, which leaves room for
+         * JSON escaping. A single larger payload still goes on its own query.
+         */
+        internal const val SCAN_ALONE_BATCH_BYTES = 16L * 1024 * 1024
         internal const val SCAN_MAX_METADATA_BYTES = 64L * 1024 * 1024
 
         private val CATALOG_NAME_REGEX = Regex(Identifiers.CATALOG_NAME_PATTERN)

@@ -1,9 +1,11 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.core.JsonFactory
+import com.fasterxml.jackson.core.StreamReadConstraints
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.api.ScanFileDto
 import com.posthog.hoglake.model.HoglakeException
@@ -197,7 +199,19 @@ class HogliteClient(
             .followRedirects(HttpClient.Redirect.NEVER)
             .build()
 
-    private val json: ObjectMapper = shared?.json ?: jacksonObjectMapper()
+    /**
+     * Reads engine responses, whose single string can be one whole stored
+     * payload read alone by a scan: Jackson's default 20M-char string cap
+     * would fail a legal one of ~21 MiB as a 500. Bounded by hoglited's
+     * response cap instead; API request parsing keeps its own constraints.
+     */
+    private val json: ObjectMapper =
+        shared?.json ?: ObjectMapper(
+            JsonFactory.builder()
+                .streamReadConstraints(
+                    StreamReadConstraints.builder().maxStringLength(MAX_RESPONSE_STRING_CHARS).build(),
+                ).build(),
+        ).registerKotlinModule()
 
     /** Which pool a URL belongs to; breakers and metrics key on it. */
     enum class Pool { STANDARD, WHALE }
@@ -1135,6 +1149,12 @@ class HogliteClient(
 
         /** The engine's bound on one `/v1/query-batch` request. */
         const val MAX_BATCH_READS = 1000
+
+        /**
+         * The longest string an engine response may carry: hoglited's 64 MiB
+         * response cap, which no string of one response can exceed in chars.
+         */
+        const val MAX_RESPONSE_STRING_CHARS = 64 * 1024 * 1024
 
         /** How long an engine that lacks `/v1/query-batch` is believed before it is asked again. */
         const val BATCH_UNSUPPORTED_RECHECK_MS = 60_000L

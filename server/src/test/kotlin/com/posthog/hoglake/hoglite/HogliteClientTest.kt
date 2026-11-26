@@ -500,6 +500,15 @@ class HogliteClientTest {
     }
 
     @Test
+    fun `a query result string past Jackson's default 20M-char cap decodes`() {
+        // One stored payload read alone by a scan arrives as one string (#685).
+        val payload = " ".repeat(21 * 1024 * 1024) + "[1]"
+        val (server, _) = serve(Step(200, "{\"cols\":[\"x\"],\"rows\":[[\"$payload\"]],\"affected\":0}"))
+        val c = client("http://127.0.0.1:${server.address.port}")
+        assertThat(c.query("t", "SELECT 1").rows.single().single()).isEqualTo(payload)
+    }
+
+    @Test
     fun `a guard failure decodes the 1-based guard_index`() {
         val (server, _) =
             serve(Step(409, "{\"error\":\"expect_failed\",\"guard_index\":2}"))

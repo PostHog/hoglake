@@ -892,11 +892,14 @@ paths:
             plan carries no statistics and costs no statistics read — the
             right default for a consumer that cannot prune (an unfiltered
             scan). `split_offsets` attaches DataFile.split_offsets to
-            every file that has them; it adds no statement to the plan
-            (the offsets live on the file row) but does add up to one
-            array per file to the response, so it too is opt-in. The two
-            combine freely: `include=column_stats,split_offsets` returns
-            both.
+            every file that has them; on PostgreSQL it adds no statement
+            to the plan (the offsets live on the file row); on a Hoglite
+            catalog it adds statements only for files whose stored list
+            is over 64 KiB, which are read outside their page, one
+            statement per batch of up to 16 MiB of them. It does add up
+            to one array per file to the response, so it too is opt-in.
+            The two combine freely: `include=column_stats,split_offsets`
+            returns both.
 
             Values may be comma-separated in one occurrence, or spread
             over repeated occurrences, or both: every occurrence is read

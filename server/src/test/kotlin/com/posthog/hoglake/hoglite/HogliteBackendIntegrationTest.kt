@@ -2,14 +2,22 @@ package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
@@ -20,11 +28,15 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -172,18 +184,19 @@ class HogliteBackendIntegrationTest {
     }
 
     @Test
-    fun `oversized requested scan metadata fails explicitly instead of timing out`() {
+    fun `oversized requested scan metadata is read alone and its total stays bounded`() {
         val cat = freshCatalog()
         store.createNamespace(cat, "ns")
         store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
         append(cat, "a.parquet")
+        // One payload past a page's per-row share is served, not refused (#685).
         scaleWrite(
             cat,
             "UPDATE files SET stats_json = ?, split_offsets_json = ?",
-            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
-            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+            " ".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES) + "[]",
+            " ".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES) + "[1]",
         )
-        assertThatThrownBy {
+        assertThat(
             store.planScan(
                 cat,
                 "ns",
@@ -191,16 +204,9 @@ class HogliteBackendIntegrationTest {
                 null,
                 null,
                 com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
-                false,
-            )
-        }.isInstanceOf(
-            HoglakeException.Validation::class.java,
-        ).hasMessageContaining("scan plan file metadata exceeds maximum")
-        assertThatThrownBy {
-            store.planScan(cat, "ns", "t", null, null, null, true)
-        }.isInstanceOf(
-            HoglakeException.Validation::class.java,
-        ).hasMessageContaining("scan plan file metadata exceeds maximum")
+                true,
+            ).single().dataFile.splitOffsets,
+        ).containsExactly(1L)
         // Individually legal payloads must not accumulate without a bound.
         val payload = " ".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES - 2) + "[]"
         scaleWrite(cat, "UPDATE files SET stats_json = ?, split_offsets_json = NULL", payload)
@@ -225,6 +231,169 @@ class HogliteBackendIntegrationTest {
         }.isInstanceOf(
             HoglakeException.Validation::class.java,
         ).hasMessageContaining("scan plan requested metadata exceeds maximum")
+    }
+
+    @Test
+    fun `a read-alone payload past Jackson's default 20M-char string cap is served`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        // Each fits the requested-metadata and engine caps, and arrives as one JSON string.
+        val padding = " ".repeat(21 * 1024 * 1024)
+        scaleWrite(cat, "UPDATE files SET stats_json = ?, split_offsets_json = ?", "$padding[]", "$padding[1]")
+        assertThat(
+            store.planScan(
+                cat,
+                "ns",
+                "t",
+                null,
+                null,
+                com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                true,
+            ).single().dataFile.splitOffsets,
+        ).containsExactly(1L)
+    }
+
+    @Test
+    fun `oversized scan payloads share read-alone queries up to the batch bound`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        append(cat, "b.parquet")
+        append(cat, "c.parquet")
+        // Two payloads fit one batch, three do not: two read-alone queries.
+        val length = HogliteCatalogStore.SCAN_ALONE_BATCH_BYTES * 2 / 5
+        scaleWrite(cat, "UPDATE files SET split_offsets_json = ?", " ".repeat(length.toInt() - 3) + "[1]")
+        val before = queryCount()
+        assertThat(store.planScan(cat, "ns", "t", null, null, null, false)).hasSize(3)
+        val unrequested = queryCount() - before
+        val after = queryCount()
+        val plan = store.planScan(cat, "ns", "t", null, null, null, true)
+        assertThat(plan.map { it.dataFile.splitOffsets }).containsOnly(listOf(1L)).hasSize(3)
+        assertThat(queryCount() - after - unrequested).isEqualTo(2)
+    }
+
+    /**
+     * One partitioned file committed with stats for `id` (lower and upper
+     * bound 7), whose stored stats and split offsets are then each padded
+     * past 280 KiB, and copied to [count] files: a response carrying all
+     * of either column is past hoglited's 64 MiB cap. The stats padding
+     * is entries of field ids no column has, ahead of the real one.
+     */
+    private fun wideFiles(
+        cat: String,
+        count: Int,
+        sorted: Boolean = false,
+        partitioned: Boolean = false,
+    ) {
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        if (sorted) {
+            store.alters.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
+            )
+        }
+        if (partitioned) {
+            store.alters.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY)))),
+            )
+        }
+        val stats = listOf(ColumnStats(1, 10, 0, null, null, SEVEN, SEVEN))
+        store.commit(
+            cat,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                FileRegistration(
+                                    "s3://hoglake-it/$cat/data/a.parquet",
+                                    10,
+                                    100,
+                                    50,
+                                    columnStats = stats,
+                                    partitionValues = if (partitioned) listOf("7") else null,
+                                ),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+        val stored = q(cat, "SELECT stats_json FROM files WHERE id = 1").firstRow()!![0] as String
+        val padding = (1_000L until 8_000L).joinToString(",") { """{"fieldId":$it,"valueCount":1,"nullCount":0}""" }
+        val padded = "[$padding," + stored.removePrefix("[")
+        assertThat(padded.length).isGreaterThan(280 * 1024)
+        scaleWrite(
+            cat,
+            "UPDATE files SET stats_json = ?, split_offsets_json = ?",
+            padded,
+            " ".repeat(280 * 1024) + "[]",
+        )
+        copyFirstFile(cat, count)
+    }
+
+    /** Copies file 1 to files 2 through [count], payloads included. */
+    private fun copyFirstFile(
+        cat: String,
+        count: Int,
+    ) {
+        scaleWrite(
+            cat,
+            """WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+                INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start, spec_id,
+                                  partition_values_json, stats_state, stats_json, split_offsets_json, begin_snapshot)
+                SELECT i, table_id, path || i, record_count, file_size_bytes, i, spec_id,
+                       partition_values_json, stats_state, stats_json, split_offsets_json, begin_snapshot
+                  FROM n CROSS JOIN files
+                 WHERE files.id = 1""",
+            count,
+        )
+        // The lookup bounds its candidates by the file id allocator.
+        scaleWrite(cat, "UPDATE meta SET next_file_id = ? WHERE id = 1", count + 1)
+    }
+
+    @ParameterizedTest(name = "{displayName} sorted={0}")
+    @ValueSource(booleans = [false, true])
+    fun `a file listing page leaves stored payloads it does not return in the engine`(sorted: Boolean) {
+        val cat = freshCatalog()
+        val count = HogliteCatalogStore.SCAN_PAGE_SIZE + 1
+        wideFiles(cat, count, sorted = sorted)
+        val files = store.listFiles(cat, "ns", "t", null, null, null, false, null, 0, emptyMap())
+        assertThat(files.map { it.dataFileId }).isEqualTo((1L..count).toList())
+        if (sorted) {
+            // Only the leading sort field's entry crosses the wire, and it still bounds every file.
+            assertThat(files.map { it.orderingBounds }).allSatisfy { bounds ->
+                val column = (bounds as FileOrderingBounds.SortKey).column
+                assertThat(column.fieldId).isEqualTo(1L)
+                assertThat(column.stats.lowerBound).isEqualTo(SEVEN)
+                assertThat(column.stats.upperBound).isEqualTo(SEVEN)
+            }
+        } else {
+            assertThat(files.map { it.orderingBounds }).allSatisfy {
+                assertThat(it).isInstanceOf(FileOrderingBounds.RowIds::class.java)
+            }
+        }
+    }
+
+    @Test
+    fun `a partition lookup leaves stored payloads it does not return in the engine`() {
+        val cat = freshCatalog()
+        val count = HogliteCatalogStore.SCAN_PAGE_SIZE + 1
+        wideFiles(cat, count, partitioned = true)
+        val lookup = HoglitePartitionLookup(store).lookup(cat, "ns", "t", 1, listOf("7"), limit = 500)
+        assertThat(lookup.aggregates.totals!!.fileCount).isEqualTo(count.toLong())
+        assertThat(lookup.files.map { it.dataFileId }).isEqualTo((1L..count).toList())
+        assertThat(lookup.nextCursor).isNull()
     }
 
     @Test
@@ -1159,5 +1328,10 @@ class HogliteBackendIntegrationTest {
         val head = store.getCatalog(catalog).headSnapshotId
         scaleWrite(catalog, "UPDATE meta SET earliest_snapshot_id = ? WHERE id = 1", head)
         assertHistory(0, null)
+    }
+
+    private companion object {
+        /** `7` as Iceberg's single-value bytes for a long. */
+        val SEVEN: ByteArray = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(7).array()
     }
 }
