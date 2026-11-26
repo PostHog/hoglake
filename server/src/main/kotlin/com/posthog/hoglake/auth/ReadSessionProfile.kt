@@ -219,11 +219,30 @@ internal class ReadSessionProfile(
         const val LOCAL_ONLY_PREFIX = "/v1/local-only"
         const val LOCAL_ONLY_MARKER = "X-Hoglake-Local-Only"
         const val LOCAL_ONLY_MARKER_VALUE = "true"
+        internal const val NAMESPACES_PATTERN = "/v1/catalogs/{catalog}/namespaces"
         internal const val NAMESPACE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}"
+        internal const val TABLES_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables"
         internal const val TABLE_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}"
         internal const val SCAN_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan"
-        val LOCAL_ONLY_PATTERNS = setOf(NAMESPACE_PATTERN, TABLE_PATTERN, SCAN_PATTERN)
-        internal const val TABLES_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables"
+        internal const val COMMIT_PATTERN = "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/commit"
+        val LOCAL_ONLY_PATTERNS =
+            setOf(
+                NAMESPACES_PATTERN,
+                NAMESPACE_PATTERN,
+                TABLES_PATTERN,
+                TABLE_PATTERN,
+                SCAN_PATTERN,
+                COMMIT_PATTERN,
+            )
+        val LOCAL_ONLY_ALLOWED_METHODS: Map<String, Set<HttpMethod>> =
+            mapOf(
+                NAMESPACES_PATTERN to setOf(HttpMethod.Get, HttpMethod.Post),
+                NAMESPACE_PATTERN to setOf(HttpMethod.Get, HttpMethod.Delete),
+                TABLES_PATTERN to setOf(HttpMethod.Get, HttpMethod.Post),
+                TABLE_PATTERN to setOf(HttpMethod.Get, HttpMethod.Delete),
+                SCAN_PATTERN to setOf(HttpMethod.Get),
+                COMMIT_PATTERN to setOf(HttpMethod.Post),
+            )
 
         /** The four routes a remote schema relays (docs/auth-tenancy.md §6.5c). */
         private val RELAY_PATTERNS = setOf(NAMESPACE_PATTERN, TABLES_PATTERN, TABLE_PATTERN, SCAN_PATTERN)
@@ -267,6 +286,46 @@ internal class ReadSessionProfile(
         fun canonicalLocalOnlyPath(path: String): String? =
             if (path.startsWith("$LOCAL_ONLY_PREFIX/catalogs/")) "/v1" + path.removePrefix(LOCAL_ONLY_PREFIX) else null
 
+        /** Return true when [method] is a local-only metadata mutation. */
+        internal fun isLocalOnlyMutation(method: HttpMethod): Boolean =
+            method == HttpMethod.Post || method == HttpMethod.Delete
+
+        /**
+         * Match a local-only request path to its canonical route pattern and path segments.
+         * Returns null if the path does not match any local-only route shape.
+         */
+        internal fun matchLocalOnlyRoute(canonicalPath: String): LocalOnlyPathMatch? {
+            val parts = canonicalPath.split('/')
+            val validPrefix =
+                parts.size >= 5 &&
+                    parts[0] == "" &&
+                    parts[1] == "v1" &&
+                    parts[2] == "catalogs" &&
+                    parts[4] == "namespaces"
+            if (!validPrefix) return null
+            val catalog = parts[3]
+            return when (parts.size) {
+                5 -> LocalOnlyPathMatch(NAMESPACES_PATTERN, catalog, null, null)
+                6 -> LocalOnlyPathMatch(NAMESPACE_PATTERN, catalog, parts[5], null)
+                7 -> if (parts[6] == "tables") LocalOnlyPathMatch(TABLES_PATTERN, catalog, parts[5], null) else null
+                8 ->
+                    if (parts[6] == "tables") {
+                        LocalOnlyPathMatch(TABLE_PATTERN, catalog, parts[5], parts[7])
+                    } else {
+                        null
+                    }
+                9 ->
+                    when {
+                        parts[6] == "tables" && parts[8] == "scan" ->
+                            LocalOnlyPathMatch(SCAN_PATTERN, catalog, parts[5], parts[7])
+                        parts[6] == "tables" && parts[8] == "commit" ->
+                            LocalOnlyPathMatch(COMMIT_PATTERN, catalog, parts[5], parts[7])
+                        else -> null
+                    }
+                else -> null
+            }
+        }
+
         internal fun matchesNamespace(
             method: HttpMethod,
             route: RouteMatch?,
@@ -284,11 +343,11 @@ internal class ReadSessionProfile(
 
         internal fun isCanonicalRoute(
             catalog: String,
-            namespace: String,
+            namespace: String?,
             table: String? = null,
         ): Boolean =
             CATALOG_NAME_REGEX.matches(catalog) &&
-                IDENTIFIER_REGEX.matches(namespace) &&
+                (namespace == null || IDENTIFIER_REGEX.matches(namespace)) &&
                 (table == null || IDENTIFIER_REGEX.matches(table))
 
         internal fun isEligibleRoute(
@@ -448,9 +507,17 @@ internal data class ReadSessionConfig(
     val servedOnly: Boolean = false,
 )
 
-/** Verified route target for a dedicated read-session call. */
+/** Parsed local-only route shape before method and entitlement checks. */
+internal data class LocalOnlyPathMatch(
+    val pattern: String,
+    val catalog: String,
+    val namespace: String?,
+    val table: String?,
+)
+
+/** Verified route target for a dedicated session call. */
 internal data class ReadSessionTarget(
     val catalog: String,
-    val namespace: String,
+    val namespace: String? = null,
     val table: String? = null,
 )

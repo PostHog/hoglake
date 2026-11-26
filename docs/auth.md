@@ -282,17 +282,24 @@ Reserved mounts and reserved namespaces keep the ordinary verifier on ordinary r
 The one exception is a remote schema's four relayed routes, described in "Read sessions on a remote schema".
 Ordinary tokens keep the ordinary verifier on all ordinary routes.
 
-#### Local-only read routes
+#### Local-only routes
 
-A dedicated client reads local objects through three local-only GET routes:
+A dedicated client accesses local objects through local-only routes under `/v1/local-only`:
 
-- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}`
-- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`
-- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan`
+- `GET /v1/local-only/catalogs/{catalog}/namespaces` (optional `?after=<name>`)
+- `POST /v1/local-only/catalogs/{catalog}/namespaces` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}`
+- `DELETE /v1/local-only/catalogs/{catalog}/namespaces/{namespace}` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables` (optional `?after=<name>`)
+- `POST /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`
+- `DELETE /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan`
+- `POST /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/commit` (writable session only; every committed data file and deletion vector URI is verified against the session's primary-catalog write grant before forwarding)
 
-Each route takes the same query and gives the same body as the ordinary route without the prefix.
-A request on these routes always uses the dedicated read verifier.
-It reads only from the configured Hoglite owner named in the signed JWT.
+List routes return paginated objects (`{"namespaces": [...], "next_after": "..."}` and `{"namespace_id": ..., "namespace": ..., "tables": [...], "next_after": "..."}`), with reserved namespaces filtered out before responding.
+Drop routes accept optional identity-fencing queries (`?namespace_id=` on namespace drop and `?table_uuid=` on table drop).
+A request on these routes always uses the dedicated verifier and forwards directly to the configured Hoglite owner named in the signed JWT (requiring a Hoglite owner build that implements the companion typed list and mutation routes).
 It never reaches a remote schema relay, a mount, or a legacy store.
 The server never redirects or rewrites it to an ordinary route.
 
@@ -300,7 +307,7 @@ The routes answer as follows:
 
 - A listener without `HOGLAKE_READ_SESSION_PROFILE` answers `501`. So does the public listener, with or without the profile, and `HOGLAKE_AUTH_MODE=off`.
 - Another path under `/v1/local-only` answers `422`.
-- Another method on a valid route answers `405` with `Allow: GET`.
+- A disallowed method on a valid route answers `405` with the route's `Allow` header.
 - A missing or refused token answers `401`.
 - A verified session that names an unentitled catalog, a reserved mount, or a reserved namespace (including a remote schema) answers `404`. The server does not call the owner.
 - An eligible local namespace, table, or scan answers as the owner answers. An absent object is `404`.
@@ -355,7 +362,7 @@ The verifier enforces strict coupling across `cat`, `prd`, and primary-catalog s
 Both read-only and writable sessions are admitted on the local-only read routes and on the four relayed or served remote `GET` routes.
 On a remote `GET` route, a writable session's `prd.team_id.<team_id>: "write"` satisfies read-only authority for `team_<team_id>` and grants no write permission.
 Note: because the relay forwards the caller's original `Authorization` header unchanged, the Host must be in the same trust boundary as the Client for the session's embedded credentials.
-Planned local-only write routes will require a writable session and refuse a read-only session; only the three local-only `GET` routes are implemented today.
+Local-only write routes (`POST` and `DELETE`) require a writable session and refuse a read-only session with `403`.
 
 The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
 give the expected verdict for each verifier.

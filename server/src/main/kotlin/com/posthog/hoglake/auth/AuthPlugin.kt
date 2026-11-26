@@ -539,17 +539,16 @@ private suspend fun selectLocalOnly(
         call.respondRefusal(HoglakeException.NotSupported("local-only reads are not configured on this listener"))
         return
     }
-    // The ordinary pattern, for the policy match only. The route still matches the raw path.
-    val match =
-        ReadSessionProfile.canonicalLocalOnlyPath(call.request.path())
-            ?.let { AuthPolicy.match(HttpMethod.Get, it) }
-            ?.takeIf { it.pattern in ReadSessionProfile.LOCAL_ONLY_PATTERNS }
-    if (match == null) {
+    // Match the raw local-only path to a known local-only route shape and check allowed methods.
+    val canonical = ReadSessionProfile.canonicalLocalOnlyPath(call.request.path())
+    val pathMatch = canonical?.let { ReadSessionProfile.matchLocalOnlyRoute(it) }
+    val allowedMethods = pathMatch?.let { ReadSessionProfile.LOCAL_ONLY_ALLOWED_METHODS[it.pattern] }
+    if (pathMatch == null || allowedMethods == null) {
         call.respondRefusal(HoglakeException.Validation("invalid local-only request"))
         return
     }
-    if (call.request.httpMethod != HttpMethod.Get) {
-        call.response.header(HttpHeaders.Allow, HttpMethod.Get.value)
+    if (call.request.httpMethod !in allowedMethods) {
+        call.response.header(HttpHeaders.Allow, allowedMethods.joinToString(", ") { it.value })
         call.respond(
             HttpStatusCode.MethodNotAllowed,
             ApiErrorDto(
@@ -559,6 +558,16 @@ private suspend fun selectLocalOnly(
         )
         return
     }
+    val isMutation = ReadSessionProfile.isLocalOnlyMutation(call.request.httpMethod)
+    val match =
+        AuthPolicy.match(call.request.httpMethod, canonical)
+            ?: RouteMatch(
+                pattern = pathMatch.pattern,
+                requirement = if (isMutation) Requirement.WRITE else Requirement.READ,
+                catalog = pathMatch.catalog,
+                namespace = pathMatch.namespace,
+                table = pathMatch.table,
+            )
     call.response.headers.append(
         ReadSessionProfile.LOCAL_ONLY_MARKER,
         ReadSessionProfile.LOCAL_ONLY_MARKER_VALUE,
@@ -579,7 +588,7 @@ private suspend fun selectLocalOnly(
             failure = HoglakeException.Unauthenticated(v.reason, "token refused")
         }
     }
-    if (caller == null || token == null) {
+    if (caller == null || token == null || grants == null) {
         call.attributes.put(AuthStateKey, AuthState.Anonymous)
         val refusal =
             if (failure != null) {
@@ -595,34 +604,37 @@ private suspend fun selectLocalOnly(
         AuthStateKey,
         AuthState.Authenticated(caller, VerifiedBackendAuthority(token, grants, verifier.now())),
     )
-    val catalog = match.catalog
-    val namespace = match.namespace
-    val table = if (match.pattern == ReadSessionProfile.NAMESPACE_PATTERN) null else match.table
+    val catalog = pathMatch.catalog
+    val namespace = pathMatch.namespace
+    val table = pathMatch.table
     val target =
-        if (catalog != null && namespace != null &&
-            (match.pattern == ReadSessionProfile.NAMESPACE_PATTERN || table != null) &&
-            !MountNames.isReserved(catalog) &&
-            !configured.reservedNamespaces.isReserved(namespace) &&
+        if (!MountNames.isReserved(catalog) &&
+            (namespace == null || !configured.reservedNamespaces.isReserved(namespace)) &&
             ReadSessionProfile.isCanonicalRoute(catalog, namespace, table)
         ) {
             ReadSessionTarget(catalog, namespace, table)
         } else {
             null
         }
-    val decision = AuthPolicy.authorize(caller, match)
-    if (target == null || decision !is AuthDecision.ByNamespace) {
-        // A verified session gets ordinary absence for a reserved or unentitled name.
-        val refusal =
-            if (target == null) {
-                HoglakeException.NotFound("namespace")
-            } else {
-                val denied = failureFor(decision, match)
-                if (denied != null) denied else HoglakeException.NotFound("namespace")
-            }
+    val requiredScope = if (isMutation) Scope.WRITE else Scope.READ
+    if (target == null || !caller.catalogClaimAllows(catalog, Scope.READ)) {
+        val refusal = HoglakeException.NotFound("namespace")
         countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
         call.respondRefusal(refusal)
         return
     }
+    if (isMutation && (!grants.writable || !caller.catalogClaimAllows(catalog, Scope.WRITE))) {
+        val refusal = HoglakeException.Forbidden("access denied")
+        countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
+        call.respondRefusal(refusal)
+        return
+    }
+    val decision =
+        AuthDecision.ByNamespace(
+            catalog = catalog,
+            namespace = namespace ?: "",
+            required = requiredScope,
+        )
     call.attributes.put(LocalOnlySelectionKey, LocalOnlySelection.of(target, decision))
 }
 

@@ -99,18 +99,19 @@ class AuthPolicyTest {
             ordinary.filter { (method, path) -> AuthPolicy.match(HttpMethod.parse(method.uppercase()), path) == null }
         assertThat(missing).describedAs("routes published in the OpenAPI spec with no AuthPolicy entry").isEmpty()
 
-        // Each local-only route is a GET whose canonical path is exactly one of the three ordinary read patterns.
-        val canonical =
+        // Each local-only route matches an allowed (method, canonicalPattern) pair in LOCAL_ONLY_ALLOWED_METHODS.
+        val publishedLocalOnly =
             localOnly.map { (method, path) ->
-                val target = ReadSessionProfile.canonicalLocalOnlyPath(path)
-                Triple(method.lowercase(), target, target?.let { AuthPolicy.match(HttpMethod.Get, it)?.pattern })
-            }
-        assertThat(canonical.map { it.first }).describedAs("local-only methods").containsOnly("get")
-        assertThat(canonical.filter { it.second == null || it.second != it.third })
-            .describedAs("local-only routes whose canonical path is not an exact policy pattern")
-            .isEmpty()
-        assertThat(canonical.map { it.third }.toSet())
-            .isEqualTo(ReadSessionProfile.LOCAL_ONLY_PATTERNS)
+                val canonical = ReadSessionProfile.canonicalLocalOnlyPath(path)
+                val matched = canonical?.let { ReadSessionProfile.matchLocalOnlyRoute(it) }
+                assertThat(matched).describedAs("local-only route $method $path").isNotNull()
+                HttpMethod.parse(method.uppercase()) to matched!!.pattern
+            }.toSet()
+        val expectedLocalOnly =
+            ReadSessionProfile.LOCAL_ONLY_ALLOWED_METHODS.flatMap { (pattern, methods) ->
+                methods.map { it to pattern }
+            }.toSet()
+        assertThat(publishedLocalOnly).isEqualTo(expectedLocalOnly)
     }
 
     @Test
