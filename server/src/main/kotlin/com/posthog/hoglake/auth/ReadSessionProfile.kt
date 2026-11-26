@@ -53,7 +53,7 @@ internal class ReadSessionProfile(
         text(claims, "jti")
         if (seconds(claims, "generation") != 1L) invalid()
         val primary = text(claims, "primary_catalog")
-        requireSingleRead(claims.get("cat"), primary)
+        val writable = parsePrimaryCatalogAccess(claims.get("cat"), primary)
         requireSingleRead(claims.get("remote_schemas"), TeamNamespaces.FAMILY)
         val predicates = claims.get("prd")
         val teams = predicates?.get("team_id")
@@ -61,8 +61,9 @@ internal class ReadSessionProfile(
             invalid()
         }
         val team = teams.properties().single()
+        val expectedTeamScope = if (writable) "write" else "read"
         if (!POSITIVE_INTEGER.matches(team.key) || team.key.toLongOrNull() == null ||
-            team.value.textValue() != "read"
+            team.value.textValue() != expectedTeamScope
         ) {
             invalid()
         }
@@ -96,7 +97,7 @@ internal class ReadSessionProfile(
         ) {
             invalid()
         }
-        return validateGrants(claims.get("grants"), primary, backend, tenant, region)
+        return validateGrants(claims.get("grants"), primary, backend, tenant, region, writable)
     }
 
     private fun validateGrants(
@@ -105,6 +106,7 @@ internal class ReadSessionProfile(
         backend: String,
         tenant: String,
         region: String,
+        writable: Boolean,
     ): ReadSessionStorageGrants {
         val targets = remoteTargets + catalog + backend
         if (targets.size != 4 || grants?.isArray != true || grants.size() < targets.size) invalid()
@@ -123,14 +125,16 @@ internal class ReadSessionProfile(
             val key = text(grant, if (prefix) "prefix" else "object_key")
             val target = text(grant, "target")
             val actions = grant.get("actions")
+            val expectedActions = if (writable && target == catalog) WRITE_ACTIONS else READ_ACTIONS
             if (!BUCKET.matches(bucket) || ".." in bucket || key.length > 1024 ||
                 prefix != key.endsWith('/') ||
                 key.removeSuffix("/").split('/').any { it == "." || it == ".." || !SEGMENT.matches(it) } ||
                 target !in targets || text(grant, "catalog") != catalog || text(grant, "region") != region ||
-                actions?.isArray != true || actions.size() != 1 || actions[0].textValue() != "s3:GetObject"
+                !matchesActions(actions, expectedActions)
             ) {
                 invalid()
             }
+            if (writable && target == catalog && !prefix) invalid()
             if (target == backend && (prefix || !key.endsWith(manifestSuffix) || target in seen)) invalid()
             val overlaps = previousKey.endsWith('/') && key.startsWith(previousKey)
             if (bucket < previousBucket || (bucket == previousBucket && (key <= previousKey || overlaps))) {
@@ -142,7 +146,38 @@ internal class ReadSessionProfile(
             parsed.add(ReadSessionStorageGrant(catalog, target, bucket, region, key, prefix))
         }
         if (seen != targets) invalid()
-        return ReadSessionStorageGrants(region, parsed, remoteTargets)
+        return ReadSessionStorageGrants(region, parsed, remoteTargets, writable)
+    }
+
+    /** Return true when [map] grants read+write on [key], false for read-only, or throw on any other shape. */
+    private fun parsePrimaryCatalogAccess(
+        map: JsonNode?,
+        key: String,
+    ): Boolean {
+        val scopes = map?.get(key)
+        if (map?.isObject != true || map.size() != 1 || scopes?.isArray != true) invalid()
+        return when (scopes.size()) {
+            1 -> {
+                if (scopes[0].textValue() != "read") invalid()
+                false
+            }
+            2 -> {
+                if (scopes[0].textValue() != "read" || scopes[1].textValue() != "write") invalid()
+                true
+            }
+            else -> invalid()
+        }
+    }
+
+    private fun matchesActions(
+        actions: JsonNode?,
+        expected: List<String>,
+    ): Boolean {
+        if (actions?.isArray != true || actions.size() != expected.size) return false
+        for (i in expected.indices) {
+            if (actions[i].textValue() != expected[i]) return false
+        }
+        return true
     }
 
     private fun requireSingleRead(
@@ -173,6 +208,14 @@ internal class ReadSessionProfile(
 
     companion object {
         val AUDIENCES = setOf("trino-session", "hoglake-session", "hoglite-session")
+        val READ_ACTIONS = listOf("s3:GetObject")
+        val WRITE_ACTIONS =
+            listOf(
+                "s3:AbortMultipartUpload",
+                "s3:GetObject",
+                "s3:ListMultipartUploadParts",
+                "s3:PutObject",
+            )
         const val LOCAL_ONLY_PREFIX = "/v1/local-only"
         const val LOCAL_ONLY_MARKER = "X-Hoglake-Local-Only"
         const val LOCAL_ONLY_MARKER_VALUE = "true"
@@ -360,11 +403,12 @@ internal data class ReadSessionStorageGrant(
     override fun toString(): String = "ReadSessionStorageGrant(redacted)"
 }
 
-/** Verified storage grants from a dedicated read session without AWS credentials. */
+/** Verified storage grants from a dedicated session without AWS credentials. */
 internal class ReadSessionStorageGrants(
     val region: String,
     private val grants: List<ReadSessionStorageGrant>,
     private val remoteTargets: Set<String> = emptySet(),
+    val writable: Boolean = false,
 ) {
     /** Return true when a signed grant of one of the configured remote targets allows the S3 object URI. */
     fun allowsRemoteTargetObject(path: String): Boolean {
@@ -382,6 +426,12 @@ internal class ReadSessionStorageGrants(
             it.catalog == catalog && it.target == catalog && it.region == region && it.covers(bucket, key)
         }
     }
+
+    /** Return true when this session is writable and a signed primary-catalog grant allows the S3 object URI. */
+    fun allowsPrimaryCatalogWrite(
+        catalog: String,
+        path: String,
+    ): Boolean = writable && allowsPrimaryCatalogObject(catalog, path)
 
     override fun toString(): String = "ReadSessionStorageGrants(redacted)"
 }

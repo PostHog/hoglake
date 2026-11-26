@@ -331,14 +331,31 @@ The token carries generation `1`, a session identifier, and a finite session dea
 Require `nbf <= iat < exp <= aws.expires_at <= session_deadline`.
 Clock skew does not extend AWS expiry.
 
-Each storage grant binds the catalog, target, bucket, region, and `s3:GetObject`.
+Each storage grant binds the catalog, target, bucket, region, and its allowed S3 actions.
 It carries either a literal `object_key` or a slash-terminated `prefix`.
 The verifier rejects overlaps and repeated grants.
-The manifest grant names one literal object for the routed tenant.
+The manifest grant names one literal object for the routed tenant and allows only `s3:GetObject`.
 Its key ends with `/<shard>/t/<routed-tenant>/manifest`, without an extension.
 The shard is the two-digit lowercase hexadecimal result of FNV-1a 32-bit modulo 256 on the full routed tenant.
-Two configured remote targets bind the read-only `team` family.
+Two configured remote targets bind the read-only `team` family and allow only `s3:GetObject`.
 The verifier does not retain or log the AWS credentials.
+
+#### Writable local sessions
+
+A dedicated session (`purpose: "user-session"`) is either **read-only** or **writable**.
+The verifier enforces strict coupling across `cat`, `prd`, and primary-catalog storage grants so half-writable tokens are always refused (`invalid_token`):
+
+- **Read-only session:** `cat.<primary_catalog>` is `["read"]`, `prd.team_id.<team_id>` is `"read"`, and every primary-catalog storage grant allows only `["s3:GetObject"]`.
+- **Writable session:** `cat.<primary_catalog>` is `["read", "write"]` (sorted), `prd.team_id.<team_id>` is `"write"`, and every primary-catalog storage grant is a slash-terminated `prefix` whose `actions` are exactly `["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListMultipartUploadParts", "s3:PutObject"]` (sorted; never `s3:DeleteObject`, `s3:ListBucket`, or a literal `object_key`).
+  The issuer must derive the primary-catalog write prefixes from trusted catalog and namespace placement so both the signed write grants and the effective S3 session policy stay strictly within the data prefixes owned by the team in `prd`.
+  The effective S3 session policy must also enforce conditional create-only writes (`s3:if-none-match: "*"` for both `PutObject` and `CompleteMultipartUpload`, while allowing `CreateMultipartUpload` and `UploadPart`) so embedded credentials cannot overwrite existing snapshot objects.
+  Because writable sessions reuse the existing profile version and audiences, an issuer must enable writable-session minting only after all downstream verifiers (the Client, its backend owner, and any remote Host) accept the writable form.
+- **Always read-only:** `remote_schemas` stays `{"team": ["read"]}`, the manifest grant stays a literal `object_key` with `["s3:GetObject"]`, and both remote target grants stay `["s3:GetObject"]`.
+
+Both read-only and writable sessions are admitted on the local-only read routes and on the four relayed or served remote `GET` routes.
+On a remote `GET` route, a writable session's `prd.team_id.<team_id>: "write"` satisfies read-only authority for `team_<team_id>` and grants no write permission.
+Note: because the relay forwards the caller's original `Authorization` header unchanged, the Host must be in the same trust boundary as the Client for the session's embedded credentials.
+Planned local-only write routes will require a writable session and refuse a read-only session; only the three local-only `GET` routes are implemented today.
 
 The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
 give the expected verdict for each verifier.

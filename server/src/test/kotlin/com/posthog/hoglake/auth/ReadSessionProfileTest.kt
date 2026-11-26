@@ -268,4 +268,51 @@ class ReadSessionProfileTest {
                 .isFalse()
         }
     }
+
+    @Test
+    fun `primary catalog write checks require a writable session and matching prefix`() {
+        val verifier = verifier()
+        val (_, readOnly) =
+            verifier.verifyReadSessionWithGrants(
+                token {
+                    (it["grants"][0] as ObjectNode).apply {
+                        remove("object_key")
+                        put("prefix", "data/team_42/")
+                    }
+                },
+                profile,
+            )
+        assertThat(readOnly.writable).isFalse()
+        assertThat(
+            readOnly.allowsPrimaryCatalogObject("example-catalog", "s3://example-customer/data/team_42/a.parquet"),
+        ).isTrue()
+        assertThat(
+            readOnly.allowsPrimaryCatalogWrite("example-catalog", "s3://example-customer/data/team_42/a.parquet"),
+        ).isFalse()
+
+        val (_, writable) =
+            verifier.verifyReadSessionWithGrants(
+                token {
+                    (it["cat"] as ObjectNode).putArray("example-catalog").add("read").add("write")
+                    (it["prd"]["team_id"] as ObjectNode).put("42", "write")
+                    (it["grants"][0] as ObjectNode).apply {
+                        remove("object_key")
+                        put("prefix", "data/team_42/")
+                        val actions = putArray("actions")
+                        ReadSessionProfile.WRITE_ACTIONS.forEach { action -> actions.add(action) }
+                    }
+                },
+                profile,
+            )
+        assertThat(writable.writable).isTrue()
+        assertThat(
+            writable.allowsPrimaryCatalogWrite("example-catalog", "s3://example-customer/data/team_42/a.parquet"),
+        ).isTrue()
+        assertThat(
+            writable.allowsPrimaryCatalogWrite("example-catalog", "s3://example-customer/data/team_43/a.parquet"),
+        ).isFalse()
+        assertThat(
+            writable.allowsPrimaryCatalogWrite("other-catalog", "s3://example-customer/data/team_42/a.parquet"),
+        ).isFalse()
+    }
 }
