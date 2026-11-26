@@ -1,6 +1,8 @@
 package com.posthog.hoglake.hydrator
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.model.BOUND_WIDENING_TYPES
+import com.posthog.hoglake.model.BoundReencode
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.HoglakeException
@@ -11,16 +13,19 @@ import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.RehydrateResult
 import com.posthog.hoglake.model.SplitOffsets
+import com.posthog.hoglake.model.boundReencodeFor
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.LayoutRepo
+import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.service.HydratorMaintenanceBackend
+import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.storage.StorageAccess
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
@@ -181,6 +186,20 @@ class Hydrator(
      * with at its spec's identity key_index, null when none resolves.
      */
     private data class PrefixClaim(val fieldId: Long, val rawValue: String?)
+
+    /**
+     * One stats row this sweep wrote with a 4-byte bound, under [type], a
+     * type a promote can widen; [rewidenAfterPromote] re-checks it.
+     */
+    private class NarrowBound(
+        val catalogId: Long,
+        val tableId: Long,
+        val dataFileId: Long,
+        val fieldId: Long,
+        val type: ColType,
+        val lower: ByteArray?,
+        val upper: ByteArray?,
+    )
 
     /**
      * The sweep's claim, PER CATALOG with a fair share of [limit] (#269).
@@ -380,6 +399,7 @@ class Hydrator(
         // A rollback discards [signals]: those files stayed pending (#488).
         val tallies = mutableMapOf<Long, MutableList<Long>>()
         val signals = CommittedSignals(startedAt)
+        val narrow = ArrayList<NarrowBound>()
         val processed =
             try {
                 jdbi.inTransaction<Int, Exception> { h ->
@@ -404,7 +424,8 @@ class Hydrator(
                                 prefixFields[file.catalogId to file.tableId]?.let { fieldId ->
                                     PrefixClaim(fieldId, prefixValue(h, file, fieldId, keyIndexes))
                                 }
-                            val outcome = hydrate(h, file, prefix, storeFor(h, file.catalogId, stores), signals)
+                            val outcome =
+                                hydrate(h, file, prefix, storeFor(h, file.catalogId, stores), signals, narrow)
                             if (outcome == Outcome.FAILED) {
                                 tally[2]++
                             } else {
@@ -439,6 +460,7 @@ class Hydrator(
                             tally[2]++
                         }
                     }
+                    rewidenAfterPromote(h, narrow)
                     pending.size
                 }
             } catch (e: Throwable) {
@@ -639,6 +661,7 @@ class Hydrator(
         prefix: PrefixClaim?,
         objects: ObjectStore,
         signals: CommittedSignals,
+        narrow: MutableList<NarrowBound>,
     ): Outcome {
         val footer = readFooter(file, objects)
         // The field-id contract check rides the footer we already hold.
@@ -663,6 +686,10 @@ class Hydrator(
         // never live-at-hydration: a drop+add-same-name between commit and
         // this sweep would otherwise land the old incarnation's stats
         // under the NEW field id, poisoning pruning on the new column.
+        // Their TYPES are the live ones ([catalogColumns] joins them by
+        // field id): a promote after the commit must not leave this file's
+        // bounds in the old width. A promote after THIS read is
+        // [rewidenAfterPromote]'s.
         val columns =
             if (FooterStats.usesFieldIds(footer.fileMetaData.schema)) {
                 catalogColumns(h, file, at = null)
@@ -683,7 +710,29 @@ class Hydrator(
         // discarded. Strictly below: a file of exactly [minFileBytes]
         // gets its rows.
         val belowFloor = file.fileSizeBytes < minFileBytes
-        if (!belowFloor) for (agg in aggs) upsertStats(h, file, agg)
+        // Bounds a promote could still widen before the sweep commits, for
+        // [rewidenAfterPromote]; handed over only once this file is done,
+        // so a file whose savepoint rolls back leaves none behind.
+        val narrowHere = ArrayList<NarrowBound>()
+        if (!belowFloor) {
+            val widenable = widenableTypes(columns)
+            for (agg in aggs) {
+                upsertStats(h, file, agg)
+                val type = widenable[agg.fieldId] ?: continue
+                if (agg.lowerBound?.size == 4 || agg.upperBound?.size == 4) {
+                    narrowHere +=
+                        NarrowBound(
+                            file.catalogId,
+                            file.tableId,
+                            file.dataFileId,
+                            agg.fieldId,
+                            type,
+                            agg.lowerBound,
+                            agg.upperBound,
+                        )
+                }
+            }
+        }
         // Row-group start offsets ride the same footer and the same flip,
         // so a file is never `provided` in one statement and offset-less
         // in the next. The FOOTER is authoritative: it overwrites any
@@ -753,6 +802,7 @@ class Hydrator(
                 }
             }
         }
+        narrow += narrowHere
         return when {
             quarantined && belowFloor -> Outcome.QUARANTINED_WITHOUT_STATS
             quarantined -> Outcome.QUARANTINED
@@ -792,6 +842,96 @@ class Hydrator(
             .bindNullableBytes("lowerBound", agg.lowerBound)
             .bindNullableBytes("upperBound", agg.upperBound)
             .execute()
+    }
+
+    /**
+     * Field id -> type for [columns]' leaves (at any depth) whose 4-byte
+     * bounds a promote can widen ([BOUND_WIDENING_TYPES]).
+     */
+    private fun widenableTypes(columns: List<CatalogColumn>): Map<Long, ColType> {
+        val out = HashMap<Long, ColType>()
+
+        fun walk(cols: List<CatalogColumn>) {
+            for (c in cols) {
+                if (c.type in BOUND_WIDENING_TYPES) out[c.fieldId] = c.type
+                walk(c.children)
+            }
+        }
+        walk(columns)
+        return out
+    }
+
+    /**
+     * THE PROMOTE RACE (#729). A file's bounds are encoded in the type
+     * [hydrate] read, and a width-changing promote re-encodes only the
+     * stats rows its own scan can see. One that commits after that read
+     * and before this sweep does sees none of this sweep's rows, so
+     * without this they would commit 4-byte bounds under a live 8-byte
+     * type, the file `provided` and never revisited.
+     *
+     * So, last thing before the COMMIT, per catalog with [narrow] rows:
+     * take the promote stats fence SHARED
+     * ([Locks.acquirePromoteStatsFenceShared]), read the live types of
+     * those fields, and widen each row whose type has since been promoted
+     * ([IcebergSingleValue.widen], the promote's own rule). The fence is
+     * held to the COMMIT, so a promote either committed before the read
+     * here (which sees its type) or waits for this sweep's COMMIT (and its
+     * scan sees these rows). Only this sweep's own rows are written, and
+     * claims are disjoint, so replicas never touch the same row.
+     *
+     * Cost when nothing was promoted: per catalog with narrow bounds, one
+     * shared lock and one `hog_column_live` read, no writes.
+     */
+    private fun rewidenAfterPromote(
+        h: Handle,
+        narrow: List<NarrowBound>,
+    ) {
+        for ((catalogId, bounds) in narrow.groupBy { it.catalogId }.toSortedMap()) {
+            Locks.acquirePromoteStatsFenceShared(h, catalogId)
+            val live =
+                h.createQuery(
+                    """
+                    SELECT table_id, field_id, col_type
+                    FROM hog_column
+                    WHERE catalog_id = :catalogId AND table_id = ANY(:tableIds)
+                      AND end_snapshot IS NULL
+                    """,
+                )
+                    .bind("catalogId", catalogId)
+                    .bindArray("tableIds", Long::class.javaObjectType, bounds.map { it.tableId }.distinct())
+                    .map { rs, _ ->
+                        (rs.getLong("table_id") to rs.getLong("field_id")) to ColType.fromWire(rs.getString("col_type"))
+                    }
+                    .list()
+                    .toMap()
+            val batch =
+                h.prepareBatch(
+                    """
+                    UPDATE hog_file_column_stats
+                       SET lower_bound = :lower, upper_bound = :upper
+                     WHERE catalog_id = :catalogId AND data_file_id = :dataFileId AND field_id = :fieldId
+                    """,
+                )
+            var widened = 0
+            for (b in bounds) {
+                // No live row: the field was dropped, and no reader decodes it.
+                val now = live[b.tableId to b.fieldId] ?: continue
+                val reencode = boundReencodeFor(b.type, now)
+                if (reencode == BoundReencode.NONE) continue
+                batch
+                    .bind("lower", b.lower?.let { IcebergSingleValue.widen(reencode, it) })
+                    .bind("upper", b.upper?.let { IcebergSingleValue.widen(reencode, it) })
+                    .bind("catalogId", catalogId)
+                    .bind("dataFileId", b.dataFileId)
+                    .bind("fieldId", b.fieldId)
+                    .add()
+                widened++
+            }
+            if (widened > 0) {
+                batch.execute()
+                log.info { "re-widened $widened bound row(s) in catalog $catalogId after a concurrent promote" }
+            }
+        }
     }
 
     /**
@@ -885,7 +1025,12 @@ class Hydrator(
      * The table's catalog columns for stats binding: [at] null = the LIVE
      * set (end_snapshot IS NULL — field-id binding); [at] non-null = the
      * set visible at that snapshot (the versioned-row rule — name-fallback
-     * binding at the file's begin_snapshot).
+     * binding at the file's begin_snapshot), each with its LIVE type and
+     * scale where its field id still has a live row (a promote is the only
+     * change that keeps a field id and changes its type) and its own where
+     * it does not. One query either way: the live row is a LEFT JOIN on
+     * field id, the same binding as [withLiveTypes], the Hoglite
+     * hydrator's.
      */
     private fun catalogColumns(
         h: Handle,
@@ -906,12 +1051,17 @@ class Hydrator(
                     """
                 } else {
                     """
-                    SELECT field_id, parent_field_id, ordinal, name, col_type,
-                           type_params::text AS type_params
-                    FROM hog_column
-                    WHERE catalog_id = :catalogId AND table_id = :tableId
-                      AND begin_snapshot <= :at
-                      AND (end_snapshot IS NULL OR :at < end_snapshot)
+                    SELECT c.field_id, c.parent_field_id, c.ordinal, c.name,
+                           COALESCE(l.col_type, c.col_type) AS col_type,
+                           (CASE WHEN l.field_id IS NULL THEN c.type_params
+                                 ELSE l.type_params END)::text AS type_params
+                    FROM hog_column c
+                    LEFT JOIN hog_column l
+                      ON l.catalog_id = c.catalog_id AND l.table_id = c.table_id
+                     AND l.field_id = c.field_id AND l.end_snapshot IS NULL
+                    WHERE c.catalog_id = :catalogId AND c.table_id = :tableId
+                      AND c.begin_snapshot <= :at
+                      AND (c.end_snapshot IS NULL OR :at < c.end_snapshot)
                     """
                 },
             )

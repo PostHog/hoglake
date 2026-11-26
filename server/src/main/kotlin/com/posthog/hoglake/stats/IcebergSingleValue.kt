@@ -1,5 +1,6 @@
 package com.posthog.hoglake.stats
 
+import com.posthog.hoglake.model.BoundReencode
 import com.posthog.hoglake.model.ColType
 import java.math.BigDecimal
 import java.math.BigInteger
@@ -346,6 +347,27 @@ object IcebergSingleValue {
                 BigInteger(data)
             }
             ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
+        }
+
+    /**
+     * One 4-byte bound re-encoded at the promoted width, value preserved
+     * (both promotions are lossless widens); any other length passes
+     * through unchanged. The one rule for a promote's stats re-encode
+     * and the hydrator's re-check after one.
+     */
+    fun widen(
+        reencode: BoundReencode,
+        data: ByteArray,
+    ): ByteArray =
+        if (data.size != 4) {
+            data
+        } else {
+            when (reencode) {
+                BoundReencode.NONE -> data
+                BoundReencode.INT_TO_LONG -> encode(ColType.LONG, (decode(ColType.INT, data) as Int).toLong())
+                BoundReencode.FLOAT_TO_DOUBLE ->
+                    encode(ColType.DOUBLE, (decode(ColType.FLOAT, data) as Float).toDouble())
+            }
         }
 
     /**

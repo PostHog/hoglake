@@ -9,6 +9,8 @@ import com.posthog.hoglake.compaction.CompactionWork.TableContext
 import com.posthog.hoglake.compaction.CompactionWork.WorkItem
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.model.BOUND_WIDENING_TYPES
+import com.posthog.hoglake.model.BoundReencode
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
@@ -20,6 +22,7 @@ import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.allNodes
+import com.posthog.hoglake.model.boundReencodeFor
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.LayoutRepo
@@ -35,6 +38,7 @@ import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.service.CompactionBackend
+import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.schema.GroupType
 import org.jdbi.v3.core.Handle
@@ -3345,6 +3349,7 @@ class CompactionService(
             }
 
             if (stats != null && stats.isNotEmpty()) {
+                val liveStats = widenToLiveTypes(h, ctx, stats)
                 val batch =
                     h.prepareBatch(
                         """
@@ -3356,7 +3361,7 @@ class CompactionService(
                             :lowerBound, :upperBound)
                     """,
                     )
-                for (s in stats) {
+                for (s in liveStats) {
                     batch
                         .bind("catalogId", ctx.catalogId)
                         .bind("dataFileId", dataFileId)
@@ -3406,6 +3411,62 @@ class CompactionService(
 
             GroupOutcome.Committed(snapshotId, outputBytes, dataFileId)
         }
+
+    /**
+     * THE PROMOTE RACE, COMPACTION'S SIDE (#729). [stats] were aggregated
+     * under the PLAN-time types ([TableContext.columns]); a width-changing
+     * promote that committed during the rewrite re-encoded only the stats
+     * rows its scan could see, and this output's are not inserted yet. So
+     * a bound of 4 bytes under a type a promote can widen
+     * ([BOUND_WIDENING_TYPES]) is checked against the field's live type
+     * and widened by the promote's own rule ([IcebergSingleValue.widen]).
+     *
+     * No fence beyond the catalog commit lock: the promote takes it too,
+     * so it either committed before the read here (which sees its type)
+     * or runs after this COMMIT (and its scan sees these rows).
+     *
+     * Cost: nothing unless some bound is 4 bytes under a widenable type,
+     * then one `hog_column_live` read of those fields.
+     */
+    private fun widenToLiveTypes(
+        h: Handle,
+        ctx: TableContext,
+        stats: List<ColumnStats>,
+    ): List<ColumnStats> {
+        val planned =
+            ctx.columns.allNodes()
+                .filter { it.def.type in BOUND_WIDENING_TYPES }
+                .associate { it.fieldId to it.def.type }
+        val narrow =
+            stats.filter { s ->
+                s.fieldId in planned && (s.lowerBound?.size == 4 || s.upperBound?.size == 4)
+            }
+        if (narrow.isEmpty()) return stats
+        val live =
+            h.createQuery(
+                """
+                SELECT field_id, col_type FROM hog_column
+                WHERE catalog_id = :catalogId AND table_id = :tableId
+                  AND field_id = ANY(:fieldIds) AND end_snapshot IS NULL
+                """,
+            )
+                .bind("catalogId", ctx.catalogId)
+                .bind("tableId", ctx.tableId)
+                .bindArray("fieldIds", Long::class.javaObjectType, narrow.map { it.fieldId })
+                .map { rs, _ -> rs.getLong("field_id") to ColType.fromWire(rs.getString("col_type")) }
+                .list()
+                .toMap()
+        return stats.map { s ->
+            // No live row: the field was dropped, and no reader decodes it.
+            val now = live[s.fieldId] ?: return@map s
+            val reencode = boundReencodeFor(planned[s.fieldId] ?: return@map s, now)
+            if (reencode == BoundReencode.NONE) return@map s
+            s.copy(
+                lowerBound = s.lowerBound?.let { IcebergSingleValue.widen(reencode, it) },
+                upperBound = s.upperBound?.let { IcebergSingleValue.widen(reencode, it) },
+            )
+        }
+    }
 
     /**
      * End-snapshot a committing group's inputs and their applied DVs at

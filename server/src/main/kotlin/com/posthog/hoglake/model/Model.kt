@@ -604,6 +604,18 @@ fun boundReencodeFor(
     }
 
 /**
+ * The types whose 4-byte bounds some permitted promotion widens to 8
+ * ([boundReencodeFor] not NONE). A stats writer that bound one of them
+ * before a promote committed re-checks its bounds against the live type
+ * before its own COMMIT (#729): the hydrator's sweep and compaction's
+ * group commit.
+ */
+val BOUND_WIDENING_TYPES: Set<ColType> =
+    PROMOTIONS
+        .filter { (from, targets) -> targets.any { boundReencodeFor(from, it) != BoundReencode.NONE } }
+        .keys
+
+/**
  * One typed ALTER TABLE operation.
  *
  * Column-addressing ops name their target by a DOTTED PATH of column

@@ -90,11 +90,32 @@ class BoundReencodeTest {
                         (IcebergSingleValue.decode(from, old) as Int).toLong(),
                     )
                 assertThat(widened).describedAs("%s -> %s bound width", from.wire, to.wire).hasSize(8)
+                assertThat(IcebergSingleValue.widen(BoundReencode.INT_TO_LONG, old))
+                    .describedAs("%s -> %s through the shared rule", from.wire, to.wire)
+                    .isEqualTo(widened)
                 assertThat(IcebergSingleValue.decode(to, widened))
                     .describedAs("%s -> %s preserves %d", from.wire, to.wire, v)
                     .isEqualTo(v.toLong())
             }
         }
+    }
+
+    @Test
+    fun `the types a racing stats writer re-checks are the sources of every widening edge`() {
+        // The hydrator's sweep and compaction's commit re-check 4-byte
+        // bounds only under these types (#729); one missing here keeps
+        // its bounds at 4 bytes under the live 8-byte type.
+        assertThat(BOUND_WIDENING_TYPES).containsExactlyInAnyOrderElementsOf(
+            legalEdges.filter { (f, t) -> boundReencodeFor(f, t) != BoundReencode.NONE }.map { it.first }.toSet(),
+        )
+        assertThat(BOUND_WIDENING_TYPES).containsExactlyInAnyOrder(
+            ColType.INT8,
+            ColType.INT16,
+            ColType.INT,
+            ColType.UINT8,
+            ColType.UINT16,
+            ColType.FLOAT,
+        )
     }
 
     @Test
