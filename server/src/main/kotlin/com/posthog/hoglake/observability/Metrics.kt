@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import java.time.Duration
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -1331,6 +1332,52 @@ object Metrics {
             "hoglake_health_probe_attempts_hung",
             "Health-probe attempts started and not finished (2 = the cap; the pod is stuck)",
         ) { outstandingAttempts() }
+    }
+
+    /**
+     * `hoglake_hoglite_backend_reachable{backend}` — one series per
+     * configured hoglite backend: 1 when its standard pool answered the
+     * last probe of the `hoglite_health` loop
+     * (`HOGLAKE_HOGLITE_HEALTH_INTERVAL_MS`), 0 when it did not, answered
+     * past its deadline, or is still in flight past it, NaN before the
+     * first answer landed
+     * (`HogliteBackendHealth`).
+     *
+     * This is where hoglite health is READ, because it is no longer in
+     * `/healthz`'s status (#678): a backend every pod shares cannot be a
+     * per-pod readiness condition without making the whole fleet
+     * unready at once. Alert on the series, not on pod readiness.
+     *
+     * `hoglake_hoglite_health_probe_attempts_hung{backend}` is the
+     * sampler's `hoglake_health_probe_attempts_hung`, per backend:
+     * attempts started and not finished. 1 is an ordinary in-flight
+     * probe; 2 (the cap) is both of the backend's probe threads parked
+     * on calls nothing can interrupt, the series above reading 0 until
+     * one returns. Alert on `== 2` held, not on `> 0`.
+     */
+    fun registerHogliteBackendHealthGauges(
+        registry: MeterRegistry,
+        backends: Set<UUID>,
+        reachable: (UUID) -> Double,
+        outstandingAttempts: (UUID) -> Int,
+    ) {
+        for (id in backends) {
+            Gauge.builder("hoglake_hoglite_backend_reachable") { reachable(id) }
+                .description(
+                    "1 when the hoglite backend answered its last health probe, 0 when not, NaN before the first",
+                )
+                .tag("backend", id.toString())
+                .strongReference(true)
+                .register(registry)
+            Gauge.builder("hoglake_hoglite_health_probe_attempts_hung") { outstandingAttempts(id).toDouble() }
+                .description(
+                    "Hoglite health-probe attempts of the backend started and not finished " +
+                        "(2 = the cap; the pod is stuck)",
+                )
+                .tag("backend", id.toString())
+                .strongReference(true)
+                .register(registry)
+        }
     }
 
     private fun gauge(

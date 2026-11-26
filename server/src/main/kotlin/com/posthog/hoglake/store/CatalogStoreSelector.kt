@@ -1027,8 +1027,13 @@ class CatalogStoreSelector(
         store: CatalogStore?,
     ): CatalogStore? = store?.let { StoreGrant.of(call, null, it)?.let { grant -> BoundCatalogStore(grant, it) } ?: it }
 
-    /** Readiness also checks every configured hoglite backend, including clients not yet used by a request. */
-    fun reachable(): Boolean = cfg?.hogliteBackends?.keys?.all { client(it).reachable() } ?: true
+    /**
+     * One bounded probe of a configured hoglite backend's standard pool,
+     * on the client requests share with it (its breaker is bypassed, its
+     * transport is not). For `HogliteBackendHealth`, which samples it
+     * off the readiness path; `/healthz` never waits on it (#678).
+     */
+    fun hogliteReachable(id: UUID): Boolean = client(id).reachable()
 
     private fun fallback(catalog: String): CatalogStore =
         defaultPostgres() ?: throw HoglakeException.NotFound("catalog '$catalog'")

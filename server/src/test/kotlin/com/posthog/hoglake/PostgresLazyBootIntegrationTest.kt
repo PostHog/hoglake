@@ -6,6 +6,7 @@ import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.testing.PgTestSupport
+import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -17,11 +18,17 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
+import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import org.testcontainers.containers.PostgreSQLContainer
+import java.net.InetSocketAddress
+import java.nio.file.Files
+import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
 import java.sql.DriverManager
+import java.time.Duration
 
 @Tag("integration")
 class PostgresLazyBootIntegrationTest {
@@ -151,5 +158,86 @@ class PostgresLazyBootIntegrationTest {
                     }
                 }
             }
+    }
+
+    /**
+     * #678 with both stores configured and PostgreSQL initialized: an
+     * unhealthy hoglite backend (hoglited answers 503 through a lease
+     * handover) reads 0 in its own series while `/healthz`, which now
+     * checks PostgreSQL, stays 200. `PostgresFreeHogliteBootTest` and
+     * `HogliteBackendHealthIntegrationTest` have no PostgreSQL store, so
+     * they cannot see the hoglite term come back on the initialized
+     * branch alone.
+     *
+     * MUTATION: make `/healthz`'s condition
+     * `!postgresReady() || (healthProbe.reachable() && <every hoglite
+     * backend reachable>)` and the last status assertion is a 503.
+     */
+    @Test
+    fun `an initialized PostgreSQL process stays ready while its hoglite backend is down`(
+        @TempDir dir: Path,
+    ) {
+        val hoglite = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        hoglite.createContext("/v1/healthz") { exchange ->
+            exchange.sendResponseHeaders(503, -1)
+            exchange.close()
+        }
+        hoglite.start()
+        try {
+            PostgreSQLContainer(PgTestSupport.image)
+                .withUsername(PgTestSupport.USER)
+                .withPassword(PgTestSupport.PASSWORD)
+                .use { postgres ->
+                    postgres.start()
+                    val id = "7c1d7e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f"
+                    val url = "http://127.0.0.1:${hoglite.address.port}"
+                    val backends = dir.resolve("backends.json")
+                    Files.writeString(backends, """{"backends":[{"id":"$id","kind":"hoglite","url":"$url"}]}""")
+                    val cfg =
+                        Config(
+                            backendsFile = backends.toString(),
+                            authMode = "enforce",
+                            postgresBackendId = "6b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+                            jdbcUrl = postgres.jdbcUrl,
+                            dbUser = postgres.username,
+                            dbPassword = postgres.password,
+                            hydratorIntervalMs = 0,
+                            expiryIntervalMs = 0,
+                            hogliteHealthIntervalMs = 100,
+                        )
+                    val auth =
+                        AuthService(
+                            AuthMode.ENFORCE,
+                            JwtVerifier(
+                                TestTokens.ISSUER,
+                                TestTokens.AUDIENCE,
+                                StaticSigningKeys(TestTokens.KID, TestTokens.keyPair().public as ECPublicKey),
+                                backends = cfg.backendKinds,
+                            ),
+                        )
+                    App.build(cfg).use { app ->
+                        testApplication {
+                            app.startBackground().use {
+                                application { app.module(this, auth) }
+
+                                fun reachable(): Double? =
+                                    app.meterRegistry.scrape().lineSequence()
+                                        .firstOrNull {
+                                            it.startsWith(
+                                                "hoglake_hoglite_backend_reachable{backend=\"$id\"}",
+                                            )
+                                        }
+                                        ?.substringAfterLast(' ')?.toDouble()
+
+                                assertThat(app.meterRegistry.find("hoglake_db_pool_active").gauge()).isNotNull()
+                                await().atMost(Duration.ofSeconds(10)).until { reachable() == 0.0 }
+                                assertThat(client.get("/healthz").status).isEqualTo(HttpStatusCode.OK)
+                            }
+                        }
+                    }
+                }
+        } finally {
+            hoglite.stop(0)
+        }
     }
 }
