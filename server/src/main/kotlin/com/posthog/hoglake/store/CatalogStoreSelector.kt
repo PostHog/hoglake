@@ -341,6 +341,10 @@ class CatalogStoreSelector(
             if (colObj.fieldNames().asSequence().any { it !in allowedColKeys }) {
                 throw HoglakeException.Validation("invalid create table body")
             }
+            val colName = colObj.get("name")?.textValue() ?: throw HoglakeException.Validation("invalid column name")
+            if (colName.startsWith("_hog")) {
+                throw HoglakeException.Validation("column name '$colName' uses reserved prefix '_hog'")
+            }
         }
         return scopedJson.writeValueAsBytes(node)
     }

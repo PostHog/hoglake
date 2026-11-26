@@ -1383,6 +1383,19 @@ private suspend fun handleLocalOnlyForward(
                 isCreateNamespace = isCreateNamespace,
             )
         }
+    if (forwarded.statusCode >= 400) {
+        val status = HttpStatusCode.fromValue(forwarded.statusCode)
+        val errorCode =
+            when (forwarded.statusCode) {
+                400 -> "bad_request"
+                403 -> "forbidden"
+                404 -> "not_found"
+                409 -> "conflict"
+                else -> "backend_unavailable"
+            }
+        call.respond(status, ApiErrorDto(error = errorCode, detail = status.description))
+        return
+    }
     call.respondText(
         text = forwarded.body,
         contentType = ContentType.Application.Json,
