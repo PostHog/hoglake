@@ -390,6 +390,193 @@ class HogliteClientTest {
     }
 
     @Test
+    fun `a caller deadline bounds a call before the retry budget does`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            runCatching { Thread.sleep(3_000) }
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        val c =
+            HogliteClient(
+                standardUrl = "http://127.0.0.1:${server.address.port}",
+                retryBudgetMs = 8_000,
+                sleeper = {},
+            )
+        val started = System.nanoTime()
+        // The later inner deadline does not extend the outer one.
+        val failure =
+            catchThrowable {
+                HogliteClient.withDeadline(started + 300_000_000) {
+                    HogliteClient.withDeadline(started + 60_000_000_000) { c.query("t", "SELECT 1") }
+                }
+            }
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        // MUTATION: ignore the caller deadline and the attempt waits out the 5 s read timeout.
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .hasMessageContaining("before the caller's deadline")
+        assertThat(elapsedMs).isLessThan(2_000)
+    }
+
+    @Test
+    fun `a caller deadline too close for an attempt refuses the first one unsent`() {
+        val calls = AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            calls.incrementAndGet()
+            ex.requestBody.readBytes()
+            runCatching { Thread.sleep(200) }
+            val body = "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}".toByteArray()
+            runCatching {
+                ex.sendResponseHeaders(200, body.size.toLong())
+                ex.responseBody.use { it.write(body) }
+            }
+        }
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        val c = client("http://127.0.0.1:${server.address.port}")
+        // A warm connection, so a sent attempt would reach the server inside the deadline.
+        txOne(c)
+        calls.set(0)
+        // MUTATION: drop the first-attempt floor and the tx is sent with a few ms, then times out unknown.
+        val failure = catchThrowable { HogliteClient.withDeadline(System.nanoTime() + 20_000_000) { txOne(c) } }
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .hasMessageContaining("before the caller's deadline")
+        assertThat(calls.get()).isZero()
+    }
+
+    @Test
+    fun `a timeout the caller deadline cut short does not feed the breaker`() {
+        val stalled = AtomicBoolean(true)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            if (stalled.get()) runCatching { Thread.sleep(3_000) }
+            val body = "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}".toByteArray()
+            runCatching {
+                ex.sendResponseHeaders(200, body.size.toLong())
+                ex.responseBody.use { it.write(body) }
+            }
+        }
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        val c = client("http://127.0.0.1:${server.address.port}", threshold = 1)
+        repeat(2) {
+            assertThatThrownBy { HogliteClient.withDeadline(System.nanoTime() + 200_000_000) { txOne(c) } }
+                .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+        }
+        stalled.set(false)
+        // MUTATION: count the cut-short timeouts and threshold 1 has opened the circuit.
+        assertThat(txOne(c).single().affected).isEqualTo(1L)
+    }
+
+    /** A client whose breaker opens on one counted failure and stays open, under a caller deadline 3 s out. */
+    private fun guardedByBreaker(url: String) =
+        HogliteClient(
+            standardUrl = url,
+            connectTimeoutMs = 100,
+            readTimeoutMs = 150,
+            circuitFailureThreshold = 1,
+            circuitOpenMs = 60_000,
+            sleeper = {},
+        )
+
+    @Test
+    fun `a read timeout the caller deadline did not cut short still feeds the breaker`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            runCatching { Thread.sleep(2_000) }
+            ex.close()
+        }
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        val c = guardedByBreaker("http://127.0.0.1:${server.address.port}")
+        // The deadline binds (before the 8 s budget) but leaves far more than the 150 ms read timeout.
+        val failure =
+            catchThrowable {
+                HogliteClient.withDeadline(
+                    System.nanoTime() + 3_000_000_000,
+                ) { c.query("t", "SELECT 1") }
+            }
+        // MUTATION: exempt every read timeout under a binding deadline and the call retries until it.
+        assertThat(failure).hasMessageContaining("circuit is open")
+        assertThatThrownBy { c.query("t", "SELECT 1") }.hasMessageContaining("circuit is open")
+    }
+
+    @Test
+    fun `a connect timeout the caller deadline did not cut short still feeds the breaker`() {
+        // A listener that never accepts: once its backlog is full, a connect times out.
+        val listener = java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))
+        val held = mutableListOf<java.net.Socket>()
+        try {
+            while (held.size < 4_096) {
+                val s = java.net.Socket()
+                held += s
+                val connected = runCatching { s.connect(InetSocketAddress("127.0.0.1", listener.localPort), 100) }
+                if (connected.isFailure) break
+            }
+            val c = guardedByBreaker("http://127.0.0.1:${listener.localPort}")
+            val failure = catchThrowable { HogliteClient.withDeadline(System.nanoTime() + 3_000_000_000) { txOne(c) } }
+            // MUTATION: exempt every connect timeout under a binding deadline and the call retries until it.
+            assertThat(failure).hasMessageContaining("circuit is open")
+            assertThatThrownBy { txOne(c) }.hasMessageContaining("circuit is open")
+        } finally {
+            held.forEach { runCatching { it.close() } }
+            listener.close()
+        }
+    }
+
+    @Test
+    fun `a call the caller deadline cuts short ends at the deadline, not a backoff after it`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            runCatching { Thread.sleep(2_000) }
+            ex.close()
+        }
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool()
+        server.start()
+        servers += server
+        // The production sleeper: the backoff is a real 200 ms pause.
+        val c = HogliteClient(standardUrl = "http://127.0.0.1:${server.address.port}")
+        val deadline = System.nanoTime() + 300_000_000
+        val failure = catchThrowable { HogliteClient.withDeadline(deadline) { txOne(c) } }
+        val pastMs = (System.nanoTime() - deadline) / 1_000_000
+        // MUTATION: pause before checking the deadline and the call ends ~200 ms past it.
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .hasMessageContaining("before the caller's deadline")
+        assertThat(pastMs).isLessThan(100)
+    }
+
+    @Test
+    fun `a refusal before the caller deadline is not waited out`() {
+        val (server, calls) = serve(Step(503, "{\"code\":\"not_applied\"}"))
+        val c = HogliteClient(standardUrl = "http://127.0.0.1:${server.address.port}")
+        val started = System.nanoTime()
+        val failure = catchThrowable { HogliteClient.withDeadline(started + 200_000_000) { txOne(c) } }
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        // MUTATION: pause before checking the deadline and the call ends after the 200 ms pause.
+        assertThat(failure)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .hasMessageContaining("before the caller's deadline")
+        assertThat(calls.get()).isEqualTo(1)
+        assertThat(elapsedMs).isLessThan(150)
+    }
+
+    @Test
     fun `an unlabelled 503 on a tx may have applied`() {
         // an engine that predates the labels answered 503 for segment and
         // checkpoint failures after apply

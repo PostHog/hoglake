@@ -98,6 +98,8 @@ class HogliteCatalogStore(
     private val operatorAuthority: Boolean = true,
     internal val expiryPurgePage: Int = com.posthog.hoglake.service.ExpiryService.PURGE_PAGE,
     internal val expiryPurgeBudgetMs: Long = com.posthog.hoglake.service.ExpiryService.PURGE_BUDGET_MS,
+    internal val retirementBatch: Int = HogliteRetirement.DEFAULT_BATCH,
+    internal val retirementQueueCeiling: Long = HogliteRetirement.DEFAULT_QUEUE_CEILING,
     /**
      * HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE, or null: every catalog's `data_path`, `{catalog}` its name.
      * [createCatalog] refuses any other, and [HogliteHydrator] reads footers only under it (#675).
@@ -1584,9 +1586,10 @@ class HogliteCatalogStore(
                 )
             }
             // THE WHOLE DROP is the mark: file rows stay live on the dropped
-            // table and RetirementService ends + queues them in paced batches
-            // once the drop sinks under the expiry floor (hoglake #193:
-            // ending 3M file rows under the commit lock was an outage).
+            // table and HogliteRetirement, run after each successful manual
+            // expiry (#674), ends + queues them in batches once the drop sinks
+            // under the expiry floor (hoglake #193: ending 3M file rows under
+            // the commit lock was an outage).
             val tx = HogliteTx()
             tx.expectOne(
                 "SELECT COUNT(*) FROM tables WHERE id = ? AND dropped_snapshot IS NULL",
@@ -3085,8 +3088,12 @@ class HogliteCatalogStore(
     internal val alters: HogliteAlters by lazy { HogliteAlters(this) }
     internal val views: HogliteViews by lazy { HogliteViews(this) }
     internal val options: HogliteOptions by lazy { HogliteOptions(this) }
-    internal val expiry: HogliteExpiry by lazy { HogliteExpiry(this, expiryPurgePage, expiryPurgeBudgetMs) }
-    internal val retirement: HogliteRetirement by lazy { HogliteRetirement(this) }
+    internal val expiry: HogliteExpiry by lazy {
+        HogliteExpiry(this, expiryPurgePage, expiryPurgeBudgetMs, retirement)
+    }
+    internal val retirement: HogliteRetirement by lazy {
+        HogliteRetirement(this, retirementBatch, retirementQueueCeiling)
+    }
     internal val hydratorMaintenance: HogliteHydrator by lazy { HogliteHydrator(this) }
 
     /**

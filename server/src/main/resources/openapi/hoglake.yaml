@@ -38,7 +38,7 @@ info:
 
     Hoglite supports catalog options, manual expiry, manual cleanup, and manual requeue,
     which also hydrates pending files.
-    Retirement runs before expiry; there is no public retirement trigger.
+    Retirement runs after each successful manual expiry; there is no separate retirement trigger.
     Other maintenance operations and publications return 501 `not_supported_on_backend`.
     Engine result limits return 422 `backend_result_too_large`; query deadlines
     return 422 `backend_query_timeout`. Narrow the query before retrying.
@@ -1544,7 +1544,18 @@ paths:
       summary: >
         Run one incremental expiry sweep now. PostgreSQL background
         sweeps use the same operation. Hoglite supports manual sweeps
-        through token placement, without a background loop.
+        through token placement, without a background loop; each
+        successful Hoglite sweep then runs retirement, which records its
+        own run and whose failure does not fail the sweep. The response
+        waits for retirement: it starts no batch later than twice the
+        purge budget after the request arrived, and never later than
+        20 s, except one batch it owes (a batch that commits no rows
+        does not pay that debt, and none starts more than 1 s past the
+        window or its own start), and its backend calls and ledger
+        write end within 3 s of that, or of its own start if the sweep
+        ran longer. A sweep that ends more than 22 s after arrival skips
+        retirement, so retirement never ends past 25 s after arrival.
+        The next sweep continues a backlog.
         Each sweep is bounded, preserves head, and respects the enabled
         consumer floor. Ended file rows enter the removal ledger;
         expiry does not delete their objects.
