@@ -3,6 +3,7 @@ package com.posthog.hoglake.hoglite
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.ChangeKind
@@ -184,33 +185,42 @@ class HogliteCatalogStore(
         binding.missing?.let { throw it }
     }
 
-    /** Run blocking work only. Never suspend or change threads inside [body]. */
+    /**
+     * Run blocking work only. Never suspend or change threads inside [body].
+     *
+     * Under a dispatched request the operation holds ONE bulkhead permit
+     * for its whole duration ([HogliteClient.underRequestPermit]), taken
+     * before the tenant is bound: a full backend refuses the operation
+     * before its first call, never between two of them. Nested scopes
+     * run under the outer one's permit.
+     */
     internal inline fun <T> catalogOperation(
         catalog: String,
         creating: Boolean = false,
         body: () -> T,
-    ): T {
-        val entered = enterCatalogOperation(catalog, creating)
-        var failure: Throwable? = null
-        try {
-            return body()
-        } catch (e: Throwable) {
-            failure = e
-            throw e
-        } finally {
+    ): T =
+        client.underRequestPermit("operation on catalog '$catalog'") {
+            val entered = enterCatalogOperation(catalog, creating)
+            var failure: Throwable? = null
             try {
-                finishCatalogOperation(catalog, entered)
-            } catch (secondary: Throwable) {
-                val original = failure
-                if (original == null) throw secondary
-                // Nested scopes may observe the same poison. Preserve the body's
-                // outcome (especially an ambiguous txid), without self/duplicate suppression.
-                if (original !== secondary && original.suppressed.none { it === secondary }) {
-                    original.addSuppressed(secondary)
+                return body()
+            } catch (e: Throwable) {
+                failure = e
+                throw e
+            } finally {
+                try {
+                    finishCatalogOperation(catalog, entered)
+                } catch (secondary: Throwable) {
+                    val original = failure
+                    if (original == null) throw secondary
+                    // Nested scopes may observe the same poison. Preserve the body's
+                    // outcome (especially an ambiguous txid), without self/duplicate suppression.
+                    if (original !== secondary && original.suppressed.none { it === secondary }) {
+                        original.addSuppressed(secondary)
+                    }
                 }
             }
         }
-    }
 
     private fun missingCatalog(
         catalog: String,
@@ -338,7 +348,9 @@ class HogliteCatalogStore(
                     null
                 }
             }
-        val metas = readMetas(bound)
+        // One permit for every chunk and retry of the list, held by the
+        // request thread that waits for them (HogliteClient, "Bulkhead").
+        val metas = client.underRequestPermit("list of ${bound.size} catalogs") { readMetas(bound) }
         return bound.indices.mapNotNull { i ->
             val name = bound[i].first
             val row = metas[i]
@@ -419,25 +431,59 @@ class HogliteCatalogStore(
     /**
      * [read] for each of [items], [LIST_FALLBACK_PARALLELISM] at a time, on
      * [fanoutPool]. The reads address explicit tenant ids, so they need no
-     * operation binding on the pool's threads. The first failure is
-     * rethrown once every read has finished.
+     * operation binding on the pool's threads. They do carry the request's
+     * admission ([RequestAdmission.carrying]): the request thread blocks
+     * here until every one is done, so the workers' calls are the
+     * request's — capped at its budget and under the permit [listCatalogs]
+     * holds — not background work (#679). The first failure is rethrown
+     * once every read has finished.
+     *
+     * Every read has finished, even when this thread is INTERRUPTED while
+     * it waits: the carried admission is only good while the request
+     * holds its permit, so the request thread does not leave the workers
+     * behind to run under an admission that has been released (the next
+     * one to start would take a permit of its own and the rest would run
+     * under none). A read that has not started skips the engine; one in
+     * flight finishes within its own capped budget. Then the interrupt
+     * is restored and the list fails as a plain [HoglakeException.BackendUnavailable],
+     * the way an interrupted call fails inside [HogliteClient].
      */
     private fun <T> parallelReads(
         items: List<Int>,
         read: (Int) -> T,
     ): List<T> {
         if (items.size == 1) return listOf(read(items[0]))
-        val futures = items.map { i -> fanoutPool.submit<T> { read(i) } }
-        var failure: Throwable? = null
-        val results =
-            futures.map { f ->
-                try {
-                    f.get()
-                } catch (e: java.util.concurrent.ExecutionException) {
-                    failure = failure ?: e.cause
-                    null
+        val admission = RequestAdmission.current()
+        val abandoned = java.util.concurrent.atomic.AtomicBoolean()
+        val futures =
+            items.map { i ->
+                fanoutPool.submit<T?> {
+                    if (abandoned.get()) null else RequestAdmission.carrying(admission) { read(i) }
                 }
             }
+        var failure: Throwable? = null
+        var interrupted = false
+        val results =
+            futures.map { f ->
+                var result: T? = null
+                while (true) {
+                    try {
+                        result = f.get()
+                        break
+                    } catch (e: java.util.concurrent.ExecutionException) {
+                        failure = failure ?: e.cause
+                        break
+                    } catch (_: InterruptedException) {
+                        abandoned.set(true)
+                        interrupted = true
+                    }
+                }
+                result
+            }
+        if (interrupted) {
+            Thread.currentThread().interrupt()
+            throw HoglakeException.BackendUnavailable("interrupted while waiting for the list's hoglite reads")
+        }
         failure?.let { throw it }
         @Suppress("UNCHECKED_CAST")
         return results as List<T>
@@ -464,6 +510,18 @@ class HogliteCatalogStore(
         if (!operatorAuthority) {
             throw HoglakeException.Forbidden("hoglite catalog deletion requires operator authority")
         }
+        // One permit for the probe, the fence, the release and the delete
+        // (HogliteClient, "Bulkhead"): a drop that has fenced is never
+        // refused the rest by a full backend.
+        return client.underRequestPermit("drop of catalog '$catalog'") { dropHeld(catalog, author, message) }
+    }
+
+    /** [dropCatalog] past its authority check, under the operation's permit. */
+    private fun dropHeld(
+        catalog: String,
+        author: String?,
+        message: String?,
+    ): DroppedCatalog {
         val binding = operationBindings.get()?.get(catalog)
         binding?.missing?.let { throw it }
         val tenantId = binding?.tenant ?: tenants.tenantFor(catalog)
@@ -2992,7 +3050,18 @@ class HogliteCatalogStore(
         }
     }
 
-    /** Record each outcome after the run. Ledger failures never replace the task outcome. */
+    /**
+     * Record each outcome after the run. Ledger failures never replace the task outcome.
+     *
+     * The run is ONE catalog operation, so a manual sweep (`POST
+     * .../maintenance/compact` and its kin, on the request thread) holds
+     * its request's bulkhead permit from before its first call to after
+     * the ledger write — across its rewrites and object-store work too,
+     * since that is how long it holds the thread — and every store call
+     * it makes runs under that permit rather than taking and returning
+     * one of its own ([catalogOperation]). A background loop's sweep has
+     * no admission and takes none (#679).
+     */
     internal fun <T> recorded(
         catalog: String,
         task: com.posthog.hoglake.model.MaintenanceTask,

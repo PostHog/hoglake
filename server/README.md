@@ -1445,6 +1445,98 @@ COMPACTION's draw, not the foreground's. Such a workload should set
 `HOGLAKE_REQUEST_THREADS` below the pool by the number of loops it
 runs.
 
+**Hoglite shares that dispatcher, behind a bulkhead** (#679). A Hoglite
+call borrows no connection but can hold its request thread for the
+backend's whole `retry_budget_ms` (8 s), an operation makes several,
+and the dispatcher cannot tell a PostgreSQL request from a Hoglite one.
+Without a bound, one stalled tenant or an owner failover across many
+takes every request thread and the PostgreSQL catalogs — whose database
+is fine — stop being served. Each backend entry in
+`HOGLAKE_BACKENDS_FILE` therefore has a **`max_concurrent_calls`**: the
+most request threads that backend may hold at once doing its work (one
+request more may wait for a permit, below). The default is half
+of `HOGLAKE_REQUEST_THREADS` (at least one) while this process serves
+PostgreSQL — the default backend (`HOGLAKE_DEFAULT_BACKEND=postgres`,
+the env default, opens it at boot) or a routed one
+(`HOGLAKE_POSTGRES_BACKEND_ID`) — and the whole dispatcher when nothing
+but Hoglite is served (`HOGLAKE_DEFAULT_BACKEND=none` and no PostgreSQL
+id). A cap that, with the one request it lets wait (below), reaches
+`HOGLAKE_REQUEST_THREADS` beside PostgreSQL (one or two request
+threads, or an explicit key within one of the width) shields nothing
+and boots with a warning that says so; a key above the dispatcher's
+width is warned about on any pod. A request holds one permit for each OPERATION,
+however many calls it makes: it is taken before the first call and kept
+to the last, so an operation is refused before it starts or not at all
+— a create that has committed its boot transaction is never refused the
+read after it, a drop that has fenced is never refused its release and
+delete. A list is one operation too, its parallel chunk and retry reads
+included: they run on a worker pool while the request thread waits for
+them, so they run under the request's permit and budget rather than as
+background work, and a request thread interrupted mid-wait keeps the
+permit until those reads have finished rather than leaving them running
+under a released one. A manual maintenance sweep (`POST
+.../maintenance/compact`, `expire`, `cleanup`) is one operation from
+its first call to its ledger write, rewrites and object-store work
+included (its parallel group workers carry the request's admission),
+so N concurrent sweeps hold N request threads inside the
+bulkhead, not beside it. The typed scoped reads of a scoped read
+session take the same permit and the same cap (on `read_timeout_ms`):
+the namespace gate's namespace read, and the table and pinned-scan
+reads (`GET .../namespaces/{namespace}/tables/{table}` and `.../scan`), which
+run on the dispatcher with no gate lookup before them. Every path to
+the engine on a request's behalf is gated: every catalog operation,
+list and maintenance sweep, every bare call outside one, and those
+three reads; only the readiness probe, which bypasses the dispatcher,
+is not. A request that finds the backend full waits at most
+200 ms (a burst one over the cap is served; a stall is not waited on)
+and is then refused with the typed 503 `backend_unavailable` +
+Retry-After, having sent nothing — so a refused commit is never
+outcome-unknown — and is counted as
+`hoglake_hoglite_bulkhead_refusals_total`. Only ONE request waits at a
+time; the next to find the backend full is refused at once. A waiter
+holds a request thread and the dispatcher is FIFO and backend-blind, so
+were every arrival let wait, each refusal would cost a thread 200 ms
+and Hoglite traffic above (spare threads ÷ 0.2 s) during a stall would
+fill the dispatcher's queue and shed the PostgreSQL requests behind it.
+A backend therefore holds at most `max_concurrent_calls` + 1 request
+threads whatever its arrival rate: 6 of 10 at the defaults. It bounds request threads,
+so only a dispatched request's work is gated; a background loop's holds
+no request thread and is not. The cap is per backend: two Hoglite
+backends may together hold more than half, and an operator who needs
+isolation BETWEEN Hoglite backends sets the key lower on each.
+
+Two companions keep the bound honest. Each Hoglite call a request makes
+runs under the smaller of the backend's `retry_budget_ms` and what the
+request has left of `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` after its QUEUE
+WAIT (frozen at admission and floored, as the lock bound is), so a
+request that queued for 25 s of a 30 s bound does not then spend 8 s
+more holding a thread for a caller that has gone. Only the queue wait is
+charged, not the handler's own elapsed time — `POST
+.../maintenance/compact` on a Hoglite catalog runs its sweep on the
+handler thread, and a remainder that shrank with the sweep would fail
+its later calls with a 503 blaming a queue wait that never happened — so
+the cap engages only when the queue wait exceeded `bound - retry
+budget` (22 s at the defaults) and an operation of several calls can
+still spend several retry budgets; the bulkhead is what bounds the
+threads it holds while it does. The cap applies to every call but a
+write transaction, which keeps the full `retry_budget_ms`: one cut
+short after it was sent would end 503 `commit_outcome_unknown`, and
+refusing it before sending instead would refuse every write the cap
+engages for (an uncapped attempt already gets no more than the 8 s
+budget, below the 10 s `commit_timeout_ms`), where PostgreSQL still
+tries the same late commit with a shortened lock wait and never cuts
+the commit itself. A write still takes the bulkhead's permit. And a
+transport failure against an
+owner-pinned pod clears the pin and retries through the service without
+feeding the pool's circuit breaker: one dead pod under enough stale pins
+used to open the standard breaker and fail every tenant for
+`circuit_open_ms`. Nor does an owner's ANSWER close or reset the
+breaker — live owners of pinned tenants would otherwise keep a dead
+service's breaker from tripping, and the unpinned tenants would pay a
+full timeout per attempt — and nor does an owner-pinned attempt, or a
+call refused before sending because its budget is spent, spend an open
+breaker's half-open trial, which belongs to the service's next attempt.
+
 Compaction's own commits now pass `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` like
 every other acquirer of that lock. It is transaction-local, so it bounds
 the whole commit tail rather than only the advisory lock: a group whose
@@ -2887,6 +2979,12 @@ transaction (`observability/`):
   that most callers time out first the surviving waits are the SHORT
   ones and the p99 can FALL while the instance gets worse. Read it with
   `hoglake_request_queue_abandoned_total`, which counts exactly those.
+  `hoglake_hoglite_bulkhead_refusals_total` is the Hoglite side of the
+  same dispatcher: calls refused because a backend already held its
+  `max_concurrent_calls` request threads (§Concurrency). Rising while
+  `hoglake_request_pool_active` stays below `_max` is the bulkhead
+  working — PostgreSQL is still being served — and points at the
+  Hoglite side (tenant stalls, owner churn), not at the dispatcher.
   Finally `hoglake_health_probe_attempts_hung` is the probe's own
   outstanding attempts: normally 0, and **2 (the cap) against a
   database that is demonstrably answering means the pod is stuck and

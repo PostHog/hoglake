@@ -183,7 +183,7 @@ fun Application.installBlockingDispatch(
             proceed()
             return@intercept
         }
-        val admission = RequestAdmission(System.nanoTime())
+        val admission = RequestAdmission(System.nanoTime(), admissionBudgetMs)
         requests.enqueued()
         var admitted = false
         try {

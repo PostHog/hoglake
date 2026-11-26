@@ -1174,6 +1174,17 @@ object Metrics {
      */
     fun requestShed() = increment("hoglake_requests_shed_total", 1.0)
 
+    /**
+     * `hoglake_hoglite_bulkhead_refusals_total` — hoglite calls refused
+     * because the backend already held its `max_concurrent_calls`
+     * request threads (#679): the 503 `backend_unavailable` a caller
+     * saw instead of a wait. Rising while `hoglake_request_pool_active`
+     * is below `_max` is the bulkhead working — PostgreSQL is still
+     * being served — and the sign to look at the hoglite side (tenant
+     * stalls, owner churn) rather than at the dispatcher.
+     */
+    fun hogliteBulkheadRefused() = increment("hoglake_hoglite_bulkhead_refusals_total", 1.0)
+
     /** The commit counter's result tag for a failed commit. */
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {

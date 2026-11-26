@@ -48,10 +48,27 @@ import kotlinx.coroutines.asContextElement
  * queue wait, the worker threads' do not — and with the wait frozen at
  * admission the difference is at most the few milliseconds the request
  * actually spent queued, rather than the whole length of the sweep.
+ *
+ * The one exception is a hoglite fan-out the request thread BLOCKS ON:
+ * the list's parallel reads (`HogliteCatalogStore.parallelReads`), and
+ * a hoglite sweep's group workers (`CompactionStorage.carriesRequestAdmission`),
+ * run on a worker pool while the request thread waits for every one of
+ * them, so their time is the request's time, and the worker runs under
+ * the request's admission by [carrying] it explicitly. Without that the
+ * hoglite client would read their calls as background work — ungated
+ * and uncapped — while the thread they are holding is a request thread
+ * (#679). A PostgreSQL sweep's workers still carry none, as above.
  */
 class RequestAdmission(
     /** `System.nanoTime()` when the interceptor handed the call to the dispatcher. */
     val enqueuedNanos: Long,
+    /**
+     * The admission bound this request was dispatched under
+     * (`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`), so blocking code with no view
+     * of the config can ask [remainingBudgetMs]. `<= 0` is the documented
+     * "unbounded" and leaves nothing to charge against.
+     */
+    val budgetMs: Long = 0,
 ) {
     @Volatile
     private var queueWaitNanos: Long = UNSET
@@ -85,6 +102,28 @@ class RequestAdmission(
      */
     fun queueWaitMs(): Long = queueWaitNanos.let { if (it == UNSET) 0L else it / 1_000_000 }
 
+    /**
+     * What is left of this request's admission bound once its queue wait
+     * is charged — [remainingLockTimeoutMs] over [budgetMs], same floor —
+     * or null when the bound is unbounded. The hoglite client caps each
+     * call's retry budget at it (#679), so a request that queued for
+     * 25 s does not then spend 8 s more against a slow tenant.
+     *
+     * It charges the QUEUE WAIT ONLY, frozen with it, for the reason
+     * [admit] gives: `POST .../maintenance/compact` on a hoglite catalog
+     * runs its sweep on the handler thread too, and a remainder that
+     * shrank with the handler's own execution would, 30 s into the
+     * sweep, hand every later hoglite call the 1 s floor and fail the
+     * sweep with a 503 blaming a queue wait that never happened. So
+     * this is not a bound on the request's total time: an operation of
+     * several calls can still spend several retry budgets, and a
+     * request that queued for less than `budget - retry budget` (22 s
+     * at the defaults) is not capped by it at all. What bounds the
+     * THREADS such an operation holds is the hoglite bulkhead, which is
+     * why the cap is a companion to it and not a replacement.
+     */
+    fun remainingBudgetMs(): Long? = if (budgetMs <= 0) null else remainingLockTimeoutMs(budgetMs, this)
+
     companion object {
         /**
          * What a request is left with after its queue wait is charged
@@ -115,6 +154,29 @@ class RequestAdmission(
          */
         fun element(admission: RequestAdmission): ThreadContextElement<RequestAdmission?> =
             holder.asContextElement(admission)
+
+        /**
+         * Run [block] on THIS thread under [admission], for a worker
+         * that does a request's work while the request thread waits for
+         * it (class comment, the fan-out exception). The thread's own
+         * ambient is restored afterwards, so a pooled worker carries
+         * nothing onto its next task — the property
+         * `RequestDispatcherTest` pins for the dispatcher's threads. A
+         * null [admission] runs [block] with none, which is what a
+         * fan-out started by background work must get.
+         */
+        fun <T> carrying(
+            admission: RequestAdmission?,
+            block: () -> T,
+        ): T {
+            val previous = holder.get()
+            holder.set(admission)
+            try {
+                return block()
+            } finally {
+                if (previous == null) holder.remove() else holder.set(previous)
+            }
+        }
 
         /**
          * The `lock_timeout` a commit-lock acquirer should actually use:

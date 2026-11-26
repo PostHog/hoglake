@@ -2,9 +2,13 @@ package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.api.toDto
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.NamespaceContainment
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
@@ -19,6 +23,9 @@ import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -91,6 +98,15 @@ class HogliteCatalogStoreTest {
     private var scanAnswer: Pair<Int, Map<String, Any?>>? = null
     private var authorityRefusal: Pair<String, Int>? = null
 
+    /** When set, every /query-batch item answers with this (status, body): a per-tenant failure the list retries. */
+    private var batchItemAnswer: Pair<Int, Map<String, Any?>>? = null
+
+    /**
+     * When set, a request ("METHOD path") this names a latch for parks on
+     * it, after it is recorded and before it is served: a stalled engine.
+     */
+    private var park: ((String) -> CountDownLatch?)? = null
+
     private val server: HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex -> handle(ex) }
@@ -119,6 +135,7 @@ class HogliteCatalogStoreTest {
         val tenantId = path.removePrefix("/v1/t/").removePrefix("/v1/tenants/").substringBefore('/')
         val first = body?.get("statements")?.get(0)?.get("sql")?.asText()
         requests += "${ex.requestMethod} $path" + (first?.let { " :: $it" } ?: "")
+        park?.invoke("${ex.requestMethod} $path")?.await(10, TimeUnit.SECONDS)
         val (status, answer) =
             when {
                 path == authorityRefusal?.first ->
@@ -215,6 +232,7 @@ class HogliteCatalogStoreTest {
         }
 
     private fun batchItem(q: JsonNode): Map<String, Any?> {
+        batchItemAnswer?.let { return mapOf("status" to it.first, "body" to it.second) }
         val t =
             tenants[q["tenant"].asText()]
                 ?: return mapOf("status" to 404, "body" to mapOf("error" to "tenant does not exist"))
@@ -581,6 +599,355 @@ class HogliteCatalogStoreTest {
         assertThat(catchThrowable { broken.listCatalogs(setOf("a")) })
             .isInstanceOf(IllegalStateException::class.java)
             .hasMessage("routing is down")
+    }
+
+    @Test
+    fun `a list's fan-out runs under the one permit its request holds, and the next request is refused`() {
+        // #679's own scenario: an owner failover answers every batch
+        // item 503, so the list retries each catalog on its own, on the
+        // fan-out pool, while the request thread waits — and the engine
+        // stalls those retries. With one permit, the request holds it for
+        // the whole list: the workers' reads reach the engine (they run
+        // under the request's permit, not as background, and not waiting
+        // for a second one), a second request is refused before it sends
+        // anything, and the list completes once the engine answers.
+        //
+        // MUTATION: drop `underRequestPermit` around `readMetas` and the
+        // refusal reds (the second request is served). Drop the
+        // `holders.add` check in the client and the workers wait 200 ms
+        // for the permit the request holds, are refused, and the list
+        // fails instead of naming both catalogs. (That the workers carry
+        // the admission at all is the budget test below.)
+        seed("t-a-1", "a")
+        seed("t-b-1", "b")
+        batchItemAnswer = 503 to mapOf("error" to "owner lost")
+        val parked = CountDownLatch(1)
+        park = { if (it.endsWith("/query")) parked else null }
+        val engine = concurrentServer()
+        try {
+            val (gated, gatedStore) = gatedStore(engine)
+
+            var listed: List<CatalogInfo>? = null
+            val lister = Thread { listed = underRequest { gatedStore.listCatalogs(setOf("a", "b")) } }
+            lister.start()
+            await { requests.count { it.endsWith("/query") } == 2 }
+            assertThat(gated.callsInFlight).describedAs("one permit for the whole list").isEqualTo(1)
+
+            val sent = requests.size
+            val refused = underRequest { catchThrowable { gatedStore.getCatalog("a") } }
+            assertThat(refused)
+                .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessageContaining("max_concurrent_calls")
+            assertThat(requests).describedAs("a refused operation sends nothing").hasSize(sent)
+
+            parked.countDown()
+            lister.join(10_000)
+            assertThat(listed!!.map { it.name }).containsExactly("a", "b")
+            assertThat(gated.callsInFlight).isEqualTo(0)
+        } finally {
+            parked.countDown()
+            engine.stop(0)
+        }
+    }
+
+    @Test
+    fun `a list's fan-out reads run under the request's budget cap, not the configured retry budget`() {
+        // What proves the workers CARRY the request's admission
+        // (`RequestAdmission.carrying` in `parallelReads`): a request that
+        // queued 29.5 s of its 30 s bound has the 1 s floor left, so its
+        // calls — the workers' retries included — are capped at 1 s of
+        // the client's 10 s retry budget. The engine parks every read for
+        // 3 s: the workers give up at ~1 s and the list fails naming the
+        // cap. A worker reading with no admission would be background
+        // work with the full 10 s, would wait out the 3 s, and the list
+        // would SUCCEED — for a caller the dispatcher had already charged
+        // 29.5 s.
+        //
+        // MUTATION: drop `RequestAdmission.carrying` from `parallelReads`
+        // (submit `read(i)` bare) and this reds: no throw, after 3 s.
+        seed("t-a-1", "a")
+        seed("t-b-1", "b")
+        batchItemAnswer = 503 to mapOf("error" to "owner lost")
+        val parked = CountDownLatch(1)
+        park = { if (it.endsWith("/query")) parked else null }
+        Thread {
+            Thread.sleep(3_000)
+            parked.countDown()
+        }.apply { isDaemon = true }.start()
+        val engine = concurrentServer()
+        try {
+            val (_, gatedStore) = gatedStore(engine)
+            val started = System.nanoTime()
+            val failure =
+                underRequest(admission(queuedMs = 29_500)) {
+                    catchThrowable { gatedStore.listCatalogs(setOf("a", "b")) }
+                }
+            assertThat((System.nanoTime() - started) / 1_000_000).isLessThan(2_500)
+            assertThat(failure)
+                .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessageContaining("1000ms retry budget")
+                .hasMessageContaining("capped")
+        } finally {
+            parked.countDown()
+            engine.stop(0)
+        }
+    }
+
+    @Test
+    fun `an interrupted list keeps its permit until its fan-out reads have finished`() {
+        // The request thread is told to leave while its workers are
+        // parked on the engine. It does not leave them behind: the
+        // admission they carry is only good while the request holds its
+        // permit, so the thread waits for them (they finish within their
+        // own budget), then restores the interrupt and fails the list as
+        // the client fails an interrupted call. Leaving at once would
+        // release the permit under two running reads, and the next read
+        // to start would take a permit of its own.
+        //
+        // MUTATION: let `f.get()`'s InterruptedException propagate (the
+        // plain `try { f.get() }` loop) and the lister is gone within the
+        // join: `isAlive` reds, `callsInFlight` reds at 0 under two parked
+        // reads, and the outcome is a raw InterruptedException.
+        seed("t-a-1", "a")
+        seed("t-b-1", "b")
+        batchItemAnswer = 503 to mapOf("error" to "owner lost")
+        val parked = CountDownLatch(1)
+        park = { if (it.endsWith("/query")) parked else null }
+        val engine = concurrentServer()
+        try {
+            val (gated, gatedStore) = gatedStore(engine)
+            var outcome: Throwable? = null
+            var interruptRestored = false
+            val lister =
+                Thread {
+                    outcome = underRequest { catchThrowable { gatedStore.listCatalogs(setOf("a", "b")) } }
+                    interruptRestored = Thread.currentThread().isInterrupted
+                }
+            lister.start()
+            await { requests.count { it.endsWith("/query") } == 2 }
+
+            lister.interrupt()
+            lister.join(500)
+            assertThat(lister.isAlive).describedAs("waits for its workers").isTrue()
+            assertThat(gated.callsInFlight).describedAs("the permit outlives the interrupt").isEqualTo(1)
+
+            parked.countDown()
+            lister.join(10_000)
+            assertThat(outcome)
+                .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                .hasMessageContaining("interrupted")
+            assertThat(interruptRestored).describedAs("the interrupt is restored").isTrue()
+            assertThat(gated.callsInFlight).isEqualTo(0)
+        } finally {
+            parked.countDown()
+            engine.stop(0)
+        }
+    }
+
+    @Test
+    fun `a recorded maintenance run holds its request's permit from before its first call to after the ledger write`() {
+        // What makes a manual sweep (POST .../maintenance/compact, and
+        // its kin) ONE bulkhead permit rather than one per store call
+        // (#679): the executor runs the sweep inside `recorded`, and
+        // `recorded` is one catalog operation. Between two store calls of
+        // the body — while it does no hoglite work at all — the permit is
+        // still held: a rival request is refused, and the body's later
+        // call runs under the same permit rather than taking a second.
+        //
+        // MUTATION: drop `catalogOperation` from `recorded` (run the body
+        // and the ledger write bare) and the first in-body assertion reds
+        // at 0, and the rival is served.
+        seed("t-wh-1", "wh")
+        seed("t-rival-1", "rival")
+        val engine = concurrentServer()
+        try {
+            val (gated, gatedStore) = gatedStore(engine)
+            val swept =
+                underRequest {
+                    gatedStore.recorded("wh", MaintenanceTask.COMPACTION, MaintenanceTrigger.MANUAL) {
+                        gatedStore.getCatalog("wh")
+                        assertThat(gated.callsInFlight).describedAs("held between the sweep's calls").isEqualTo(1)
+                        val rival = underRequest(admission()) { catchThrowable { gatedStore.getCatalog("rival") } }
+                        assertThat(rival)
+                            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                            .hasMessageContaining("max_concurrent_calls")
+                        gatedStore.getCatalog("wh")
+                        assertThat(gated.callsInFlight).describedAs("no second permit for a later call").isEqualTo(1)
+                        "swept"
+                    }
+                }
+            assertThat(swept).isEqualTo("swept")
+            assertThat(gated.callsInFlight).isEqualTo(0)
+            assertThat(requests.filter { it.contains("t-rival-1") }).describedAs("the rival sent nothing").isEmpty()
+            assertThat(requests.last()).startsWith("POST /v1/t/t-wh-1/tx :: ")
+        } finally {
+            engine.stop(0)
+        }
+    }
+
+    @Test
+    fun `a create that has committed its boot transaction is not refused the read after it`() {
+        // The operation-level hold of `catalogOperation` (#679): with a
+        // rival queued for the one permit while the boot transaction is
+        // in flight, the create's post-commit `getCatalog` runs under the
+        // permit the create took before its first call. Were the permit
+        // per call, the fair semaphore would hand it to the rival the
+        // moment the boot transaction returned it; the rival's read is
+        // parked, so the create would wait 200 ms and be refused with a
+        // catalog already committed.
+        //
+        // MUTATION: make `catalogOperation` run its body bare (no
+        // `underRequestPermit`) and the create fails BackendUnavailable
+        // after the boot transaction.
+        seed("t-rival-1", "rival")
+        val engine = concurrentServer()
+        try {
+            val (gated, gatedStore) = gatedStore(engine)
+            val (created, failure) =
+                heldAcross(gated, gatedStore, parkedCall = "POST /v1/t/t-wh-1/tx") {
+                    gatedStore.createCatalog("wh", "s3://bucket/wh", "me", null)
+                }
+            assertThat(failure).isNull()
+            assertThat(created!!.name).isEqualTo("wh")
+            assertThat(requests.count { it == "POST /v1/t/t-wh-1/query" })
+                .describedAs("the enforcement probe and the post-commit read both reached the engine")
+                .isEqualTo(2)
+        } finally {
+            engine.stop(0)
+        }
+    }
+
+    @Test
+    fun `a drop that has fenced is not refused its release and delete`() {
+        // The same hold for `dropCatalog`, which runs outside
+        // `catalogOperation` and takes its permit itself: with a rival
+        // queued while the fence transaction is in flight, the release
+        // and the tenant delete run under the drop's permit (#683's
+        // half-way drop is a transport failure's to cause, not the
+        // bulkhead's).
+        //
+        // MUTATION: call `dropHeld` bare in `dropCatalog` and the drop
+        // fails BackendUnavailable with the catalog fenced and its tenant
+        // still there.
+        seed("t-wh-1", "wh")
+        seed("t-rival-1", "rival")
+        val engine = concurrentServer()
+        try {
+            val (gated, gatedStore) = gatedStore(engine)
+            val (dropped, failure) =
+                heldAcross(gated, gatedStore, parkedCall = "POST /v1/t/t-wh-1/tx") {
+                    gatedStore.dropCatalog("wh", null, null)
+                }
+            assertThat(failure).isNull()
+            assertThat(dropped!!.name).isEqualTo("wh")
+            assertThat(tenants.keys).containsExactly("t-rival-1")
+            assertThat(requests.filter { it.contains("t-wh-1") }.takeLast(2))
+                .containsExactly("POST /v1/t/t-wh-1/release", "DELETE /v1/tenants/t-wh-1")
+        } finally {
+            engine.stop(0)
+        }
+    }
+
+    /**
+     * Run [operation] under a request on a one-permit store while a RIVAL
+     * request queues for that permit from the moment [parkedCall] (one of
+     * the operation's calls, "METHOD path", parked on the engine) is in
+     * flight. The permit is fair, so the rival is served the moment the
+     * permit is given back: an operation that gave it back between two
+     * calls would find the rival holding it (the rival's read is parked)
+     * past the 200 ms it waits, and be refused midway. Returns what
+     * [operation] did; the rival's read, if it got one, is checked to
+     * have come after the operation's last call.
+     */
+    private fun <T> heldAcross(
+        gated: HogliteClient,
+        gatedStore: HogliteCatalogStore,
+        parkedCall: String,
+        operation: () -> T,
+    ): Pair<T?, Throwable?> {
+        val parkedOperation = CountDownLatch(1)
+        val parkedRival = CountDownLatch(1)
+        park = { call ->
+            when (call) {
+                parkedCall -> parkedOperation
+                "POST /v1/t/t-rival-1/query" -> parkedRival
+                else -> null
+            }
+        }
+        var result: T? = null
+        var failure: Throwable? = null
+        val runner =
+            Thread {
+                try {
+                    result = underRequest { operation() }
+                } catch (e: Throwable) {
+                    failure = e
+                }
+            }
+        runner.start()
+        try {
+            await { requests.any { it.startsWith(parkedCall) } }
+            val rival = Thread { underRequest { catchThrowable { gatedStore.getCatalog("rival") } } }
+            rival.start()
+            await { gated.permitWaiters == 1 }
+            parkedOperation.countDown()
+            runner.join(10_000)
+            parkedRival.countDown()
+            rival.join(10_000)
+        } finally {
+            parkedOperation.countDown()
+            parkedRival.countDown()
+        }
+        val rivalRead = requests.indexOfFirst { it == "POST /v1/t/t-rival-1/query" }
+        if (rivalRead >= 0) {
+            assertThat(rivalRead)
+                .describedAs("the rival read only after the operation's last call")
+                .isGreaterThan(requests.indexOfLast { !it.contains("t-rival-1") })
+        }
+        assertThat(gated.callsInFlight).isEqualTo(0)
+        return result to failure
+    }
+
+    /**
+     * A server that serves exchanges concurrently: the shared [server]
+     * answers one at a time, which would make the engine the bulkhead.
+     */
+    private fun concurrentServer(): HttpServer =
+        HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            executor = Executors.newCachedThreadPool()
+            createContext("/") { ex -> handle(ex) }
+            start()
+        }
+
+    /** A store on [engine] whose client admits one request thread at a time, with a budget the cap can bite into. */
+    private fun gatedStore(engine: HttpServer): Pair<HogliteClient, HogliteCatalogStore> {
+        val gated =
+            HogliteClient(
+                "http://127.0.0.1:${engine.address.port}",
+                retryBudgetMs = 10_000,
+                maxConcurrentCalls = 1,
+                sleeper = {},
+            )
+        return gated to HogliteCatalogStore(gated, { "t-$it-1" })
+    }
+
+    /** An admission that queued [queuedMs] of a 30 s bound and was admitted now. */
+    private fun admission(queuedMs: Long = 0): RequestAdmission =
+        RequestAdmission(System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(queuedMs), 30_000)
+            .also { it.admit(System.nanoTime()) }
+
+    /** Run [block] under an ambient [admission], as the dispatch seam's context element leaves a handler. */
+    private fun <T> underRequest(
+        admission: RequestAdmission = admission(),
+        block: () -> T,
+    ): T = RequestAdmission.carrying(admission, block)
+
+    private fun await(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition()) {
+            check(System.nanoTime() < deadline) { "condition not met within 5s" }
+            Thread.sleep(10)
+        }
     }
 
     @Test

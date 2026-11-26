@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.compaction.CompactionService.Companion.MAX_NAMED_INPUT_PATHS
 import com.posthog.hoglake.compaction.CompactionService.Companion.SHUTDOWN_WAIT_SECONDS
 import com.posthog.hoglake.compaction.CompactionService.Companion.wasInterrupt
@@ -1474,10 +1475,15 @@ internal class CompactionExecutor(
             for (item in items) tally += terminalAwareGroup(catalog, item, cfg, heapExhausted)
             return tally
         }
+        // Null for PostgreSQL, and outside a request: the workers run as
+        // background work ([CompactionStorage.carriesRequestAdmission]).
+        val admission = if (storage.carriesRequestAdmission) RequestAdmission.current() else null
         val futures =
             items.map { item ->
                 pool.submit(
-                    java.util.concurrent.Callable { terminalAwareGroup(catalog, item, cfg, heapExhausted) },
+                    java.util.concurrent.Callable {
+                        RequestAdmission.carrying(admission) { terminalAwareGroup(catalog, item, cfg, heapExhausted) }
+                    },
                 )
             }
         return try {
