@@ -13,7 +13,8 @@ WORKDIR /src
 
 # Wrapper + build scripts first so the dependency layer caches across
 # source-only changes.
-COPY gradlew settings.gradle.kts build.gradle.kts ./
+# Use the same Kotlin compiler heap settings as the test build.
+COPY gradlew settings.gradle.kts build.gradle.kts gradle.properties ./
 COPY gradle/ gradle/
 # settings.gradle.kts includes :trino; its build file must exist for
 # configuration, but the connector is not part of this image.
