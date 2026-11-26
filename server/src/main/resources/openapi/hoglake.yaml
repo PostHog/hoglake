@@ -392,9 +392,11 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "403":
           description: >-
-            A non-operator creating a `containment` mark, or a namespace named
-            `team_<digits>` (any case, any leading zeros) in a catalog listed in
-            `HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS`. Error `forbidden`.
+            A caller without operator access cannot set a `containment` mark.
+            With auth enabled, creating `team_<digits>` in a catalog listed in
+            `HOGLAKE_OPERATOR_TEAM_NAMESPACE_CATALOGS` requires a verified operator token.
+            The name matches in any case, with or without leading zeros.
+            Error `forbidden`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }

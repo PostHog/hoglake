@@ -319,11 +319,16 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         // Before the store: the only path that creates a namespace, on every backend.
                         reservedNamespaces.refuse(req.name)
-                        // Auth off has no callers to tell apart: it is the operator, as for a drop.
-                        val operator = call.hoglakeAuth.callerOrNull?.kind?.isOperator() ?: true
-                        operatorTeamNamespaces.refuse(call.catalog(), req.name, operator)
+                        val auth = call.hoglakeAuth
+                        val verifiedOperator = auth.callerOrNull?.kind?.isOperator() == true
+                        operatorTeamNamespaces.refuse(
+                            call.catalog(),
+                            req.name,
+                            auth is AuthState.Off || verifiedOperator,
+                        )
                         // The mark is the operator's alone (PUT .../containment is OPERATOR in AuthPolicy), and
                         // this route is WRITE, so the body decides.
+                        val operator = auth.callerOrNull == null || verifiedOperator
                         if (req.containment != null && !operator) {
                             throw com.posthog.hoglake.model.HoglakeException.Forbidden(
                                 "only an operator may create a namespace with a containment mark",

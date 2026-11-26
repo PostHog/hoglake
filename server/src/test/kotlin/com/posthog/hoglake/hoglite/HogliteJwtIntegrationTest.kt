@@ -252,7 +252,8 @@ class HogliteJwtIntegrationTest {
             }
             // Warn mode bypasses generic policy refusals, not backend lifecycle capabilities.
             testApplication {
-                App.build(cfg).use { app ->
+                val catalog = "warnlake"
+                App.build(cfg.copy(operatorTeamNamespaceCatalogs = setOf(catalog))).use { app ->
                     val warn =
                         AuthService(
                             AuthMode.WARN,
@@ -265,7 +266,6 @@ class HogliteJwtIntegrationTest {
                         )
                     application { app.module(this, warn) }
                     val tenant = "opaque_warn_1"
-                    val catalog = "warnlake"
                     val warnOperator = token("operator", "admin", tenant, catalog)
                     val warnAdmin = token("tenant", "admin", tenant, catalog)
                     val warnWriter = token("tenant", "write", tenant, catalog)
@@ -274,6 +274,21 @@ class HogliteJwtIntegrationTest {
                             header(HttpHeaders.Authorization, "Bearer $warnOperator")
                             contentType(ContentType.Application.Json)
                             setBody("""{"name":"$catalog","data_path":"s3://hoglake-it/warnlake"}""")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.Created)
+                    val refused =
+                        client.post("/v1/catalogs/$catalog/namespaces") {
+                            header(HttpHeaders.Authorization, "Bearer $warnWriter")
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"team_41"}""")
+                        }
+                    assertThat(refused.status).isEqualTo(HttpStatusCode.Forbidden)
+                    assertThat(refused.bodyAsText()).contains("\"error\":\"forbidden\"")
+                    assertThat(
+                        client.post("/v1/catalogs/$catalog/namespaces") {
+                            header(HttpHeaders.Authorization, "Bearer $warnOperator")
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"team_41"}""")
                         }.status,
                     ).isEqualTo(HttpStatusCode.Created)
                     for (credential in listOf(warnAdmin, warnWriter)) {
