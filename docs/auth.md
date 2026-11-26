@@ -297,9 +297,9 @@ A dedicated client accesses local objects through local-only routes under `/v1/l
 - `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan`
 - `POST /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/commit` (writable session only; every committed data file and deletion vector URI is verified against the session's primary-catalog write grant before forwarding)
 
-Each route takes the same query and gives the same body as the ordinary route without the prefix.
-A request on these routes always uses the dedicated read verifier.
-It reads only from the configured Hoglite owner named in the signed JWT.
+List routes return paginated objects (`{"namespaces": [...], "next_after": "..."}` and `{"namespace_id": ..., "namespace": ..., "tables": [...], "next_after": "..."}`), with reserved namespaces filtered out before responding.
+Drop routes accept optional identity-fencing queries (`?namespace_id=` on namespace drop and `?table_uuid=` on table drop).
+A request on these routes always uses the dedicated verifier and forwards directly to the configured Hoglite owner named in the signed JWT (requiring a Hoglite owner build that implements the companion typed list and mutation routes).
 It never reaches a remote schema relay, a mount, or a legacy store.
 The server never redirects or rewrites it to an ordinary route.
 
@@ -307,7 +307,7 @@ The routes answer as follows:
 
 - A listener without `HOGLAKE_READ_SESSION_PROFILE` answers `501`. So does the public listener, with or without the profile, and `HOGLAKE_AUTH_MODE=off`.
 - Another path under `/v1/local-only` answers `422`.
-- Another method on a valid route answers `405` with `Allow: GET`.
+- A disallowed method on a valid route answers `405` with the route's `Allow` header.
 - A missing or refused token answers `401`.
 - A verified session that names an unentitled catalog, a reserved mount, or a reserved namespace (including a remote schema) answers `404`. The server does not call the owner.
 - An eligible local namespace, table, or scan answers as the owner answers. An absent object is `404`.

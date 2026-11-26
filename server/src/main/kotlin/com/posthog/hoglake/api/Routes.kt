@@ -1347,8 +1347,17 @@ private suspend fun handleLocalOnlyForward(
     val uri = call.request.uri
     val queryIndex = uri.indexOf('?')
     val rawQuery = if (queryIndex == -1) null else uri.substring(queryIndex + 1)
-    if (method != HttpMethod.Get && rawQuery != null) {
+    if (method == HttpMethod.Post && rawQuery != null) {
         throw BadRequestException("invalid scoped metadata request")
+    }
+    if (method == HttpMethod.Delete && rawQuery != null) {
+        val validDeleteQuery =
+            when (pattern) {
+                ReadSessionProfile.NAMESPACE_PATTERN -> rawQuery.startsWith("namespace_id=")
+                ReadSessionProfile.TABLE_PATTERN -> rawQuery.startsWith("table_uuid=")
+                else -> false
+            }
+        if (!validDeleteQuery) throw BadRequestException("invalid scoped metadata request")
     }
     val requestBody =
         if (method == HttpMethod.Post) {
@@ -1381,17 +1390,18 @@ private suspend fun handleLocalOnlyForward(
     )
 }
 
-private suspend fun readBoundedLocalOnlyBody(call: ApplicationCall): ByteArray {
-    val channel = call.request.receiveChannel()
-    val out = java.io.ByteArrayOutputStream()
-    val buf = ByteArray(8192)
-    while (out.size() <= MAX_LOCAL_ONLY_BODY_BYTES) {
-        val n = channel.readAvailable(buf, 0, buf.size)
-        if (n <= 0) break
-        out.write(buf, 0, n)
-    }
-    return out.toByteArray()
-}
+private suspend fun readBoundedLocalOnlyBody(call: ApplicationCall): ByteArray =
+    withTimeoutOrNull(5_000L) {
+        val channel = call.request.receiveChannel()
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        while (out.size() <= MAX_LOCAL_ONLY_BODY_BYTES) {
+            val n = channel.readAvailable(buf, 0, buf.size)
+            if (n <= 0) break
+            out.write(buf, 0, n)
+        }
+        out.toByteArray()
+    } ?: throw BadRequestException("scoped metadata body read timed out")
 
 /**
  * The target that the auth plugin selected for this local-only route with the

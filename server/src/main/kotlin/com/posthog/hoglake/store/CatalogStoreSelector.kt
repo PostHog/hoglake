@@ -1,6 +1,11 @@
 package com.posthog.hoglake.store
 
+import com.fasterxml.jackson.core.JsonFactory
+import com.fasterxml.jackson.core.StreamReadFeature
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.api.ScanFileDto
@@ -255,40 +260,130 @@ class CatalogStoreSelector(
         if (isMutation && !grants.writable) {
             throw HoglakeException.Forbidden("access denied")
         }
-        if (isCreateNamespace) {
-            val bodyNode =
-                runCatching { scopedJson.readTree(requestBody ?: ByteArray(0)) }.getOrNull()
-                    ?: throw HoglakeException.Validation("invalid create namespace body")
-            val name =
-                bodyNode.get("name")?.textValue()?.takeIf { it.isNotBlank() }
-                    ?: throw HoglakeException.Validation("invalid namespace name")
-            if (currentCfg.reservedNamespaces.isReserved(name) ||
-                TeamNamespaces.hasShape(name) ||
-                name.equals("information_schema", ignoreCase = true)
-            ) {
-                throw HoglakeException.Forbidden("access denied")
+        val validatedBody =
+            when {
+                isCreateNamespace -> validateAndCanonicalizeCreateNamespace(requestBody, currentCfg)
+                isCommit -> validateAndCanonicalizeCommit(requestBody, target.catalog, grants)
+                method == "POST" -> validateAndCanonicalizeCreateTable(requestBody)
+                else -> null
+            }
+        val result =
+            client(routing.backendId).forRequest(authority.token)
+                .forwardScopedMetadata(method, tenant, target.catalog, subpath, query, validatedBody)
+        if (method == "GET" && subpath == "/namespaces" && result.statusCode == 200) {
+            return ScopedForwardResult(result.statusCode, filterReservedNamespaces(result.body, currentCfg))
+        }
+        return result
+    }
+
+    private fun isReservedLocalNamespace(
+        name: String,
+        currentCfg: Config,
+    ): Boolean =
+        currentCfg.reservedNamespaces.isReserved(name) ||
+            TeamNamespaces.hasShape(name) ||
+            name.equals("information_schema", ignoreCase = true)
+
+    private fun filterReservedNamespaces(
+        body: String,
+        currentCfg: Config,
+    ): String {
+        val root = scopedJson.readTree(body) as? ObjectNode ?: return body
+        val arr = root.get("namespaces") as? ArrayNode ?: return body
+        val filtered = scopedJson.createArrayNode()
+        for (entry in arr) {
+            val name = entry.get("name")?.textValue() ?: continue
+            if (!isReservedLocalNamespace(name, currentCfg)) {
+                filtered.add(entry)
             }
         }
-        if (isCommit) {
-            val bodyNode =
-                runCatching { scopedJson.readTree(requestBody ?: ByteArray(0)) }.getOrNull()
-                    ?: throw HoglakeException.Validation("invalid commit body")
-            for (field in listOf("add_files", "add_delete_files")) {
-                val arr = bodyNode.get(field) ?: continue
-                if (!arr.isArray) throw HoglakeException.Validation("invalid commit body")
-                for (item in arr) {
-                    val path = item.get("path")?.textValue() ?: throw HoglakeException.Validation("missing file path")
-                    if (!grants.allowsPrimaryCatalogWrite(target.catalog, path)) {
-                        throw HoglakeException.Forbidden("access denied")
-                    }
+        root.set<ArrayNode>("namespaces", filtered)
+        return scopedJson.writeValueAsString(root)
+    }
+
+    private fun parseStrictObject(
+        bytes: ByteArray?,
+        allowedKeys: Set<String>,
+        errorMessage: String,
+    ): ObjectNode {
+        val node =
+            runCatching { scopedJson.readTree(bytes ?: ByteArray(0)) }.getOrNull() as? ObjectNode
+                ?: throw HoglakeException.Validation(errorMessage)
+        val names = node.fieldNames().asSequence().toList()
+        if (names.any { it !in allowedKeys }) {
+            throw HoglakeException.Validation(errorMessage)
+        }
+        return node
+    }
+
+    private fun validateAndCanonicalizeCreateNamespace(
+        requestBody: ByteArray?,
+        currentCfg: Config,
+    ): ByteArray {
+        val node = parseStrictObject(requestBody, setOf("name"), "invalid create namespace body")
+        val name =
+            node.get("name")?.textValue()?.takeIf { it.isNotBlank() }
+                ?: throw HoglakeException.Validation("invalid namespace name")
+        if (isReservedLocalNamespace(name, currentCfg)) {
+            throw HoglakeException.Forbidden("access denied")
+        }
+        return scopedJson.writeValueAsBytes(node)
+    }
+
+    private fun validateAndCanonicalizeCreateTable(requestBody: ByteArray?): ByteArray {
+        val node = parseStrictObject(requestBody, setOf("name", "columns", "comment"), "invalid create table body")
+        val columns =
+            node.get("columns") as? ArrayNode
+                ?: throw HoglakeException.Validation("invalid create table body")
+        val allowedColKeys = setOf("name", "type", "type_params", "nullable", "comment")
+        for (col in columns) {
+            val colObj = col as? ObjectNode ?: throw HoglakeException.Validation("invalid create table body")
+            if (colObj.fieldNames().asSequence().any { it !in allowedColKeys }) {
+                throw HoglakeException.Validation("invalid create table body")
+            }
+        }
+        return scopedJson.writeValueAsBytes(node)
+    }
+
+    private fun validateAndCanonicalizeCommit(
+        requestBody: ByteArray?,
+        catalog: String,
+        grants: com.posthog.hoglake.auth.ReadSessionStorageGrants,
+    ): ByteArray {
+        val node =
+            parseStrictObject(
+                requestBody,
+                setOf("table_uuid", "base_snapshot_id", "add_files", "add_delete_files"),
+                "invalid commit body",
+            )
+        val fileKeys =
+            mapOf(
+                "add_files" to setOf("path", "record_count", "file_size_bytes", "footer_size"),
+                "add_delete_files" to setOf("data_file_id", "path", "delete_count", "file_size_bytes"),
+            )
+        for ((field, allowedItemKeys) in fileKeys) {
+            val arr = node.get(field) ?: continue
+            if (!arr.isArray) throw HoglakeException.Validation("invalid commit body")
+            for (item in arr) {
+                val obj = item as? ObjectNode ?: throw HoglakeException.Validation("invalid commit body")
+                if (obj.fieldNames().asSequence().any { it !in allowedItemKeys }) {
+                    throw HoglakeException.Validation("invalid commit body")
+                }
+                val path = obj.get("path")?.textValue() ?: throw HoglakeException.Validation("missing file path")
+                if (!grants.allowsPrimaryCatalogWrite(catalog, path)) {
+                    throw HoglakeException.Forbidden("access denied")
                 }
             }
         }
-        return client(routing.backendId).forRequest(authority.token)
-            .forwardScopedMetadata(method, tenant, target.catalog, subpath, query, requestBody)
+        return scopedJson.writeValueAsBytes(node)
     }
 
-    private val scopedJson = ObjectMapper()
+    private val scopedJson =
+        ObjectMapper(
+            JsonFactory.builder()
+                .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+                .build(),
+        ).enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
 
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
     private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
