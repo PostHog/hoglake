@@ -35,6 +35,7 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.remoteSchemaRefusal
 import com.posthog.hoglake.store.servedNamespaceRefusal
+import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -48,6 +49,7 @@ import io.ktor.server.request.receiveChannel
 import io.ktor.server.request.uri
 import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
 import io.ktor.server.routing.RoutingCall
 import io.ktor.server.routing.RoutingPipelineCall
 import io.ktor.server.routing.delete
@@ -96,13 +98,46 @@ fun Application.installApiRoutes(
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
     // sites by these names. Both names refer to the one CatalogStore.
     routing {
-        // The local-only reads serve only the typed reads that the auth plugin selected. They never relay.
+        // The local-only routes serve only the typed routes that the auth plugin selected. They never relay.
+        get(LOCAL_ONLY_NAMESPACES_ROUTE) {
+            handleLocalOnlyForward(call, selector, HttpMethod.Get, ReadSessionProfile.NAMESPACES_PATTERN)
+        }
+        post(LOCAL_ONLY_NAMESPACES_ROUTE) {
+            handleLocalOnlyForward(
+                call,
+                selector,
+                HttpMethod.Post,
+                ReadSessionProfile.NAMESPACES_PATTERN,
+                isCreateNamespace = true,
+            )
+        }
         get(LOCAL_ONLY_NAMESPACE_ROUTE) {
             handleLocalOnlyNamespaceGet(call, selector)
+        }
+        delete(LOCAL_ONLY_NAMESPACE_ROUTE) {
+            handleLocalOnlyForward(call, selector, HttpMethod.Delete, ReadSessionProfile.NAMESPACE_PATTERN)
+        }
+        get(LOCAL_ONLY_TABLES_ROUTE) {
+            handleLocalOnlyForward(call, selector, HttpMethod.Get, ReadSessionProfile.TABLES_PATTERN)
+        }
+        post(LOCAL_ONLY_TABLES_ROUTE) {
+            handleLocalOnlyForward(call, selector, HttpMethod.Post, ReadSessionProfile.TABLES_PATTERN)
         }
         get(LOCAL_ONLY_TABLE_ROUTE) {
             val target = call.localOnlyTarget(ReadSessionProfile::matchesTable)
             handleScopedTableGet(call, selector, target, ReadSessionProfile.LOCAL_ONLY_PREFIX)
+        }
+        delete(LOCAL_ONLY_TABLE_ROUTE) {
+            handleLocalOnlyForward(call, selector, HttpMethod.Delete, ReadSessionProfile.TABLE_PATTERN)
+        }
+        post(LOCAL_ONLY_COMMIT_ROUTE) {
+            handleLocalOnlyForward(
+                call,
+                selector,
+                HttpMethod.Post,
+                ReadSessionProfile.COMMIT_PATTERN,
+                isCommit = true,
+            )
         }
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -1281,9 +1316,82 @@ private suspend fun requireEmptyScopedBody(
     if (empty != true) throw BadRequestException(message)
 }
 
+private const val LOCAL_ONLY_NAMESPACES_ROUTE =
+    "${ReadSessionProfile.LOCAL_ONLY_PREFIX}/catalogs/{catalog}/namespaces"
 private const val LOCAL_ONLY_NAMESPACE_ROUTE =
-    "${ReadSessionProfile.LOCAL_ONLY_PREFIX}/catalogs/{catalog}/namespaces/{namespace}"
-private const val LOCAL_ONLY_TABLE_ROUTE = "$LOCAL_ONLY_NAMESPACE_ROUTE/tables/{table}"
+    "$LOCAL_ONLY_NAMESPACES_ROUTE/{namespace}"
+private const val LOCAL_ONLY_TABLES_ROUTE = "$LOCAL_ONLY_NAMESPACE_ROUTE/tables"
+private const val LOCAL_ONLY_TABLE_ROUTE = "$LOCAL_ONLY_TABLES_ROUTE/{table}"
+private const val LOCAL_ONLY_COMMIT_ROUTE = "$LOCAL_ONLY_TABLE_ROUTE/commit"
+private const val MAX_LOCAL_ONLY_BODY_BYTES = 256 * 1024
+
+private suspend fun handleLocalOnlyForward(
+    call: ApplicationCall,
+    selector: CatalogStoreSelector,
+    method: HttpMethod,
+    pattern: String,
+    isCommit: Boolean = false,
+    isCreateNamespace: Boolean = false,
+) {
+    call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+    val target = call.localOnlyTarget { m, route -> m == method && route?.pattern == pattern }
+    val subpath =
+        when (pattern) {
+            ReadSessionProfile.NAMESPACES_PATTERN -> "/namespaces"
+            ReadSessionProfile.NAMESPACE_PATTERN -> "/namespaces/${target.namespace}"
+            ReadSessionProfile.TABLES_PATTERN -> "/namespaces/${target.namespace}/tables"
+            ReadSessionProfile.TABLE_PATTERN -> "/namespaces/${target.namespace}/tables/${target.table}"
+            ReadSessionProfile.COMMIT_PATTERN -> "/namespaces/${target.namespace}/tables/${target.table}/commit"
+            else -> throw HoglakeException.NotFound("namespace")
+        }
+    val uri = call.request.uri
+    val queryIndex = uri.indexOf('?')
+    val rawQuery = if (queryIndex == -1) null else uri.substring(queryIndex + 1)
+    if (method != HttpMethod.Get && rawQuery != null) {
+        throw BadRequestException("invalid scoped metadata request")
+    }
+    val requestBody =
+        if (method == HttpMethod.Post) {
+            val bytes = readBoundedLocalOnlyBody(call)
+            if (bytes.isEmpty() || bytes.size > MAX_LOCAL_ONLY_BODY_BYTES) {
+                throw BadRequestException("invalid scoped metadata body")
+            }
+            bytes
+        } else {
+            requireEmptyScopedBody(call, "invalid scoped metadata request")
+            null
+        }
+    val forwarded =
+        runInterruptible {
+            selector.forwardLocalOnlyMetadata(
+                call = call,
+                method = method.value,
+                target = target,
+                subpath = subpath,
+                query = rawQuery,
+                requestBody = requestBody,
+                isCommit = isCommit,
+                isCreateNamespace = isCreateNamespace,
+            )
+        }
+    call.respondText(
+        text = forwarded.body,
+        contentType = ContentType.Application.Json,
+        status = HttpStatusCode.fromValue(forwarded.statusCode),
+    )
+}
+
+private suspend fun readBoundedLocalOnlyBody(call: ApplicationCall): ByteArray {
+    val channel = call.request.receiveChannel()
+    val out = java.io.ByteArrayOutputStream()
+    val buf = ByteArray(8192)
+    while (out.size() <= MAX_LOCAL_ONLY_BODY_BYTES) {
+        val n = channel.readAvailable(buf, 0, buf.size)
+        if (n <= 0) break
+        out.write(buf, 0, n)
+    }
+    return out.toByteArray()
+}
 
 /**
  * The target that the auth plugin selected for this local-only route with the

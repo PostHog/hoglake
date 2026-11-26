@@ -1298,9 +1298,7 @@ class ScopedNamespaceDispatchTest {
                 LOCAL_ONLY_PREFIX,
                 "$LOCAL_ONLY_PREFIX/",
                 "$LOCAL_ONLY_PREFIX/catalogs/example-catalog",
-                "$LOCAL_ONLY_PREFIX/catalogs/example-catalog/namespaces",
                 "$LOCAL_ONLY_PREFIX//catalogs/example-catalog/namespaces/reports",
-                localOnly("$readPath/tables"),
                 localOnly("$readTablePath/files"),
                 "$LOCAL_ONLY_PREFIX/namespaces/reports",
             )) {
@@ -1316,7 +1314,7 @@ class ScopedNamespaceDispatchTest {
                         setBody("{}")
                     }
                 assertThat(posted.status).describedAs(target).isEqualTo(HttpStatusCode.MethodNotAllowed)
-                assertThat(posted.headers[HttpHeaders.Allow]).isEqualTo("GET")
+                assertThat(posted.headers[HttpHeaders.Allow]).isEqualTo("GET, DELETE")
                 assertThat(posted.headers[LOCAL_ONLY_MARKER]).isNull()
                 val head = client.head(localOnly(target)) { header(HttpHeaders.Authorization, "Bearer $jwt") }
                 assertThat(head.status).describedAs(target).isEqualTo(HttpStatusCode.MethodNotAllowed)
@@ -1409,6 +1407,83 @@ class ScopedNamespaceDispatchTest {
                 "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports",
                 "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics",
                 "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics",
+            )
+            assertThat(legacy).isEmpty()
+        }
+
+    @Test
+    fun `local-only list and write routes enforce writable sessions and primary prefix bounds`() =
+        testApplication {
+            val cfg = config(withReadSession = true)
+            application { harness(cfg, readFixture = true) }
+            val readJwt = readVector["token"].asText()
+            val writeJwt =
+                vectors["vectors"]
+                    .first { it["name"].asText() == "complete writable session" }["token"]
+                    .asText()
+            val nsBase = "$LOCAL_ONLY_PREFIX/catalogs/example-catalog/namespaces"
+
+            // Read-only session can list namespaces and tables, but is refused (403) on mutations before Hoglite.
+            body =
+                """{"namespaces":[{"namespace_id":17,"name":"reports",""" +
+                """"containment":{"field":"team_id","value":42}}]}"""
+            val listed = client.get(nsBase) { header(HttpHeaders.Authorization, "Bearer $readJwt") }
+            assertThat(listed.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(listed.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+
+            val roCreate =
+                client.post(nsBase) {
+                    header(HttpHeaders.Authorization, "Bearer $readJwt")
+                    setBody("""{"name":"scratch"}""")
+                }
+            assertThat(roCreate.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(roCreate.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+
+            // Writable session creating a reserved namespace is refused (403) before Hoglite.
+            val reservedCreate =
+                client.post(nsBase) {
+                    header(HttpHeaders.Authorization, "Bearer $writeJwt")
+                    setBody("""{"name":"team_42"}""")
+                }
+            assertThat(reservedCreate.status).isEqualTo(HttpStatusCode.Forbidden)
+
+            // Writable session committing an out-of-scope file URI is refused (403) before Hoglite.
+            val badCommit =
+                client.post("$nsBase/reports/tables/metrics/commit") {
+                    header(HttpHeaders.Authorization, "Bearer $writeJwt")
+                    setBody(
+                        """{"table_uuid":"$tableUuid","base_snapshot_id":1,""" +
+                            """"add_files":[{"path":"s3://example-customer/data/team_43/x.parquet",""" +
+                            """"record_count":1,"file_size_bytes":10}]}""",
+                    )
+                }
+            assertThat(badCommit.status).isEqualTo(HttpStatusCode.Forbidden)
+
+            // Valid writable session create and commit forward to Hoglite with the original token.
+            body = """{"namespace_id":18,"name":"scratch","containment":{"field":"team_id","value":42}}"""
+            val created =
+                client.post(nsBase) {
+                    header(HttpHeaders.Authorization, "Bearer $writeJwt")
+                    setBody("""{"name":"scratch"}""")
+                }
+            assertThat(created.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(created.headers[LOCAL_ONLY_MARKER]).isEqualTo("true")
+
+            body = """{"snapshot_id":2,"table_uuid":"$tableUuid","files_added":1,"deletes_added":0}"""
+            val committed =
+                client.post("$nsBase/reports/tables/metrics/commit") {
+                    header(HttpHeaders.Authorization, "Bearer $writeJwt")
+                    setBody(
+                        """{"table_uuid":"$tableUuid","base_snapshot_id":1,""" +
+                            """"add_files":[{"path":"s3://example-customer/data/team_42/x.parquet",""" +
+                            """"record_count":1,"file_size_bytes":10}]}""",
+                    )
+                }
+            assertThat(committed.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(requests.map { it.first }).containsExactly(
+                "GET /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces",
+                "POST /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces",
+                "POST /v1/t/fixture_3/metadata/v1/catalogs/example-catalog/namespaces/reports/tables/metrics/commit",
             )
             assertThat(legacy).isEmpty()
         }
