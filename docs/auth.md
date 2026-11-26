@@ -347,7 +347,9 @@ The verifier enforces strict coupling across `cat`, `prd`, and primary-catalog s
 
 - **Read-only session:** `cat.<primary_catalog>` is `["read"]`, `prd.team_id.<team_id>` is `"read"`, and every primary-catalog storage grant allows only `["s3:GetObject"]`.
 - **Writable session:** `cat.<primary_catalog>` is `["read", "write"]` (sorted), `prd.team_id.<team_id>` is `"write"`, and every primary-catalog storage grant is a slash-terminated `prefix` whose `actions` are exactly `["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListMultipartUploadParts", "s3:PutObject"]` (sorted; never `s3:DeleteObject`, `s3:ListBucket`, or a literal `object_key`).
-  The issuer's effective S3 session policy must also enforce conditional create-only writes (`s3:if-none-match: "*"` for both `PutObject` and `CompleteMultipartUpload`, while allowing `CreateMultipartUpload` and `UploadPart`) so embedded credentials cannot overwrite existing snapshot objects.
+  The issuer must derive the primary-catalog write prefixes from trusted catalog and namespace placement so both the signed write grants and the effective S3 session policy stay strictly within the data prefixes owned by the team in `prd`.
+  The effective S3 session policy must also enforce conditional create-only writes (`s3:if-none-match: "*"` for both `PutObject` and `CompleteMultipartUpload`, while allowing `CreateMultipartUpload` and `UploadPart`) so embedded credentials cannot overwrite existing snapshot objects.
+  Because writable sessions reuse the existing profile version and audiences, an issuer must enable writable-session minting only after all downstream verifiers (the Client, its backend owner, and any remote Host) accept the writable form.
 - **Always read-only:** `remote_schemas` stays `{"team": ["read"]}`, the manifest grant stays a literal `object_key` with `["s3:GetObject"]`, and both remote target grants stay `["s3:GetObject"]`.
 
 Both read-only and writable sessions are admitted on the local-only read routes and on the four relayed or served remote `GET` routes.
