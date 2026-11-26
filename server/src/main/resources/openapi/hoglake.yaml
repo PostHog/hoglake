@@ -991,6 +991,48 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
 
+  /local-only/catalogs/{catalog}/namespaces:
+    get:
+      operationId: listLocalOnlyNamespaces
+      summary: Dedicated session only. List local namespaces owned by the session's team.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - in: query
+          name: after
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated team-owned local namespaces
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+    post:
+      operationId: createLocalOnlyNamespace
+      summary: Writable dedicated session only. Create a non-reserved team-owned local namespace.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "201":
+          description: Created namespace
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "409": { description: Namespace already exists }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
   /local-only/catalogs/{catalog}/namespaces/{namespace}:
     get:
       operationId: getLocalOnlyNamespace
@@ -1024,6 +1066,74 @@ paths:
         "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
         "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
+    delete:
+      operationId: dropLocalOnlyNamespace
+      summary: Writable dedicated session only. Drop an empty team-owned local namespace.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - in: query
+          name: namespace_id
+          required: false
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        "200":
+          description: Dropped namespace snapshot
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "409": { description: Namespace non-empty or identity mismatch }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}/tables:
+    get:
+      operationId: listLocalOnlyTables
+      summary: Dedicated session only. List live tables in a team-owned local namespace.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - in: query
+          name: after
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated live tables
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+    post:
+      operationId: createLocalOnlyTable
+      summary: Writable dedicated session only. Create a table in a team-owned local namespace.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "201":
+          description: Created table
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "409": { description: Table already exists }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
     get:
@@ -1054,6 +1164,54 @@ paths:
         "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
         "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
         "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+    delete:
+      operationId: dropLocalOnlyTable
+      summary: Writable dedicated session only. Drop a table in a team-owned local namespace.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: table_uuid
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Dropped table snapshot
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "409": { description: Table identity mismatch }
+        "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
+        "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
+  /local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/commit:
+    post:
+      operationId: commitLocalOnlyTable
+      summary: Writable dedicated session only. Commit data files or deletion vectors to a local table.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+      responses:
+        "200":
+          description: Committed snapshot
+          headers:
+            X-Hoglake-Local-Only: { $ref: "#/components/headers/LocalOnlyMarker" }
+        "400": { $ref: "#/components/responses/LocalOnlyBadRequest" }
+        "401": { $ref: "#/components/responses/LocalOnlyUnauthenticated" }
+        "403": { $ref: "#/components/responses/LocalOnlyForbidden" }
+        "404": { $ref: "#/components/responses/LocalOnlyNotFound" }
+        "405": { $ref: "#/components/responses/LocalOnlyMethodNotAllowed" }
+        "409": { description: Stale snapshot or table UUID conflict }
         "422": { $ref: "#/components/responses/LocalOnlyInvalidRoute" }
         "501": { $ref: "#/components/responses/LocalOnlyNotConfigured" }
         "503": { $ref: "#/components/responses/BackendUnavailable" }
