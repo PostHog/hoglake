@@ -41,6 +41,18 @@ internal object ReadSessionVectors {
             """.trimIndent(),
         ) as ObjectNode
 
+    private fun writableClaims(): ObjectNode =
+        claims().apply {
+            (this["cat"] as ObjectNode).putArray("example-catalog").add("read").add("write")
+            (this["prd"]["team_id"] as ObjectNode).put("42", "write")
+            (this["grants"][0] as ObjectNode).apply {
+                remove("object_key")
+                put("prefix", "data/team_42/")
+                val actions = putArray("actions")
+                ReadSessionProfile.WRITE_ACTIONS.forEach { actions.add(it) }
+            }
+        }
+
     /**
      * PROPOSED (docs/auth.md, "Read sessions on a remote schema"): what the
      * caller rule answers for a verified read session and one requested
@@ -57,15 +69,14 @@ internal object ReadSessionVectors {
             catalog: String,
             namespace: String,
             relay: String,
+            session: ObjectNode = claims(),
         ) {
-            // Every case is the same session: only the request differs.
-            val claims = claims()
             val header = mapper.createObjectNode().put("alg", "ES256").put("kid", ContractVectors.KID).put("typ", "JWT")
             vectors.addObject().apply {
                 put("name", name)
                 put("verify_at", VERIFY_AT)
-                set<ObjectNode>("claims", claims)
-                put("token", ContractVectors.sign(header, claims))
+                set<ObjectNode>("claims", session)
+                put("token", ContractVectors.sign(header, session))
                 putObject("request").put("catalog", catalog).put("namespace", namespace)
                 putObject("expect").put("read", "accept").put("relay", relay)
             }
@@ -78,6 +89,8 @@ internal object ReadSessionVectors {
         add("another letter case", "example-catalog", "TEAM_42", "not_found")
         add("a name outside the family", "example-catalog", "reports", "not_found")
         add("the family label itself", "example-catalog", "team", "not_found")
+        add("writable session on the team it holds", "example-catalog", "team_42", "relay", writableClaims())
+        add("writable session on another team", "example-catalog", "team_43", "not_found", writableClaims())
     }
 
     fun document(): ObjectNode {
@@ -101,19 +114,61 @@ internal object ReadSessionVectors {
             name: String,
             readResult: String = JwtViolation.MALFORMED,
             now: Long = VERIFY_AT,
+            base: () -> ObjectNode = ::claims,
+            writable: Boolean = false,
             change: (ObjectNode) -> Unit = {},
         ) {
-            val claims = claims().also(change)
+            val claims = base().also(change)
             val header = mapper.createObjectNode().put("alg", "ES256").put("kid", ContractVectors.KID).put("typ", "JWT")
             vectors.addObject().apply {
                 put("name", name)
                 put("verify_at", now)
                 set<ObjectNode>("claims", claims)
                 put("token", ContractVectors.sign(header, claims))
-                putObject("expect").put("read", readResult).put("ordinary", JwtViolation.WRONG_AUDIENCE)
+                putObject("expect").apply {
+                    put("read", readResult)
+                    put("ordinary", JwtViolation.WRONG_AUDIENCE)
+                    if (readResult == "accept") put("writable", writable)
+                }
             }
         }
         add("complete read session", "accept")
+        add("complete writable session", "accept", base = ::writableClaims, writable = true)
+        add("writable cat with read predicate", base = ::writableClaims) {
+            (it["prd"]["team_id"] as ObjectNode).put("42", "read")
+        }
+        add("read cat with writable predicate", base = ::writableClaims) {
+            (it["cat"] as ObjectNode).putArray("example-catalog").add("read")
+        }
+        add("writable claims with read-only primary grant", base = ::writableClaims) {
+            (it["grants"][0] as ObjectNode).putArray("actions").add("s3:GetObject")
+        }
+        add("read claims with writable primary grant") {
+            (it["grants"][0] as ObjectNode).apply {
+                remove("object_key")
+                put("prefix", "data/team_42/")
+                val actions = putArray("actions")
+                ReadSessionProfile.WRITE_ACTIONS.forEach { action -> actions.add(action) }
+            }
+        }
+        add("writable cat missing read scope", base = ::writableClaims) {
+            (it["cat"] as ObjectNode).putArray("example-catalog").add("write")
+        }
+        add("writable primary grant with object_key", base = ::writableClaims) {
+            (it["grants"][0] as ObjectNode).apply {
+                remove("prefix")
+                put("object_key", "data/team_42/file.parquet")
+            }
+        }
+        add("writable primary grant with DeleteObject", base = ::writableClaims) {
+            (it["grants"][0]["actions"] as ArrayNode).add("s3:DeleteObject")
+        }
+        add("writable manifest grant", base = ::writableClaims) {
+            (it["grants"][1] as ObjectNode).putArray("actions").add("s3:GetObject").add("s3:PutObject")
+        }
+        add("writable remote_schemas", base = ::writableClaims) {
+            (it["remote_schemas"] as ObjectNode).putArray("team").add("write")
+        }
         add("mixed audiences", JwtViolation.WRONG_AUDIENCE) { (it["aud"] as ArrayNode).add(ContractVectors.AUDIENCE) }
         add("duplicate audience", JwtViolation.WRONG_AUDIENCE) {
             (it["aud"] as ArrayNode).set(1, mapper.nodeFactory.textNode("trino-session"))

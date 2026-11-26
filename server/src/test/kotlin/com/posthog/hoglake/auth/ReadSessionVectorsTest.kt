@@ -54,9 +54,10 @@ class ReadSessionVectorsTest {
                 val token = vector["token"].asText()
                 val expect = vector["expect"]
                 if (expect["read"].asText() == "accept") {
-                    val caller = verifier.verifyReadSession(token, profile)
+                    val (caller, grants) = verifier.verifyReadSessionWithGrants(token, profile)
                     assertThat(caller.subject).isEqualTo(vector["claims"]["sub"].asText())
                     assertThat(caller.remoteSchemaFamilies).containsExactly("team")
+                    assertThat(grants.writable).isEqualTo(expect["writable"].asBoolean())
                 } else {
                     assertThatThrownBy { verifier.verifyReadSession(token, profile) }
                         .isInstanceOfSatisfying(JwtViolation::class.java) {
