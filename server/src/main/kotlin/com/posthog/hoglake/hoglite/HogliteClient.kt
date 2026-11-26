@@ -309,6 +309,31 @@ class HogliteClient(
         )
     }
 
+    /** Forward one typed local-only metadata list or mutation to the Hoglite owner with the caller's token. */
+    internal fun forwardScopedMetadata(
+        method: String,
+        tenant: String,
+        catalog: String,
+        subpath: String,
+        query: String?,
+        requestBody: ByteArray?,
+    ): ScopedForwardResult {
+        val token = bearerToken
+        if (shared == null || token == null) throw HogliteScopedNamespaceRead.metadataUnavailable()
+        return HogliteScopedNamespaceRead.forwardMetadata(
+            http,
+            standardUrl,
+            token,
+            method,
+            tenant,
+            catalog,
+            subpath,
+            query,
+            requestBody,
+            readTimeoutMs,
+        )
+    }
+
     /**
      * Run [statements] as one hoglite transaction on [tenant], exactly
      * once under retries: [txid] is caller-fixed and [fingerprint]
