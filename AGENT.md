@@ -2056,7 +2056,9 @@ history holds them.
 by table, with each index's rationale beside it) ·
 [docs/iceberg-federation.md](docs/iceberg-federation.md) /
 [docs/trino-integration.md](docs/trino-integration.md) (engine
-surfaces).
+surfaces) · [docs/identifier-case.md](docs/identifier-case.md)
+(PROPOSED, not built: case-preserving, case-insensitive names; the
+server still compares names exactly).
 
 Rehearsing a Postgres major-version move: the integration harness pins
 the version production runs, overridable for a dry run of the whole
