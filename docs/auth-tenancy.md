@@ -547,8 +547,15 @@ It needs `HOGLAKE_POSTGRES_BACKEND_ID` to identify this process's PostgreSQL bac
 Unknown fields, invalid shapes, or multiple `cat` entries return 401 `invalid_token`.
 
 Every routed token names exactly one `cat` entry, including catalog operator tokens.
-Catalog operators retain `ten: operator` and operator authority; `cat` identifies only their placement.
-Legacy tokens without `rtg` keep their previous behavior.
+A catalog operator retains `ten: operator`, and its `cat` is its binding, not only its placement:
+it is an operator on that one catalog (every scope, containment, `POST /v1/catalogs` for that name)
+and a stranger everywhere else (404 on another catalog, 403 on the fleet routes), as
+[auth.md](auth.md#scoped-tokens-exactly) describes and hoglite enforces. The `cat` entry must grant
+`admin`; a narrower word refuses the token. An operator token without `cat` or `org` stays
+fleet-wide; one with `org` but no `cat` is refused, and one carrying `scope` is refused, as hoglite
+refuses both.
+A token without `rtg` keeps its previous placement (the default backend); the binding and the `org`
+rule above apply to an operator token with or without `rtg`.
 
 `HOGLAKE_BACKENDS_FILE` points to a JSON object with a `backends` array.
 Each entry has `id`, `kind: hoglite`, and `url`.
@@ -810,9 +817,11 @@ to claim.
 - **Callers.** A non-operator gets 403 `forbidden`: a tenant, and a scoped
   token, which cannot create namespaces at all. Operators are unaffected, and
   so is auth `off`, which has no callers to tell apart.
-- **Auth modes.** Under `warn`, a request with no valid token is treated as
-  the operator, as everywhere else, so this rule is enforced only in `enforce`
-  mode or on the public listener.
+- **Auth modes.** In `warn` mode, a request needs a verified operator token to
+  create a matching namespace. The namespace check returns 403 if the request
+  reaches it without that token. Backend routing runs first. For example, a
+  Hoglite-only server returns 404 when a request has no verified backend
+  placement. Other namespace creates keep their existing behavior.
 - **Boot.** Each entry must match the catalog-name pattern, else the server
   does not start.
 - **Existing namespaces are left alone.** One created before its catalog was
@@ -904,8 +913,8 @@ plugin's rules again for the name the handler passes, before it resolves a
 binding or a store (`auth/StoreEntitlement.kt`):
 
 - A request with no caller gets 401.
-- A name the token does not name (`Caller.knowsCatalog`; an operator knows every
-  catalog) gets the plugin's 404.
+- A name the token does not name (`Caller.knowsCatalog`; a fleet-wide operator
+  knows every catalog, a catalog-bound one only its own) gets the plugin's 404.
 - A name the token holds without the scope the route asks for gets the plugin's
   403, so a write route is not served from a catalog held only for read.
 - The modes are the plugin's: no check under `off`; under `warn` the refusal is

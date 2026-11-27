@@ -99,18 +99,19 @@ class AuthPolicyTest {
             ordinary.filter { (method, path) -> AuthPolicy.match(HttpMethod.parse(method.uppercase()), path) == null }
         assertThat(missing).describedAs("routes published in the OpenAPI spec with no AuthPolicy entry").isEmpty()
 
-        // Each local-only route is a GET whose canonical path is exactly one of the three ordinary read patterns.
-        val canonical =
+        // Each local-only route matches an allowed (method, canonicalPattern) pair in LOCAL_ONLY_ALLOWED_METHODS.
+        val publishedLocalOnly =
             localOnly.map { (method, path) ->
-                val target = ReadSessionProfile.canonicalLocalOnlyPath(path)
-                Triple(method.lowercase(), target, target?.let { AuthPolicy.match(HttpMethod.Get, it)?.pattern })
-            }
-        assertThat(canonical.map { it.first }).describedAs("local-only methods").containsOnly("get")
-        assertThat(canonical.filter { it.second == null || it.second != it.third })
-            .describedAs("local-only routes whose canonical path is not an exact policy pattern")
-            .isEmpty()
-        assertThat(canonical.map { it.third }.toSet())
-            .isEqualTo(ReadSessionProfile.LOCAL_ONLY_PATTERNS)
+                val canonical = ReadSessionProfile.canonicalLocalOnlyPath(path)
+                val matched = canonical?.let { ReadSessionProfile.matchLocalOnlyRoute(it) }
+                assertThat(matched).describedAs("local-only route $method $path").isNotNull()
+                HttpMethod.parse(method.uppercase()) to matched!!.pattern
+            }.toSet()
+        val expectedLocalOnly =
+            ReadSessionProfile.LOCAL_ONLY_ALLOWED_METHODS.flatMap { (pattern, methods) ->
+                methods.map { it to pattern }
+            }.toSet()
+        assertThat(publishedLocalOnly).isEqualTo(expectedLocalOnly)
     }
 
     @Test
@@ -247,6 +248,50 @@ class AuthPolicyTest {
             .isEqualTo(AuthDecision.Allow)
         assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/anything")))
             .isEqualTo(AuthDecision.Allow)
+    }
+
+    @Test
+    fun `a catalog-bound operator reaches its catalog and provisioning, and nothing fleet-wide`() {
+        val caller = boundOperator("lake")
+        // Its own catalog, the operator-only containment route included.
+        assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/lake")))
+            .isEqualTo(AuthDecision.Allow)
+        assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(HttpMethod.Delete, "/v1/catalogs/lake")))
+            .isEqualTo(AuthDecision.Allow)
+        assertThat(
+            AuthPolicy.authorize(
+                caller,
+                AuthPolicy.match(HttpMethod.Put, "/v1/catalogs/lake/namespaces/ns/containment"),
+            ),
+        ).isEqualTo(AuthDecision.Allow)
+        // Another catalog: the 404 a tenant gets, on both route shapes.
+        assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/other")))
+            .isEqualTo(AuthDecision.UnknownCatalog("other"))
+        assertThat(
+            AuthPolicy.authorize(
+                caller,
+                AuthPolicy.match(HttpMethod.Put, "/v1/catalogs/other/namespaces/ns/containment"),
+            ),
+        ).isEqualTo(AuthDecision.UnknownCatalog("other"))
+        // Provisioning names its catalog in the body: let through to the handler, which holds it.
+        assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(HttpMethod.Post, "/v1/catalogs")))
+            .isEqualTo(AuthDecision.Allow)
+        // MUTATION: `caller.kind.isOperator()` in place of `fleetWide` and these are Allow.
+        for ((method, path) in listOf(
+            HttpMethod.Get to "/metrics",
+            HttpMethod.Get to "/v1/database/health",
+            HttpMethod.Post to "/v1/debug/decode-bound",
+            HttpMethod.Get to "/v1/maintenance/status",
+            HttpMethod.Get to "/v1/maintenance/runs",
+        )) {
+            assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(method, path)))
+                .describedAs(path)
+                .isEqualTo(AuthDecision.InsufficientScope(path, Scope.ADMIN))
+        }
+        // The listing is filtered by the handler to what the caller sees.
+        assertThat(AuthPolicy.authorize(caller, AuthPolicy.match(HttpMethod.Get, "/v1/catalogs")))
+            .isEqualTo(AuthDecision.Allow)
+        assertThat(caller.visibleCatalogs()).containsExactly("lake")
     }
 
     @Test
@@ -451,6 +496,9 @@ class AuthPolicyTest {
     }
 
     private fun operator() = Caller("sa:test", null, Caller.Kind.OPERATOR, emptyMap(), "jti", null)
+
+    private fun boundOperator(catalog: String) =
+        Caller("sa:test", "org-1", Caller.Kind.OPERATOR, mapOf(catalog to setOf(Scope.ADMIN)), "jti", null)
 
     /**
      * Read `paths:` out of the OpenAPI document.

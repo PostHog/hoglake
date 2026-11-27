@@ -534,6 +534,88 @@ object ContractVectors {
                         ),
                     ),
             ),
+            Spec(
+                "operator_routed_without_admin",
+                "A routed operator whose cat grants read, not admin: a bound operator holds every scope on its " +
+                    "catalog whatever the words say, so a binding narrower than admin is refused as malformed, " +
+                    "never read as a reader and never as an operator. hoglite refuses the same token.",
+                "operator",
+                operatorInput().apply {
+                    put("org", ORG)
+                    put("catalog", ORG)
+                    set<JsonNode>("placement", placement())
+                },
+                14,
+                refuse(JwtViolation.MALFORMED),
+                ttl = OPERATOR_TTL,
+                mutation = "cat grants read instead of admin",
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "org" to text(ORG),
+                        "cat" to cat("read"),
+                        "cli" to text("provisioner"),
+                        "rtg" to rtg(),
+                    ),
+            ),
+            Spec(
+                "operator_org_without_binding",
+                "An operator token carrying org but no cat: refused as malformed, never read as a " +
+                    "fleet-wide operator with its org dropped. hoglite accepts an unbound operator only when cat " +
+                    "and org are both absent.",
+                "operator",
+                operatorInput().apply { put("org", ORG) },
+                15,
+                refuse(JwtViolation.MALFORMED),
+                ttl = OPERATOR_TTL,
+                mutation = "org is set with no cat",
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "org" to text(ORG),
+                        "cli" to text("provisioner"),
+                    ),
+            ),
+            Spec(
+                "operator_scope",
+                "An operator token whose binding is spelled in scope rather than cat: refused as malformed, never " +
+                    "read as bound or as fleet-wide. An operator token carries no scope; hoglite refuses any token " +
+                    "carrying one.",
+                "operator",
+                operatorInput(),
+                16,
+                refuse(JwtViolation.MALFORMED),
+                ttl = OPERATOR_TTL,
+                mutation = "scope carries hoglake:<org>:admin with no cat",
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "scope" to text("hoglake:$ORG:admin"),
+                        "cli" to text("provisioner"),
+                    ),
+            ),
+            Spec(
+                "operator_blank_scope",
+                "An operator token whose scope is empty and which carries no cat: refused as malformed, never " +
+                    "read as a fleet-wide operator. An operator token carries no scope, whatever its value; hoglite " +
+                    "refuses any token carrying one.",
+                "operator",
+                operatorInput(),
+                17,
+                refuse(JwtViolation.MALFORMED),
+                ttl = OPERATOR_TTL,
+                mutation = "scope is set to the empty string with no cat",
+                body =
+                    listOf(
+                        "sub" to text("issuer:provisioner"),
+                        "ten" to text("operator"),
+                        "scope" to text(""),
+                        "cli" to text("provisioner"),
+                    ),
+            ),
         )
     }
 

@@ -164,10 +164,15 @@ class CatalogService(private val jdbi: Jdbi) {
                     val theirPrefix = existing.dataPath.trimEnd('/') + "/"
                     if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
                         throw HoglakeException.Validation(
-                            "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
-                                "'${existing.name}' (data_path " +
-                                "'${Identifiers.cap(existing.dataPath)}'); " +
-                                "catalog data_paths must be disjoint",
+                            detail =
+                                "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
+                                    "'${existing.name}' (data_path " +
+                                    "'${Identifiers.cap(existing.dataPath)}'); " +
+                                    "catalog data_paths must be disjoint",
+                            overlaps = existing.name,
+                            redacted =
+                                "data_path '${Identifiers.cap(dataPath)}' overlaps another catalog's; " +
+                                    "catalog data_paths must be disjoint",
                         )
                     }
                 }

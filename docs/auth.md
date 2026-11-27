@@ -25,7 +25,7 @@ The issuer is a deployment choice, not a hoglake dependency:
 | deployment | issuer | storage credentials |
 | --- | --- | --- |
 | single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own key (`local`): `hoglake token keygen` once, `hoglake token mint` per client, no issuer service | each client's own AWS identity; the server's own (`ambient`) for its jobs |
-| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
+| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS; it must not put `scope` on operator tokens, which hoglake refuses | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
 | PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower: to clients alongside the token, to the server's jobs through the `broker` provider |
 
 hoglake's code carries no PostHog concepts. Catalog names, namespaces, the
@@ -40,7 +40,7 @@ one issuer among possible issuers.
 | mode | behaviour | when |
 | --- | --- | --- |
 | `off` (default) | no verification; every request is accepted and the caller-supplied `author` is trusted | local development, CI, a single-tenant install on a trusted network |
-| `warn` | tokens are verified and decisions are computed and counted, but nothing is refused, except a verified scoped token, which is filtered as in `enforce` | measuring before a cutover: watch `hoglake_auth_requests_total{outcome="missing"}` reach zero per client class |
+| `warn` | verifies tokens and counts decisions. Enforces restrictions on verified scoped tokens. Requires a verified operator token for [protected team namespace creation](auth-tenancy.md#62d-operator-only-team-namespaces). | measuring before a cutover: watch `hoglake_auth_requests_total{outcome="missing"}` reach zero per client class |
 | `enforce` | deny by default; a route without a verified, sufficient token gets 401 or 403 | production |
 | `local` | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer) | a standalone install that wants real authentication and no extra service |
 
@@ -82,6 +82,7 @@ under `local` and 404s otherwise.
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
 | `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
+| `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` | the least lifetime a token must have left at a hoglite backend for a long-running route there; default 300, 0 disables. See [below](#backends-that-verify-the-token-themselves) |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_SESSION_PROFILE` | `off` (default) or `on`: whether tokens carrying the [session profile](#session-profile-with-embedded-storage-credentials) are accepted. Off, such a token is refused as `profile_not_enabled`, never read as a plain metadata token |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
@@ -136,8 +137,8 @@ The core, which every issuer must emit:
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes, by decision | token id, for correlating a request with a token. Required because the access log names each request's token by it, and an audit line written while a request is handled reaches the token through its `request_id`; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
-| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today; making it optional is tracked |
-| `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
+| `org` | tenant and scoped, today; optional on a catalog-bound operator; forbidden on an unbound one | the tenant the token belongs to, for the audit log. On a scoped token hoglake also compares it with a namespace's org mark and refuses a namespace marked for another org as if it did not exist ([auth-tenancy.md](auth-tenancy.md) §6.2b). Required by the verifier today on tenant and scoped tokens; making it optional is tracked. On an operator token it is the binding's: a catalog-bound operator may carry it or not, and an operator token carrying `org` with no `cat` is refused as malformed, never read as fleet-wide with its org dropped |
+| `cat`, or `scope` | tenant and scoped, one or both; `cat` alone on an operator, where it binds it | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph. On an `operator` token `cat` is the binding: the token is an operator on the catalogs it names and nothing elsewhere (below). Every bound catalog must carry `admin`, or the token is refused as malformed; a binding that names no catalog is refused. An operator token carries no `scope`; hoglake refuses one, as hoglite does |
 
 Authorization is per catalog. The scope vocabulary is ordered,
 `read < write < maintenance < admin`: `write` includes `read`, `maintenance`
@@ -153,7 +154,9 @@ do not start with `hoglake:` belong to other audiences and are ignored; a
 refuses the token. When both `cat` and `scope` are present they must describe
 the same grants after each has applied its own rules, or the token is
 refused. One limit: a routed (`rtg`) token still needs exactly one `cat`
-entry.
+entry. All of this is for tenant and scoped tokens: an `operator` token
+carrying `scope`, even one with only foreign values, is refused (see
+[Scoped tokens, exactly](#scoped-tokens-exactly)).
 
 Profile extensions, optional and generic. An issuer uses them when its
 deployment needs them; hoglake applies them without knowing what they mean:
@@ -182,6 +185,46 @@ there; only a catalog-bound `operator` request provisions or deletes. An
 issuer that starts adding the backend audience to tokens it already mints
 should let the older single-audience tokens expire before the backend
 enforces.
+
+hoglite verifies the token on every call, where hoglake checks it once
+when the request starts, and accepts it until 60 seconds past `exp`. A
+request that makes many calls can outlive its token there and fail
+partway, after some of its transactions applied (#680). Two rules cover
+that:
+
+- **Refused up front.** On a hoglite catalog, a long-running route
+  answers 401 `token_expired`, with `WWW-Authenticate: Bearer
+  error="token_expired"`, before any backend call, when `exp + 60 - now`
+  is under `HOGLAKE_HOGLITE_MIN_TOKEN_LIFETIME_SECONDS` (default 300; 0
+  disables it). `now` is when hoglake verified the token, on hoglake's
+  clock. The routes selected for the floor are the ones whose
+  transactions grow with the catalog's backlog: `POST
+  .../maintenance/expire`, `.../cleanup`, `.../compact` and
+  `.../rehydrate`, `DELETE /v1/catalogs/{catalog}` and `POST
+  .../uploads/schedule-expired`. Other routes can run a fixed few
+  transactions, and the next rule covers them. Nothing ran, so the 401
+  is safe to answer with a fresh token, which pyhoglake's
+  `ClientCredentials` and the DuckDB extension do on any 401. The
+  refusal is counted on `hoglake_auth_requests_total` and audited like
+  any other; under `warn` it is let through, except for a scoped caller.
+- **Failed midway anyway.** A 401 from hoglite after one of the
+  request's transactions applied, or may have, answers 503
+  `commit_outcome_unknown` naming that transaction, never 401: a client
+  must not re-mint and replay a request that partly ran. A maintenance
+  run answers it too, rather than 200 with a failure count. Only an
+  operation that takes an `idempotency_key` is exactly-once on a retry
+  with the same key; the routes above take none, so re-read the
+  catalog's state before running one again.
+
+Tune the minimum with the issuer's token lifetime. A fresh token has its
+lifetime plus 60 seconds left by this reckoning, less the time from mint
+to verify and any amount hoglake's clock runs ahead of the issuer's. A
+scheduler minting 5-minute tokens has 60 seconds of margin against the
+default 300: a hoglake clock more than that ahead of the issuer refuses
+every such call, and the re-minted retry too. Lower the minimum, or mint
+longer-lived tokens for maintenance.
+
+PostgreSQL catalogs are unaffected by both.
 
 #### Typed scoped namespace read
 
@@ -239,17 +282,24 @@ Reserved mounts and reserved namespaces keep the ordinary verifier on ordinary r
 The one exception is a remote schema's four relayed routes, described in "Read sessions on a remote schema".
 Ordinary tokens keep the ordinary verifier on all ordinary routes.
 
-#### Local-only read routes
+#### Local-only routes
 
-A dedicated client reads local objects through three local-only GET routes:
+A dedicated client accesses local objects through local-only routes under `/v1/local-only`:
 
-- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}`
-- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`
-- `/v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan`
+- `GET /v1/local-only/catalogs/{catalog}/namespaces` (optional `?after=<name>`)
+- `POST /v1/local-only/catalogs/{catalog}/namespaces` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}`
+- `DELETE /v1/local-only/catalogs/{catalog}/namespaces/{namespace}` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables` (optional `?after=<name>`)
+- `POST /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`
+- `DELETE /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}` (writable session only)
+- `GET /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan`
+- `POST /v1/local-only/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/commit` (writable session only; every committed data file and deletion vector URI is verified against the session's primary-catalog write grant before forwarding)
 
-Each route takes the same query and gives the same body as the ordinary route without the prefix.
-A request on these routes always uses the dedicated read verifier.
-It reads only from the configured Hoglite owner named in the signed JWT.
+List routes return paginated objects (`{"namespaces": [...], "next_after": "..."}` and `{"namespace_id": ..., "namespace": ..., "tables": [...], "next_after": "..."}`), with reserved namespaces filtered out before responding.
+Drop routes accept optional identity-fencing queries (`?namespace_id=` on namespace drop and `?table_uuid=` on table drop).
+A request on these routes always uses the dedicated verifier and forwards directly to the configured Hoglite owner named in the signed JWT (requiring a Hoglite owner build that implements the companion typed list and mutation routes).
 It never reaches a remote schema relay, a mount, or a legacy store.
 The server never redirects or rewrites it to an ordinary route.
 
@@ -257,7 +307,7 @@ The routes answer as follows:
 
 - A listener without `HOGLAKE_READ_SESSION_PROFILE` answers `501`. So does the public listener, with or without the profile, and `HOGLAKE_AUTH_MODE=off`.
 - Another path under `/v1/local-only` answers `422`.
-- Another method on a valid route answers `405` with `Allow: GET`.
+- A disallowed method on a valid route answers `405` with the route's `Allow` header.
 - A missing or refused token answers `401`.
 - A verified session that names an unentitled catalog, a reserved mount, or a reserved namespace (including a remote schema) answers `404`. The server does not call the owner.
 - An eligible local namespace, table, or scan answers as the owner answers. An absent object is `404`.
@@ -288,14 +338,31 @@ The token carries generation `1`, a session identifier, and a finite session dea
 Require `nbf <= iat < exp <= aws.expires_at <= session_deadline`.
 Clock skew does not extend AWS expiry.
 
-Each storage grant binds the catalog, target, bucket, region, and `s3:GetObject`.
+Each storage grant binds the catalog, target, bucket, region, and its allowed S3 actions.
 It carries either a literal `object_key` or a slash-terminated `prefix`.
 The verifier rejects overlaps and repeated grants.
-The manifest grant names one literal object for the routed tenant.
+The manifest grant names one literal object for the routed tenant and allows only `s3:GetObject`.
 Its key ends with `/<shard>/t/<routed-tenant>/manifest`, without an extension.
 The shard is the two-digit lowercase hexadecimal result of FNV-1a 32-bit modulo 256 on the full routed tenant.
-Two configured remote targets bind the read-only `team` family.
+Two configured remote targets bind the read-only `team` family and allow only `s3:GetObject`.
 The verifier does not retain or log the AWS credentials.
+
+#### Writable local sessions
+
+A dedicated session (`purpose: "user-session"`) is either **read-only** or **writable**.
+The verifier enforces strict coupling across `cat`, `prd`, and primary-catalog storage grants so half-writable tokens are always refused (`invalid_token`):
+
+- **Read-only session:** `cat.<primary_catalog>` is `["read"]`, `prd.team_id.<team_id>` is `"read"`, and every primary-catalog storage grant allows only `["s3:GetObject"]`.
+- **Writable session:** `cat.<primary_catalog>` is `["read", "write"]` (sorted), `prd.team_id.<team_id>` is `"write"`, and every primary-catalog storage grant is a slash-terminated `prefix` whose `actions` are exactly `["s3:AbortMultipartUpload", "s3:GetObject", "s3:ListMultipartUploadParts", "s3:PutObject"]` (sorted; never `s3:DeleteObject`, `s3:ListBucket`, or a literal `object_key`).
+  The issuer must derive the primary-catalog write prefixes from trusted catalog and namespace placement so both the signed write grants and the effective S3 session policy stay strictly within the data prefixes owned by the team in `prd`.
+  The effective S3 session policy must also enforce conditional create-only writes (`s3:if-none-match: "*"` for both `PutObject` and `CompleteMultipartUpload`, while allowing `CreateMultipartUpload` and `UploadPart`) so embedded credentials cannot overwrite existing snapshot objects.
+  Because writable sessions reuse the existing profile version and audiences, an issuer must enable writable-session minting only after all downstream verifiers (the Client, its backend owner, and any remote Host) accept the writable form.
+- **Always read-only:** `remote_schemas` stays `{"team": ["read"]}`, the manifest grant stays a literal `object_key` with `["s3:GetObject"]`, and both remote target grants stay `["s3:GetObject"]`.
+
+Both read-only and writable sessions are admitted on the local-only read routes and on the four relayed or served remote `GET` routes.
+On a remote `GET` route, a writable session's `prd.team_id.<team_id>: "write"` satisfies read-only authority for `team_<team_id>` and grants no write permission.
+Note: because the relay forwards the caller's original `Authorization` header unchanged, the Host must be in the same trust boundary as the Client for the session's embedded credentials.
+Local-only write routes (`POST` and `DELETE`) require a writable session and refuse a read-only session with `403`.
 
 The [signed read session vectors](../server/src/test/resources/oauth/read-session-vectors.json)
 give the expected verdict for each verifier.
@@ -337,6 +404,7 @@ It adds no claim and changes no claim.
 - Scan `GET` requires canonical `snapshot` and `table_uuid` query parameters for a read session, as the local scan does. The Host checks both against the table it resolves for the scan and answers `404` when either differs. A table that starts to shadow another of the same name between the table lookup and the scan is therefore refused, not read.
 - The Host checks every data file and deletion vector path of a scan answer against the grants of the two remote targets. It refuses an out-of-grant or malformed path with a redacted `403`, as the local scan does for the primary-catalog grants.
 - The scan query is exactly those two parameters. `include` and every other parameter is refused with `400`.
+- Namespace `GET` and the table list take no query for a read session. `snapshot`, `at_timestamp` and every other parameter is refused with `400`, before anything is read: a read session lists the current state only.
 - Table `GET` and the table list omit row totals for a read session, and table `GET` allows only an omitted `totals` or `totals=false`, as the local table route does. Totals are computed before any grant check, so they are not given to a caller whose files are checked.
 - A table list entry for a read session carries `name`, `table_uuid`, and `comment` and `earliest_snapshot_id` when set. It has none of the count and size fields.
 - The four answers carry `Cache-Control: no-store`. A Client sets the header again on the answer it relays to a read session.
@@ -426,10 +494,34 @@ must emit all of the following:
 A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
 `invalid_predicate`, …).
 
-An `operator` token bypasses per-catalog checks and may create catalogs,
-manage containment, and read operator-only routes. Operator tokens
-are therefore only as safe as the keys in the JWKS: whoever can sign with them
-is an operator.
+An `operator` token without `cat` is fleet-wide: it bypasses
+per-catalog checks and may create catalogs, manage containment, and read
+operator-only routes. An `operator` token with `cat` (and so every
+routed one, since `rtg` needs exactly one `cat` entry) is **bound** to the
+catalogs it names: on them it is an operator, holding every scope, containment
+included; every other catalog answers 404 as it does for a tenant; `POST
+/v1/catalogs` creates only a catalog it names (another name is the same 404,
+checked before the name itself, so a reserved name it does not hold is a 404
+too, never the reserved name's 422), and its refusal for a `data_path` that
+overlaps another catalog's names that catalog and its `data_path` only when
+the token names that catalog too; the catalog listing shows its own; and the
+fleet routes (`/metrics`,
+`/v1/database/health`, `/v1/maintenance/status` and `/runs`, the debug
+surface) answer 403. Because a bound operator holds every scope on its
+catalog whatever the words say, the binding must grant `admin` on every
+catalog it names: `{"lake": ["read"]}` on an operator token is refused as
+`invalid_token` (malformed), never read as a reader and never as an operator.
+An operator token carries no `scope`; hoglake refuses one, as hoglite does:
+any `scope`, whatever its value (empty, foreign values only, or `hoglake:`
+grants), refuses an operator token as `invalid_token` (malformed), with or
+without `cat`. An unbound
+operator token must not carry `org` either: `org` names the tenant a binding
+acts for, so an operator token with `org` but no `cat` is refused as
+`invalid_token` rather than read as fleet-wide with its org dropped. This is
+the binding hoglite enforces (an unbound operator is one with neither `cat`
+nor `org`; a routed operator's `cat` must say `admin`), enforced in hoglake
+too. Operator tokens are therefore only as safe as the keys in
+the JWKS: whoever can sign with them is an operator.
 
 ### Errors
 
@@ -479,7 +571,13 @@ hydrator's footer fetches), `write` (compaction: its inputs' reads plus the
 put and multipart upload of its output — and no delete, so a leaked or buggy
 compaction session cannot remove a tenant's referenced files), and `delete`
 (cleanup's drain of the removal queue, the one job that deletes). A broker
-grants `s3:DeleteObject` only for `delete`. The token request is the
+grants `s3:DeleteObject` only for `delete`. The `prefix` is a request, not
+an authority: a broker must bound the session by the catalog's placement as
+its own records hold it, and refuse a `prefix` outside it. hoglake sends the
+catalog's `data_path`, and a Hoglite tenant can rewrite its own (#668), so a
+broker that scoped its session to whatever `prefix` it was sent would give
+that tenant a read session on another catalog's objects. hogtower's broker
+refuses one with `prefix_outside_catalog`. The token request is the
 clients' client-credentials form, `grant_type=client_credentials` with
 `audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
 URLs must be `https` — the client secret and every vended key cross that
@@ -502,7 +600,11 @@ its own, and every session it uses is one the broker chose to grant and can
 audit. PostHog runs it, pointed at hogtower; anyone can implement the shape in
 front of their own STS wrapper or a secrets engine. Under `ambient` the
 server's role reaches every catalog it serves, which is the normal trade for a
-single-org install.
+single-org install. A Hoglite tenant can rewrite its own `data_path` (#668), so
+a Hoglite rehydrate reads footers only under `HOGLAKE_HOGLITE_DATA_PATH_TEMPLATE`
+or the catalog's `broker` session, and under `ambient` or `static` with no
+template it only requeues and records a failed `hydrator` run saying why
+(server/README).
 
 Whatever the provider, it serves only the server's own work: the background
 jobs, and the same work when a caller with `maintenance` scope triggers it

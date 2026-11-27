@@ -1,11 +1,19 @@
 package com.posthog.hoglake.store
 
+import com.fasterxml.jackson.core.JsonFactory
+import com.fasterxml.jackson.core.StreamReadFeature
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.NamespaceDto
 import com.posthog.hoglake.api.ScanFileDto
 import com.posthog.hoglake.api.TableDto
 import com.posthog.hoglake.auth.AuthPolicy
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.Jwt
+import com.posthog.hoglake.auth.JwtViolation
 import com.posthog.hoglake.auth.ReadSessionProfile
 import com.posthog.hoglake.auth.ReadSessionTarget
 import com.posthog.hoglake.auth.Routing
@@ -14,6 +22,7 @@ import com.posthog.hoglake.auth.StoreGrant
 import com.posthog.hoglake.auth.VerifiedBackendAuthority
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.refuseIgnoredRouting
+import com.posthog.hoglake.auth.refuseTokenAtStore
 import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.remoteTeamSchemas
 import com.posthog.hoglake.auth.requireCatalogEntitlement
@@ -28,9 +37,11 @@ import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HogliteCompaction
 import com.posthog.hoglake.hoglite.HogliteCompactionCursors
+import com.posthog.hoglake.hoglite.HogliteHydrator
 import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
+import com.posthog.hoglake.hoglite.ScopedForwardResult
 import com.posthog.hoglake.hoglite.ScopedReadOutcome
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.HoglakeException
@@ -50,6 +61,7 @@ import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.TeamNamespaces
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
+import io.ktor.http.HttpMethod
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
@@ -134,14 +146,15 @@ class CatalogStoreSelector(
         target: ReadSessionTarget,
     ): TableDto {
         val table = target.table ?: throw HoglakeException.NotFound("table")
-        if (!allowsReadSessionRoute(target.catalog, target.namespace, table)) {
+        val namespace = target.namespace ?: throw HoglakeException.NotFound("table")
+        if (!allowsReadSessionRoute(target.catalog, namespace, table)) {
             throw HoglakeException.NotFound("table")
         }
         val (caller, routing, authority) = resolveReadSessionRouting(call, target.catalog, "table")
         val tenant = checkNotNull(routing.tenant)
         val outcome =
             client(routing.backendId).forRequest(authority.token)
-                .readScopedTable(tenant, target.catalog, target.namespace, table)
+                .readScopedTable(tenant, target.catalog, namespace, table)
         return when (outcome) {
             ScopedReadOutcome.NotFound -> throw HoglakeException.NotFound("table")
             ScopedReadOutcome.Forbidden -> throw HoglakeException.Forbidden("access denied")
@@ -168,7 +181,8 @@ class CatalogStoreSelector(
         tableUuid: UUID,
     ): List<ScanFileDto> {
         val table = target.table ?: throw HoglakeException.NotFound("table")
-        if (!allowsReadSessionRoute(target.catalog, target.namespace, table)) {
+        val namespace = target.namespace ?: throw HoglakeException.NotFound("table")
+        if (!allowsReadSessionRoute(target.catalog, namespace, table)) {
             throw HoglakeException.NotFound("table")
         }
         val (_, routing, authority) = resolveReadSessionRouting(call, target.catalog, "table")
@@ -176,7 +190,7 @@ class CatalogStoreSelector(
         val grants = checkNotNull(authority.storageGrants)
         val outcome =
             client(routing.backendId).forRequest(authority.token)
-                .readScopedScan(tenant, target.catalog, target.namespace, table, snapshot, tableUuid)
+                .readScopedScan(tenant, target.catalog, namespace, table, snapshot, tableUuid)
         return when (outcome) {
             ScopedReadOutcome.NotFound -> throw HoglakeException.NotFound("table")
             ScopedReadOutcome.Forbidden -> throw HoglakeException.Forbidden("access denied")
@@ -201,23 +215,179 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         target: ReadSessionTarget,
     ): NamespaceDto? {
-        if (!allowsReadSessionRoute(target.catalog, target.namespace)) {
+        val namespace = target.namespace ?: throw HoglakeException.NotFound("namespace")
+        if (!allowsReadSessionRoute(target.catalog, namespace)) {
             throw HoglakeException.NotFound("namespace")
         }
         val (_, routing, authority) = resolveReadSessionRouting(call, target.catalog, "namespace")
         val tenant = checkNotNull(routing.tenant)
         val result =
             client(routing.backendId).forRequest(authority.token)
-                .readScopedNamespace(tenant, target.catalog, target.namespace) ?: return null
+                .readScopedNamespace(tenant, target.catalog, namespace) ?: return null
         val held = result.containment
         val fields = checkNotNull(cfg).authPredicateFields.split(',').map { it.trim() }.toSet()
-        if (result.name != target.namespace || result.namespaceId?.let { it > 0 } != true ||
+        if (result.name != namespace || result.namespaceId?.let { it > 0 } != true ||
             result.remote != null || held == null || held.org != null || held.field !in fields || held.value <= 0
         ) {
             throw HoglakeException.BackendUnavailable("scoped namespace unavailable")
         }
         return result
     }
+
+    /** Forward one local-only typed metadata list or mutation to the Hoglite owner. */
+    internal fun forwardLocalOnlyMetadata(
+        call: ApplicationCall,
+        method: String,
+        target: ReadSessionTarget,
+        subpath: String,
+        query: String?,
+        requestBody: ByteArray?,
+        isCommit: Boolean = false,
+        isCreateNamespace: Boolean = false,
+    ): ScopedForwardResult {
+        val currentCfg = cfg ?: throw HoglakeException.NotFound("namespace")
+        val namespace = target.namespace
+        if (MountNames.isReserved(target.catalog) ||
+            (namespace != null && currentCfg.reservedNamespaces.isReserved(namespace)) ||
+            !ReadSessionProfile.isCanonicalRoute(target.catalog, namespace, target.table)
+        ) {
+            throw HoglakeException.NotFound("namespace")
+        }
+        val (_, routing, authority) = resolveReadSessionRouting(call, target.catalog, "namespace")
+        val tenant = checkNotNull(routing.tenant)
+        val grants = checkNotNull(authority.storageGrants)
+        val isMutation = method == "POST" || method == "DELETE"
+        if (isMutation && !grants.writable) {
+            throw HoglakeException.Forbidden("access denied")
+        }
+        val validatedBody =
+            when {
+                isCreateNamespace -> validateAndCanonicalizeCreateNamespace(requestBody, currentCfg)
+                isCommit -> validateAndCanonicalizeCommit(requestBody, target.catalog, grants)
+                method == "POST" -> validateAndCanonicalizeCreateTable(requestBody)
+                else -> null
+            }
+        val result =
+            client(routing.backendId).forRequest(authority.token)
+                .forwardScopedMetadata(method, tenant, target.catalog, subpath, query, validatedBody)
+        if (method == "GET" && subpath == "/namespaces" && result.statusCode == 200) {
+            return ScopedForwardResult(result.statusCode, filterReservedNamespaces(result.body, currentCfg))
+        }
+        return result
+    }
+
+    private fun isReservedLocalNamespace(
+        name: String,
+        currentCfg: Config,
+    ): Boolean =
+        currentCfg.reservedNamespaces.isReserved(name) ||
+            TeamNamespaces.hasShape(name) ||
+            name.equals("information_schema", ignoreCase = true)
+
+    private fun filterReservedNamespaces(
+        body: String,
+        currentCfg: Config,
+    ): String {
+        val root = scopedJson.readTree(body) as? ObjectNode ?: return body
+        val arr = root.get("namespaces") as? ArrayNode ?: return body
+        val filtered = scopedJson.createArrayNode()
+        for (entry in arr) {
+            val name = entry.get("name")?.textValue() ?: continue
+            if (!isReservedLocalNamespace(name, currentCfg)) {
+                filtered.add(entry)
+            }
+        }
+        root.set<ArrayNode>("namespaces", filtered)
+        return scopedJson.writeValueAsString(root)
+    }
+
+    private fun parseStrictObject(
+        bytes: ByteArray?,
+        allowedKeys: Set<String>,
+        errorMessage: String,
+    ): ObjectNode {
+        val node =
+            runCatching { scopedJson.readTree(bytes ?: ByteArray(0)) }.getOrNull() as? ObjectNode
+                ?: throw HoglakeException.Validation(errorMessage)
+        val names = node.fieldNames().asSequence().toList()
+        if (names.any { it !in allowedKeys }) {
+            throw HoglakeException.Validation(errorMessage)
+        }
+        return node
+    }
+
+    private fun validateAndCanonicalizeCreateNamespace(
+        requestBody: ByteArray?,
+        currentCfg: Config,
+    ): ByteArray {
+        val node = parseStrictObject(requestBody, setOf("name"), "invalid create namespace body")
+        val name =
+            node.get("name")?.textValue()?.takeIf { it.isNotBlank() }
+                ?: throw HoglakeException.Validation("invalid namespace name")
+        if (isReservedLocalNamespace(name, currentCfg)) {
+            throw HoglakeException.Forbidden("access denied")
+        }
+        return scopedJson.writeValueAsBytes(node)
+    }
+
+    private fun validateAndCanonicalizeCreateTable(requestBody: ByteArray?): ByteArray {
+        val node = parseStrictObject(requestBody, setOf("name", "columns", "comment"), "invalid create table body")
+        val columns =
+            node.get("columns") as? ArrayNode
+                ?: throw HoglakeException.Validation("invalid create table body")
+        val allowedColKeys = setOf("name", "type", "type_params", "nullable", "comment")
+        for (col in columns) {
+            val colObj = col as? ObjectNode ?: throw HoglakeException.Validation("invalid create table body")
+            if (colObj.fieldNames().asSequence().any { it !in allowedColKeys }) {
+                throw HoglakeException.Validation("invalid create table body")
+            }
+            val colName = colObj.get("name")?.textValue() ?: throw HoglakeException.Validation("invalid column name")
+            if (colName.startsWith("_hog")) {
+                throw HoglakeException.Validation("column name '$colName' uses reserved prefix '_hog'")
+            }
+        }
+        return scopedJson.writeValueAsBytes(node)
+    }
+
+    private fun validateAndCanonicalizeCommit(
+        requestBody: ByteArray?,
+        catalog: String,
+        grants: com.posthog.hoglake.auth.ReadSessionStorageGrants,
+    ): ByteArray {
+        val node =
+            parseStrictObject(
+                requestBody,
+                setOf("table_uuid", "base_snapshot_id", "add_files", "add_delete_files"),
+                "invalid commit body",
+            )
+        val fileKeys =
+            mapOf(
+                "add_files" to setOf("path", "record_count", "file_size_bytes", "footer_size"),
+                "add_delete_files" to setOf("data_file_id", "path", "delete_count", "file_size_bytes"),
+            )
+        for ((field, allowedItemKeys) in fileKeys) {
+            val arr = node.get(field) ?: continue
+            if (!arr.isArray) throw HoglakeException.Validation("invalid commit body")
+            for (item in arr) {
+                val obj = item as? ObjectNode ?: throw HoglakeException.Validation("invalid commit body")
+                if (obj.fieldNames().asSequence().any { it !in allowedItemKeys }) {
+                    throw HoglakeException.Validation("invalid commit body")
+                }
+                val path = obj.get("path")?.textValue() ?: throw HoglakeException.Validation("missing file path")
+                if (!grants.allowsPrimaryCatalogWrite(catalog, path)) {
+                    throw HoglakeException.Forbidden("access denied")
+                }
+            }
+        }
+        return scopedJson.writeValueAsBytes(node)
+    }
+
+    private val scopedJson =
+        ObjectMapper(
+            JsonFactory.builder()
+                .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+                .build(),
+        ).enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
 
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
     private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
@@ -728,7 +898,17 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
     ): HydratorMaintenanceBackend =
-        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) { it.hydratorMaintenance }
+        handOut(call, catalog, postgres, ::BoundHydratorMaintenance) {
+            // Hoglite has no hydrator loop: the requeue then hydrates pending files (#675).
+            val config = checkNotNull(cfg)
+            HogliteHydrator(
+                it,
+                objectStore,
+                maxWholeObjectBytes = config.hydratorMaxWholeObjectBytes,
+                maxFooterBytes = config.hogliteMaxFooterBytes,
+                minFileBytes = config.hydratorMinFileBytes,
+            )
+        }
 
     fun maintenanceStatus(
         call: ApplicationCall,
@@ -745,7 +925,6 @@ class CatalogStoreSelector(
             val config = checkNotNull(cfg)
             HogliteMaintenanceStatus(
                 it,
-                config.hydratorIntervalMs,
                 config.expiryIntervalMs,
                 config.cleanupIntervalMs,
                 config.compactionIntervalMs,
@@ -864,6 +1043,8 @@ class CatalogStoreSelector(
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${routing.catalog}'")
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
+                    // Before the store exists, so before any backend call.
+                    requireTokenLifetime(call, routing.catalog)
                     hogliteStore(
                         routing,
                         client(routing.backendId).forRequest(call.verifiedBackendToken),
@@ -871,6 +1052,42 @@ class CatalogStoreSelector(
                     )
                 }
         }
+
+    /**
+     * Refuse a hoglite request on a long-running route ([LONG_RUNNING_ROUTES])
+     * whose token has less than [Config.hogliteMinTokenLifetimeSeconds] left
+     * by hoglite's reckoning: `exp` plus hoglite's leeway, from when it
+     * verified here. hoglite verifies the token on every call, so one that
+     * lapses midway fails the request after some of its transactions applied
+     * (#680). Nothing has been sent yet, so this is the 401 `token_expired` a
+     * client re-mints its token and retries on; a request that fails midway
+     * anyway is `commit_outcome_unknown` (HogliteClient, "Request authority").
+     * Counted and audited, and let through under `warn`, as any refusal the
+     * store decides ([refuseTokenAtStore]).
+     */
+    private fun requireTokenLifetime(
+        call: ApplicationCall,
+        catalog: String,
+    ) {
+        val minimum = cfg?.hogliteMinTokenLifetimeSeconds ?: return
+        if (minimum <= 0) return
+        val route = AuthPolicy.match(call.request.httpMethod, call.request.path()) ?: return
+        if (call.request.httpMethod to route.pattern !in LONG_RUNNING_ROUTES) return
+        val authority = call.verifiedBackendAuthority ?: return
+        val expiry = Jwt.seconds(Jwt.parse(authority.token).claims, "exp")
+        val left = expiry + HogliteClient.TOKEN_LEEWAY_SECONDS - authority.verifiedAt
+        if (left < minimum) {
+            call.refuseTokenAtStore(
+                HoglakeException.Unauthenticated(
+                    JwtViolation.EXPIRED,
+                    "the token has ${left}s left at the hoglite backend, under the ${minimum}s this operation " +
+                        "requires; nothing ran: retry with a fresh token",
+                ),
+                catalog,
+                at = "token_lifetime",
+            )
+        }
+    }
 
     /**
      * Build a store from trusted placement. This method does not discover
@@ -910,6 +1127,7 @@ class CatalogStoreSelector(
             operatorAuthority = operatorAuthority,
             expiryPurgePage = cfg.expiryPurgePage,
             expiryPurgeBudgetMs = cfg.expiryPurgeBudgetMs,
+            dataPathTemplate = cfg.hogliteDataPathTemplate.ifEmpty { null },
         )
 
     private fun hogliteCompactionConfig(): CompactionConfig {
@@ -953,4 +1171,29 @@ class CatalogStoreSelector(
         /** Only PostgreSQL catalogs can use the PostgreSQL sampler's name-keyed totals. */
         val usePostgresTotals: Boolean,
     )
+
+    private companion object {
+        /**
+         * The routes selected for [requireTokenLifetime], by method and
+         * AuthPolicy pattern: the ones whose hoglite request runs a number
+         * of transactions that grows with the catalog's backlog, under one
+         * token. Expiry (floor, purge pages), cleanup (claims, drains, ledger
+         * purges), compaction (claims, publishes), rehydrate (the requeue,
+         * then its run row; every maintenance run adds one), the catalog
+         * drop (fence, release, delete) and the upload sweep (a fence per
+         * claim). Other routes can run more than one (a table-creation
+         * abort runs lazy expiry around its own write, a guarded publish a
+         * reject after it), but a fixed few, on a short request; a token
+         * that lapses between them still answers `commit_outcome_unknown`.
+         */
+        val LONG_RUNNING_ROUTES =
+            setOf(
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/expire",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/cleanup",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/compact",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/maintenance/rehydrate",
+                HttpMethod.Delete to "/v1/catalogs/{catalog}",
+                HttpMethod.Post to "/v1/catalogs/{catalog}/uploads/schedule-expired",
+            )
+    }
 }

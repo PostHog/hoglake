@@ -46,6 +46,12 @@ internal data class ScopedTableResult(
     val table: TableDto,
 )
 
+/** Raw JSON response from a forwarded typed Hoglite metadata operation. */
+internal data class ScopedForwardResult(
+    val statusCode: Int,
+    val body: String,
+)
+
 /** Bounded codec and transport for typed Hoglite metadata operations. */
 internal object HogliteScopedNamespaceRead {
     private const val MAX_TARGET_BYTES = 4 * 1024
@@ -92,6 +98,41 @@ internal object HogliteScopedNamespaceRead {
     fun tableUnavailable() = HoglakeException.BackendUnavailable("hoglite scoped table read unavailable")
 
     fun scanUnavailable() = HoglakeException.BackendUnavailable("hoglite scoped scan read unavailable")
+
+    fun metadataUnavailable() = HoglakeException.BackendUnavailable("hoglite scoped metadata operation unavailable")
+
+    fun forwardMetadata(
+        http: HttpClient,
+        standardUrl: String,
+        token: String,
+        method: String,
+        tenant: String,
+        catalog: String,
+        subpath: String,
+        query: String?,
+        requestBody: ByteArray?,
+        timeoutMs: Long,
+    ): ScopedForwardResult {
+        val fullPath =
+            "/v1/t/${segment(tenant, ::metadataUnavailable)}/metadata/v1/catalogs/" +
+                "${segment(catalog, ::metadataUnavailable)}$subpath"
+        return execute(
+            http = http,
+            standardUrl = standardUrl,
+            token = token,
+            path = fullPath,
+            query = query,
+            timeoutMs = timeoutMs,
+            maxResponseBytes = MAX_TABLE_RESPONSE_BYTES,
+            acceptedStatuses = setOf(200, 201, 400, 403, 404, 409),
+            onUnavailable = ::metadataUnavailable,
+            method = method,
+            requestBody = requestBody,
+        ) { status, body ->
+            val node = decodeUtf8(body, tableJson)
+            ScopedForwardResult(status, tableJson.writeValueAsString(node))
+        }
+    }
 
     fun read(
         http: HttpClient,
@@ -187,6 +228,8 @@ internal object HogliteScopedNamespaceRead {
         maxResponseBytes: Int,
         acceptedStatuses: Set<Int>,
         onUnavailable: () -> HoglakeException.BackendUnavailable,
+        method: String = "GET",
+        requestBody: ByteArray? = null,
         decode: (Int, Body) -> T,
     ): T {
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(minOf(BUDGET_MS, timeoutMs))
@@ -206,13 +249,22 @@ internal object HogliteScopedNamespaceRead {
                 throw onUnavailable()
             }
             val remaining = remaining(deadline, onUnavailable)
-            val request =
+            val reqBuilder =
                 HttpRequest.newBuilder(uri)
                     .timeout(Duration.ofNanos(remaining))
                     .header("Authorization", "Bearer $token")
                     .header("Accept", "application/json")
-                    .GET()
-                    .build()
+            val request =
+                when (method) {
+                    "GET" -> reqBuilder.GET().build()
+                    "DELETE" -> reqBuilder.DELETE().build()
+                    "POST" ->
+                        reqBuilder
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody ?: ByteArray(0)))
+                            .build()
+                    else -> throw onUnavailable()
+                }
             val responseFuture =
                 http.sendAsync(request) { info ->
                     val lengths = info.headers().allValues("Content-Length")

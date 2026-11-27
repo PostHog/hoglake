@@ -109,6 +109,10 @@ class StoreEntitlementRoutesTest {
 
     private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
 
+    /** An operator bound to `alpha` (#667): an operator there, a tenant's stranger to `beta`. */
+    private fun bound() =
+        TestTokens.mint(pair, TestTokens.operatorClaims().dropLast(1) + ""","org":"org-1","cat":{"alpha":["admin"]}}""")
+
     @Test
     fun `no catalog route hands out a store for a catalog the token does not name`() = drive(AuthMode.ENFORCE)
 
@@ -149,7 +153,9 @@ class StoreEntitlementRoutesTest {
             var refusedAtTheStore = 0
             for (rule in routes()) {
                 val what = "${rule.method.value} ${rule.pattern}"
-                for ((kind, token) in listOf("tenant" to tenant(), "scoped" to scoped(), "operator" to operator())) {
+                val tokens =
+                    listOf("tenant" to tenant(), "scoped" to scoped(), "operator" to operator(), "bound" to bound())
+                for ((kind, token) in tokens) {
                     // The path's catalog first: which callers reach this route's handler at all.
                     handed.clear()
                     val own =
@@ -163,7 +169,8 @@ class StoreEntitlementRoutesTest {
                     }
                     val expected =
                         when (kind) {
-                            "operator" -> true
+                            // A bound operator reaches every route of its own catalog, the OPERATOR ones included.
+                            "operator", "bound" -> true
                             // `warn` lets a tenant through the plugin on every route.
                             "tenant" -> !mode.isEnforcing || rule.requirement != Requirement.OPERATOR
                             else ->
@@ -181,9 +188,9 @@ class StoreEntitlementRoutesTest {
                             header(HttpHeaders.Authorization, "Bearer $token")
                             header("X-Handler-Catalog", "beta")
                         }
-                    if (kind == "operator" || (kind == "tenant" && !mode.isEnforcing)) {
-                        // An operator's authority is every catalog, as at the door;
-                        // a tenant's refusal under `warn` is counted and let through.
+                    if (kind == "operator" || (kind in setOf("tenant", "bound") && !mode.isEnforcing)) {
+                        // A fleet-wide operator's authority is every catalog, as at the door;
+                        // a tenant's or a bound operator's refusal under `warn` is counted and let through.
                         if (handed.map { it.substringBefore('(') }.sorted() != everyFunction) {
                             wrong += "$what as $kind: beta was not handed out by every function: $handed"
                         }
